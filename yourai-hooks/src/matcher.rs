@@ -17,10 +17,10 @@ pub enum CompiledMatcher {
 }
 
 impl CompiledMatcher {
-    /// 从配置字符串编译。
-    pub fn compile(pattern: &str) -> Self {
+    /// 从配置字符串编译；非法正则返回错误，供配置注册阶段 fail fast。
+    pub fn try_compile(pattern: &str) -> Result<Self, String> {
         if pattern.is_empty() || pattern == "*" {
-            return CompiledMatcher::All;
+            return Ok(CompiledMatcher::All);
         }
         // 仅含字母数字 _ | → 精确匹配或 pipe 分隔
         if pattern
@@ -31,16 +31,18 @@ impl CompiledMatcher {
                 .split('|')
                 .map(|s| normalize_legacy_tool_name(s.trim()).to_string())
                 .collect();
-            return CompiledMatcher::Exact(parts);
+            return Ok(CompiledMatcher::Exact(parts));
         }
         // 否则作为正则
-        match Regex::new(pattern) {
-            Ok(re) => CompiledMatcher::Regex(Arc::new(re)),
-            Err(_) => {
-                // 无效正则退化为不匹配
-                CompiledMatcher::Exact(vec!["__invalid_regex__".to_string()])
-            }
-        }
+        Regex::new(pattern)
+            .map(|regex| CompiledMatcher::Regex(Arc::new(regex)))
+            .map_err(|error| format!("invalid hook matcher regex '{pattern}': {error}"))
+    }
+
+    /// 便捷编译。调用方处理不可信配置时应使用 [`Self::try_compile`]。
+    pub fn compile(pattern: &str) -> Self {
+        Self::try_compile(pattern)
+            .unwrap_or_else(|_| CompiledMatcher::Exact(vec!["__invalid_regex__".to_string()]))
     }
 
     /// 测试是否匹配。
@@ -118,5 +120,10 @@ mod tests {
         assert!(CompiledMatcher::compile("Task").matches("Agent"));
         assert!(CompiledMatcher::compile("^Task$").matches("Agent"));
         assert!(CompiledMatcher::compile("KillShell").matches("TaskStop"));
+    }
+
+    #[test]
+    fn invalid_regex_is_reported_by_strict_compiler() {
+        assert!(CompiledMatcher::try_compile("[").is_err());
     }
 }

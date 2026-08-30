@@ -20,6 +20,7 @@ use crate::wire_output::{
     SyncOutput,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -165,14 +166,15 @@ impl ConcreteHookRuntime {
                 }
             }
         }
-        let regs = crate::config::build_registrations(config, source);
+        let regs = crate::config::build_registrations(config, source).map_err(ErrorKind::Config)?;
         let mut guard = self.registrations.write().await;
         guard.extend(regs.into_iter().map(RegisteredHook::from));
         Ok(())
     }
 
-    /// 注册单个注册项。
-    pub async fn register(&self, reg: HookRegistration) {
+    /// 测试辅助：注入已经构造好的注册项。生产代码走 `register_config` 或 `HookRegistry`。
+    #[cfg(test)]
+    async fn register(&self, reg: HookRegistration) {
         let mut guard = self.registrations.write().await;
         guard.push(reg.into());
     }
@@ -199,7 +201,6 @@ impl ConcreteHookRuntime {
                 .iter()
                 .filter(|reg| {
                     reg.event_name == event_name
-                        && handler_supported_for_event(&reg.handler, event_name)
                         && condition_matches(reg.if_condition.as_deref(), invocation)
                         && match match_query {
                             Some(q) => reg.matcher.matches(q),
@@ -237,7 +238,8 @@ impl ConcreteHookRuntime {
         )
         .await;
 
-        let mut contributions = Vec::new();
+        // 执行记录保留完成顺序用于观测；聚合贡献必须恢复注册顺序，确保语义确定。
+        let mut indexed_contributions = Vec::new();
         let mut runs = Vec::new();
 
         let mut once_ids = Vec::new();
@@ -312,13 +314,16 @@ impl ConcreteHookRuntime {
                                 HookOutput::Parsed(_) => {}
                                 _ => {}
                             }
-                            contributions.push(contrib);
+                            indexed_contributions.push((executed.registration_index, contrib));
                             runs.push(run);
                         }
                         Err(e) => {
                             run.status = HookRunStatus::Failed;
                             run.stderr = Some(e.to_string());
-                            contributions.push(failure_contribution(reg, e.to_string()));
+                            indexed_contributions.push((
+                                executed.registration_index,
+                                failure_contribution(reg, e.to_string()),
+                            ));
                             runs.push(run);
                         }
                     }
@@ -327,15 +332,18 @@ impl ConcreteHookRuntime {
                     run.duration = duration;
                     run.status = HookRunStatus::Failed;
                     run.stderr = Some(error.clone());
-                    contributions.push(failure_contribution(reg, error));
+                    indexed_contributions.push((
+                        executed.registration_index,
+                        failure_contribution(reg, error),
+                    ));
                     runs.push(run);
                 }
                 HandlerExecResult::TimedOut { duration } => {
                     run.duration = duration;
                     run.status = HookRunStatus::TimedOut;
-                    contributions.push(failure_contribution(
-                        reg,
-                        format!("hook timed out after {duration:?}"),
+                    indexed_contributions.push((
+                        executed.registration_index,
+                        failure_contribution(reg, format!("hook timed out after {duration:?}")),
                     ));
                     runs.push(run);
                 }
@@ -350,6 +358,11 @@ impl ConcreteHookRuntime {
             guard.retain(|reg| !once_ids.contains(&reg.id));
         }
 
+        indexed_contributions.sort_by_key(|(registration_index, _)| *registration_index);
+        let contributions: Vec<Contribution> = indexed_contributions
+            .into_iter()
+            .map(|(_, contribution)| contribution)
+            .collect();
         let common = aggregate_common(&contributions);
         let outcome = aggregate(event_name, contributions);
         Ok(HookDispatchResult {
@@ -385,11 +398,11 @@ impl HookRegistry for ConcreteHookRuntime {
             let reg = RegisteredHook {
                 id: registration.id,
                 event_name: registration.event.as_str().to_string(),
-                matcher: registration
-                    .matcher
-                    .as_deref()
-                    .map(crate::matcher::CompiledMatcher::compile)
-                    .unwrap_or(crate::matcher::CompiledMatcher::All),
+                matcher: match registration.matcher.as_deref() {
+                    Some(pattern) => crate::matcher::CompiledMatcher::try_compile(pattern)
+                        .map_err(ErrorKind::Config)?,
+                    None => crate::matcher::CompiledMatcher::All,
+                },
                 handler: RegisteredHandler::Native(registration.handler),
                 timeout: registration.timeout,
                 source: registration.source,
@@ -444,16 +457,6 @@ fn failure_contribution(reg: &RegisteredHook, message: String) -> Contribution {
         _ => {}
     }
     contribution
-}
-
-fn handler_supported_for_event(handler: &RegisteredHandler, event_name: &str) -> bool {
-    !matches!(
-        (handler, event_name),
-        (
-            RegisteredHandler::Config(HandlerConfig::Http { .. }),
-            "SessionStart" | "Setup"
-        )
-    )
 }
 
 /// Claude 的 `if` 使用 permission-rule 形式。这里覆盖通用工具字段；未来工具可通过
@@ -557,6 +560,7 @@ async fn run_handlers_parallel(
     background_tx: &tokio::sync::broadcast::Sender<crate::command::BackgroundHookEvent>,
 ) -> Vec<ExecutedHook> {
     let mut join_set: JoinSet<ExecutedHook> = JoinSet::new();
+    let mut task_metadata = HashMap::new();
 
     for (registration_index, reg) in matched.iter().enumerate() {
         let inv = invocation.clone();
@@ -587,12 +591,12 @@ async fn run_handlers_parallel(
             RegisteredHandler::Native(handler) => handler.clone(),
         };
 
-        join_set.spawn(async move {
+        let started_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let task = join_set.spawn(async move {
             let start = std::time::Instant::now();
-            let started_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
             let exec_future = execute_with_timeout(handler.as_ref(), &inv, timeout);
             let result = match exec_future.await {
                 Ok(output) => HandlerExecResult::Success {
@@ -619,12 +623,25 @@ async fn run_handlers_parallel(
                 result,
             }
         });
+        task_metadata.insert(task.id(), (registration_index, started_at));
     }
 
     let mut results = Vec::with_capacity(matched.len());
     while let Some(res) = join_set.join_next().await {
-        if let Ok(executed) = res {
-            results.push(executed);
+        match res {
+            Ok(executed) => results.push(executed),
+            Err(error) => {
+                if let Some((registration_index, started_at)) = task_metadata.get(&error.id()) {
+                    results.push(ExecutedHook {
+                        registration_index: *registration_index,
+                        started_at: *started_at,
+                        result: HandlerExecResult::Failed {
+                            error: format!("hook handler task failed: {error}"),
+                            duration: Duration::ZERO,
+                        },
+                    });
+                }
+            }
         }
     }
     results
@@ -729,22 +746,13 @@ fn parse_handler_output(
 }
 
 fn parse_json_value(value: &Value) -> Result<HookJsonOutput, YourAiError> {
-    if value.get("async") == Some(&Value::Bool(true)) {
-        let async_output = serde_json::from_value::<crate::wire_output::AsyncOutput>(value.clone())
-            .map_err(|e| ErrorKind::Provider {
-                name: "hook",
-                message: format!("async output parse: {e}"),
-            })?;
-        Ok(HookJsonOutput::Async(async_output))
-    } else {
-        let sync_output = serde_json::from_value::<SyncOutput>(value.clone()).map_err(|e| {
-            ErrorKind::Provider {
-                name: "hook",
-                message: format!("sync output parse: {e}"),
-            }
-        })?;
-        Ok(HookJsonOutput::Sync(sync_output))
-    }
+    crate::wire_output::parse_hook_json(&value.to_string()).map_err(|error| {
+        ErrorKind::Provider {
+            name: "hook",
+            message: format!("parsed hook output validation failed: {error}"),
+        }
+        .into()
+    })
 }
 
 fn apply_json_output(
@@ -1350,6 +1358,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_pretool_prompt_denies_tool_without_stopping_turn() {
+        let executor = Arc::new(RecordingModelExecutor {
+            requests: Mutex::new(Vec::new()),
+            decision: HookModelDecision {
+                ok: false,
+                reason: Some("tool rejected by model hook".to_string()),
+            },
+        });
+        let rt = ConcreteHookRuntime::new().with_model_executor(executor);
+        let config: HooksConfig = serde_json::from_value(serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "prompt", "prompt": "review $ARGUMENTS"}]
+                }]
+            }
+        }))
+        .unwrap();
+        rt.register_config(&config, HookSource::Project)
+            .await
+            .unwrap();
+
+        let result = rt
+            .dispatch(&HookInvocation::new(
+                BaseInput::new("sess", "/tmp"),
+                HookEvent::PreToolUse {
+                    tool_name: "Bash".to_string(),
+                    tool_input: serde_json::json!({"command": "rm -rf /tmp/example"}),
+                    tool_use_id: "call".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert!(!result.common.prevent_continuation);
+        match result.outcome {
+            HookPointOutcome::PreToolUse(outcome) => assert!(matches!(
+                outcome.permission,
+                HookPermission::Deny { ref reason } if reason == "tool rejected by model hook"
+            )),
+            _ => panic!("expected PreToolUse outcome"),
+        }
+    }
+
+    #[tokio::test]
     async fn dispatch_command_handler_echo_context() {
         let rt = ConcreteHookRuntime::new();
         rt.register(command_registration(
@@ -1527,6 +1580,43 @@ mod tests {
         assert_eq!(result.runs[0].stdout.as_deref(), Some("fast"));
         assert_eq!(result.runs[1].hook_id, "slow");
         assert_eq!(result.runs[1].stdout.as_deref(), Some("slow"));
+    }
+
+    #[tokio::test]
+    async fn aggregation_uses_registration_order_not_completion_order() {
+        let rt = ConcreteHookRuntime::new();
+        rt.register(command_registration(
+            "slow-first",
+            "UserPromptSubmit",
+            crate::matcher::CompiledMatcher::All,
+            r#"sleep 0.05; printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"first"}}'"#,
+        ))
+        .await;
+        rt.register(command_registration(
+            "fast-second",
+            "UserPromptSubmit",
+            crate::matcher::CompiledMatcher::All,
+            r#"printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"second"}}'"#,
+        ))
+        .await;
+
+        let result = rt
+            .dispatch(&HookInvocation::new(
+                BaseInput::new("sess", "/tmp"),
+                HookEvent::UserPromptSubmit {
+                    prompt: "hi".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(result.runs[0].hook_id, "fast-second");
+        match result.outcome {
+            HookPointOutcome::UserPromptSubmit(outcome) => {
+                assert_eq!(outcome.additional_contexts, ["first", "second"]);
+            }
+            _ => panic!("expected UserPromptSubmit outcome"),
+        }
     }
 
     #[tokio::test]
@@ -1786,6 +1876,46 @@ mod tests {
             }
             _ => panic!("expected UserPromptSubmit"),
         }
+    }
+
+    #[tokio::test]
+    async fn panicking_native_handler_produces_failed_run() {
+        let rt = ConcreteHookRuntime::new();
+        let handler = crate::handler::NativeHandler::new(|_| -> Result<HookJsonOutput, String> {
+            panic!("native hook panic")
+        });
+        HookRegistry::register(
+            &rt,
+            NativeHookRegistration {
+                id: "panicking-native".to_string(),
+                event: yourai_core::hooks::HookEventKind::UserPromptSubmit,
+                matcher: None,
+                handler: Arc::new(handler),
+                timeout: None,
+                source: HookSource::Session,
+                failure_policy: FailurePolicy::Open,
+                once: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = rt
+            .dispatch(&HookInvocation::new(
+                BaseInput::new("sess", "/tmp"),
+                HookEvent::UserPromptSubmit {
+                    prompt: "hi".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.runs.len(), 1);
+        assert_eq!(result.runs[0].status, HookRunStatus::Failed);
+        assert!(result.runs[0]
+            .stderr
+            .as_deref()
+            .unwrap()
+            .contains("hook handler task failed"));
     }
 
     #[test]

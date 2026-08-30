@@ -56,6 +56,7 @@ impl HookHandler for ModelHookHandler {
         invocation: &'a HookInvocation,
     ) -> BoxFuture<'a, Result<HookOutput, yourai_core::YourAiError>> {
         let wire_input = crate::event::to_wire_json(invocation).to_string();
+        let event = invocation.event_kind();
         let request = HookModelRequest {
             prompt: self.prompt.replace("$ARGUMENTS", &wire_input),
             model: self.model.clone(),
@@ -70,12 +71,22 @@ impl HookHandler for ModelHookHandler {
                 let reason = decision
                     .reason
                     .unwrap_or_else(|| "hook condition was not met".to_string());
-                serde_json::json!({
-                    "continue": false,
-                    "stopReason": reason,
-                    "decision": "block",
-                    "reason": reason,
-                })
+                if event == yourai_core::hooks::HookEventKind::PreToolUse {
+                    serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": reason,
+                        }
+                    })
+                } else {
+                    serde_json::json!({
+                        "continue": false,
+                        "stopReason": reason,
+                        "decision": "block",
+                        "reason": reason,
+                    })
+                }
             };
             Ok(HookOutput::Parsed(output))
         })

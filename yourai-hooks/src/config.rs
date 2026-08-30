@@ -296,16 +296,22 @@ pub struct HookRegistration {
 }
 
 /// 从配置构建注册项列表。
-pub fn build_registrations(config: &HooksConfig, source: HookSource) -> Vec<HookRegistration> {
+pub fn build_registrations(
+    config: &HooksConfig,
+    source: HookSource,
+) -> Result<Vec<HookRegistration>, String> {
     let mut regs = Vec::new();
     for (event_name, groups) in &config.hooks {
+        if yourai_core::hooks::HookEventKind::from_name(event_name).is_none() {
+            return Err(format!("unknown hook event: {event_name}"));
+        }
         for (gi, group) in groups.iter().enumerate() {
-            let matcher = group
-                .matcher
-                .as_deref()
-                .map(CompiledMatcher::compile)
-                .unwrap_or(CompiledMatcher::All);
+            let matcher = match group.matcher.as_deref() {
+                Some(pattern) => CompiledMatcher::try_compile(pattern)?,
+                None => CompiledMatcher::All,
+            };
             for (hi, handler) in group.hooks.iter().enumerate() {
+                handler.validate()?;
                 let id = format!("{}:{}:{}:{}", source.as_str(), event_name, gi, hi);
                 let timeout = handler.timeout();
                 let failure_policy = handler.failure_policy();
@@ -323,7 +329,7 @@ pub fn build_registrations(config: &HooksConfig, source: HookSource) -> Vec<Hook
             }
         }
     }
-    regs
+    Ok(regs)
 }
 
 #[cfg(test)]
@@ -358,7 +364,7 @@ mod tests {
     fn build_regs() {
         let json = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo hi"}]}]}}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let regs = build_registrations(&config, HookSource::User);
+        let regs = build_registrations(&config, HookSource::User).unwrap();
         assert_eq!(regs.len(), 1);
         assert_eq!(regs[0].event_name, "PreToolUse");
         assert_eq!(regs[0].id, "user:PreToolUse:0:0");
@@ -422,5 +428,20 @@ mod tests {
             serde_json::from_str(r#"{"type":"prompt","prompt":"review"}"#).unwrap();
         assert!(prompt.validate().is_ok());
         assert!(prompt.requires_model_executor());
+    }
+
+    #[test]
+    fn registration_builder_rejects_invalid_matcher_and_timeout() {
+        let bad_matcher: HooksConfig = serde_json::from_str(
+            r#"{"hooks":{"PreToolUse":[{"matcher":"[","hooks":[{"type":"command","command":"check"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(build_registrations(&bad_matcher, HookSource::Project).is_err());
+
+        let bad_timeout: HooksConfig = serde_json::from_str(
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"check","timeout":-1}]}]}}"#,
+        )
+        .unwrap();
+        assert!(build_registrations(&bad_timeout, HookSource::Project).is_err());
     }
 }

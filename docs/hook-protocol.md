@@ -403,7 +403,8 @@ YourAI 的 `CompiledMatcher` 预编译为三种变体（`All` / `Exact` / `Regex
 3. 同一来源内对完全相同的配置 Handler 去重
 4. **并行执行**所有匹配 Handler（`JoinSet`）
 5. 逐个解析输出为 `Contribution`
-6. 聚合为最终 `HookPointOutcome`
+6. `HookRun` 保留完成顺序用于观测；`Contribution` 恢复注册顺序
+7. 按注册顺序聚合为最终 `HookPointOutcome`
 
 ### 6.2 公共控制与 PreToolUse 权限是两个维度
 
@@ -833,6 +834,20 @@ permission: HookPermission::Deny { reason: "no rm -rf" }
 | Workspace trust | 未信任项目 Hook 不执行 | 注册前由宿主策略层检查 | 待宿主验收 |
 | 事件数量 | 27 | 27 | 已对齐 |
 | hookSpecificOutput 变体 | 15 | 15 | 已对齐 |
+
+### 11.1 下一阶段必须补齐的运行边界
+
+以下项目尚未完成，不属于当前“已对齐”范围：
+
+1. 生产 Loop 在所有 hook point 的触发与 outcome 消费，以及 `asyncRewake` 唤醒。
+2. Loop 丢弃 `dispatch` future 的取消集成测试；core trait 已明确 drop-based 取消契约。
+3. Command/HTTP 的默认 timeout（兼容基线为 60 秒）及 stdout、stderr、HTTP body
+   的最大字节数。
+4. Command 超时/取消时终止整个进程组，而不仅是直接 shell 子进程。
+5. Command 环境变量继承和默认 shell 策略；需要兼顾最小暴露原则、跨平台行为与
+   Claude 脚本兼容性。
+6. Managed/User/Project/Plugin/Session 的 source precedence、显式 `order` 和稳定装配顺序。
+7. Command 同进程双向 prompt request、workspace trust 的宿主接线。
 
 “无需修改即可运行”是最终验收结论，不是设计前提；只有本表全部通过自动化
 conformance 测试后才可启用该表述。

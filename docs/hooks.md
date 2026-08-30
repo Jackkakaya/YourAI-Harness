@@ -1,7 +1,8 @@
-# YourAI Hook 系统设计
+# YourAI Hook 系统设计（历史稿）
 
-> 状态：设计稿，尚未实现。本文是 Hook 子系统的独立规范；架构总览见
-> [`architecture.md`](./architecture.md)。
+> **状态：已被 [`hook-protocol.md`](./hook-protocol.md) 取代。** 本文保留早期设计背景，
+> 其中信封协议、事件数量、串行 waterfall、旧 trait 签名等内容不再是实现规范，不能作为
+> 当前代码的验收依据。架构总览见 [`architecture.md`](./architecture.md)。
 
 ## 0. 核心执行模型
 

@@ -5,6 +5,8 @@ use std::net::{IpAddr, SocketAddr};
 use yourai_core::hooks::{HookHandler, HookInvocation, HookOutput};
 
 /// HTTP Hook 的宿主级安全策略。`None` 表示不额外限制，空列表表示全部拒绝。
+/// DNS 安全检查默认允许 loopback，以支持已受信任配置中的本地 Hook 服务；宿主可用
+/// `allowed_urls` 进一步收紧，且必须在注册 Project 配置前完成 workspace trust 检查。
 #[derive(Debug, Clone, Default)]
 pub struct HttpHookPolicy {
     pub allowed_urls: Option<Vec<String>>,
@@ -223,9 +225,23 @@ fn headers_to_reqwest(headers: HashMap<String, String>) -> reqwest::header::Head
 
 fn wildcard_url_match(pattern: &str, url: &str) -> bool {
     let mut expression = String::from("^");
-    for ch in pattern.chars() {
+    let authority_end = pattern
+        .find("://")
+        .map(|scheme_end| {
+            pattern[scheme_end + 3..]
+                .find('/')
+                .map(|path_start| scheme_end + 3 + path_start)
+                .unwrap_or(pattern.len())
+        })
+        .unwrap_or(0);
+    for (index, ch) in pattern.char_indices() {
         if ch == '*' {
-            expression.push_str(".*");
+            if index < authority_end {
+                // Host wildcard 只能匹配当前 DNS label，不能跨 `.`、端口或进入 path。
+                expression.push_str("[^./:]*");
+            } else {
+                expression.push_str(".*");
+            }
         } else {
             expression.push_str(&regex::escape(&ch.to_string()));
         }
@@ -237,25 +253,18 @@ fn wildcard_url_match(pattern: &str, url: &str) -> bool {
 }
 
 fn ensure_safe_ip(ip: IpAddr) -> Result<(), yourai_core::YourAiError> {
+    let ip = match ip {
+        IpAddr::V6(ipv6) => ipv6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ipv6)),
+        ip => ip,
+    };
+    // 本地 HTTP hook 是受支持的显式用例；workspace trust 必须在注册配置前完成。
     if ip.is_loopback() {
         return Ok(());
     }
-    let blocked = match ip {
-        IpAddr::V4(ip) => {
-            ip.is_private()
-                || ip.is_link_local()
-                || ip.is_multicast()
-                || ip.is_broadcast()
-                || ip.is_unspecified()
-        }
-        IpAddr::V6(ip) => {
-            ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || ip.is_multicast()
-                || ip.is_unspecified()
-        }
-    };
-    if blocked {
+    if !is_publicly_routable(ip) {
         return Err(yourai_core::ErrorKind::Provider {
             name: "hook",
             message: format!("HTTP hook blocked by SSRF policy: {ip}"),
@@ -263,6 +272,33 @@ fn ensure_safe_ip(ip: IpAddr) -> Result<(), yourai_core::YourAiError> {
         .into());
     }
     Ok(())
+}
+
+fn is_publicly_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            let [a, b, c, _] = ipv4.octets();
+            !(a == 0
+                || a == 10
+                || a == 127
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 192 && b == 168)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224)
+        }
+        IpAddr::V6(ipv6) => {
+            let segments = ipv6.segments();
+            // 仅允许 2000::/3 全球单播，并排除文档前缀 2001:db8::/32。
+            segments[0] & 0xe000 == 0x2000 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +337,10 @@ mod tests {
             "https://hooks.example.com/*",
             "https://evil.example/trace"
         ));
+        assert!(!wildcard_url_match(
+            "https://*.example.com/*",
+            "https://evil.com/a.example.com/trace"
+        ));
     }
 
     #[test]
@@ -308,6 +348,8 @@ mod tests {
         assert!(ensure_safe_ip("10.0.0.1".parse().unwrap()).is_err());
         assert!(ensure_safe_ip("169.254.1.1".parse().unwrap()).is_err());
         assert!(ensure_safe_ip("127.0.0.1".parse().unwrap()).is_ok());
+        assert!(ensure_safe_ip("100.64.0.1".parse().unwrap()).is_err());
+        assert!(ensure_safe_ip("::ffff:10.0.0.1".parse().unwrap()).is_err());
     }
 
     #[test]

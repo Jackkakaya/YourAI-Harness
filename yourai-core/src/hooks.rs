@@ -715,6 +715,10 @@ pub enum FailurePolicy {
 pub trait HookRuntime: Send + Sync {
     /// 分发一次 Hook 调用。
     ///
+    /// 取消契约：返回的 future 必须是 cancellation-safe。调用方通过丢弃 future 取消
+    /// dispatch；实现方必须随之中止尚未完成的同步 handler，并清理其直接子进程。
+    /// 后台 handler 已经脱离本次 dispatch，其生命周期由后台任务协议单独管理。
+    ///
     /// 实现方应：
     /// 1. 按 `event_name` + matcher 过滤注册项
     /// 2. 并行执行匹配 handler（带各自超时）
