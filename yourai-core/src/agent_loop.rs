@@ -19,21 +19,31 @@ pub struct TurnOutput {
 
 impl TurnOutput {
     pub fn new(text: impl Into<String>) -> Self {
-        TurnOutput { text: text.into(), usage: None, pending: Vec::new() }
+        TurnOutput {
+            text: text.into(),
+            usage: None,
+            pending: Vec::new(),
+        }
     }
 }
 
 /// 编排 turn 流程（模型调用 → 工具执行 → 重复直到完成）。
 ///
-/// 最小签名，最大自由：只给 [`TurnContext`]（providers 引用 + inbox/outbox/cancel）。
+/// 最小签名，最大自由：只给 [`TurnContext`]（providers 快照 + inbox/outbox/cancel）。
 /// 启动输入不是特殊参数——**它是 inbox 的第一条消息**，loop 只有一条读路径。
 ///
-/// 消费契约：loop 是 inbox 的独占拉取消费者；step 边界 `try_recv`、
-/// 等待时 `recv().await`（务必与 `cancel` 一起 `select!`）；
-/// 退出前必须再 drain 一次，残留放入 [`TurnOutput::pending`]。
+/// 消费契约：
+/// - loop 是 inbox 的独占拉取消费者；step 边界 `try_recv`、
+///   等待时 `recv().await`（务必与 `cancel` 一起 `select!`）；
+///   退出前必须再 drain 一次，残留放入 [`TurnOutput::pending`]。
+/// - outbox `send` 返回 `false` = 消费端已关闭，应尽快以
+///   `Aborted(Disconnected)` 中止。
+///
+/// 生命周期：返回的 future 绑定 `&'a self` 与 `TurnContext<'a>`——
+/// 有状态 loop 可在 async block 中借用自身字段，无需预先 clone。
 pub trait AgentLoop: Send + Sync {
     fn run_turn<'a>(
-        &self,
+        &'a self,
         tc: TurnContext<'a>,
     ) -> BoxFuture<'a, Result<TurnOutput, YourAiError>>;
 }

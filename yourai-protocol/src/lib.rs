@@ -54,13 +54,22 @@ pub enum Out {
     Message { text: String },
 
     /// 工具调用开始
-    ToolStarted { id: String, name: String, input: Value },
+    ToolStarted {
+        id: String,
+        name: String,
+        input: Value,
+    },
 
     /// 长工具增量通道：shell stdout 逐行 / browser 截图 / subagent 事件树转发
     ToolProgress { id: String, payload: Value },
 
     /// 工具调用结束
-    ToolDone { id: String, name: String, output: Value, is_error: bool },
+    ToolDone {
+        id: String,
+        name: String,
+        output: Value,
+        is_error: bool,
+    },
 
     /// 一切"loop 问外界"（审批/提问/表单/计划确认/MCP elicitation）
     Ask { id: String, payload: Value },

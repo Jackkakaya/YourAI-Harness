@@ -1,10 +1,13 @@
 //! Context 容器 + Agent + turn 运输机制。
 //!
 //! - [`Context`]：12 个 provider 插槽，`RwLock<Option<Arc<dyn>>>`，
-//!   turn 级热替换（决策 5.2）；读取缺失报 `Config`（决策 5.8）
+//!   turn 级热替换（决策 5.2）；读取缺失报 `Config`（决策 5.8），
+//!   可选读取用 `try_*`（供 DefaultLoop 依赖矩阵使用）
 //! - [`Agent`]：组装产物；[`Agent::start`] 是**全局唯一 spawn 点**
-//! - [`TurnHandle`]：一次 turn 的句柄（inbox/outbox/cancel/join）
-//! - [`TurnContext`]：装配给 loop 的本次 turn 交互参数（决策 5.5）
+//! - [`TurnHandle`]：一次 turn 的句柄；**drop 即取消**（消费端离开不再耗资源）
+//! - [`TurnContext`]：装配给 loop 的本次 turn 交互参数（决策 5.5），
+//!   providers 是 start/run 时刻的**快照**（`ProviderSnapshot`）——
+//!   一个 turn 内不可能前后使用两个实现；热替换下一 turn 生效
 
 use std::sync::{Arc, RwLock};
 
@@ -13,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{AgentLoop, TurnOutput};
 use crate::context_manager::ContextManager;
-use crate::error::{ErrorKind, YourAiError};
+use crate::error::{AbortReason, ErrorKind, YourAiError};
 use crate::hooks::HookRegistry;
 use crate::memory::MemoryManager;
 use crate::model::ModelProvider;
@@ -46,7 +49,7 @@ pub struct Context {
     hooks: RwLock<Option<Arc<dyn HookRegistry>>>,
 }
 
-// 读取器：缺失报 Config 错——缺什么在使用点报（决策 5.8）
+// 必需读取器：缺失报 Config 错——缺什么在使用点报（决策 5.8）
 macro_rules! getters {
     ($($name:ident : $trait:ident),* $(,)?) => {
         $(
@@ -67,11 +70,24 @@ macro_rules! getters {
     };
 }
 
+// 可选读取器：缺失返回 None（DefaultLoop 依赖矩阵用：memory/skills/
+// sandbox/security/usage/observability/hooks/session 缺失均有合理缺省）
+macro_rules! try_getters {
+    ($($name:ident : $field:ident, $trait:ident),* $(,)?) => {
+        $(
+            #[doc = concat!("可选读取：未装配返回 `None`（决策 5.8 依赖矩阵的可选侧）")]
+            pub fn $name(&self) -> Option<Arc<dyn $trait>> {
+                self.$field.read().unwrap().clone()
+            }
+        )*
+    };
+}
+
 // 写入器：运行时热替换（决策 5.2，turn 级语义）
 macro_rules! setters {
     ($($setter:ident : $field:ident, $trait:ident),* $(,)?) => {
         $(
-            #[doc = concat!("运行时热替换（决策 5.2）：当前 turn 用旧值跑完，下一 turn 生效")]
+            #[doc = concat!("运行时热替换（决策 5.2）：正在跑的 turn 用旧快照跑完，下一 turn 生效")]
             pub fn $setter(&self, v: Arc<dyn $trait>) {
                 *self.$field.write().unwrap() = Some(v);
             }
@@ -95,6 +111,21 @@ impl Context {
         hooks: HookRegistry,
     }
 
+    try_getters! {
+        try_agent_loop: agent_loop, AgentLoop,
+        try_model: model, ModelProvider,
+        try_context_manager: context_manager, ContextManager,
+        try_session: session, SessionManager,
+        try_memory: memory, MemoryManager,
+        try_tools: tools, ToolRegistry,
+        try_skills: skills, SkillProvider,
+        try_sandbox: sandbox, SandboxProvider,
+        try_security: security, SecurityProvider,
+        try_usage: usage, UsageTracker,
+        try_observability: observability, ObservabilityProvider,
+        try_hooks: hooks, HookRegistry,
+    }
+
     setters! {
         set_agent_loop: agent_loop, AgentLoop,
         set_model: model, ModelProvider,
@@ -109,9 +140,59 @@ impl Context {
         set_observability: observability, ObservabilityProvider,
         set_hooks: hooks, HookRegistry,
     }
+
+    /// turn 开始时的 provider 快照（决策 5.2：一个 turn 内实现恒定）。
+    ///
+    /// 前置条件：`agent_loop` 已装配（start/run 已检查；set_* 只换不撤）。
+    pub fn snapshot(&self) -> ProviderSnapshot {
+        ProviderSnapshot {
+            agent_loop: self
+                .try_agent_loop()
+                .expect("agent_loop verified by caller"),
+            model: self.try_model(),
+            context_manager: self.try_context_manager(),
+            session: self.try_session(),
+            memory: self.try_memory(),
+            tools: self.try_tools(),
+            skills: self.try_skills(),
+            sandbox: self.try_sandbox(),
+            security: self.try_security(),
+            usage: self.try_usage(),
+            observability: self.try_observability(),
+            hooks: self.try_hooks(),
+        }
+    }
 }
 
 // endregion: --- Context ---
+
+// region:    --- ProviderSnapshot ---
+
+/// turn 作用域的 provider 快照：在 `start()/run()` 时刻取一次，
+/// turn 内全部读取走这里——热替换只影响下一 turn（决策 5.2）。
+///
+/// DefaultLoop 依赖矩阵（决策 5.8）：
+/// - 必需：`agent_loop`（start 已查）、`model`、`context_manager`（用点报 Config）
+/// - 工具循环需要：`tools`（无则视作空工具集）
+/// - 可选：`session` / `memory` / `skills` / `sandbox` / `security`
+///   （缺省 = 不拦截）/ `usage` / `observability` / `hooks`（缺省 = 不发）
+#[derive(Clone)]
+pub struct ProviderSnapshot {
+    pub agent_loop: Arc<dyn AgentLoop>,
+    pub model: Option<Arc<dyn ModelProvider>>,
+    pub context_manager: Option<Arc<dyn ContextManager>>,
+    pub session: Option<Arc<dyn SessionManager>>,
+    pub memory: Option<Arc<dyn MemoryManager>>,
+    pub tools: Option<Arc<dyn ToolRegistry>>,
+    pub skills: Option<Arc<dyn SkillProvider>>,
+    pub sandbox: Option<Arc<dyn SandboxProvider>>,
+    pub security: Option<Arc<dyn SecurityProvider>>,
+    pub usage: Option<Arc<dyn UsageTracker>>,
+    pub observability: Option<Arc<dyn ObservabilityProvider>>,
+    pub hooks: Option<Arc<dyn HookRegistry>>,
+}
+
+// endregion: --- ProviderSnapshot ---
 
 // region:    --- Builder ---
 
@@ -203,8 +284,13 @@ impl Agent {
     /// 非阻塞启动：spawn turn，立即返回句柄（全局唯一 spawn 点）。
     ///
     /// loop 未装配时返回 `Config` 错（决策 5.8：缺什么在使用点报）。
+    ///
+    /// 注意：丢弃 [`TurnHandle`] 即取消该 turn（防消费端离开后继续耗资源）；
+    /// 要 fire-and-forget 请把句柄存进任务表，不要直接丢弃。
     pub fn start(self: &Arc<Self>, first: In) -> Result<TurnHandle, YourAiError> {
-        let loop_ = self.ctx.agent_loop()?;
+        // 先查 loop（Config 错误路径），再取快照——快照即本 turn 的恒定视图
+        let _ = self.ctx.agent_loop()?;
+        let snap = self.ctx.snapshot();
 
         let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel();
         let (outbox_tx, outbox_rx) = mpsc::unbounded_channel();
@@ -215,8 +301,10 @@ impl Agent {
         let task_cancel = cancel.clone();
         let result = tokio::spawn(async move {
             let sink = ChannelSink::new(outbox_tx);
+            let loop_ = snap.agent_loop.clone();
             let tc = TurnContext {
                 ctx: &ctx,
+                snap,
                 inbox: &mut inbox_rx,
                 outbox: &sink,
                 cancel: &task_cancel,
@@ -225,25 +313,48 @@ impl Agent {
             // tc drop 后 sink drop → outbox 关闭 = turn 结束信号
         });
 
-        Ok(TurnHandle { inbox: inbox_tx, outbox: outbox_rx, cancel, result })
+        Ok(TurnHandle {
+            inbox: inbox_tx,
+            outbox: outbox_rx,
+            cancel,
+            result: Some(result),
+        })
     }
 
-    /// 阻塞变体：outbox 接 DiscardSink（不建 channel，避免无人消费堆积）；
-    /// 不 spawn——在调用方 task 内直接驱动。
+    /// 阻塞变体（**仅非交互**）：
+    /// - outbox 接 DiscardSink（不建 channel，避免无人消费堆积）
+    /// - 不 spawn——在调用方 task 内直接驱动
+    /// - loop 若发出 [`Out::Ask`]，内部取消立即触发，返回 `Config` 错
+    ///   （交互场景请用 [`Agent::start`]；本地代码 / 脚本场景用 run）
     pub async fn run(&self, first: In) -> Result<TurnOutput, YourAiError> {
-        let loop_ = self.ctx.agent_loop()?;
+        let _ = self.ctx.agent_loop()?;
+        let snap = self.ctx.snapshot();
 
         let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel();
         let _ = inbox_tx.send(first);
         let cancel = CancellationToken::new();
-        let sink = DiscardSink;
+        let sink = NonInteractiveSink {
+            cancel: cancel.clone(),
+        };
+        let loop_ = snap.agent_loop.clone();
         let tc = TurnContext {
             ctx: &self.ctx,
+            snap,
             inbox: &mut inbox_rx,
             outbox: &sink,
             cancel: &cancel,
         };
-        loop_.run_turn(tc).await
+        match loop_.run_turn(tc).await {
+            // run() 没有外部 cancel 入口，Aborted(Cancelled) 只能来自
+            // AskAbortSink 触发——即 loop 在非交互模式发出了 Ask
+            Err(YourAiError::Aborted(reason @ AbortReason::Cancelled)) => {
+                Err(YourAiError::Error(ErrorKind::Config(format!(
+                    "non-interactive run() received Out::Ask from loop (abort reason: {reason:?}); \
+                     use Agent::start() for interactive turns"
+                ))))
+            }
+            other => other,
+        }
     }
 }
 
@@ -252,6 +363,9 @@ impl Agent {
 // region:    --- TurnHandle / TurnContext ---
 
 /// 一次 turn 的句柄（随 turn 生灭；outbox 关闭 = turn 结束）。
+///
+/// **Drop 即取消**：句柄被丢弃 = 消费端离开，turn 立即取消，
+/// 不再继续消耗模型/工具资源。
 #[derive(Debug)]
 pub struct TurnHandle {
     /// 外界 → loop（steer / Reply）
@@ -260,17 +374,22 @@ pub struct TurnHandle {
     pub outbox: UnboundedReceiver<Out>,
     /// 控制面快路径（绕过 inbox 立即生效）
     pub cancel: CancellationToken,
-    result: tokio::task::JoinHandle<Result<TurnOutput, YourAiError>>,
+    result: Option<tokio::task::JoinHandle<Result<TurnOutput, YourAiError>>>,
 }
 
 impl TurnHandle {
     /// 等最终结果（消费完 outbox 后调用）
-    pub async fn join(self) -> Result<TurnOutput, YourAiError> {
-        match self.result.await {
-            Ok(r) => r,
-            Err(e) => Err(YourAiError::Error(ErrorKind::Other(format!(
-                "turn task join failed: {e}"
-            )))),
+    pub async fn join(mut self) -> Result<TurnOutput, YourAiError> {
+        match self.result.take() {
+            Some(h) => match h.await {
+                Ok(r) => r,
+                Err(e) => Err(YourAiError::Error(ErrorKind::Other(format!(
+                    "turn task join failed: {e}"
+                )))),
+            },
+            None => Err(YourAiError::Error(ErrorKind::Loop(
+                "turn already joined".into(),
+            ))),
         }
     }
 
@@ -280,13 +399,21 @@ impl TurnHandle {
     }
 }
 
+impl Drop for TurnHandle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 /// 每次 turn 装配给 loop 的交互参数（决策 5.5：管道是 run 的参数，不是环境状态）。
 pub struct TurnContext<'a> {
-    /// 全局 providers
+    /// 全局 Context（admin 用：热替换 set_* 在这里；loop 不该用它读 providers）
     pub ctx: &'a Context,
+    /// start/run 时刻的 provider 快照——turn 内读 providers 一律走这里
+    pub snap: ProviderSnapshot,
     /// 外界 → loop（含第一条消息）；loop 独占拉取消费
     pub inbox: &'a mut UnboundedReceiver<In>,
-    /// loop → 外界（同步 fire-and-forget）
+    /// loop → 外界（同步 fire-and-forget；返回 false = 消费端已关闭）
     pub outbox: &'a dyn OutSink,
     /// 控制面，绕过 inbox 立即生效
     pub cancel: &'a CancellationToken,
@@ -308,8 +435,8 @@ impl ChannelSink {
 }
 
 impl OutSink for ChannelSink {
-    fn send(&self, m: Out) {
-        let _ = self.tx.send(m); // 消费端已离开 → 静默丢弃
+    fn send(&self, m: Out) -> bool {
+        self.tx.send(m).is_ok() // false = 消费端已关闭
     }
 }
 
@@ -317,13 +444,30 @@ impl OutSink for ChannelSink {
 pub struct DiscardSink;
 
 impl OutSink for DiscardSink {
-    fn send(&self, _: Out) {}
+    fn send(&self, _: Out) -> bool {
+        true
+    }
+}
+
+/// run() 的 sink：非交互模式，loop 一发 Ask 立即触发内部取消，
+/// loop 经 select!（契约要求）感知并返回（快路径，不等 recv 超时）。
+struct NonInteractiveSink {
+    cancel: CancellationToken,
+}
+
+impl OutSink for NonInteractiveSink {
+    fn send(&self, m: Out) -> bool {
+        if let Out::Ask { .. } = m {
+            self.cancel.cancel();
+        }
+        true
+    }
 }
 
 /// 裸 sender 也可直接当 sink 用
 impl OutSink for UnboundedSender<Out> {
-    fn send(&self, m: Out) {
-        let _ = self.send(m);
+    fn send(&self, m: Out) -> bool {
+        self.send(m).is_ok()
     }
 }
 
@@ -335,6 +479,7 @@ impl OutSink for UnboundedSender<Out> {
 mod tests {
     use super::*;
     use crate::error::AbortReason;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use yourai_protocol::Out;
 
     /// 测试桩：读第一条消息 → 发 Chunk+Message → 返回文本。
@@ -343,17 +488,23 @@ mod tests {
 
     impl AgentLoop for EchoLoop {
         fn run_turn<'a>(
-    &self,
-    tc: TurnContext<'a>,
-) -> crate::future::BoxFuture<'a, Result<TurnOutput, YourAiError>> {
+            &'a self,
+            tc: TurnContext<'a>,
+        ) -> crate::future::BoxFuture<'a, Result<TurnOutput, YourAiError>> {
             Box::pin(async move {
                 match tc.inbox.recv().await {
                     Some(In::UserText { text }) => {
-                        tc.outbox.send(Out::Chunk { text: format!("echo: {text}") });
-                        tc.outbox.send(Out::Message { text: format!("done: {text}") });
+                        tc.outbox.send(Out::Chunk {
+                            text: format!("echo: {text}"),
+                        });
+                        tc.outbox.send(Out::Message {
+                            text: format!("done: {text}"),
+                        });
                         Ok(TurnOutput::new(format!("done: {text}")))
                     }
-                    _ => Err(YourAiError::Error(ErrorKind::Loop("expected UserText".into()))),
+                    _ => Err(YourAiError::Error(ErrorKind::Loop(
+                        "expected UserText".into(),
+                    ))),
                 }
             })
         }
@@ -401,7 +552,7 @@ mod tests {
         struct WaitingLoop;
         impl AgentLoop for WaitingLoop {
             fn run_turn<'a>(
-                &self,
+                &'a self,
                 tc: TurnContext<'a>,
             ) -> crate::future::BoxFuture<'a, Result<TurnOutput, YourAiError>> {
                 Box::pin(async move {
@@ -440,18 +591,18 @@ mod tests {
         struct LoopA;
         impl AgentLoop for LoopA {
             fn run_turn<'a>(
-    &self,
-    _tc: TurnContext<'a>,
-) -> crate::future::BoxFuture<'a, Result<TurnOutput, YourAiError>> {
+                &'a self,
+                _tc: TurnContext<'a>,
+            ) -> crate::future::BoxFuture<'a, Result<TurnOutput, YourAiError>> {
                 Box::pin(async { Ok(TurnOutput::new("A")) })
             }
         }
         struct LoopB;
         impl AgentLoop for LoopB {
             fn run_turn<'a>(
-    &self,
-    _tc: TurnContext<'a>,
-) -> crate::future::BoxFuture<'a, Result<TurnOutput, YourAiError>> {
+                &'a self,
+                _tc: TurnContext<'a>,
+            ) -> crate::future::BoxFuture<'a, Result<TurnOutput, YourAiError>> {
                 Box::pin(async { Ok(TurnOutput::new("B")) })
             }
         }
@@ -461,6 +612,170 @@ mod tests {
 
         agent.ctx().set_agent_loop(Arc::new(LoopB)); // 热替换
         assert_eq!(agent.run(In::user_text("x")).await.unwrap().text, "B");
+    }
+
+    /// 决策 5.2 收紧后的语义：turn 内 providers 来自快照——
+    /// 热替换不影响正在跑的 turn，下一 turn 才生效。
+    #[tokio::test]
+    async fn turn_reads_snapshot_not_live_context() {
+        struct ModelProbeLoop;
+        impl AgentLoop for ModelProbeLoop {
+            fn run_turn<'a>(
+                &'a self,
+                tc: TurnContext<'a>,
+            ) -> crate::future::BoxFuture<'a, Result<TurnOutput, YourAiError>> {
+                Box::pin(async move {
+                    let has_model = tc.snap.model.is_some();
+                    // turn 中途热替换 model——本 turn 的快照不受影响
+                    tc.ctx.set_model(Arc::new(StubModel));
+                    Ok(TurnOutput::new(if has_model {
+                        "has-model"
+                    } else {
+                        "no-model"
+                    }))
+                })
+            }
+        }
+
+        struct StubModel;
+        impl ModelProvider for StubModel {
+            fn complete<'a>(
+                &'a self,
+                _req: crate::model::ModelRequest,
+            ) -> crate::future::BoxFuture<'a, Result<crate::chat::ChatResponse, YourAiError>>
+            {
+                unimplemented!("机制测试不触达模型")
+            }
+            fn stream<'a>(
+                &'a self,
+                _req: crate::model::ModelRequest,
+            ) -> crate::future::BoxFuture<'a, Result<crate::chat::ChatStreamResponse, YourAiError>>
+            {
+                unimplemented!("机制测试不触达模型")
+            }
+            fn model_iden(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let agent = Agent::builder()
+            .agent_loop(Arc::new(ModelProbeLoop))
+            .build();
+        // 第一 turn：快照里没有 model（虽然 loop 中途 set 了）
+        assert_eq!(
+            agent.run(In::user_text("x")).await.unwrap().text,
+            "no-model"
+        );
+        // 第二 turn：上一 turn 的热替换在快照里生效
+        assert_eq!(
+            agent.run(In::user_text("x")).await.unwrap().text,
+            "has-model"
+        );
+    }
+
+    /// 丢弃 TurnHandle = 取消 turn（防消费端离开后后台继续耗资源）。
+    #[tokio::test]
+    async fn dropping_handle_cancels_turn() {
+        struct HangingLoop {
+            observed_cancel: Arc<AtomicBool>,
+        }
+        impl AgentLoop for HangingLoop {
+            fn run_turn<'a>(
+                &'a self,
+                tc: TurnContext<'a>,
+            ) -> crate::future::BoxFuture<'a, Result<TurnOutput, YourAiError>> {
+                Box::pin(async move {
+                    let _ = tc.inbox.recv().await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                            Ok(TurnOutput::new("never"))
+                        }
+                        _ = tc.cancel.cancelled() => {
+                            self.observed_cancel.store(true, Ordering::SeqCst);
+                            Err(YourAiError::Aborted(AbortReason::Cancelled))
+                        }
+                    }
+                })
+            }
+        }
+
+        let observed = Arc::new(AtomicBool::new(false));
+        let agent = Agent::builder()
+            .agent_loop(Arc::new(HangingLoop {
+                observed_cancel: observed.clone(),
+            }))
+            .build();
+        let handle = agent.start(In::user_text("hi")).expect("ok");
+        drop(handle); // 消费端离开，不做任何显式取消
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "句柄 drop 应已触发 turn 取消"
+        );
+    }
+
+    /// OutSink::send 返回 false = 消费端已关闭，loop 可立即以
+    /// Disconnected 中止（不必等到 recv 点）。
+    #[tokio::test]
+    async fn outbox_disconnect_is_detectable() {
+        struct SendAwareLoop;
+        impl AgentLoop for SendAwareLoop {
+            fn run_turn<'a>(
+                &'a self,
+                tc: TurnContext<'a>,
+            ) -> crate::future::BoxFuture<'a, Result<TurnOutput, YourAiError>> {
+                Box::pin(async move {
+                    let alive = tc.outbox.send(Out::Chunk { text: "x".into() });
+                    if !alive {
+                        return Err(YourAiError::Aborted(AbortReason::Disconnected));
+                    }
+                    Ok(TurnOutput::new("ok"))
+                })
+            }
+        }
+
+        let agent = Agent::builder().agent_loop(Arc::new(SendAwareLoop)).build();
+        let mut handle = agent.start(In::user_text("hi")).expect("ok");
+        handle.outbox.close(); // 消费端关闭（不等价于 turn 结束）
+        let err = handle.join().await.unwrap_err();
+        assert!(
+            matches!(err, YourAiError::Aborted(AbortReason::Disconnected)),
+            "应为 Disconnected，实际: {err:?}"
+        );
+    }
+
+    /// run() 是非交互模式：loop 发 Ask → 立即失败（不会永久等待）。
+    #[tokio::test]
+    async fn run_is_non_interactive_ask_fails_fast() {
+        struct AskLoop;
+        impl AgentLoop for AskLoop {
+            fn run_turn<'a>(
+                &'a self,
+                tc: TurnContext<'a>,
+            ) -> crate::future::BoxFuture<'a, Result<TurnOutput, YourAiError>> {
+                Box::pin(async move {
+                    let _ = tc.inbox.recv().await; // 先消费首条（现实 loop 的行为）
+                    let _ = tc.outbox.send(Out::Ask {
+                        id: "ask-1".into(),
+                        payload: serde_json::json!({"kind": "approval"}),
+                    });
+                    // 契约：等待一律与 cancel 一起 select!
+                    tokio::select! {
+                        _ = tc.inbox.recv() => Ok(TurnOutput::new("replied")),
+                        _ = tc.cancel.cancelled() => {
+                            Err(YourAiError::Aborted(AbortReason::Cancelled))
+                        }
+                    }
+                })
+            }
+        }
+
+        let agent = Agent::builder().agent_loop(Arc::new(AskLoop)).build();
+        let err = agent.run(In::user_text("hi")).await.unwrap_err();
+        assert!(
+            matches!(err, YourAiError::Error(ErrorKind::Config(ref m)) if m.contains("Ask")),
+            "run() 遇 Ask 应报 Config 错，实际: {err:?}"
+        );
     }
 }
 

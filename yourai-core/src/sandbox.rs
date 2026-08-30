@@ -14,7 +14,10 @@ pub enum SandboxPolicy {
     ReadOnly { network_access: bool },
 
     /// 工作区可写 + 指定额外可写根；网络可选
-    WorkspaceWrite { writable_roots: Vec<PathBuf>, network_access: bool },
+    WorkspaceWrite {
+        writable_roots: Vec<PathBuf>,
+        network_access: bool,
+    },
 
     /// 外部沙箱（容器/VM 由实现方决定）
     ExternalSandbox { network_access: bool },
@@ -22,7 +25,10 @@ pub enum SandboxPolicy {
 
 impl SandboxPolicy {
     pub fn workspace_write() -> Self {
-        SandboxPolicy::WorkspaceWrite { writable_roots: Vec::new(), network_access: false }
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots: Vec::new(),
+            network_access: false,
+        }
     }
 }
 

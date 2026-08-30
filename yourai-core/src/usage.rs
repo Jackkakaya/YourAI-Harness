@@ -14,8 +14,18 @@ pub struct UsageStats {
 }
 
 pub trait UsageTracker: Send + Sync {
-    fn record(&self, session_id: &SessionId, usage: &Usage) -> BoxFuture<'_, Result<(), YourAiError>>;
-    fn total(&self) -> BoxFuture<'_, Result<UsageStats, YourAiError>>;
-    fn session_usage(&self, session_id: &SessionId) -> BoxFuture<'_, Result<UsageStats, YourAiError>>;
-    fn reset_session(&self, session_id: &SessionId) -> BoxFuture<'_, Result<(), YourAiError>>;
+    fn record<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        usage: &'a Usage,
+    ) -> BoxFuture<'a, Result<(), YourAiError>>;
+    fn total<'a>(&'a self) -> BoxFuture<'a, Result<UsageStats, YourAiError>>;
+    fn session_usage<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+    ) -> BoxFuture<'a, Result<UsageStats, YourAiError>>;
+    fn reset_session<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+    ) -> BoxFuture<'a, Result<(), YourAiError>>;
 }

@@ -13,11 +13,23 @@ pub struct MemoryEntry {
 }
 
 pub trait MemoryManager: Send + Sync {
-    fn store(&self, key: &str, value: &str) -> BoxFuture<'_, Result<(), YourAiError>>;
-    fn retrieve(&self, key: &str) -> BoxFuture<'_, Result<Option<String>, YourAiError>>;
-    fn search(&self, query: &str, limit: usize)
-        -> BoxFuture<'_, Result<Vec<MemoryEntry>, YourAiError>>;
-    fn list(&self, category: Option<&str>) -> BoxFuture<'_, Result<Vec<MemoryEntry>, YourAiError>>;
-    fn delete(&self, key: &str) -> BoxFuture<'_, Result<(), YourAiError>>;
-    fn clear(&self) -> BoxFuture<'_, Result<(), YourAiError>>;
+    /// 存一条记忆；`category` 用于 [`list`](MemoryManager::list) 的分类筛选
+    fn store<'a>(
+        &'a self,
+        key: &'a str,
+        value: &'a str,
+        category: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), YourAiError>>;
+    fn retrieve<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<String>, YourAiError>>;
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<MemoryEntry>, YourAiError>>;
+    fn list<'a>(
+        &'a self,
+        category: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Vec<MemoryEntry>, YourAiError>>;
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), YourAiError>>;
+    fn clear<'a>(&'a self) -> BoxFuture<'a, Result<(), YourAiError>>;
 }

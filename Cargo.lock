@@ -2416,6 +2416,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "uuid",
  "yourai-protocol",
 ]
 

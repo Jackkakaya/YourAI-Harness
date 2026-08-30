@@ -4,14 +4,15 @@
 
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
+use uuid::Uuid;
 
-/// 会话标识
+/// 会话标识（UUID v4，跨主机唯一）
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(pub String);
 
 impl SessionId {
     pub fn new() -> Self {
-        SessionId(uuid_v4_like())
+        SessionId(Uuid::new_v4().to_string())
     }
 }
 
@@ -38,19 +39,19 @@ pub struct SessionMeta {
 }
 
 pub trait SessionManager: Send + Sync {
-    fn create_session(&self) -> BoxFuture<'_, Result<SessionMeta, YourAiError>>;
-    fn load_session(&self, id: &SessionId) -> BoxFuture<'_, Result<SessionMeta, YourAiError>>;
-    fn save_session(&self, session: &SessionMeta) -> BoxFuture<'_, Result<(), YourAiError>>;
-    fn list_sessions(&self) -> BoxFuture<'_, Result<Vec<SessionMeta>, YourAiError>>;
-    fn delete_session(&self, id: &SessionId) -> BoxFuture<'_, Result<(), YourAiError>>;
-    fn fork_session(&self, id: &SessionId) -> BoxFuture<'_, Result<SessionId, YourAiError>>;
-}
-
-// 内部：无外部 UUID 依赖的轻量 id 生成（机制层不引多余依赖）
-fn uuid_v4_like() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let a = nanos as u64;
-    let b = std::process::id() as u64;
-    format!("{a:016x}{b:08x}")
+    fn create_session<'a>(&'a self) -> BoxFuture<'a, Result<SessionMeta, YourAiError>>;
+    fn load_session<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> BoxFuture<'a, Result<SessionMeta, YourAiError>>;
+    fn save_session<'a>(
+        &'a self,
+        session: &'a SessionMeta,
+    ) -> BoxFuture<'a, Result<(), YourAiError>>;
+    fn list_sessions<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SessionMeta>, YourAiError>>;
+    fn delete_session<'a>(&'a self, id: &'a SessionId) -> BoxFuture<'a, Result<(), YourAiError>>;
+    fn fork_session<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> BoxFuture<'a, Result<SessionId, YourAiError>>;
 }

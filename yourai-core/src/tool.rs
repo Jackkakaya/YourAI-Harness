@@ -1,22 +1,49 @@
 //! 工具：定义侧（给模型的 schema）与执行侧（ToolContext 赋能）分离。
 //!
-//! 执行签名带 [`ToolContext`]——工具能发进度、能被取消（决策 5.5）。
-//! 这是 subagent / browser / 长任务可显示的先决条件；
-//! 工具仍然不知道 UI 存在——只对 outbox 讲协议。
+//! 执行签名带 [`ToolContext`]——工具有自己的身份（call_id）、能发进度、
+//! 能被取消、能拿到两层审批能力（决策 5.5 + 收敛修订）。
+//!
+//! **两层审批**（架构收敛结论）：
+//! - 第一层（loop）：`check_tool_call`——loop 在调度工具前统一问
+//! - 第二层（具体工具）：`check_command` / `check_file_access` 与
+//!   `sandbox.apply(&mut Command)`——只有工具自己知道 Command/路径，
+//!   由工具经 [`ToolContext`] 注入的能力自行调用
+//!
+//! 工具仍然不知道 UI 存在——只对 outbox 讲协议（Ask/Reply 也经 loop 中介）。
 
-use crate::chat::Tool;
+use crate::chat::{Tool, ToolResponse};
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
+use crate::sandbox::SandboxProvider;
+use crate::security::SecurityProvider;
 use crate::ui::OutSink;
 use serde_json::Value;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// 工具执行期的能力注入（由 loop 在执行时装配）。
 pub struct ToolContext<'a> {
+    /// 本次工具调用的身份（= 模型 ToolCall 的 call_id）；
+    /// 进度/审批等 Out 事件的 id 都用它，前端据此归组
+    pub call_id: String,
     /// 发 Out（约定：工具只发 `Out::ToolProgress`；subagent 转发子事件也走这里）
     pub emit: &'a dyn OutSink,
     /// ESC 打断长工具
     pub cancel: &'a CancellationToken,
+    /// 第二层审批：命令/文件级检查（快照，可能为 None = 不拦截）
+    pub security: Option<Arc<dyn SecurityProvider>>,
+    /// 沙箱：工具对自建的 `tokio::process::Command` 调 `apply`（快照）
+    pub sandbox: Option<Arc<dyn SandboxProvider>>,
+}
+
+impl ToolContext<'_> {
+    /// 发一条进度事件（id 自动取 call_id）；返回 false = 消费端已关闭
+    pub fn emit_progress(&self, payload: Value) -> bool {
+        self.emit.send(yourai_protocol::Out::ToolProgress {
+            id: self.call_id.clone(),
+            payload,
+        })
+    }
 }
 
 pub trait ToolHandler: Send + Sync {
@@ -26,14 +53,19 @@ pub trait ToolHandler: Send + Sync {
     /// 给模型看的 schema（genai::chat::Tool）
     fn definition(&self) -> Tool;
 
-    /// 执行。返回 Err 时由 loop 转成 is_error 结果喂回模型，不逃逸成 turn 失败。
-    fn execute(&self, tc: ToolContext<'_>, input: Value) -> BoxFuture<'_, Result<Value, YourAiError>>;
+    /// 执行。返回 Err 时由 loop 转成 is_error 的 ToolResponse 喂回模型，
+    /// 不逃逸成 turn 失败。
+    fn execute<'a>(
+        &'a self,
+        tc: ToolContext<'a>,
+        input: Value,
+    ) -> BoxFuture<'a, Result<Value, YourAiError>>;
 }
 
 pub trait ToolRegistry: Send + Sync {
-    fn register(&self, handler: std::sync::Arc<dyn ToolHandler>);
+    fn register(&self, handler: Arc<dyn ToolHandler>);
     /// 批量注册（MCP connect → Vec 一批进）
-    fn extend(&self, handlers: Vec<std::sync::Arc<dyn ToolHandler>>) {
+    fn extend(&self, handlers: Vec<Arc<dyn ToolHandler>>) {
         for h in handlers {
             self.register(h);
         }
@@ -42,11 +74,18 @@ pub trait ToolRegistry: Send + Sync {
     fn has(&self, name: &str) -> bool;
     /// 所有工具的 schema（发给模型）
     fn definitions(&self) -> Vec<Tool>;
-    fn execute(
-        &self,
-        tc: ToolContext<'_>,
-        name: &str,
+    /// 统一执行入口：loop 只认 name + call_id，
+    /// handler 查找与错误→ToolResponse 的转换由实现方负责
+    fn execute<'a>(
+        &'a self,
+        tc: ToolContext<'a>,
+        name: &'a str,
         input: Value,
-    ) -> BoxFuture<'_, Result<Value, YourAiError>>;
+    ) -> BoxFuture<'a, Result<Value, YourAiError>>;
     fn count(&self) -> usize;
+}
+
+/// 便捷构造：工具执行失败 → 错误 ToolResponse（loop 用）
+pub fn tool_error_response(call_id: &str, name: &str, err: &YourAiError) -> ToolResponse {
+    ToolResponse::new(call_id, format!("ERROR: {err}")).with_fn_name(name.to_string())
 }

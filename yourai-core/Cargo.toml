@@ -13,3 +13,4 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 genai = { workspace = true }
+uuid = { workspace = true }

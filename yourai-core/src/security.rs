@@ -1,7 +1,11 @@
 //! SecurityProvider：审批与权限决策（纯决策函数，不知道 UI 存在）。
 //!
-//! 返回 [`ApprovalDecision::Ask`] 时，审批的交互中介是 loop：
-//! loop 发 `Out::Ask`、等 `In::Reply`（select! cancel）。
+//! **两层审批**（架构收敛结论）：
+//! - 第一层：[`SecurityProvider::check_tool_call`]——loop 在调度工具前统一问；
+//!   返回 [`ApprovalDecision::Ask`] 时，交互中介是 loop：
+//!   loop 发 `Out::Ask`、等 `In::Reply`（select! cancel）
+//! - 第二层：`check_command` / `check_file_access`——只有具体工具
+//!   （shell/fs）知道命令与路径，由工具经 ToolContext 注入的能力调用
 
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
@@ -26,12 +30,22 @@ pub struct SecurityContext {
 }
 
 pub trait SecurityProvider: Send + Sync {
-    fn check_tool_call(&self, ctx: &SecurityContext)
-        -> BoxFuture<'_, Result<ApprovalDecision, YourAiError>>;
-    fn check_command(&self, command: &str) -> BoxFuture<'_, Result<ApprovalDecision, YourAiError>>;
-    fn check_file_access(
-        &self,
-        path: &str,
+    /// 第一层：工具调用级审批（loop 调用）
+    fn check_tool_call<'a>(
+        &'a self,
+        ctx: &'a SecurityContext,
+    ) -> BoxFuture<'a, Result<ApprovalDecision, YourAiError>>;
+
+    /// 第二层：命令级审批（shell 类工具自调）
+    fn check_command<'a>(
+        &'a self,
+        command: &'a str,
+    ) -> BoxFuture<'a, Result<ApprovalDecision, YourAiError>>;
+
+    /// 第二层：文件访问审批（fs 类工具自调）
+    fn check_file_access<'a>(
+        &'a self,
+        path: &'a str,
         write: bool,
-    ) -> BoxFuture<'_, Result<ApprovalDecision, YourAiError>>;
+    ) -> BoxFuture<'a, Result<ApprovalDecision, YourAiError>>;
 }

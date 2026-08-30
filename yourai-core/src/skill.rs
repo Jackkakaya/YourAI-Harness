@@ -21,8 +21,8 @@ pub struct SkillContent {
 }
 
 pub trait SkillProvider: Send + Sync {
-    fn list(&self) -> BoxFuture<'_, Result<Vec<SkillInfo>, YourAiError>>;
-    fn load(&self, id: &str) -> BoxFuture<'_, Result<SkillContent, YourAiError>>;
-    fn register(&self, skill: SkillContent) -> BoxFuture<'_, Result<(), YourAiError>>;
-    fn unregister(&self, id: &str) -> BoxFuture<'_, Result<(), YourAiError>>;
+    fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SkillInfo>, YourAiError>>;
+    fn load<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<SkillContent, YourAiError>>;
+    fn register<'a>(&'a self, skill: SkillContent) -> BoxFuture<'a, Result<(), YourAiError>>;
+    fn unregister<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), YourAiError>>;
 }
