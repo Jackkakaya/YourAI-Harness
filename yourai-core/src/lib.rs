@@ -96,7 +96,9 @@ pub mod prelude {
     pub use crate::model::{ModelProvider, ModelRequest};
     pub use crate::observability::{ObservabilityProvider, Span};
     pub use crate::sandbox::{SandboxPolicy, SandboxProvider, SandboxType};
-    pub use crate::security::{ApprovalDecision, SecurityContext, SecurityProvider};
+    pub use crate::security::{
+        ApprovalDecision, PolicyDecision, SecurityContext, SecurityProvider,
+    };
     pub use crate::session::{SessionId, SessionManager, SessionMeta};
     pub use crate::skill::{SkillContent, SkillInfo, SkillProvider};
     pub use crate::tool::{ToolContext, ToolHandler, ToolRegistry};

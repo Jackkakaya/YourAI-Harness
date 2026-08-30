@@ -296,7 +296,7 @@ TurnOutput { text, usage, pending }  → join() 交付；pending 非空由调用
 
 **职责：** 编排 turn 流程（模型调用 → 工具执行 → 重复直到完成）
 
-**设计决策：最小签名，最大自由。** 只给 TurnContext（providers 引用 + inbox/outbox/cancel），用户完全自己编排。启动输入不是特殊参数——**它是 inbox 的第一条消息**，loop 只有一条读路径。
+**设计决策：最小签名，最大自由。** 只给 TurnContext（providers 快照 + inbox/outbox/cancel），用户完全自己编排。启动输入不是特殊参数——**它是 inbox 的第一条消息**，loop 只有一条读路径。live Context 不进入 TurnContext，避免自定义 loop 绕过 turn 级快照。
 
 ```rust
 pub trait AgentLoop: Send + Sync {
@@ -305,13 +305,13 @@ pub trait AgentLoop: Send + Sync {
 }
 
 pub struct TurnContext<'a> {
-    pub ctx:    &'a Context,                          // 全局 providers
+    pub snap:   ProviderSnapshot,                     // turn 启动时的 provider 快照
     pub inbox:  &'a mut UnboundedReceiver<In>,        // 外界 → loop（含第一条消息）
     pub outbox: &'a dyn OutSink,                      // loop → 外界，send(Out)，同步 fire-and-forget
     pub cancel: &'a CancellationToken,                // 控制面，绕过 inbox 立即生效
 }
 
-pub trait OutSink: Send + Sync { fn send(&self, m: Out); }
+pub trait OutSink: Send + Sync { fn send(&self, m: Out) -> bool; }
 
 pub struct TurnOutput {
     pub text:    String,           // agent 最终回答
@@ -320,8 +320,8 @@ pub struct TurnOutput {
 }
 
 impl Agent {
-    pub fn start(&self, first: In) -> TurnHandle;              // 全局唯一 spawn 点
-    pub async fn run(&self, first: In) -> Result<TurnOutput>;  // 丢弃 outbox 的阻塞变体
+    pub fn start(self: &Arc<Self>, first: In) -> Result<TurnHandle>; // 全局唯一 spawn 点
+    pub async fn run(&self, first: In) -> Result<TurnOutput>;        // 非交互变体
 }
 // start 内部：建 channels → first 发入 inbox → spawn(run_turn) → 返回 TurnHandle
 ```
@@ -333,15 +333,16 @@ impl Agent {
 impl AgentLoop for MyLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, Result<TurnOutput, YourAiError>> {
         Box::pin(async move {
-            let model = tc.snap.model.ok_or_else(missing("model"))?;
-            let history = tc.snap.context_manager.ok_or_else(missing("context_manager"))?;
+            let model = tc.snap.model.clone().ok_or_else(|| ErrorKind::Config("provider not configured: model".into()))?;
+            let history = tc.snap.context_manager.clone().ok_or_else(|| ErrorKind::Config("provider not configured: context_manager".into()))?;
 
             // 第一条消息 = 用户输入，直接 match，无装箱
             if let Some(In::UserText { text }) = tc.inbox.recv().await {
                 history.add_user_message(&text).await?;
             }
 
-            let resp = model.complete(history.build_request()).await?;
+            let resp = model.complete(ModelRequest::new(
+                history.build_request(), history.default_options())).await?;
             let text = resp.into_first_text().unwrap_or_default();
             history.add_assistant_message(&text).await?;
             Ok(TurnOutput { text, usage: None, pending: vec![] })
@@ -446,7 +447,7 @@ pub trait MemoryManager: Send + Sync {
 
 **设计：** 分离定义侧（给模型看的 schema）和执行侧（实际运行的代码）。执行签名带 `ToolContext`——**工具有身份（call_id）、能发进度、能被取消、能拿两层审批能力**。shell 流 stdout、browser 发截图、subagent 转发子事件都靠 `tc.emit_progress()`（id 自动取 call_id）；ESC 打断长工具靠 `tc.cancel`。工具仍然不知道 UI 存在——只对 outbox 讲协议。
 
-**两层审批**：第一层 `check_tool_call` 由 loop 在调度前统一问；第二层 `check_command`/`check_file_access` 与 `sandbox.apply(&mut Command)` 只有具体工具自己知道 Command/路径——经 ToolContext 注入的能力由工具自调。
+**两层审批**：第一层 `check_tool_call` 由 loop 在调度前统一问，允许 `Ask`；工具通过 `security_context(input)` 显式描述破坏性和网络属性，loop 不猜工具语义。第二层 `check_command`/`check_file_access` 与 `sandbox.apply(&mut Command)` 只有具体工具自己知道 Command/路径——经 ToolContext 注入的能力由工具自调。第二层只能 Allow/Deny，不能 Ask：此时 loop 正在等待工具，工具没有 inbox 消费权，交互会形成循环等待。
 
 ```rust
 pub struct ToolContext<'a> {
@@ -464,6 +465,7 @@ impl ToolContext<'_> {
 pub trait ToolHandler: Send + Sync {
     fn name(&self) -> &str;
     fn definition(&self) -> Tool;                    // genai::chat::Tool
+    fn security_context(&self, input: &Value) -> SecurityContext;
     fn execute<'a>(&'a self, tc: ToolContext<'a>, input: Value) -> BoxFuture<'a, Result<Value, YourAiError>>;
 }
 
@@ -472,6 +474,7 @@ pub trait ToolRegistry: Send + Sync {
     fn unregister(&self, name: &str);
     fn has(&self, name: &str) -> bool;
     fn definitions(&self) -> Vec<Tool>;              // 所有工具的 schema
+    fn security_context(&self, name: &str, input: &Value) -> Result<SecurityContext>;
     fn execute(&self, tc: ToolContext<'_>, name: &str, input: Value) -> BoxFuture<'_, Result<Value>>;
     fn count(&self) -> usize;
 }
@@ -543,6 +546,11 @@ pub enum ApprovalDecision {
     Ask,
 }
 
+pub enum PolicyDecision {
+    Allow,
+    Deny,
+}
+
 pub struct SecurityContext {
     pub action: String,
     pub input: Value,
@@ -553,9 +561,9 @@ pub struct SecurityContext {
 pub trait SecurityProvider: Send + Sync {
     // 第一层：工具调用级审批（loop 在调度前统一问）
     fn check_tool_call(&self, ctx: &SecurityContext) -> BoxFuture<'_, Result<ApprovalDecision>>;
-    // 第二层：命令/文件级（shell/fs 工具经 ToolContext 自调）
-    fn check_command(&self, command: &str) -> BoxFuture<'_, Result<ApprovalDecision>>;
-    fn check_file_access(&self, path: &str, write: bool) -> BoxFuture<'_, Result<ApprovalDecision>>;
+    // 第二层：命令/文件级强制策略；不能 Ask，避免工具等待 Reply
+    fn check_command(&self, command: &str) -> BoxFuture<'_, Result<PolicyDecision>>;
+    fn check_file_access(&self, path: &str, write: bool) -> BoxFuture<'_, Result<PolicyDecision>>;
 }
 ```
 
@@ -715,7 +723,7 @@ YourAI 是开箱即用的 agent，用户可以零定制直接跑，也可以替�
 
 **决策：** `RwLock<Option<Arc<dyn Trait>>>` 够用，不引入 `arc-swap`。
 
-**语义（收敛修订：由"读取时取最新"收紧为 **turn 开始时快照**）：** `start()/run()` 在启动时把 12 个插槽快照成 `ProviderSnapshot` 装进 `TurnContext`——一个 turn 内所有 provider 读取都走快照，**热替换必然只影响下一 turn**，语义可预测且不需要任何锁协议配合。`tc.ctx`（live Context）只留给 admin 用（`set_*`、运行期注册），loop 不从它读 providers。替换后旧 Arc 由快照持有，进行中的调用安全完成。agent 瓶颈在 IO，锁竞争可忽略；未来如需优化，换 `arc-swap` 是实现细节，不影响 trait 定义。
+**语义（收敛修订：由"读取时取最新"收紧为 **turn 开始时快照**）：** `start()/run()` 在启动时把 12 个插槽快照成 `ProviderSnapshot` 装进 `TurnContext`——一个 turn 内所有 provider 读取都走快照，**热替换必然只影响下一 turn**。live Context 不进入 TurnContext；管理方经 `Agent::ctx()` 调 `set_*`/registry API。替换后旧 Arc 由快照持有，进行中的调用安全完成。agent 瓶颈在 IO，锁竞争可忽略；未来如需优化，换 `arc-swap` 是实现细节，不影响 trait 定义。
 
 ### 5.3 MCP 集成 ✅ 已决策
 
@@ -874,8 +882,7 @@ core 里 spawn 只出现在一处——`Agent::start()` 内部（对应 pi 低�
 impl Agent {
     /// 非阻塞启动（pi 的 agentLoop()）：spawn turn，立即返回句柄
     pub fn start(self: &Arc<Self>, first: In) -> Result<TurnHandle, YourAiError> {
-        let _ = self.ctx.agent_loop()?;            // 缺 loop 报 Config（5.8 使用点原则）
-        let snap = self.ctx.snapshot();            // turn 级快照（5.2）
+        let snap = self.ctx.snapshot()?;           // 快照 + 缺 loop 的 Config 检查
         let (inbox_tx, inbox_rx) = unbounded_channel();
         let (outbox_tx, outbox_rx) = unbounded_channel();
         let cancel = CancellationToken::new();
@@ -883,7 +890,7 @@ impl Agent {
         let result = tokio::spawn(async move {
             let loop_ = snap.agent_loop.clone();
             let tc = TurnContext {
-                ctx: &ctx, snap,
+                snap,
                 inbox: &mut inbox_rx,
                 outbox: &ChannelSink::new(outbox_tx),
                 cancel: &cancel,
@@ -1031,6 +1038,15 @@ pi 的做法：故意什么都不带，官方答案 = subagent 扩展（工具�
 struct SubagentTool { /* 子 agent 配置 */ }
 
 impl ToolHandler for SubagentTool {
+    fn name(&self) -> &str { "subagent" }
+    fn definition(&self) -> Tool { /* ... */ }
+    fn security_context(&self, input: &Value) -> SecurityContext {
+        SecurityContext {
+            action: self.name().into(), input: input.clone(),
+            is_destructive: false, is_network: true,
+        }
+    }
+
     fn execute<'a>(&'a self, tc: ToolContext<'a>, input: Value) -> BoxFuture<'a, Result<Value, YourAiError>> {
         Box::pin(async move {
             let child = Agent::builder()
@@ -1039,7 +1055,7 @@ impl ToolHandler for SubagentTool {
                 ))
                 // ...
                 .build();
-            let handle = child.start(In::UserText { text: task_prompt })?;
+            let mut handle = child.start(In::UserText { text: task_prompt })?;
             // 子 agent 的 outbox 逐条 Out → 序列化进 ToolProgress.payload 转发
             while let Some(out) = handle.outbox.recv().await {
                 let payload = serde_json::to_value(&out)?;
@@ -1048,7 +1064,7 @@ impl ToolHandler for SubagentTool {
                 }
             }
             let output = handle.join().await?;
-            Ok(json!({ "result": output.text }))
+            Ok(serde_json::json!({ "result": output.text }))
         })
     }
 }
@@ -1123,7 +1139,7 @@ run_turn(tc)
 **流式 + 可取消（genai ChatStream）：**
 
 ```rust
-let model = tc.snap.model.ok_or_else(missing("model"))?;
+let model = tc.snap.model.clone().ok_or_else(|| ErrorKind::Config("provider not configured: model".into()))?;
 let mut stream = model.stream(req).await?.stream;      // ChatStreamResponse.stream → ChatStream
 let mut text = String::new();
 loop {
@@ -1193,8 +1209,8 @@ struct MyLoop;
 impl AgentLoop for MyLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, Result<TurnOutput, YourAiError>> {
         Box::pin(async move {
-            let model = tc.snap.model.ok_or_else(missing("model"))?;
-            let history = tc.snap.context_manager.ok_or_else(missing("context_manager"))?;
+            let model = tc.snap.model.clone().ok_or_else(|| ErrorKind::Config("provider not configured: model".into()))?;
+            let history = tc.snap.context_manager.clone().ok_or_else(|| ErrorKind::Config("provider not configured: context_manager".into()))?;
 
             if let Some(In::UserText { text }) = tc.inbox.recv().await {
                 history.add_user_message(&text).await?;
@@ -1218,6 +1234,7 @@ impl AgentLoop for MyLoop {
 ### 8.1 快速开始（用默认实现）
 
 ```rust
+use std::sync::Arc;
 use yourai_core::prelude::*;
 use yourai_loop_default::DefaultLoop;
 use yourai_model_genai::GenaiModel;
@@ -1247,8 +1264,8 @@ impl AgentLoop for MyLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, Result<TurnOutput, YourAiError>> {
         Box::pin(async move {
             // 完全自定义编排逻辑（providers 从 tc.snap 快照读）
-            let model = tc.snap.model.ok_or_else(missing("model"))?;
-            let history = tc.ctx.context_manager()?;
+            let model = tc.snap.model.clone().ok_or_else(|| ErrorKind::Config("provider not configured: model".into()))?;
+            let history = tc.snap.context_manager.clone().ok_or_else(|| ErrorKind::Config("provider not configured: context_manager".into()))?;
             // ...
             Ok(TurnOutput { text: "custom response".into(), usage: None, pending: vec![] })
         })
@@ -1273,11 +1290,20 @@ impl ToolHandler for WeatherTool {
         // genai 0.6.5 API：Tool::new(name) + with_description / with_schema
         Tool::new("get_weather")
             .with_description("Get current weather for a city")
-            .with_schema(schema!({
+            .with_schema(serde_json::json!({
                 "type": "object",
                 "properties": { "city": { "type": "string" } },
                 "required": ["city"]
             }))
+    }
+
+    fn security_context(&self, input: &Value) -> SecurityContext {
+        SecurityContext {
+            action: self.name().into(),
+            input: input.clone(),
+            is_destructive: false,
+            is_network: true,
+        }
     }
 
     fn execute<'a>(&'a self, tc: ToolContext<'a>, input: Value) -> BoxFuture<'a, Result<Value, YourAiError>> {

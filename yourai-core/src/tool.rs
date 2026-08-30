@@ -15,7 +15,7 @@ use crate::chat::{Tool, ToolResponse};
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
 use crate::sandbox::SandboxProvider;
-use crate::security::SecurityProvider;
+use crate::security::{SecurityContext, SecurityProvider};
 use crate::ui::OutSink;
 use serde_json::Value;
 use std::sync::Arc;
@@ -53,6 +53,13 @@ pub trait ToolHandler: Send + Sync {
     /// 给模型看的 schema（genai::chat::Tool）
     fn definition(&self) -> Tool;
 
+    /// 为第一层审批描述这次调用。
+    ///
+    /// loop 在执行前通过 registry 调用本方法，再把结果交给
+    /// `SecurityProvider::check_tool_call`。工具必须显式标注破坏性和网络属性，
+    /// 避免 loop 根据名字猜测安全语义。
+    fn security_context(&self, input: &Value) -> SecurityContext;
+
     /// 执行。返回 Err 时由 loop 转成 is_error 的 ToolResponse 喂回模型，
     /// 不逃逸成 turn 失败。
     fn execute<'a>(
@@ -74,8 +81,10 @@ pub trait ToolRegistry: Send + Sync {
     fn has(&self, name: &str) -> bool;
     /// 所有工具的 schema（发给模型）
     fn definitions(&self) -> Vec<Tool>;
-    /// 统一执行入口：loop 只认 name + call_id，
-    /// handler 查找与错误→ToolResponse 的转换由实现方负责
+    /// 获取一次调用的第一层审批上下文（handler 查找由 registry 负责）。
+    fn security_context(&self, name: &str, input: &Value) -> Result<SecurityContext, YourAiError>;
+    /// 统一执行入口：registry 负责 handler 查找与调用；
+    /// 错误到 ToolResponse 的转换由 loop 统一完成。
     fn execute<'a>(
         &'a self,
         tc: ToolContext<'a>,
