@@ -1,0 +1,10 @@
+[package]
+name = "yourai-protocol"
+description = "YourAI 共同语言：loop 与外界之间的全部消息词汇（叶子 crate，零实现依赖）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

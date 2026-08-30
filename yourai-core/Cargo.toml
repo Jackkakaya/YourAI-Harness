@@ -1,0 +1,15 @@
+[package]
+name = "yourai-core"
+description = "YourAI 机制层：纯接口定义（trait）+ turn 运输机制，零业务实现"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yourai-protocol = { path = "../yourai-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+genai = { workspace = true }
