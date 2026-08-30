@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_loop::{AgentLoop, TurnOutput};
 use crate::context_manager::ContextManager;
 use crate::error::{ErrorKind, YourAiError};
-use crate::hooks::HookRegistry;
+use crate::hooks::HookRuntime;
 use crate::memory::MemoryManager;
 use crate::model::ModelProvider;
 use crate::observability::ObservabilityProvider;
@@ -49,7 +49,7 @@ pub struct Context {
     security: RwLock<Option<Arc<dyn SecurityProvider>>>,
     usage: RwLock<Option<Arc<dyn UsageTracker>>>,
     observability: RwLock<Option<Arc<dyn ObservabilityProvider>>>,
-    hooks: RwLock<Option<Arc<dyn HookRegistry>>>,
+    hooks: RwLock<Option<Arc<dyn HookRuntime>>>,
 }
 
 // 必需读取器：缺失报 Config 错——缺什么在使用点报（决策 5.8）
@@ -111,7 +111,7 @@ impl Context {
         security: SecurityProvider,
         usage: UsageTracker,
         observability: ObservabilityProvider,
-        hooks: HookRegistry,
+        hooks: HookRuntime,
     }
 
     try_getters! {
@@ -126,7 +126,7 @@ impl Context {
         try_security: security, SecurityProvider,
         try_usage: usage, UsageTracker,
         try_observability: observability, ObservabilityProvider,
-        try_hooks: hooks, HookRegistry,
+        try_hooks: hooks, HookRuntime,
     }
 
     setters! {
@@ -141,7 +141,7 @@ impl Context {
         set_security: security, SecurityProvider,
         set_usage: usage, UsageTracker,
         set_observability: observability, ObservabilityProvider,
-        set_hooks: hooks, HookRegistry,
+        set_hooks: hooks, HookRuntime,
     }
 
     /// turn 开始时的 provider 快照（决策 5.2：一个 turn 内实现恒定）。
@@ -189,7 +189,7 @@ pub struct ProviderSnapshot {
     pub security: Option<Arc<dyn SecurityProvider>>,
     pub usage: Option<Arc<dyn UsageTracker>>,
     pub observability: Option<Arc<dyn ObservabilityProvider>>,
-    pub hooks: Option<Arc<dyn HookRegistry>>,
+    pub hooks: Option<Arc<dyn HookRuntime>>,
 }
 
 // endregion: --- ProviderSnapshot ---
@@ -211,7 +211,7 @@ pub struct AgentBuilder {
     security: Option<Arc<dyn SecurityProvider>>,
     usage: Option<Arc<dyn UsageTracker>>,
     observability: Option<Arc<dyn ObservabilityProvider>>,
-    hooks: Option<Arc<dyn HookRegistry>>,
+    hooks: Option<Arc<dyn HookRuntime>>,
 }
 
 macro_rules! builder_methods {
@@ -238,7 +238,7 @@ impl AgentBuilder {
         security: security, SecurityProvider,
         usage: usage, UsageTracker,
         observability: observability, ObservabilityProvider,
-        hooks: hooks, HookRegistry,
+        hooks: hooks, HookRuntime,
     }
 
     /// 组装 Agent（不做完整性检查，决策 5.8）

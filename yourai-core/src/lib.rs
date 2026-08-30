@@ -91,7 +91,12 @@ pub mod prelude {
     pub use crate::context_manager::ContextManager;
     pub use crate::error::{AbortReason, ErrorKind, YourAiError};
     pub use crate::future::BoxFuture;
-    pub use crate::hooks::{HookEvent, HookEventType, HookHandler, HookOutcome, HookRegistry};
+    pub use crate::hooks::{
+        BaseInput, FailurePolicy, HookBlockingError, HookCommonOutcome, HookDispatchResult,
+        HookEvent, HookEventKind, HookHandler, HookInvocation, HookMessage, HookMessageKind,
+        HookOutput, HookPermission, HookPointOutcome, HookRegistry, HookRun, HookRunStatus,
+        HookRuntime, HookSource, NativeHookRegistration,
+    };
     pub use crate::memory::{MemoryEntry, MemoryManager};
     pub use crate::model::{ModelProvider, ModelRequest};
     pub use crate::observability::{ObservabilityProvider, Span};
