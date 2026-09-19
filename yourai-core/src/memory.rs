@@ -3,7 +3,7 @@
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryEntry {
     pub key: String,
     pub value: String,

@@ -23,7 +23,13 @@ use serde_json::Value;
 #[non_exhaustive]
 pub enum In {
     /// 对话输入 & steer（同一条路：首条 = 用户输入，后续 = mid-turn 注入）
-    UserText { text: String },
+    UserText {
+        text: String,
+        /// 仅影响运行中追加输入；作为首条输入时直接开始本次 Turn。
+        /// 旧 wire 消息缺省为 Steer。
+        #[serde(default)]
+        mode: InputMode,
+    },
 
     /// 对一切 [`Out::Ask`] 的答复（审批/提问/表单/计划确认/MCP elicitation）
     Reply { id: String, payload: Value },
@@ -32,8 +38,28 @@ pub enum In {
 impl In {
     /// 便捷构造：用户输入
     pub fn user_text(text: impl Into<String>) -> Self {
-        In::UserText { text: text.into() }
+        In::UserText {
+            text: text.into(),
+            mode: InputMode::Steer,
+        }
     }
+
+    pub fn follow_up(text: impl Into<String>) -> Self {
+        In::UserText {
+            text: text.into(),
+            mode: InputMode::FollowUp,
+        }
+    }
+}
+
+/// 用户输入的消费时机，取消仍独立走控制通道。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum InputMode {
+    #[default]
+    Steer,
+    FollowUp,
 }
 
 // endregion: --- In ---

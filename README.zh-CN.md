@@ -15,7 +15,7 @@ YourAI 将 Agent Harness 拆成三种职责：
 Core seam 后面的所有能力都可以替换。Loop 本身也是 provider，而不是框架写死的策略。
 
 > [!IMPORTANT]
-> YourAI 目前仍处于基础能力阶段。类型化协议、turn 运输、provider interface 和 Hook runtime 已经实现；生产级 DefaultLoop、CLI、TUI 和内置 provider adapter 仍在规划中。
+> YourAI 目前仍处于基础能力阶段。类型化协议、core、Hook runtime、DefaultLoop、会话宿主、文件持久化、模型摘要及扩展已经实现。提供简易 TUI 与模型配置；Web 前端和操作系统沙箱尚未提供。
 
 ## 主要特性
 
@@ -33,15 +33,26 @@ Core seam 后面的所有能力都可以替换。Loop 本身也是 provider，�
 | `yourai-protocol` | 叶子 crate，定义外部 `In`、`Out` 和 usage 词汇。 |
 | `yourai-core` | Provider interface，以及 turn 运输、生命周期、取消和快照机制。 |
 | `yourai-hooks` | Claude 兼容的 Hook wire 协议与 Command/HTTP/Native runtime adapter。 |
+| `yourai-loop` | 默认单次执行：流式模型、Hook、压缩编排、工具审批、交互、执行限制与收尾。 |
+| `yourai-runtime` | 统一装配、会话宿主、持久化 Provider、工作区、子 Agent 和任务扩展。 |
+| `yourai-tui` | 简易终端对话、流式输出、审批与 TOML 模型配置。 |
 
 依赖方向保持单向：
 
 ```text
 yourai-protocol  ←  yourai-core  ←  yourai-hooks
-       词汇              seam            adapter
+                               ←  yourai-loop
 ```
 
+`yourai-runtime` 提供统一装配、会话宿主、持久化、compact 与扩展，见 [五张图的实现与验收](./docs/runtime-implementation.md)。
+
+上下文管理下一阶段设计见 [ContextManager 与压缩算法](./docs/context-manager-design.md)，说明请求预算、工具输出清理、摘要选区及持久化规则。
+
 ## 快速开始
+
+测试真实模型：复制 `yourai.example.toml` 为 `yourai.toml`，填写模型名、地址和密钥环境变量，执行 `cargo run -p yourai-tui`。操作与配置见 [TUI 使用说明](./docs/tui.md)。
+
+DefaultLoop 的装配、配置与行为约定见 [实现文档](./docs/default-loop-implementation.md)。
 
 安装较新的 Rust stable toolchain，然后克隆并验证 workspace：
 
@@ -63,12 +74,12 @@ impl AgentLoop for EchoLoop {
     fn run_turn<'a>(
         &'a self,
         tc: TurnContext<'a>,
-    ) -> BoxFuture<'a, Result<TurnOutput, YourAiError>> {
+    ) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
             match tc.inbox.recv().await {
-                Some(In::UserText { text }) => {
+                Some(In::UserText { text, .. }) => {
                     if !tc.outbox.send(Out::Chunk { text: text.clone() }) {
-                        return Err(YourAiError::Aborted(AbortReason::Disconnected));
+                        return Err(YourAiError::Aborted(AbortReason::Disconnected).into());
                     }
                     Ok(TurnOutput::new(text))
                 }
@@ -106,6 +117,8 @@ Core 刻意不选择模型厂商、持久化引擎、工具集合、UI 或 ReAct
 ## 文档
 
 - [架构与设计决策](./docs/architecture.md)
+- [DefaultLoop 完整流程与组件设计入口（设计基线）](./docs/default-loop-flow.md)
+- [Core 组件接口与迁移说明](./docs/core-contracts.md)
 - [Hook 协议与 Runtime 契约](./docs/hook-protocol.md)
 - [Claude Code Hook 兼容性调研](./docs/claude-code-hook-protocol.md)
 - [历史 Hook 设计稿](./docs/hooks.md)

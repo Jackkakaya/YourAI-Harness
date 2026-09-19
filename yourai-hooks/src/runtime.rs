@@ -103,6 +103,7 @@ pub struct ConcreteHookRuntime {
     http_policy: crate::http::HttpHookPolicy,
     model_executor: Option<Arc<dyn HookModelExecutor>>,
     background_tx: tokio::sync::broadcast::Sender<crate::command::BackgroundHookEvent>,
+    background_tasks: crate::command::BackgroundTasks,
 }
 
 impl ConcreteHookRuntime {
@@ -113,6 +114,7 @@ impl ConcreteHookRuntime {
             http_policy: crate::http::HttpHookPolicy::default(),
             model_executor: None,
             background_tx,
+            background_tasks: Default::default(),
         }
     }
 
@@ -123,6 +125,7 @@ impl ConcreteHookRuntime {
             http_policy,
             model_executor: None,
             background_tx,
+            background_tasks: Default::default(),
         }
     }
 
@@ -132,7 +135,7 @@ impl ConcreteHookRuntime {
         self
     }
 
-    /// 订阅后台 Hook 完成事件。未来 Loop 用它实现 `asyncRewake`。
+    /// 订阅后台 Hook 完成事件。Loop 用它实现 `asyncRewake`。
     pub fn subscribe_background_events(
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::command::BackgroundHookEvent> {
@@ -235,6 +238,7 @@ impl ConcreteHookRuntime {
             &self.http_policy,
             self.model_executor.as_ref(),
             &self.background_tx,
+            &self.background_tasks,
         )
         .await;
 
@@ -381,6 +385,32 @@ impl Default for ConcreteHookRuntime {
 }
 
 impl HookRuntime for ConcreteHookRuntime {
+    fn subscribe_background(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<yourai_core::hooks::HookBackgroundEvent>> {
+        Some(self.background_tx.subscribe())
+    }
+    fn shutdown_session<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> yourai_core::BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(async move {
+            let tasks = self
+                .background_tasks
+                .lock()
+                .unwrap()
+                .remove(id)
+                .unwrap_or_default();
+            for task in &tasks {
+                task.abort();
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+            Ok(())
+        })
+    }
+
     fn dispatch<'a>(
         &'a self,
         invocation: &'a HookInvocation,
@@ -558,6 +588,7 @@ async fn run_handlers_parallel(
     http_policy: &crate::http::HttpHookPolicy,
     model_executor: Option<&Arc<dyn HookModelExecutor>>,
     background_tx: &tokio::sync::broadcast::Sender<crate::command::BackgroundHookEvent>,
+    background_tasks: &crate::command::BackgroundTasks,
 ) -> Vec<ExecutedHook> {
     let mut join_set: JoinSet<ExecutedHook> = JoinSet::new();
     let mut task_metadata = HashMap::new();
@@ -573,6 +604,8 @@ async fn run_handlers_parallel(
                 HandlerConfig::Command { command, shell, .. } => Arc::new(
                     crate::command::CommandHandler::new(command.clone(), *shell).with_background(
                         crate::command::BackgroundCommandContext {
+                            session_id: invocation.base.session_id.clone(),
+                            tasks: background_tasks.clone(),
                             hook_id: reg.id.clone(),
                             event_name: reg.event_name.clone(),
                             rewake: config.async_rewake(),
@@ -1174,9 +1207,19 @@ fn aggregate_generic(contributions: Vec<Contribution>) -> yourai_core::hooks::Ge
     }
 }
 
-/// 便捷构造：Arc<ConcreteHookRuntime>。
+/// 便捷构造：`Arc<ConcreteHookRuntime>`。
 pub fn new_runtime() -> Arc<ConcreteHookRuntime> {
     Arc::new(ConcreteHookRuntime::new())
+}
+
+impl Drop for ConcreteHookRuntime {
+    fn drop(&mut self) {
+        for tasks in self.background_tasks.lock().unwrap().values() {
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
 }
 
 #[cfg(test)]

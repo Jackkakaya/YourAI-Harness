@@ -1,5 +1,13 @@
 # YourAI 架构设计文档
 
+> 最新存储设计见 [会话存储与内存上下文](./session-storage-design.md)。ContextManager 管内存，SessionManager 管持久化，默认 SQLite，以全局唯一 session_id 定位，不引入 tenant_id。SQLite 主链已实现；下文早期示例仅展示运输接口，自持久化 ContextManager 示例已经废止，真实提交路径见存储文档。
+
+> 后续流程设计见 [DefaultLoop 完整执行流程与组件设计入口](./default-loop-flow.md)。
+> 该文档记录会话宿主、主循环、compact、工具审批和全部 Hook 的目标协作流程，
+> 五张图已有默认实现，见 [Runtime 实现与验收](./runtime-implementation.md)；本篇保留架构背景。
+> 最新 Rust 接口及迁移以 [Core 组件接口契约](./core-contracts.md) 和源码为准；
+> 下文早期签名示例尚未全部迁移，包括 TurnResult、compact 和工具交互等接口。
+
 ## 1. 设计理念
 
 **Everything is a Plugin.** 
@@ -734,14 +742,15 @@ YourAI 是开箱即用的 agent，用户可以零定制直接跑，也可以替�
 - MCP server 生命周期管理（进程启动/重启/健康检查）是 `yourai-tools-mcp` 内部事务
 - core 零新增 trait
 
-### 5.4 Session 与 ContextManager 关系 ✅ 已决策
+### 5.4 Session 与 ContextManager 关系
 
-**决策：** 方案 D——ContextManager 持有 session_id，自己 load/save。
+**决策：** ContextManager 管理一个会话的内存上下文；SessionManager 管理会话持久化记录，默认 SQLite。新方案替代原方案 D。
 
-- `SessionManager` 只管元数据（title、时间戳、model）
-- ContextManager 实现绑定 session_id：构造时 load 历史，每次 add_message 自动持久化
-- 恢复 session = 用 `SqliteContextManager::open(db, session_id)` 重建，历史自动恢复
-- core trait 无需改动，持久化策略（内存/SQLite/JSONL）是实现层的事
+- `SessionManager` 管会话元数据、消息与摘要持久化；调度、队列和执行所有权属于宿主，不公开为 SessionManager 方法。沿用 sessions/messages/usage_events 三主表，用量由 UsageTracker 管理。
+- ContextManager 管理内存上下文及其变更流程，通过 SessionManager 执行记录读写；不实现 SQL、不管理连接。
+- 公共操作收敛为 restore / append / build_request / compact。append 和 compact 内部先持久化、后更新内存；compact 内化工具清理、摘要和摘要 Hook，返回执行状态，不暴露候选或 reset 步骤。
+- SessionHistory 已移除，提交协调收进 ContextManager。设计见 [ContextManager 设计](./context-manager-design.md)。
+- core 已定义记录接口，数据库实现位于 runtime Adapter；完整表结构与迁移说明见 [存储设计](./session-storage-design.md)。
 
 ### 5.5 交互模型与协议分层 ✅ 已决策
 

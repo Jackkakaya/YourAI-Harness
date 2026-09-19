@@ -15,7 +15,7 @@ YourAI separates an agent harness into three responsibilities:
 Everything behind the core seams is replaceable. The loop itself is a provider, not a hard-coded framework policy.
 
 > [!IMPORTANT]
-> YourAI is currently a foundation-stage project. The typed protocol, turn transport, provider interfaces, and Hook runtime are implemented. A production DefaultLoop, CLI, TUI, and built-in provider adapters are still planned.
+> YourAI implements the core contracts, hooks, DefaultLoop, session hosting, durable history, model-backed compaction and optional extensions. A simple TUI and model configuration are included; a Web frontend and OS sandbox are not included.
 
 ## Highlights
 
@@ -33,15 +33,24 @@ Everything behind the core seams is replaceable. The loop itself is a provider, 
 | `yourai-protocol` | Leaf crate containing the external `In`, `Out`, and usage vocabulary. |
 | `yourai-core` | Provider interfaces plus turn transport, lifecycle, cancellation, and snapshots. |
 | `yourai-hooks` | Claude-compatible Hook wire protocol and command/HTTP/native runtime adapters. |
+| `yourai-loop` | Default single-turn loop: streaming, hooks, compaction coordination, tools, approvals, interaction, limits, and cleanup. |
+| `yourai-runtime` | Harness assembly, session host, durable providers, workspace, subagent and task extensions. |
+| `yourai-tui` | Simple terminal chat, streaming output, approvals and TOML model configuration. |
 
 Dependency direction stays one-way:
 
 ```text
 yourai-protocol  ←  yourai-core  ←  yourai-hooks
-     vocabulary       seams          adapters
+                               ←  yourai-loop
 ```
 
 ## Quick start
+
+To test a real model, copy `yourai.example.toml` to `yourai.toml`, configure the model, endpoint and key environment variable, then run `cargo run -p yourai-tui`. See [TUI usage](./docs/tui.md).
+
+See [Runtime implementation and verification](./docs/runtime-implementation.md) for all five flow diagrams and the runnable example.
+
+See [DefaultLoop implementation and integration](./docs/default-loop-implementation.md) for configuration and assembly.
 
 Install a recent stable Rust toolchain, then clone and verify the workspace:
 
@@ -63,12 +72,12 @@ impl AgentLoop for EchoLoop {
     fn run_turn<'a>(
         &'a self,
         tc: TurnContext<'a>,
-    ) -> BoxFuture<'a, Result<TurnOutput, YourAiError>> {
+    ) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
             match tc.inbox.recv().await {
-                Some(In::UserText { text }) => {
+                Some(In::UserText { text, .. }) => {
                     if !tc.outbox.send(Out::Chunk { text: text.clone() }) {
-                        return Err(YourAiError::Aborted(AbortReason::Disconnected));
+                        return Err(YourAiError::Aborted(AbortReason::Disconnected).into());
                     }
                     Ok(TurnOutput::new(text))
                 }
@@ -106,6 +115,8 @@ The core deliberately does not choose a model vendor, persistence engine, tool s
 ## Documentation
 
 - [Architecture and design decisions](./docs/architecture.md)
+- [DefaultLoop flow and component design baseline (Chinese)](./docs/default-loop-flow.md)
+- [Core component contracts and API migration (Chinese)](./docs/core-contracts.md)
 - [Hook protocol and runtime contract](./docs/hook-protocol.md)
 - [Claude Code Hook compatibility research](./docs/claude-code-hook-protocol.md)
 - [Historical Hook design](./docs/hooks.md)

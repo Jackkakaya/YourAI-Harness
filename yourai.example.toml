@@ -1,0 +1,27 @@
+# Copy to yourai.toml. Relative session_dir is resolved against the config file.
+session_dir = ".yourai/sessions"
+system_prompt = "You are a helpful programming assistant."
+# Enable workspace, tasks, subagents, local memory and skills explicitly.
+extensions = false
+
+[model]
+# openai = Chat Completions; also works with compatible gateways.
+# Other choices: openai-responses, anthropic, gemini, ollama.
+provider = "openai"
+name = "YOUR_MODEL_NAME"
+base_url = "https://api.openai.com/v1/"
+api_key_env = "OPENAI_API_KEY"
+# Alternatively remove api_key_env and set api_key = "...".
+# For native providers, omit base_url to use the provider default.
+# For a local OpenAI-compatible server without auth, set api_key = "local".
+
+[context]
+# Set this to the actual model/gateway context window; the value below is an example.
+context_window = 128000
+output_reserve = 4096
+safety_margin = 1024
+advance_tokens = 4096
+keep_recent_tokens = 20000
+summary_tokens = 2000
+tool_output_chars = 16000
+prune_enabled = false

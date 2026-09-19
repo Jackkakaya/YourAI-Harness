@@ -24,17 +24,17 @@
 //!     fn run_turn<'a>(
 //!         &'a self,
 //!         tc: TurnContext<'a>,
-//!     ) -> BoxFuture<'a, Result<TurnOutput, YourAiError>> {
+//!     ) -> BoxFuture<'a, TurnResult> {
 //!         Box::pin(async move {
 //!             match tc.inbox.recv().await {
-//!                 Some(In::UserText { text }) => {
+//!                 Some(In::UserText { text, .. }) => {
 //!                     let alive = tc.outbox.send(Out::Chunk { text: format!("echo: {text}") });
 //!                     if !alive {
-//!                         return Err(YourAiError::Aborted(AbortReason::Disconnected));
+//!                         return Err(YourAiError::Aborted(AbortReason::Disconnected).into());
 //!                     }
 //!                     Ok(TurnOutput::new(format!("done: {text}")))
 //!                 }
-//!                 _ => Err(YourAiError::Error(ErrorKind::Loop("expected UserText".into()))),
+//!                 _ => Err(ErrorKind::Loop("expected UserText".into()).into()),
 //!             }
 //!         })
 //!     }
@@ -51,31 +51,37 @@
 //! ```
 
 pub mod agent_loop;
+pub mod compaction;
 pub mod context;
 pub mod context_manager;
 pub mod error;
 pub mod future;
 pub mod hooks;
+pub mod interaction;
 pub mod memory;
 pub mod model;
 pub mod observability;
+pub mod runtime_event;
 pub mod sandbox;
 pub mod security;
 pub mod session;
+pub mod session_runtime;
 pub mod skill;
 pub mod tool;
+pub mod turn;
 pub mod ui;
 pub mod usage;
 
 /// genai 类型 re-export（决策 5.6）：下游一律写 `yourai_core::chat::Xxx`
 pub mod chat {
     pub use genai::chat::{
-        ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatRole, ChatStreamEvent,
-        ChatStreamResponse, MessageContent, StreamEnd, Tool, ToolCall, ToolResponse,
-        Usage as GenaiUsage,
+        Binary, BinarySource, ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatRole,
+        ChatStreamEvent, ChatStreamResponse, ContentPart, MessageContent, StopReason, StreamChunk,
+        StreamEnd, Tool, ToolCall, ToolResponse, Usage as GenaiUsage,
     };
 }
 
+pub use agent_loop::{TurnFailure, TurnResult};
 pub use error::{AbortReason, ErrorKind, YourAiError};
 pub use future::BoxFuture;
 pub use model::ModelRequest;
@@ -83,12 +89,15 @@ pub use ui::OutSink;
 
 /// 一步式引入全部常用项
 pub mod prelude {
-    pub use crate::agent_loop::{AgentLoop, TurnOutput};
+    pub use crate::agent_loop::{AgentLoop, TurnFailure, TurnOutput, TurnResult};
     pub use crate::chat::*;
+    pub use crate::compaction::{
+        CompactAction, CompactionRequest, CompactionResult, CompactionTrigger, ContextPolicy,
+    };
     pub use crate::context::{
         Agent, AgentBuilder, Context, ProviderSnapshot, TurnContext, TurnHandle,
     };
-    pub use crate::context_manager::ContextManager;
+    pub use crate::context_manager::{ContextExecution, ContextManager, ContextRequest};
     pub use crate::error::{AbortReason, ErrorKind, YourAiError};
     pub use crate::future::BoxFuture;
     pub use crate::hooks::{
@@ -97,17 +106,25 @@ pub mod prelude {
         HookOutput, HookPermission, HookPointOutcome, HookRegistry, HookRun, HookRunStatus,
         HookRuntime, HookSource, NativeHookRegistration,
     };
+    pub use crate::interaction::{InteractionKind, InteractionRequest, ToolInteraction};
     pub use crate::memory::{MemoryEntry, MemoryManager};
-    pub use crate::model::{ModelProvider, ModelRequest};
+    pub use crate::model::{ModelEventStream, ModelProvider, ModelRecovery, ModelRequest};
     pub use crate::observability::{ObservabilityProvider, Span};
     pub use crate::sandbox::{SandboxPolicy, SandboxProvider, SandboxType};
     pub use crate::security::{
         ApprovalDecision, PolicyDecision, SecurityContext, SecurityProvider,
     };
-    pub use crate::session::{SessionId, SessionManager, SessionMeta};
+    pub use crate::session::{
+        CompactionChange, ContextChange, MessagePage, MessageQuery, MessageStatus,
+        RequestObservation, SessionId, SessionManager, SessionMeta, StoredMessage,
+    };
+    pub use crate::session_runtime::{
+        InputRejected, SessionContext, SessionRuntime, SessionStatus, SessionTurn,
+    };
     pub use crate::skill::{SkillContent, SkillInfo, SkillProvider};
     pub use crate::tool::{ToolContext, ToolHandler, ToolRegistry};
+    pub use crate::turn::{TurnId, TurnInfo, TurnLimit, TurnLimits, TurnOptions};
     pub use crate::ui::OutSink;
-    pub use crate::usage::{UsageStats, UsageTracker};
-    pub use yourai_protocol::{In, Level, Out, Usage};
+    pub use crate::usage::{UsageEvent, UsageStats, UsageTracker};
+    pub use yourai_protocol::{In, InputMode, Level, Out, Usage};
 }

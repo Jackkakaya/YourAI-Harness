@@ -14,3 +14,5 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 genai = { workspace = true }
 uuid = { workspace = true }
+futures-core = "0.3"
+futures-util = "0.3"

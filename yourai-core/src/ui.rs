@@ -10,4 +10,9 @@ use yourai_protocol::Out;
 /// - `false`：消费端已关闭——loop 应尽快以 `Aborted(Disconnected)` 中止
 pub trait OutSink: Send + Sync {
     fn send(&self, m: Out) -> bool;
+
+    /// 等待消费端关闭。无关闭信号的同步 sink 保持 pending；发送失败仍然有效。
+    fn closed(&self) -> crate::BoxFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
 }

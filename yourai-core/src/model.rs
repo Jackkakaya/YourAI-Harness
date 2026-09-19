@@ -4,9 +4,23 @@
 //! capture_usage / capture_tool_calls / capture_reasoning_content 等
 //! 选项由 ContextManager 组装请求时带出，不再断链。
 
-use crate::chat::{ChatOptions, ChatRequest, ChatResponse, ChatStreamResponse};
+use crate::chat::ChatStreamEvent;
+use crate::chat::{ChatOptions, ChatRequest, ChatResponse};
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
+use std::pin::Pin;
+
+/// 可直接构造的统一事件流；genai 原始流由运行时适配器转换。
+pub type ModelEventStream =
+    Pin<Box<dyn futures_core::Stream<Item = Result<ChatStreamEvent, YourAiError>> + Send>>;
+
+/// 只对尚未产生可见内容的失败尝试恢复。未知错误默认不可重试。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRecovery {
+    Fatal,
+    Retry,
+    Compact,
+}
 
 /// 一次模型调用的完整参数。
 #[derive(Debug, Clone)]
@@ -22,20 +36,46 @@ impl ModelRequest {
 }
 
 pub trait ModelProvider: Send + Sync {
+    /// Model-specific media input budget. Unknown capabilities fail closed.
+    fn media_tokens(&self, _part: &crate::chat::ContentPart) -> Result<u64, YourAiError> {
+        Err(crate::ErrorKind::Config(
+            "media budgeting/capability is not configured for this model".into(),
+        )
+        .into())
+    }
+
+    fn stream_events<'a>(
+        &'a self,
+        req: ModelRequest,
+    ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>>;
+
+    /// 适配器可以按结构化服务端错误覆盖分类；不以任意错误文本猜测溢出。
+    fn recovery(&self, error: &YourAiError) -> ModelRecovery {
+        if let YourAiError::Error(crate::ErrorKind::Model {
+            source: genai::Error::HttpError { status, body, .. },
+        }) = error
+        {
+            let code = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/error/code")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                });
+            if code.as_deref() == Some("context_length_exceeded") {
+                return ModelRecovery::Compact;
+            }
+            if status.as_u16() == 429 || status.is_server_error() {
+                return ModelRecovery::Retry;
+            }
+        }
+        ModelRecovery::Fatal
+    }
     /// 非流式调用
     fn complete<'a>(
         &'a self,
         req: ModelRequest,
     ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>>;
 
-    /// 流式调用（配合 [`ChatStreamEvent`](crate::chat::ChatStreamEvent) 消费；
-    /// `StreamEnd` 的 captured_usage / captured_tool_calls 需在
-    /// ChatOptions 中开启对应 capture）
-    fn stream<'a>(
-        &'a self,
-        req: ModelRequest,
-    ) -> BoxFuture<'a, Result<ChatStreamResponse, YourAiError>>;
-
-    /// 当前模型标识（如 "deepseek-chat"）
     fn model_iden(&self) -> &str;
 }

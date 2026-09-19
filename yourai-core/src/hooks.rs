@@ -713,6 +713,17 @@ pub enum FailurePolicy {
 /// - **HookRuntime 不负责**：修改 ContextManager、执行工具、向用户提问
 /// - **Loop 负责**：消费 `HookDispatchResult`，应用效果到业务流程
 pub trait HookRuntime: Send + Sync {
+    fn subscribe_background(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<HookBackgroundEvent>> {
+        None
+    }
+    fn shutdown_session<'a>(
+        &'a self,
+        _session_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(async { Ok(()) })
+    }
     /// 分发一次 Hook 调用。
     ///
     /// 取消契约：返回的 future 必须是 cancellation-safe。调用方通过丢弃 future 取消
@@ -730,6 +741,19 @@ pub trait HookRuntime: Send + Sync {
         &'a self,
         invocation: &'a HookInvocation,
     ) -> BoxFuture<'a, Result<HookDispatchResult, YourAiError>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct HookBackgroundEvent {
+    pub session_id: String,
+    pub task_id: String,
+    pub hook_id: String,
+    pub event_name: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub timed_out: bool,
+    pub rewake: bool,
 }
 
 /// 运行期注册一个原生 Hook 所需的完整元数据。

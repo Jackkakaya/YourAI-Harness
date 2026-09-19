@@ -7,8 +7,8 @@
 //! - 第二层：`check_command` / `check_file_access`——只有具体工具
 //!   （shell/fs）知道命令与路径，由工具经 ToolContext 注入的能力调用；
 //!   这一层只做不可交互的策略强制，返回 [`PolicyDecision`]（Allow/Deny）。
-//!   需要用户确认的动作必须在第一层完成，避免 loop 等工具、工具又等 Reply
-//!   的循环等待。
+//!   权限审批在第一层完成。工具的普通提问/MCP elicitation 可使用独立的
+//!   ToolInteraction 桥，但不能通过交互绕过第二层硬限制。
 
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
@@ -26,7 +26,7 @@ pub enum ApprovalDecision {
 /// 工具内部的强制策略结果。
 ///
 /// 第二层检查发生在 loop 已经开始等待工具执行之后，没有 inbox 消费权，
-/// 因而不能发起 Ask/Reply；需要交互的判断必须由第一层 `check_tool_call` 完成。
+/// 权限检查本身不能发起 Ask/Reply；需要审批的判断由第一层完成。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PolicyDecision {
@@ -44,6 +44,15 @@ pub struct SecurityContext {
 }
 
 pub trait SecurityProvider: Send + Sync {
+    /// Apply validated policy updates atomically. Unsupported providers fail explicitly.
+    fn update_permissions<'a>(
+        &'a self,
+        _updates: &'a [Value],
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(async {
+            Err(crate::ErrorKind::Config("permission updates unsupported".into()).into())
+        })
+    }
     /// 第一层：工具调用级审批（loop 调用）
     fn check_tool_call<'a>(
         &'a self,

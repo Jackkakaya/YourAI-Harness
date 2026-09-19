@@ -3,7 +3,7 @@
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkillInfo {
     pub id: String,
     pub name: String,
@@ -11,7 +11,7 @@ pub struct SkillInfo {
     pub category: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkillContent {
     pub info: SkillInfo,
     /// 注入到模型上下文的指令文本

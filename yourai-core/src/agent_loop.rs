@@ -6,7 +6,8 @@ use crate::future::BoxFuture;
 
 /// 一次 turn 的产出。
 ///
-/// - `pending`：退出前 inbox 里没消费的残留消息（决策 5.5 退出契约），
+/// - `pending`：Loop 已接收但尚未处理的消息；Core 在 Loop 返回后关闭 inbox，
+///   再把尚未接收的消息追加进来，成功和失败路径都保留。
 ///   调用方负责用它们续 turn（followUp 机制）——loop 开不了新 turn，
 ///   turn 边界属于调用方。
 #[derive(Debug, Clone)]
@@ -27,6 +28,46 @@ impl TurnOutput {
     }
 }
 
+/// 失败也携带部分文本、用量和未处理输入，不能因取消或错误丢失 follow-up。
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct TurnFailure {
+    #[source]
+    pub error: Box<YourAiError>,
+    pub output: TurnOutput,
+}
+
+impl TurnFailure {
+    pub fn new(error: impl Into<YourAiError>, output: TurnOutput) -> Self {
+        Self {
+            error: Box::new(error.into()),
+            output,
+        }
+    }
+}
+
+impl From<YourAiError> for TurnFailure {
+    fn from(error: YourAiError) -> Self {
+        Self::new(error, TurnOutput::new(""))
+    }
+}
+
+impl From<crate::error::ErrorKind> for TurnFailure {
+    fn from(error: crate::error::ErrorKind) -> Self {
+        Self::new(error, TurnOutput::new(""))
+    }
+}
+
+impl From<crate::error::AbortReason> for TurnFailure {
+    fn from(error: crate::error::AbortReason) -> Self {
+        Self::new(error, TurnOutput::new(""))
+    }
+}
+
+/// 运行成功与可恢复的失败报告。裸 `?` 只保留错误；已产生部分结果时，
+/// Loop 应使用 TurnFailure::new 显式携带其本地累计状态。
+pub type TurnResult = Result<TurnOutput, TurnFailure>;
+
 /// 编排 turn 流程（模型调用 → 工具执行 → 重复直到完成）。
 ///
 /// 最小签名，最大自由：只给 [`TurnContext`]（providers 快照 + inbox/outbox/cancel）。
@@ -35,15 +76,32 @@ impl TurnOutput {
 /// 消费契约：
 /// - loop 是 inbox 的独占拉取消费者；step 边界 `try_recv`、
 ///   等待时 `recv().await`（务必与 `cancel` 一起 `select!`）；
-///   退出前必须再 drain 一次，残留放入 [`TurnOutput::pending`]。
+///   已拉取但未处理的消息放入 [`TurnOutput::pending`]（失败则放入 TurnFailure）；
+///   尚未拉取的消息由 Core 在正常返回后关闭并 drain，杜绝最后一次 drain 的竞态。
 /// - outbox `send` 返回 `false` = 消费端已关闭，应尽快以
 ///   `Aborted(Disconnected)` 中止。
 ///
 /// 生命周期：返回的 future 绑定 `&'a self` 与 `TurnContext<'a>`——
 /// 有状态 loop 可在 async block 中借用自身字段，无需预先 clone。
 pub trait AgentLoop: Send + Sync {
-    fn run_turn<'a>(
+    /// The same system context is used by normal requests and manual compaction.
+    fn request_system<'a>(
         &'a self,
-        tc: TurnContext<'a>,
-    ) -> BoxFuture<'a, Result<TurnOutput, YourAiError>>;
+        _providers: &'a crate::context::ProviderSnapshot,
+        session: Option<&'a crate::session_runtime::SessionContext>,
+    ) -> BoxFuture<'a, Result<String, YourAiError>> {
+        Box::pin(async move {
+            Ok(session
+                .map(|s| {
+                    s.instructions
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default())
+        })
+    }
+
+    fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult>;
 }

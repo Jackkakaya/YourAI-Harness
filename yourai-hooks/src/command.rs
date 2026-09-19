@@ -13,27 +13,54 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use yourai_core::hooks::{HookHandler, HookInvocation, HookOutput};
 
-#[derive(Debug, Clone)]
-pub struct BackgroundHookEvent {
-    pub task_id: String,
-    pub hook_id: String,
-    pub event_name: String,
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
-    pub timed_out: bool,
-    /// `true` 时 exit code 2 应由未来的 Loop 消费者唤醒模型。
-    pub rewake: bool,
-}
+pub use yourai_core::hooks::HookBackgroundEvent as BackgroundHookEvent;
+pub(crate) type BackgroundTasks = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<tokio::task::JoinHandle<()>>>>,
+>;
 
 #[derive(Clone)]
 pub(crate) struct BackgroundCommandContext {
+    pub session_id: String,
+    pub tasks: BackgroundTasks,
     pub hook_id: String,
     pub event_name: String,
     pub rewake: bool,
     pub timeout: Option<std::time::Duration>,
     pub force_background: bool,
     pub sender: tokio::sync::broadcast::Sender<BackgroundHookEvent>,
+}
+
+// Own the process group across foreground/background handoff and future cancellation.
+struct OwnedChild {
+    child: Option<tokio::process::Child>,
+    group: Option<u32>,
+}
+impl std::ops::Deref for OwnedChild {
+    type Target = tokio::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.child.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for OwnedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child.as_mut().unwrap()
+    }
+}
+impl OwnedChild {
+    async fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        self.child.take().unwrap().wait_with_output().await
+    }
+}
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.group {
+            // SAFETY: the group ID belongs to the child we spawned with process_group(0).
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
 }
 
 /// Command hook handler。
@@ -61,7 +88,7 @@ impl CommandHandler {
     async fn spawn(
         &self,
         invocation: &HookInvocation,
-    ) -> Result<tokio::process::Child, yourai_core::YourAiError> {
+    ) -> Result<OwnedChild, yourai_core::YourAiError> {
         let json_input = to_wire_json(invocation);
 
         let mut cmd = match self.shell {
@@ -90,13 +117,22 @@ impl CommandHandler {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.as_std_mut().process_group(0);
+        }
         cmd.current_dir(&invocation.base.cwd);
 
-        let mut child = cmd.spawn().map_err(|e| yourai_core::ErrorKind::Provider {
+        let child = cmd.spawn().map_err(|e| yourai_core::ErrorKind::Provider {
             name: "hook",
             message: format!("failed to spawn command: {e}"),
         })?;
 
+        let mut child = OwnedChild {
+            group: child.id(),
+            child: Some(child),
+        };
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(format!("{json_input}\n").as_bytes())
@@ -187,7 +223,9 @@ impl CommandHandler {
                 .map(std::time::Duration::from_millis);
             let task_id = format!("async_hook_{}", uuid::Uuid::new_v4());
             let event_task_id = task_id.clone();
-            tokio::spawn(async move {
+            let owner = background.session_id.clone();
+            let tasks = background.tasks.clone();
+            let task = tokio::spawn(async move {
                 let stdout_task = tokio::spawn(async move {
                     let mut remaining = String::new();
                     let result = stdout.read_to_string(&mut remaining).await;
@@ -204,6 +242,7 @@ impl CommandHandler {
                     },
                     None => child.wait().await.map(Some),
                 };
+                drop(child); // End the owned process group before joining pipe readers.
                 let (read_result, remaining) = stdout_task.await.unwrap_or_else(|error| {
                     (Ok(0), format!("failed joining stdout reader: {error}"))
                 });
@@ -223,6 +262,7 @@ impl CommandHandler {
                     stderr.push_str(&format!("\n{error}"));
                 }
                 let _ = background.sender.send(BackgroundHookEvent {
+                    session_id: background.session_id.clone(),
                     task_id: event_task_id,
                     hook_id: background.hook_id,
                     event_name: background.event_name,
@@ -233,6 +273,12 @@ impl CommandHandler {
                     rewake: background.rewake,
                 });
             });
+            {
+                let mut registry = tasks.lock().unwrap();
+                let owned = registry.entry(owner).or_default();
+                owned.retain(|task| !task.is_finished());
+                owned.push(task);
+            }
             return Ok(HookOutput::Backgrounded { task_id });
         }
 
@@ -272,13 +318,15 @@ impl CommandHandler {
 }
 
 fn background_child(
-    child: tokio::process::Child,
+    child: OwnedChild,
     background: BackgroundCommandContext,
     timeout_override: Option<std::time::Duration>,
 ) -> HookOutput {
     let task_id = format!("async_hook_{}", uuid::Uuid::new_v4());
     let event_task_id = task_id.clone();
-    tokio::spawn(async move {
+    let owner = background.session_id.clone();
+    let tasks = background.tasks.clone();
+    let task = tokio::spawn(async move {
         let wait = child.wait_with_output();
         let result = match timeout_override.or(background.timeout) {
             Some(timeout) => match tokio::time::timeout(timeout, wait).await {
@@ -289,6 +337,7 @@ fn background_child(
         };
         let event = match result {
             Ok(Some(output)) => BackgroundHookEvent {
+                session_id: background.session_id.clone(),
                 task_id: event_task_id,
                 hook_id: background.hook_id,
                 event_name: background.event_name,
@@ -299,6 +348,7 @@ fn background_child(
                 rewake: background.rewake,
             },
             Ok(None) => BackgroundHookEvent {
+                session_id: background.session_id.clone(),
                 task_id: event_task_id,
                 hook_id: background.hook_id,
                 event_name: background.event_name,
@@ -309,6 +359,7 @@ fn background_child(
                 rewake: background.rewake,
             },
             Err(error) => BackgroundHookEvent {
+                session_id: background.session_id.clone(),
                 task_id: event_task_id,
                 hook_id: background.hook_id,
                 event_name: background.event_name,
@@ -321,6 +372,12 @@ fn background_child(
         };
         let _ = background.sender.send(event);
     });
+    {
+        let mut registry = tasks.lock().unwrap();
+        let owned = registry.entry(owner).or_default();
+        owned.retain(|task| !task.is_finished());
+        owned.push(task);
+    }
     HookOutput::Backgrounded { task_id }
 }
 

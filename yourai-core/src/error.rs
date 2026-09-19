@@ -21,6 +21,8 @@ pub enum YourAiError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AbortReason {
+    #[error("stopped by hook: {0}")]
+    HookStopped(String),
     /// cancel token 触发（ESC / Shutdown）
     #[error("cancelled")]
     Cancelled,
@@ -28,6 +30,14 @@ pub enum AbortReason {
     /// inbox/outbox 对端消失（调用方已离开）
     #[error("client disconnected")]
     Disconnected,
+
+    /// 总执行或当前操作的截止时间到达；调用方根据操作边界决定收尾方式。
+    #[error("deadline exceeded")]
+    DeadlineExceeded,
+
+    /// Loop 在下一次操作前发现执行额度耗尽。
+    #[error("turn limit reached: {0:?}")]
+    LimitReached(crate::turn::TurnLimit),
 }
 
 /// 故障来源细分（第二级）。
