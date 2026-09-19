@@ -78,7 +78,6 @@ pub struct CompactionRequest {
     pub custom_instructions: Option<String>,
     pub target_tokens: Option<u64>,
     pub deadline: Option<Instant>,
-    pub system: Option<String>,
     pub tools: Vec<Tool>,
     /// Shared counter survives errors/cancellation so the caller charges attempted calls.
     pub calls: Arc<AtomicU32>,
@@ -92,7 +91,6 @@ impl CompactionRequest {
             custom_instructions: None,
             target_tokens: None,
             deadline: None,
-            system: None,
             tools: vec![],
             calls: Arc::new(AtomicU32::new(0)),
             max_model_calls: 8,

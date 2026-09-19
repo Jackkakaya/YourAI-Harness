@@ -21,7 +21,7 @@ use crate::agent_loop::{AgentLoop, TurnFailure, TurnOutput, TurnResult};
 use crate::context_manager::ContextManager;
 use crate::error::{ErrorKind, YourAiError};
 use crate::hooks::HookRuntime;
-use crate::memory::MemoryManager;
+use crate::memory::MemoryProvider;
 use crate::model::ModelProvider;
 use crate::observability::ObservabilityProvider;
 use crate::sandbox::SandboxProvider;
@@ -43,7 +43,7 @@ pub struct Context {
     model: RwLock<Option<Arc<dyn ModelProvider>>>,
     context_manager: RwLock<Option<Arc<dyn ContextManager>>>,
     session: RwLock<Option<Arc<dyn SessionManager>>>,
-    memory: RwLock<Option<Arc<dyn MemoryManager>>>,
+    memory: RwLock<Option<Arc<dyn MemoryProvider>>>,
     tools: RwLock<Option<Arc<dyn ToolRegistry>>>,
     skills: RwLock<Option<Arc<dyn SkillProvider>>>,
     sandbox: RwLock<Option<Arc<dyn SandboxProvider>>>,
@@ -105,7 +105,7 @@ impl Context {
         model: ModelProvider,
         context_manager: ContextManager,
         session: SessionManager,
-        memory: MemoryManager,
+        memory: MemoryProvider,
         tools: ToolRegistry,
         skills: SkillProvider,
         sandbox: SandboxProvider,
@@ -120,7 +120,7 @@ impl Context {
         try_model: model, ModelProvider,
         try_context_manager: context_manager, ContextManager,
         try_session: session, SessionManager,
-        try_memory: memory, MemoryManager,
+        try_memory: memory, MemoryProvider,
         try_tools: tools, ToolRegistry,
         try_skills: skills, SkillProvider,
         try_sandbox: sandbox, SandboxProvider,
@@ -135,7 +135,7 @@ impl Context {
         set_model: model, ModelProvider,
         set_context_manager: context_manager, ContextManager,
         set_session: session, SessionManager,
-        set_memory: memory, MemoryManager,
+        set_memory: memory, MemoryProvider,
         set_tools: tools, ToolRegistry,
         set_skills: skills, SkillProvider,
         set_sandbox: sandbox, SandboxProvider,
@@ -183,7 +183,7 @@ pub struct ProviderSnapshot {
     pub model: Option<Arc<dyn ModelProvider>>,
     pub context_manager: Option<Arc<dyn ContextManager>>,
     pub session: Option<Arc<dyn SessionManager>>,
-    pub memory: Option<Arc<dyn MemoryManager>>,
+    pub memory: Option<Arc<dyn MemoryProvider>>,
     pub tools: Option<Arc<dyn ToolRegistry>>,
     pub skills: Option<Arc<dyn SkillProvider>>,
     pub sandbox: Option<Arc<dyn SandboxProvider>>,
@@ -205,7 +205,7 @@ pub struct AgentBuilder {
     model: Option<Arc<dyn ModelProvider>>,
     context_manager: Option<Arc<dyn ContextManager>>,
     session: Option<Arc<dyn SessionManager>>,
-    memory: Option<Arc<dyn MemoryManager>>,
+    memory: Option<Arc<dyn MemoryProvider>>,
     tools: Option<Arc<dyn ToolRegistry>>,
     skills: Option<Arc<dyn SkillProvider>>,
     sandbox: Option<Arc<dyn SandboxProvider>>,
@@ -232,7 +232,7 @@ impl AgentBuilder {
         model: model, ModelProvider,
         context_manager: context_manager, ContextManager,
         session: session, SessionManager,
-        memory: memory, MemoryManager,
+        memory: memory, MemoryProvider,
         tools: tools, ToolRegistry,
         skills: skills, SkillProvider,
         sandbox: sandbox, SandboxProvider,

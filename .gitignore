@@ -12,3 +12,5 @@ Cargo.lock.bak
 # Local model credentials and sessions
 /yourai.toml
 /.yourai/
+
+/yourai.json

@@ -6,19 +6,23 @@ use yourai_core::prelude::*;
 impl State<'_> {
     pub(crate) async fn model_step(
         &mut self,
+        attempt: u32,
     ) -> Result<(ChatMessage, Vec<ToolCall>), (YourAiError, bool)> {
         let mut visible = false;
-        let result = self.read_model(&mut visible).await;
+        let result = self.read_model(&mut visible, attempt).await;
         result.map_err(|e| (e, visible))
     }
     async fn read_model(
         &mut self,
         visible: &mut bool,
+        attempt: u32,
     ) -> Result<(ChatMessage, Vec<ToolCall>), YourAiError> {
         self.bound_tools.clear();
         let mut tools = vec![];
         if let Some(registry) = &self.tc.snap.tools {
-            for definition in registry.definitions() {
+            let mut definitions = registry.definitions();
+            definitions.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+            for definition in definitions {
                 let handler = registry.resolve(definition.name.as_str())?;
                 let definition = handler.definition();
                 if handler.name() != definition.name.as_str() {
@@ -36,9 +40,7 @@ impl State<'_> {
             self.history.session_id(),
             self.tc.info.options.session.as_deref(),
         )?;
-        let mut prepared = self
-            .history
-            .build_request(Some(&self.system), &tools, &execution)?;
+        let mut prepared = self.history.build_request(&tools, &execution)?;
         if prepared.maintenance_needed {
             if let Err(e) = self.compact(CompactionTrigger::Threshold).await {
                 if matches!(e, YourAiError::Aborted(_)) || !prepared.fits() {
@@ -48,9 +50,7 @@ impl State<'_> {
                 self.history.restore().await?;
                 self.notice(Level::Warning, format!("Automatic maintenance failed: {e}"))?;
             }
-            prepared = self
-                .history
-                .build_request(Some(&self.system), &tools, &execution)?;
+            prepared = self.history.build_request(&tools, &execution)?;
         }
         if !prepared.fits() {
             return Err(ErrorKind::Loop(
@@ -78,12 +78,12 @@ impl State<'_> {
             .unwrap_or(self.config.operation_timeout);
         let deadline = self.deadline(Some(timeout));
         self.model_calls += 1;
+        let mut request = ModelRequest::new(request, options);
+        request.session_id = Some(self.history.session_id().0.clone());
+        request.turn_id = Some(self.tc.info.id.to_string());
+        request.attempt = attempt;
         let mut stream = self
-            .wait(
-                model.stream_events(ModelRequest::new(request, options)),
-                Some(timeout),
-                "model",
-            )
+            .wait(model.stream_events(request), Some(timeout), "model")
             .await?;
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -237,4 +237,31 @@ impl State<'_> {
             }
         }
     }
+}
+
+/// Safe, structured error context for retry notices; never print request payloads.
+pub(crate) fn retry_cause(error: &YourAiError) -> String {
+    let Some((status, body)) = error.model_http_error() else {
+        return "model provider error".into();
+    };
+    let mut reason = format!("HTTP {status}");
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        for field in ["code", "dimension"] {
+            if let Some(value) = value
+                .get("error")
+                .and_then(|e| e.get(field))
+                .and_then(|v| v.as_str())
+            {
+                if !value.is_empty()
+                    && value.len() <= 64
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                {
+                    reason.push_str(&format!(", {field}={value}"));
+                }
+            }
+        }
+    }
+    reason
 }

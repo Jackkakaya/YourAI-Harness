@@ -24,6 +24,9 @@ pub struct History {
     pub usage: Mutex<Vec<Usage>>,
 }
 impl ContextManager for History {
+    fn system_prompt(&self) -> String {
+        String::new()
+    }
     fn restore(&self) -> BoxFuture<'_, Result<(), YourAiError>> {
         Box::pin(async { Ok(()) })
     }
@@ -32,7 +35,7 @@ impl ContextManager for History {
             self.messages
                 .lock()
                 .unwrap()
-                .extend(messages.into_iter().map(|m| m.message));
+                .extend(messages.into_iter().map(|m| m.model_message()));
             Ok(())
         })
     }
@@ -57,12 +60,11 @@ impl ContextManager for History {
     }
     fn build_request(
         &self,
-        system: Option<&str>,
         tools: &[Tool],
         _: &ContextExecution,
     ) -> Result<ContextRequest, YourAiError> {
         let mut request = ChatRequest::new(self.messages());
-        request.system = system.map(str::to_owned);
+        request.system = Some(self.system_prompt());
         request.tools = Some(tools.to_vec());
         Ok(ContextRequest {
             request,

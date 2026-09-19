@@ -44,6 +44,13 @@ pub struct SecurityContext {
 }
 
 pub trait SecurityProvider: Send + Sync {
+    /// Explicit host-selected YOLO mode: skip tool permission decisions and
+    /// permission prompts. Does not answer ordinary tool questions or disable
+    /// cancellation, schema validation, lifecycle hooks, or OS sandboxing.
+    fn bypass_approvals(&self) -> bool {
+        false
+    }
+
     /// Apply validated policy updates atomically. Unsupported providers fail explicitly.
     fn update_permissions<'a>(
         &'a self,

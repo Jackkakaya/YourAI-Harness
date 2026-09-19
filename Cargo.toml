@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["yourai-protocol", "yourai-core", "yourai-hooks", "yourai-loop", "yourai-runtime", "yourai-tui"]
+members = ["yourai-protocol", "yourai-core", "yourai-loop", "yourai-harness", "yourai-tui"]
 
 [workspace.package]
 version = "0.1.0"

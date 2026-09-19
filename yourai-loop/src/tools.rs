@@ -168,7 +168,7 @@ impl State<'_> {
                 .options
                 .limits
                 .tool_timeout
-                .unwrap_or(self.config.operation_timeout),
+                .unwrap_or(self.config.tool_timeout),
         ));
         let mut request_ids = HashSet::new();
         loop {
@@ -225,6 +225,15 @@ impl State<'_> {
         handler: &Arc<dyn ToolHandler>,
         hook_permission: HookPermission,
     ) -> Result<(), YourAiError> {
+        if self
+            .tc
+            .snap
+            .security
+            .as_ref()
+            .is_some_and(|s| s.bypass_approvals())
+        {
+            return self.tc.check_control();
+        }
         for attempt in 0..=self.config.max_permission_rechecks {
             let security = self.security(handler, &call.fn_arguments).await?;
             let deny = match &hook_permission {

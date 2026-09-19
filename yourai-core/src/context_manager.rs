@@ -54,12 +54,12 @@ impl ContextRequest {
     }
 }
 pub trait ContextManager: Send + Sync {
+    fn system_prompt(&self) -> String;
     fn session_id(&self) -> &SessionId;
     fn restore(&self) -> BoxFuture<'_, Result<(), YourAiError>>;
     fn append(&self, messages: Vec<StoredMessage>) -> BoxFuture<'_, Result<(), YourAiError>>;
     fn build_request(
         &self,
-        system: Option<&str>,
         tools: &[Tool],
         execution: &ContextExecution,
     ) -> Result<ContextRequest, YourAiError>;
@@ -71,6 +71,10 @@ pub trait ContextManager: Send + Sync {
     ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>>;
     /// Read-only active view and archival identity checks used by recovery/deduplication.
     fn records(&self) -> Vec<StoredMessage>;
+    /// Committed high-water mark, including messages removed from active context.
+    fn last_sequence(&self) -> i64 {
+        self.records().iter().map(|m| m.seq).max().unwrap_or(0)
+    }
     fn messages(&self) -> Vec<ChatMessage> {
         self.records().into_iter().map(|r| r.message).collect()
     }

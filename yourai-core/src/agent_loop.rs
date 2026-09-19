@@ -84,24 +84,5 @@ pub type TurnResult = Result<TurnOutput, TurnFailure>;
 /// 生命周期：返回的 future 绑定 `&'a self` 与 `TurnContext<'a>`——
 /// 有状态 loop 可在 async block 中借用自身字段，无需预先 clone。
 pub trait AgentLoop: Send + Sync {
-    /// The same system context is used by normal requests and manual compaction.
-    fn request_system<'a>(
-        &'a self,
-        _providers: &'a crate::context::ProviderSnapshot,
-        session: Option<&'a crate::session_runtime::SessionContext>,
-    ) -> BoxFuture<'a, Result<String, YourAiError>> {
-        Box::pin(async move {
-            Ok(session
-                .map(|s| {
-                    s.instructions
-                        .values()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default())
-        })
-    }
-
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult>;
 }

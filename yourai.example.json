@@ -1,0 +1,11 @@
+{
+  "model": "gateway/YOUR_MODEL_NAME",
+  "provider": {
+    "gateway": {
+      "options": {
+        "baseURL": "https://api.openai.com/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      }
+    }
+  }
+}

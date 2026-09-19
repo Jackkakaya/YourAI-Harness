@@ -107,7 +107,10 @@ pub mod prelude {
         HookRuntime, HookSource, NativeHookRegistration,
     };
     pub use crate::interaction::{InteractionKind, InteractionRequest, ToolInteraction};
-    pub use crate::memory::{MemoryEntry, MemoryManager};
+    pub use crate::memory::{
+        CompletedMemoryTurn, MemoryEntry, MemoryManager, MemoryProvider, MemorySession,
+        RecallRequest, RecalledMemory,
+    };
     pub use crate::model::{ModelEventStream, ModelProvider, ModelRecovery, ModelRequest};
     pub use crate::observability::{ObservabilityProvider, Span};
     pub use crate::sandbox::{SandboxPolicy, SandboxProvider, SandboxType};

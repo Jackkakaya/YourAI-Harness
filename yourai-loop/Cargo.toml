@@ -15,5 +15,5 @@ futures-util = "0.3"
 jsonschema = { version = "0.33", default-features = false }
 
 [dev-dependencies]
-yourai-hooks = { path = "../yourai-hooks" }
+yourai-harness = { path = "../yourai-harness" }
 tokio = { workspace = true, features = ["test-util"] }

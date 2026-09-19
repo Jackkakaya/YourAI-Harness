@@ -1,19 +1,19 @@
 //! Hook 协议层：事件类型 + 结果类型 + trait 接口。
 //!
 //! **本模块只定义协议和接口，不含任何实现。**
-//! 具体实现（command 执行器、HTTP 执行器、运行时注册表）在 `yourai-hooks` crate。
+//! 具体实现（command 执行器、HTTP 执行器、运行时注册表）在 `yourai-harness::hooks` crate。
 //!
 //! ## 协议层次
 //!
 //! ```text
 //! Loop 构造 HookInvocation（类型化）
-//!   → HookRuntime::dispatch（trait，实现方在 yourai-hooks）
+//!   → HookRuntime::dispatch（trait，实现方在 yourai-harness::hooks）
 //!   → 返回 HookDispatchResult（类型化）
 //!   → Loop 消费 outcome
 //! ```
 //!
 //! 外部 wire 协议（snake_case 输入 / camelCase 输出）是实现细节，
-//! 由 `yourai-hooks` 的 `wire_output` 模块负责序列化/反序列化。
+//! 由 `yourai-harness::hooks` 的 `wire_output` 模块负责序列化/反序列化。
 
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
@@ -98,6 +98,12 @@ pub enum HookEvent {
     },
     SessionEnd {
         reason: String,
+    },
+    /// Post-commit notification. Cannot veto or continue an already finished turn.
+    TurnCompleted {
+        turn_id: String,
+        after_seq: i64,
+        through_seq: i64,
     },
     Stop {
         stop_hook_active: bool,
@@ -204,6 +210,7 @@ pub enum HookEventKind {
     UserPromptSubmit,
     SessionStart,
     SessionEnd,
+    TurnCompleted,
     Stop,
     StopFailure,
     SubagentStart,
@@ -225,7 +232,7 @@ pub enum HookEventKind {
 }
 
 impl HookEventKind {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::PreToolUse,
         Self::PostToolUse,
         Self::PostToolUseFailure,
@@ -235,6 +242,7 @@ impl HookEventKind {
         Self::UserPromptSubmit,
         Self::SessionStart,
         Self::SessionEnd,
+        Self::TurnCompleted,
         Self::Stop,
         Self::StopFailure,
         Self::SubagentStart,
@@ -266,6 +274,7 @@ impl HookEventKind {
             Self::UserPromptSubmit => "UserPromptSubmit",
             Self::SessionStart => "SessionStart",
             Self::SessionEnd => "SessionEnd",
+            Self::TurnCompleted => "TurnCompleted",
             Self::Stop => "Stop",
             Self::StopFailure => "StopFailure",
             Self::SubagentStart => "SubagentStart",
@@ -304,6 +313,7 @@ impl HookEvent {
             HookEvent::UserPromptSubmit { .. } => HookEventKind::UserPromptSubmit,
             HookEvent::SessionStart { .. } => HookEventKind::SessionStart,
             HookEvent::SessionEnd { .. } => HookEventKind::SessionEnd,
+            HookEvent::TurnCompleted { .. } => HookEventKind::TurnCompleted,
             HookEvent::Stop { .. } => HookEventKind::Stop,
             HookEvent::StopFailure { .. } => HookEventKind::StopFailure,
             HookEvent::SubagentStart { .. } => HookEventKind::SubagentStart,
@@ -362,6 +372,7 @@ impl HookEvent {
                 .file_name()
                 .and_then(|n| n.to_str()),
             HookEvent::UserPromptSubmit { .. }
+            | HookEvent::TurnCompleted { .. }
             | HookEvent::Stop { .. }
             | HookEvent::TeammateIdle { .. }
             | HookEvent::TaskCreated { .. }
@@ -704,7 +715,7 @@ pub enum FailurePolicy {
 
 /// Hook 运行时接口。
 ///
-/// 实现方在 `yourai-hooks` crate（`ConcreteHookRuntime`）。
+/// 实现方在 `yourai-harness::hooks` crate（`ConcreteHookRuntime`）。
 /// Loop 通过此 trait 分发 Hook 调用并消费类型化结果。
 ///
 /// ## 职责边界
@@ -787,7 +798,7 @@ pub trait HookRegistry: Send + Sync {
 
 /// Hook handler 接口。
 ///
-/// 实现方在 `yourai-hooks` crate（`CommandHandler`、`HttpHandler`、`NativeHandler`）。
+/// 实现方在 `yourai-harness::hooks` crate（`CommandHandler`、`HttpHandler`、`NativeHandler`）。
 /// `HookRuntime` 实现方持有 `Arc<dyn HookHandler>` 并在 dispatch 时调用。
 pub trait HookHandler: Send + Sync {
     /// 执行 handler，返回原始输出（由 runtime 解析为类型化结果）。
@@ -826,12 +837,12 @@ mod tests {
 
     #[test]
     fn claude_event_discriminators_are_complete_and_unique() {
-        assert_eq!(HookEventKind::ALL.len(), 27);
+        assert_eq!(HookEventKind::ALL.len(), 28);
         let names: std::collections::HashSet<_> = HookEventKind::ALL
             .into_iter()
             .map(HookEventKind::as_str)
             .collect();
-        assert_eq!(names.len(), 27);
+        assert_eq!(names.len(), 28);
         assert!(names.contains("PreToolUse"));
         assert!(names.contains("FileChanged"));
     }

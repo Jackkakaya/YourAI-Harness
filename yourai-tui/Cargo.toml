@@ -6,14 +6,16 @@ license.workspace = true
 
 [dependencies]
 yourai-core = { path = "../yourai-core" }
-yourai-runtime = { path = "../yourai-runtime" }
+yourai-harness = { path = "../yourai-harness" }
 serde.workspace = true
 serde_json.workspace = true
 genai.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tokio-util.workspace = true
-toml = "0.8"
 ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.2"
 url = "2"
+
+unicode-segmentation = "1"
+pulldown-cmark = { version = "0.13", default-features = false }

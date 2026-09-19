@@ -16,10 +16,10 @@ use yourai_core::{model::ModelRecovery, prelude::*};
 /// Policy defaults, not additional Providers. TurnLimits can impose stricter limits.
 #[derive(Debug, Clone)]
 pub struct LoopConfig {
-    pub system_prompt: Option<String>,
     /// Explicitly selected skills; listing a skill does not activate it.
     pub skill_ids: Vec<String>,
     pub memory_search_limit: usize,
+    pub memory_max_chars: usize,
     pub max_model_calls: u32,
     pub max_tool_calls: u32,
     pub max_model_retries: u32,
@@ -28,6 +28,8 @@ pub struct LoopConfig {
     pub max_permission_rechecks: u32,
     pub retry_delay: Duration,
     pub operation_timeout: Duration,
+    /// Tool execution deadline, separate from model/storage operation timeouts.
+    pub tool_timeout: Duration,
     pub approval_timeout: Duration,
     pub hook_timeout: Duration,
     pub cleanup_timeout: Duration,
@@ -35,17 +37,18 @@ pub struct LoopConfig {
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
-            system_prompt: None,
             skill_ids: vec![],
             memory_search_limit: 0,
+            memory_max_chars: 8000,
             max_model_calls: 64,
             max_tool_calls: 256,
             max_model_retries: 2,
             max_overflow_compactions: 1,
             max_stop_continuations: 3,
             max_permission_rechecks: 1,
-            retry_delay: Duration::from_millis(250),
+            retry_delay: Duration::from_secs(5),
             operation_timeout: Duration::from_secs(120),
+            tool_timeout: Duration::from_secs(610),
             approval_timeout: Duration::from_secs(300),
             hook_timeout: Duration::from_secs(30),
             cleanup_timeout: Duration::from_secs(5),
@@ -66,32 +69,6 @@ impl DefaultLoop {
 }
 
 impl AgentLoop for DefaultLoop {
-    fn request_system<'a>(
-        &'a self,
-        providers: &'a ProviderSnapshot,
-        session: Option<&'a SessionContext>,
-    ) -> BoxFuture<'a, Result<String, YourAiError>> {
-        Box::pin(async move {
-            let mut system = self.config.system_prompt.clone().unwrap_or_default();
-            if let Some(session) = session {
-                for text in session.instructions.values() {
-                    system.push('\n');
-                    system.push_str(text);
-                }
-            }
-            if !self.config.skill_ids.is_empty() {
-                let skills = providers.skills.as_ref().ok_or_else(|| {
-                    ErrorKind::Config("selected skills require SkillProvider".into())
-                })?;
-                for id in &self.config.skill_ids {
-                    system.push('\n');
-                    system.push_str(&skills.load(id).await?.instructions);
-                }
-            }
-            Ok(system)
-        })
-    }
-
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
             let history =
@@ -129,7 +106,6 @@ impl AgentLoop for DefaultLoop {
                 partial_message: None,
                 request_observation: None,
                 deferred_context: vec![],
-                system: self.config.system_prompt.clone().unwrap_or_default(),
             };
             let result = state.run().await;
             if let Err(error) = &result {
@@ -159,7 +135,6 @@ struct State<'a> {
     tool_calls: u32,
     stop_continuations: u32,
     unresolved: VecDeque<ToolCall>,
-    system: String,
     bound_tools: HashMap<String, Arc<dyn ToolHandler>>,
     call_ids: HashSet<String>,
     deferred_context: Vec<String>,
@@ -186,18 +161,17 @@ impl State<'_> {
             .inbox
             .try_recv()
             .map_err(|_| ErrorKind::Loop("missing initial input".into()))?;
-        let prompt = match &first {
-            In::UserText { text, .. } => text.clone(),
+        match &first {
+            In::UserText { .. } => (),
             _ => {
                 self.queued.push_back(first);
                 return Err(ErrorKind::Config("Turn must start with UserText".into()).into());
             }
         };
         self.queued.push_back(first);
-        if !self.accept_input(0).await? {
+        if !self.accept_input(0, true).await? {
             return Ok(());
         }
-        self.prepare_system(&prompt).await?;
         let mut retries = 0;
         let mut overflow = 0;
         let mut force_compact = false;
@@ -208,7 +182,7 @@ impl State<'_> {
                 force_compact = false;
             }
             self.check_model_budget()?;
-            let attempt = self.model_step().await;
+            let attempt = self.model_step(retries + 1).await;
             let (message, calls) = match attempt {
                 Ok(value) => {
                     retries = 0;
@@ -233,12 +207,33 @@ impl State<'_> {
                                 continue;
                             }
                             ModelRecovery::Retry if retries < self.config.max_model_retries => {
-                                let delay = self
+                                let base_delay = self
                                     .config
                                     .retry_delay
                                     .saturating_mul(1u32 << retries.min(10));
+                                // Jitter avoids synchronized retries; zero stays useful for deterministic tests.
+                                let jitter = if base_delay.is_zero() {
+                                    Duration::ZERO
+                                } else {
+                                    Duration::from_millis(
+                                        (uuid::Uuid::new_v4().as_u128() % 1000) as u64,
+                                    )
+                                };
+                                let delay = base_delay
+                                    .saturating_add(jitter)
+                                    .min(Duration::from_secs(60))
+                                    .max(self.model.retry_after(&error).unwrap_or_default());
                                 retries += 1;
-                                self.notice(Level::Warning, "Model request failed; retrying")?;
+                                self.notice(
+                                    Level::Warning,
+                                    format!(
+                                        "Model request failed ({}); retry {}/{} in {:.1}s (Esc cancels)",
+                                        model::retry_cause(&error),
+                                        retries,
+                                        self.config.max_model_retries,
+                                        delay.as_secs_f64()
+                                    ),
+                                )?;
                                 self.wait(
                                     async {
                                         tokio::time::sleep(delay).await;
@@ -260,6 +255,9 @@ impl State<'_> {
                         )
                     ) {
                         self.stop_failure(&error).await;
+                    }
+                    if let Some((status, _)) = error.model_http_error() {
+                        self.notice(Level::Warning, format!("HTTP {status}: stopped after {} attempt(s) for this model step; {} model call(s) in this turn", retries + 1, self.model_calls))?;
                     }
                     return Err(error);
                 }
@@ -311,37 +309,6 @@ impl State<'_> {
         }
     }
 
-    async fn prepare_system(&mut self, prompt: &str) -> Result<(), YourAiError> {
-        let snapshot = self.tc.snap.clone();
-        let session = self.tc.info.options.session.clone();
-        self.system = self
-            .wait(
-                snapshot
-                    .agent_loop
-                    .request_system(&snapshot, session.as_deref()),
-                self.op_timeout(),
-                "system",
-            )
-            .await?;
-        if self.config.memory_search_limit > 0 {
-            if let Some(memory) = self.tc.snap.memory.clone() {
-                let entries = self
-                    .wait(
-                        memory.search(prompt, self.config.memory_search_limit),
-                        self.op_timeout(),
-                        "memory",
-                    )
-                    .await?;
-                // Retrieved content is context data, never a new system instruction.
-                let context: Vec<_> = entries
-                    .into_iter()
-                    .map(|e| format!("Memory [{}]: {}", e.key, e.value))
-                    .collect();
-                self.add_context(&context).await?;
-            }
-        }
-        Ok(())
-    }
     fn check_model_budget(&self) -> Result<(), YourAiError> {
         self.tc.check_control()?;
         let max = self
@@ -360,7 +327,6 @@ impl State<'_> {
     async fn compact(&mut self, trigger: CompactionTrigger) -> Result<(), YourAiError> {
         let mut request = CompactionRequest::new(trigger);
         request.deadline = Some(self.deadline(self.op_timeout()));
-        request.system = Some(self.system.clone());
         request.tools = self
             .tc
             .snap

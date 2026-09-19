@@ -608,7 +608,7 @@ async fn real_hook_runtime_registration_effect_is_consumed_by_loop() {
             })
         }
     }
-    let runtime = Arc::new(yourai_hooks::runtime::ConcreteHookRuntime::new());
+    let runtime = Arc::new(yourai_harness::hooks::runtime::ConcreteHookRuntime::new());
     runtime
         .register(NativeHookRegistration {
             id: "context".into(),

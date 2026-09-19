@@ -155,14 +155,18 @@ impl State<'_> {
                     ..
                 })
             ) {
-                self.accept_input(index).await?;
+                self.accept_input(index, false).await?;
             } else {
                 index += 1;
             }
         }
         Ok(())
     }
-    pub(crate) async fn accept_input(&mut self, index: usize) -> Result<bool, YourAiError> {
+    pub(crate) async fn accept_input(
+        &mut self,
+        index: usize,
+        initial: bool,
+    ) -> Result<bool, YourAiError> {
         let text = match &self.queued[index] {
             In::UserText { text, .. } => text.clone(),
             _ => return Ok(false),
@@ -179,7 +183,76 @@ impl State<'_> {
             return Ok(false);
         }
         let history = self.history.clone();
-        let record = StoredMessage::new(ChatMessage::user(&text));
+        let mut record = StoredMessage::new(ChatMessage::user(&text));
+        if initial && self.config.memory_search_limit > 0 && !text.trim().is_empty() {
+            if let Some(memory) = self.tc.snap.memory.clone() {
+                let cancel = self.tc.cancel.clone();
+                let query = RecallRequest {
+                    query: &text,
+                    limit: self.config.memory_search_limit,
+                    max_chars: self.config.memory_max_chars,
+                };
+                match self
+                    .wait(memory.recall(query, &cancel), self.op_timeout(), "memory")
+                    .await
+                {
+                    Ok(entries) => {
+                        let mut seen = std::collections::HashSet::new();
+                        let mut selected = vec![];
+                        for entry in entries {
+                            if selected.len() >= self.config.memory_search_limit {
+                                break;
+                            }
+                            if entry.content.trim().is_empty()
+                                || !seen.insert((
+                                    entry.provider.clone(),
+                                    entry.id.clone(),
+                                    entry.content.clone(),
+                                ))
+                            {
+                                continue;
+                            }
+                            let mut candidate = selected.clone();
+                            candidate.push(entry);
+                            // Bound the rendered metadata too, not just provider prose.
+                            if serde_json::to_string(&candidate)
+                                .map_or(usize::MAX, |s| s.chars().count())
+                                > self.config.memory_max_chars
+                            {
+                                continue;
+                            }
+                            selected = candidate;
+                        }
+                        record.attach_recall(selected);
+                    }
+                    Err(e @ YourAiError::Aborted(_)) => return Err(e),
+                    Err(e) => {
+                        self.notice(Level::Warning, format!("Memory recall unavailable: {e}"))?
+                    }
+                }
+            }
+        }
+        if initial && !self.config.skill_ids.is_empty() {
+            let skills =
+                self.tc.snap.skills.clone().ok_or_else(|| {
+                    ErrorKind::Config("selected skills require SkillProvider".into())
+                })?;
+            let mut parts = record
+                .api_content
+                .clone()
+                .unwrap_or_else(|| record.message.content.clone())
+                .into_parts();
+            for id in &self.config.skill_ids.clone() {
+                let skill = self
+                    .wait(skills.load(id), self.op_timeout(), "skill")
+                    .await?;
+                parts.push(ContentPart::from_text(format!(
+                    "<skill id={id:?}>\n{}\n</skill>",
+                    skill.instructions
+                )));
+            }
+            record.api_content = Some(parts.into());
+        }
         self.wait(history.append(vec![record]), self.op_timeout(), "history")
             .await?;
         self.queued.remove(index); // Transfer only after a successful commit.
