@@ -3216,7 +3216,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
- "yourai-protocol",
 ]
 
 [[package]]
@@ -3228,6 +3227,7 @@ dependencies = [
  "futures-util",
  "genai",
  "httpdate",
+ "jsonschema",
  "libc",
  "regex",
  "reqwest 0.12.28",
@@ -3240,29 +3240,6 @@ dependencies = [
  "tokio-util",
  "uuid",
  "yourai-core",
- "yourai-loop",
-]
-
-[[package]]
-name = "yourai-loop"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "jsonschema",
- "serde_json",
- "tokio",
- "tokio-util",
- "uuid",
- "yourai-core",
- "yourai-harness",
-]
-
-[[package]]
-name = "yourai-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
