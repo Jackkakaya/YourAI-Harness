@@ -79,7 +79,15 @@ async fn coding_loop_modifies_tests_and_persists_results() {
         .tools
         .clone()
         .unwrap();
-    for name in ["read", "write", "edit", "shell", "read_tool_result"] {
+    for name in [
+        "read",
+        "write",
+        "edit",
+        "shell",
+        "read_tool_result",
+        "webfetch",
+        "websearch",
+    ] {
         assert!(offered.iter().any(|t| t.name.as_str() == name));
     }
     let id = h.host.context().id;

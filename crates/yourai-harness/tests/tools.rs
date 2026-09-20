@@ -280,7 +280,8 @@ async fn oversized_writes_leave_original_unchanged_and_tools_have_unique_schemas
     assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "original");
     let tools = coding_tools(&root).unwrap();
     let names: std::collections::HashSet<_> = tools.iter().map(|t| t.name()).collect();
-    assert_eq!(names.len(), 4);
+    assert_eq!(names.len(), 6);
+    assert!(names.contains("webfetch") && names.contains("websearch"));
     for t in &tools {
         assert_eq!(t.name(), t.definition().name.as_str());
     }

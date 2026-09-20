@@ -18,10 +18,12 @@ fs2 = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["gzip", "brotli", "deflate"] }
 tempfile = "3"
 similar = "2"
 httpdate = "1"
+html2md = "0.2.15"
+pulldown-cmark = { version = "0.13", default-features = false }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 [dev-dependencies]

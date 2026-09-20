@@ -1,6 +1,8 @@
-//! Local tools implement Core's existing ToolHandler; no loop or storage dependency.
+//! Built-in tools implement Core's existing ToolHandler; no loop or storage dependency.
 mod files;
 mod shell;
+mod web;
+pub use web::{WebFetch, WebSearch};
 
 pub use files::{Edit, Read, Write};
 mod registry;
@@ -30,6 +32,8 @@ pub fn coding_tools(cwd: &Path) -> Result<Vec<Arc<dyn ToolHandler>>, YourAiError
         Arc::new(Write::new(cwd.clone())),
         Arc::new(Edit::new(cwd.clone())),
         Arc::new(Shell::new(cwd)),
+        Arc::new(WebFetch::new()?),
+        Arc::new(WebSearch::new()?),
     ])
 }
 

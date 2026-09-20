@@ -282,7 +282,7 @@ pub(crate) async fn assemble(
         for definition in tools.definitions() {
             if !matches!(
                 definition.name.as_str(),
-                "read_tool_result" | "read" | "write" | "edit" | "shell"
+                "read_tool_result" | "read" | "write" | "edit" | "shell" | "webfetch" | "websearch"
             ) {
                 registry.register(tools.resolve(definition.name.as_str())?);
             }
