@@ -89,6 +89,7 @@ async fn run(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<Value, YourAiError> {
+    let cwd_str = utf8_path(cwd, "shell")?;
     let mut cmd = tokio::process::Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(command)
@@ -154,6 +155,6 @@ async fn run(
         termination
     };
     Ok(
-        json!({"ok":termination=="exit" && status.success(),"exit_code":status.code(),"stdout":String::from_utf8_lossy(&stdout),"stderr":String::from_utf8_lossy(&stderr),"termination":termination,"output_complete":oeof && eeof,"cwd":cwd}),
+        json!({"ok":termination=="exit" && status.success(),"exit_code":status.code(),"stdout":String::from_utf8_lossy(&stdout),"stderr":String::from_utf8_lossy(&stderr),"termination":termination,"output_complete":oeof && eeof,"cwd":cwd_str}),
     )
 }

@@ -1,7 +1,7 @@
 //! Markdown is presentation only: no HTML execution, links or task-state mutations.
 use super::{
-    render::{ACCENT, BLUE, GREEN, MUTED, PANEL, TEXT},
     state::clean,
+    theme::{ACCENT, BLUE, GREEN, MUTED, PANEL, TEXT},
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::prelude::*;
@@ -23,6 +23,8 @@ struct Writer {
     lists: Vec<Option<u64>>,
     quote: usize,
     code: bool,
+    code_lang: String,
+    code_src: String,
     table: Option<Table>,
     links: Vec<String>,
 }
@@ -147,6 +149,8 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
         lists: vec![],
         quote: 0,
         code: false,
+        code_lang: String::new(),
+        code_src: String::new(),
         table: None,
         links: vec![],
     };
@@ -189,12 +193,12 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
                 }
                 Tag::CodeBlock(kind) => {
                     w.flush();
-                    let language = match kind {
+                    w.code_lang = match kind {
                         CodeBlockKind::Fenced(lang) => clean(&lang),
                         _ => String::new(),
                     };
                     w.lines.push(Line::from(Span::styled(
-                        format!("  ┌ {language}"),
+                        format!("  ┌ {}", w.code_lang),
                         Style::default().fg(MUTED),
                     )));
                     w.code = true;
@@ -238,8 +242,34 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
                     w.lists.pop();
                 }
                 TagEnd::CodeBlock => {
-                    w.flush();
                     w.code = false;
+                    let src = std::mem::take(&mut w.code_src);
+                    let lang = std::mem::take(&mut w.code_lang);
+                    match super::syntax::highlight(&src, &lang) {
+                        Some(highlighted) => {
+                            for line in highlighted {
+                                let spans = line
+                                    .spans
+                                    .into_iter()
+                                    .map(|s| Span::styled(s.content, s.style.bg(PANEL)))
+                                    .collect();
+                                w.lines.extend(wrap_spans(spans, w.width, "  │ "));
+                            }
+                        }
+                        // Unknown/unspecified language: keep the single-color look.
+                        None => {
+                            for line in src.lines() {
+                                w.lines.extend(wrap_spans(
+                                    vec![Span::styled(
+                                        line.to_owned(),
+                                        Style::default().fg(BLUE).bg(PANEL),
+                                    )],
+                                    w.width,
+                                    "  │ ",
+                                ));
+                            }
+                        }
+                    }
                     w.lines
                         .push(Line::from(Span::styled("  └", Style::default().fg(MUTED))));
                 }
@@ -261,15 +291,8 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
                 _ => {}
             },
             Event::Text(text) if w.code => {
-                for part in text.split_inclusive('\n') {
-                    w.text(
-                        part.trim_end_matches('\n'),
-                        Style::default().fg(BLUE).bg(PANEL),
-                    );
-                    if part.ends_with('\n') {
-                        w.flush();
-                    }
-                }
+                // Buffered whole, then highlighted at TagEnd::CodeBlock.
+                w.code_src.push_str(&text);
             }
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
                 w.text(&text, w.style())
@@ -304,7 +327,7 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
     }
     w.lines
 }
-fn wrap_spans(spans: Styled, width: usize, prefix: &str) -> Vec<Line<'static>> {
+pub(crate) fn wrap_spans(spans: Styled, width: usize, prefix: &str) -> Vec<Line<'static>> {
     let available = width.saturating_sub(prefix.width()).max(1);
     let mut lines = vec![];
     let mut current = vec![Span::styled(prefix.to_owned(), Style::default().fg(MUTED))];
@@ -364,6 +387,26 @@ mod tests {
             .iter()
             .flat_map(|l| &l.spans)
             .any(|s| s.content.contains("bold") && s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(lines.iter().all(|l| l.width() <= 60));
+    }
+    #[test]
+    fn fenced_code_is_highlighted_and_unknown_fences_fall_back() {
+        use super::super::theme::SY_STRING;
+        let lines = render(
+            "```rust\nlet s = \"hi\";\n```\n\n```wat-lang?\nx = 1\n```",
+            60,
+        );
+        let spans: Vec<&Span<'_>> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        assert!(
+            spans.iter().any(|s| s.style.fg == Some(SY_STRING)),
+            "rust fence picked up syntax colors"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content.contains("x = 1") && s.style.fg == Some(BLUE)),
+            "unknown fence keeps the legacy single color"
+        );
         assert!(lines.iter().all(|l| l.width() <= 60));
     }
     #[test]

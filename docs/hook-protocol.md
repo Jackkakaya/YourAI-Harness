@@ -4,7 +4,7 @@
 > YourAI 的内部类型化协议，以及两者之间的映射关系。
 >
 > - Claude Code 协议核对版本：commit `a371abb`（2026-04-05）
-> - YourAI 实现：`yourai-hooks` crate
+> - YourAI 实现：`crates/yourai-harness/src/hooks/`
 > - 完整 Claude 源码核对：[`claude-code-hook-protocol.md`](./claude-code-hook-protocol.md)
 > - 设计背景：[`hooks.md`](./hooks.md)
 
@@ -874,14 +874,14 @@ conformance 测试后才可启用该表述。
 
 | 内容 | 文件 |
 |---|---|
-| 协议类型与 trait | `yourai-core/src/hooks.rs` |
-| Wire 输入序列化 | `yourai-hooks/src/event.rs` |
-| Wire 输出反序列化 | `yourai-hooks/src/wire_output.rs` |
-| Matcher 编译与匹配 | `yourai-hooks/src/matcher.rs` |
-| 配置解析 + 注册项 | `yourai-hooks/src/config.rs` |
-| Native 与模型 capability adapter | `yourai-hooks/src/handler.rs` |
-| Command 执行器 | `yourai-hooks/src/command.rs` |
-| HTTP 执行器 | `yourai-hooks/src/http.rs` |
-| Runtime（注册 + 分发 + 聚合） | `yourai-hooks/src/runtime.rs` |
+| 协议类型与 trait | `crates/yourai-core/src/hooks.rs` |
+| Wire 输入序列化 | `crates/yourai-harness/src/hooks/event.rs` |
+| Wire 输出反序列化 | `crates/yourai-harness/src/hooks/wire_output.rs` |
+| Matcher 编译与匹配 | `crates/yourai-harness/src/hooks/matcher.rs` |
+| 配置解析 + 注册项 | `crates/yourai-harness/src/hooks/config.rs` |
+| Native 与模型 capability adapter | `crates/yourai-harness/src/hooks/handler.rs` |
+| Command 执行器 | `crates/yourai-harness/src/hooks/command.rs` |
+| HTTP 执行器 | `crates/yourai-harness/src/hooks/http.rs` |
+| Runtime（注册 + 分发 + 聚合） | `crates/yourai-harness/src/hooks/runtime.rs` |
 | Claude Code 源码核对 | `docs/claude-code-hook-protocol.md` |
 | 设计背景 | `docs/hooks.md` |

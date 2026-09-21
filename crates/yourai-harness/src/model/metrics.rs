@@ -208,6 +208,32 @@ mod tests {
             .is_none());
         assert_eq!(budget.snapshot().requests.cache_reported_responses, 1);
     }
+    #[tokio::test(start_paused = true)]
+    async fn transient_429_without_retry_after_uses_configured_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::SqliteStore::open(&dir.path().join("sessions.sqlite3")).unwrap();
+        let budget = ModelBudget::configured(
+            None,
+            None,
+            super::super::RequestPolicy {
+                rpm: None,
+                cooldown_seconds: 7,
+            },
+            store,
+        )
+        .unwrap();
+        budget.reserve().unwrap();
+        Attempt::new(budget.clone()).fail(Some(&http_error(
+            r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+        )));
+        assert_eq!(
+            budget.control.remaining(),
+            std::time::Duration::from_secs(7)
+        );
+        tokio::time::advance(std::time::Duration::from_secs(7)).await;
+        assert!(budget.control.remaining().is_zero());
+    }
+
     #[test]
     fn quota_429_is_not_treated_as_transient_rate_limit() {
         struct Provider;

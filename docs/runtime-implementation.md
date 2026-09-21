@@ -2,19 +2,19 @@
 
 > 会话记录使用 SQLite；ContextManager 内部完成消息提交、工具清理、摘要 Hook 和模型视图更新。详见 [存储设计](./session-storage-design.md) 与 [ContextManager 设计](./context-manager-design.md)。
 
-`default-loop-flow.md` 的五张图现在分别由以下组件实现。统一入口为 `yourai-runtime::Harness::open`，core 不反向依赖具体实现。
+`default-loop-flow.md` 的五张图现在统一实现在 `yourai-harness` 中，入口为 `yourai_harness::Harness::open`；`yourai-core` 仅保留协议、Provider 接口和 turn 运输机制，不反向依赖具体实现。
 
 ## 五张图对应的代码
 
 | 图 | 实现 | 验证 |
 |---|---|---|
-| 1 会话宿主 | `yourai-runtime/src/host.rs`：SessionHost；创建、恢复、队列、串行执行、serve 驱动、关闭、后台唤醒 | runtime 测试：队列恢复、驱动取消、并发关闭、跨会话事件隔离 |
-| 2 主循环与 compact | `yourai-loop/src/{lib,control,model}.rs`；`yourai-runtime/src/memory_context.rs`：MemoryContext | loop 测试：压缩调度、限制、重试与收尾；runtime 测试：真实摘要、完整归档、手动压缩 |
-| 3 工具、审批、MCP | `yourai-loop/src/{tools,interaction}.rs`；runtime 的 ToolSet、PolicySecurity | loop 测试：参数重检、审批、MCP、批次中断；runtime 测试：权限持久化、完整 tasks 调用 |
-| 4 扩展 | `yourai-runtime/src/extensions.rs`：Workspace、RuntimeConfig、TaskBoard、SubagentTool | runtime 测试：真实 Git worktree、目录监听、配置恢复、任务状态、独立子会话 |
-| 5 Hook | `yourai-hooks` 执行器；`yourai-runtime/src/model_hooks.rs` 模型执行器 | hooks 测试：注册、匹配、聚合、协议；runtime 测试：agent Hook、后台唤醒、关闭进程 |
+| 1 会话宿主 | `crates/yourai-harness/src/runtime/mod.rs`：SessionHost；创建、恢复、队列、串行执行、serve 驱动、关闭、后台唤醒 | runtime 测试：队列恢复、驱动取消、并发关闭、跨会话事件隔离 |
+| 2 主循环与 compact | `crates/yourai-harness/src/default_loop/`；`crates/yourai-harness/src/context/` | loop 测试：压缩调度、限制、重试与收尾；runtime/context 测试：真实摘要、完整归档、手动压缩 |
+| 3 工具、审批、MCP | `crates/yourai-harness/src/default_loop/{tools,interaction}.rs`；Harness 的 ToolSet 与 PolicySecurity | loop 测试：参数重检、审批、MCP、批次中断；runtime 测试：权限持久化、完整 tasks 调用 |
+| 4 扩展 | `crates/yourai-harness/src/{workspace,collaboration,memory,skills}/` | runtime 测试：Git worktree、配置恢复、任务状态、独立子会话 |
+| 5 Hook | `crates/yourai-harness/src/hooks/`；`assembly/model_hooks.rs` 模型执行器 | Hook、Loop 与 runtime 测试：注册、匹配、聚合、agent Hook、后台唤醒、关闭进程 |
 
-测试文件：[Loop 测试](../yourai-loop/tests/flow.rs)、[Runtime 测试](../yourai-runtime/tests/runtime.rs)、[Context 测试](../yourai-runtime/tests/context.rs)、[SQLite 测试](../yourai-runtime/tests/sqlite.rs)。
+主要测试文件：[Loop 测试](../crates/yourai-harness/tests/loop_flow.rs)、[Runtime 测试](../crates/yourai-harness/tests/runtime.rs)、[Context 测试](../crates/yourai-harness/tests/context.rs)、[SQLite 测试](../crates/yourai-harness/tests/sqlite.rs)。
 
 ## 装配与前端入口
 
@@ -35,10 +35,10 @@ TUI 渲染 / Web SSE  <- host.serve(limits, sink, cancel)
 退出               -> harness.close()，接收剩余输入
 ```
 
-[终端示例](../yourai-runtime/examples/run.rs)：
+[终端示例](../crates/yourai-harness/examples/run.rs)：
 
 ```sh
-cargo run -p yourai-runtime --example run -- <model-id> <prompt>
+cargo run -p yourai-harness --example run -- <model-id> <prompt>
 ```
 
 模型凭据由 genai 从环境读取。示例输出 JSON 事件，并拒绝交互审批；完整 TUI/Web 界面不在这个库中。前端实现 OutSink，将 Ask 对应的 Reply 交回 submit 即可复用同一条执行路径。

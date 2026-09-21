@@ -13,6 +13,22 @@ use std::{
 };
 use yourai_core::{model::ModelRecovery, prelude::*};
 
+const MODEL_CALL_LIMIT_PROMPT: &str = r#"CRITICAL - MAXIMUM MODEL CALLS REACHED
+
+The maximum number of model calls allowed for this turn has been reached. Tools are disabled until the next user input. Respond with text only.
+
+STRICT REQUIREMENTS:
+1. Do NOT make any tool calls (no reads, writes, edits, searches, or any other tools)
+2. MUST provide a text response summarizing work done so far
+
+Response must include:
+- Statement that the maximum number of model calls has been reached
+- Summary of what has been accomplished so far
+- List of any remaining tasks that were not completed
+- Recommendations for what should be done next
+
+Any attempt to use tools is a critical violation. Respond with text ONLY."#;
+
 /// Policy defaults, not additional Providers. TurnLimits can impose stricter limits.
 #[derive(Debug, Clone)]
 pub struct LoopConfig {
@@ -20,14 +36,17 @@ pub struct LoopConfig {
     pub skill_ids: Vec<String>,
     pub memory_search_limit: usize,
     pub memory_max_chars: usize,
-    pub max_model_calls: u32,
+    pub max_model_calls: Option<u32>,
     pub max_tool_calls: u32,
     pub max_model_retries: u32,
     pub max_overflow_compactions: u32,
     pub max_stop_continuations: u32,
     pub max_permission_rechecks: u32,
     pub retry_delay: Duration,
+    pub retry_max_delay: Duration,
     pub operation_timeout: Duration,
+    pub model_header_timeout: Duration,
+    pub model_chunk_timeout: Duration,
     /// Tool execution deadline, separate from model/storage operation timeouts.
     pub tool_timeout: Duration,
     pub approval_timeout: Duration,
@@ -40,14 +59,17 @@ impl Default for LoopConfig {
             skill_ids: vec![],
             memory_search_limit: 0,
             memory_max_chars: 8000,
-            max_model_calls: 64,
+            max_model_calls: None,
             max_tool_calls: 256,
             max_model_retries: 2,
             max_overflow_compactions: 1,
             max_stop_continuations: 3,
             max_permission_rechecks: 1,
-            retry_delay: Duration::from_secs(5),
+            retry_delay: Duration::from_secs(2),
+            retry_max_delay: Duration::from_secs(30),
             operation_timeout: Duration::from_secs(120),
+            model_header_timeout: Duration::from_secs(300),
+            model_chunk_timeout: Duration::from_secs(300),
             tool_timeout: Duration::from_secs(610),
             approval_timeout: Duration::from_secs(300),
             hook_timeout: Duration::from_secs(30),
@@ -96,6 +118,7 @@ impl AgentLoop for DefaultLoop {
                 output: TurnOutput::new(""),
                 queued: VecDeque::new(),
                 input_closed: false,
+                forced_final: false,
                 model_calls: 0,
                 tool_calls: 0,
                 stop_continuations: 0,
@@ -131,6 +154,7 @@ struct State<'a> {
     output: TurnOutput,
     queued: VecDeque<In>,
     input_closed: bool,
+    forced_final: bool,
     model_calls: u32,
     tool_calls: u32,
     stop_continuations: u32,
@@ -182,6 +206,14 @@ impl State<'_> {
                 force_compact = false;
             }
             self.check_model_budget()?;
+            if !self.forced_final
+                && self
+                    .effective_max()
+                    .is_some_and(|m| self.model_calls + 1 >= m)
+            {
+                self.add_context(&[MODEL_CALL_LIMIT_PROMPT.into()]).await?;
+                self.forced_final = true;
+            }
             let attempt = self.model_step(retries + 1).await;
             let (message, calls) = match attempt {
                 Ok(value) => {
@@ -207,39 +239,35 @@ impl State<'_> {
                                 continue;
                             }
                             ModelRecovery::Retry if retries < self.config.max_model_retries => {
-                                let base_delay = self
+                                self.check_model_budget()?;
+                                let base = self
                                     .config
                                     .retry_delay
                                     .saturating_mul(1u32 << retries.min(10));
                                 // Jitter avoids synchronized retries; zero stays useful for deterministic tests.
-                                let jitter = if base_delay.is_zero() {
+                                let jitter = if base.is_zero() {
                                     Duration::ZERO
                                 } else {
-                                    Duration::from_millis(
-                                        (uuid::Uuid::new_v4().as_u128() % 1000) as u64,
-                                    )
+                                    base / 4 * (uuid::Uuid::new_v4().as_u128() % 100) as u32 / 100
                                 };
-                                let delay = base_delay
+                                let delay = base
                                     .saturating_add(jitter)
-                                    .min(Duration::from_secs(60))
+                                    .min(self.config.retry_max_delay)
                                     .max(self.model.retry_after(&error).unwrap_or_default());
                                 retries += 1;
-                                self.notice(
-                                    Level::Warning,
-                                    format!(
-                                        "Model request failed ({}); retry {}/{} in {:.1}s (Esc cancels)",
-                                        model::retry_cause(&error),
-                                        retries,
-                                        self.config.max_model_retries,
-                                        delay.as_secs_f64()
-                                    ),
-                                )?;
+                                self.send(Out::Retry {
+                                    attempt: retries,
+                                    max: self.config.max_model_retries,
+                                    reason: model::retry_cause(&error),
+                                    wait_ms: delay.as_millis().min(u64::MAX as u128) as u64,
+                                })?;
+                                // checked_add: an absurd server retry-after must not panic here.
                                 self.wait(
                                     async {
                                         tokio::time::sleep(delay).await;
                                         Ok(())
                                     },
-                                    None,
+                                    delay.checked_add(self.config.operation_timeout),
                                     "retry",
                                 )
                                 .await?;
@@ -273,6 +301,18 @@ impl State<'_> {
             self.send(Out::Message {
                 text: self.output.text.clone(),
             })?;
+            if self.forced_final {
+                if !self.unresolved.is_empty() {
+                    self.notice(
+                        Level::Warning,
+                        "Model requested tools at the model-call limit; they were not executed.",
+                    )?;
+                    // Keep persisted tool-call/result pairs complete for the next turn.
+                    self.cleanup(&AbortReason::LimitReached(TurnLimit::ModelCalls).into())
+                        .await;
+                }
+                return Ok(());
+            }
             if !self.unresolved.is_empty() {
                 while let Some(call) = self.unresolved.front().cloned() {
                     self.tc.check_control()?;
@@ -309,20 +349,24 @@ impl State<'_> {
         }
     }
 
+    /// Retries and compaction calls consume the same hard per-turn budget.
     fn check_model_budget(&self) -> Result<(), YourAiError> {
         self.tc.check_control()?;
-        let max = self
-            .tc
-            .info
-            .options
-            .limits
-            .max_model_calls
-            .unwrap_or(self.config.max_model_calls)
-            .min(self.config.max_model_calls);
-        if self.model_calls >= max {
+        if self
+            .effective_max()
+            .is_some_and(|max| self.model_calls >= max)
+        {
             return Err(AbortReason::LimitReached(TurnLimit::ModelCalls).into());
         }
         Ok(())
+    }
+    /// TurnLimits may only tighten the configured per-turn call budget.
+    fn effective_max(&self) -> Option<u32> {
+        let config = self.config.max_model_calls;
+        match self.tc.info.options.limits.max_model_calls {
+            Some(l) => Some(config.map_or(l, |c| c.min(l))),
+            None => config,
+        }
     }
     async fn compact(&mut self, trigger: CompactionTrigger) -> Result<(), YourAiError> {
         let mut request = CompactionRequest::new(trigger);
@@ -334,15 +378,9 @@ impl State<'_> {
             .as_ref()
             .map(|r| r.definitions())
             .unwrap_or_default();
-        let max = self
-            .tc
-            .info
-            .options
-            .limits
-            .max_model_calls
-            .unwrap_or(self.config.max_model_calls)
-            .min(self.config.max_model_calls);
-        request.max_model_calls = max.saturating_sub(self.model_calls);
+        if let Some(max) = self.effective_max() {
+            request.max_model_calls = max.saturating_sub(self.model_calls);
+        }
         let calls = request.calls.clone();
         let usage = request.usage.clone();
         let cancel = self.tc.cancel.child_token();

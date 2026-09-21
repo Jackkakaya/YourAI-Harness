@@ -361,3 +361,4 @@ async fn cancellation_token_stops_shell_and_sandbox_denial_prevents_spawn() {
         .is_err());
     assert!(!root.join("blocked").exists());
 }
+// REGRESSION-ANCHOR

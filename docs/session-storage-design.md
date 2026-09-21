@@ -23,11 +23,11 @@ UsageTracker → LocalUsage → 同一个 SqliteStore 的 usage_events
 
 实现位置：
 
-- `yourai-core/src/session.rs`：会话、消息、分页查询、压缩提交接口。
-- `yourai-core/src/context_manager.rs`：内存上下文接口。
-- `yourai-runtime/src/sqlite.rs`：三张表、事务、显式 JSON 导入。
-- `yourai-runtime/src/memory_context.rs`：上下文及提交协调。
-- `yourai-runtime/src/local.rs`：用量记录与统计。
+- `crates/yourai-core/src/session.rs`：会话、消息、分页查询、压缩提交接口。
+- `crates/yourai-core/src/context_manager.rs`：内存上下文接口。
+- `crates/yourai-harness/src/storage/sqlite.rs`：三张表、事务、显式 JSON 导入。
+- `crates/yourai-harness/src/context/`：上下文投影、压缩及提交协调。
+- `crates/yourai-harness/src/storage/usage.rs`：用量记录与统计。
 
 ContextManager 通过 SessionManager 保存消息和摘要，通过 UsageTracker 记账；没有 SQL 或连接。归档只保留身份索引，活跃消息原文用于模型请求。system 指令由宿主装配，每次经 build_request 传入，不通过 append 保存。
 
@@ -99,8 +99,8 @@ SQLite 使用 WAL、foreign_keys=ON、synchronous=FULL、5 秒 busy timeout。�
 旧目录存在 meta.json/history.json 且未导入时，启动明确报错，不静默创建空历史。先关闭会话，再执行：
 
 ```sh
-cargo run -p yourai-tui -- --config yourai.toml --import-json-sessions
-cargo run -p yourai-tui -- --config yourai.toml --resume SESSION_ID
+cargo run -p yourai-tui -- --config /path/to/yourai.json --import-json-sessions
+cargo run -p yourai-tui -- --config /path/to/yourai.json --resume SESSION_ID
 ```
 
 导入在单个事务中完成，保留原始 JSON 文件；重复导入或 ID 冲突报错，不覆盖数据库。旧 boundary 转换为消息 status，旧 summary 转为摘要消息，usage 取 history.json 中的流水，不再次导入重复的 usage.json 聚合。旧时间戳转换为毫秒。

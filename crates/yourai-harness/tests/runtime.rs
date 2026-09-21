@@ -1168,6 +1168,132 @@ async fn rate_limit_attempts_stop_at_retry_limit() {
     assert_eq!(metrics.requests.rate_limited, 3);
     assert_eq!(metrics.requests.active, 0);
     assert!(
-        yourai_harness::default_loop::LoopConfig::default().retry_delay >= Duration::from_secs(5)
+        yourai_harness::default_loop::LoopConfig::default().retry_delay >= Duration::from_secs(2)
     );
+}
+
+#[tokio::test]
+async fn harness_model_switch_preserves_budget_history_and_updates_context() {
+    let dir = TempDir::new().unwrap();
+    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+    config.system_prompt = Some("test".into());
+    config.context_policy.context_window = Some(64_000);
+    config.max_shared_model_calls = Some(2);
+    let old = Arc::new(Model::new(vec![answer("first")]));
+    let h = Harness::open(config, old.clone()).await.unwrap();
+    h.host.submit(In::user_text("one")).unwrap();
+    h.host
+        .run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(h.budget.snapshot().calls, 1);
+
+    let new = Arc::new(Model::new(vec![answer("second"), answer("over budget")]));
+    let policy = ContextPolicy {
+        context_window: Some(32_000),
+        output_reserve: 2048,
+        ..ContextPolicy::default()
+    };
+    h.switch_model(new.clone(), policy).await.unwrap();
+    let usage = h.host.context_usage().unwrap();
+    assert_eq!(usage.context_window, Some(32_000));
+    assert_eq!(usage.output_reserve, 2048);
+    assert_eq!(
+        h.sessions
+            .load_session(&h.host.context().id)
+            .await
+            .unwrap()
+            .model
+            .as_deref(),
+        Some(new.model_iden())
+    );
+    h.host.submit(In::user_text("two")).unwrap();
+    h.host
+        .run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(h.budget.snapshot().calls, 2);
+    assert_eq!(h.budget.snapshot().requests.completed, 2);
+    assert_eq!(old.requests.lock().unwrap().len(), 1);
+    assert!(new.requests.lock().unwrap()[0]
+        .request
+        .messages
+        .iter()
+        .any(|m| m.content.first_text() == Some("first")));
+    h.host.submit(In::user_text("three")).unwrap();
+    assert!(h
+        .host
+        .run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .is_err());
+    assert_eq!(new.requests.lock().unwrap().len(), 1);
+    h.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
+    let dir = TempDir::new().unwrap();
+    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+    config.system_prompt = Some("test".into());
+    config.context_policy.context_window = Some(64_000);
+    let old = Arc::new(Model::new(vec![Box::pin(futures_util::stream::pending())]));
+    let h = Harness::open(config, old.clone()).await.unwrap();
+    h.host.submit(In::user_text("wait")).unwrap();
+    let host = h.host.clone();
+    let turn = tokio::spawn(async move {
+        host.run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while old.requests.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let policy = ContextPolicy {
+        context_window: Some(32_000),
+        ..ContextPolicy::default()
+    };
+    let new = Arc::new(Model::new(vec![answer("new")]));
+    assert!(h
+        .switch_model(new.clone(), policy)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("busy"));
+    assert_eq!(h.host.context_usage().unwrap().context_window, Some(64_000));
+    assert!(new.requests.lock().unwrap().is_empty());
+    h.host.interrupt();
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    h.close().await.unwrap();
 }

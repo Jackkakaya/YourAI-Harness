@@ -118,7 +118,7 @@ with tempfile.TemporaryDirectory() as tmp:
                     os.write(master, b'\x1b[1;1R')
 
     try:
-        wait_for(b'Conversation')
+        wait_for(b'Untitled session')
         if rate_limit or quota_limit or single_request or retry_once:
             os.write(master,b'hello\r')
             if single_request or retry_once:
@@ -134,7 +134,9 @@ with tempfile.TemporaryDirectory() as tmp:
             assert len(requests) == expected, len(requests)
             if rate_limit:
                 gaps = [b-a for a,b in zip(request_times,request_times[1:])]
-                assert gaps[0] >= 7 and gaps[1] >= 10, gaps
+                # Exponential backoff is now 2s, then 4s; the configured
+                # shared 7s cooldown dominates both attempts.
+                assert all(gap >= 7 for gap in gaps), gaps
             os.write(master,b'\x11')
             child.wait(timeout=10)
             assert child.returncode == 0
@@ -149,15 +151,19 @@ with tempfile.TemporaryDirectory() as tmp:
             db.close()
             print(f'PASS: real SDK HTTP path -> {expected} requests; intervals {[round(b-a,2) for a,b in zip(request_times,request_times[1:])]}')
             sys.exit(0)
+        os.write(master, b'\x02')  # Ctrl-B opens the stats dashboard.
         wait_for(b'16.0K')
-        os.write(master, b'\x1b[<0;2;1M\x1b[<32;13;1M\x1b[<0;13;1m')
-        wait_for('已复制'.encode())
-        assert clipboard_file.read_text() == 'Conversation', repr(clipboard_file.read_text())
+        os.write(master, b'\x02')  # Close the dashboard.
+        time.sleep(0.3)
+        os.write(master, b'\x1b[<0;4;1M\x1b[<32;11;1M\x1b[<0;11;1m')
+        wait_for(b'Copied')
+        assert clipboard_file.read_text() == 'Untitled', repr(clipboard_file.read_text())
         os.write(master, b'/')
         wait_for(b'/continue')
         os.write(master, b'\x1b\x7f/theme nord\r')
         # Esc dismisses completion; Backspace removes the slash before a new command.
-        wait_for(b'nord')
+        # Theme command is local; wait for the editor to clear (no theme button in footer now).
+        time.sleep(0.5)
         assert len(requests) == 0, 'theme command should not reach the model'
         os.write(master, b'\x1b[200~list tasks\nsecond line\x1b[201~\r')
         if yolo:
@@ -175,12 +181,17 @@ with tempfile.TemporaryDirectory() as tmp:
         assert content == 'list tasks\nsecond line', repr(content)
         if not yolo:
             os.write(master, b'y\r')
+            # Clear the historical approval dialog (which contains the tool input JSON)
+            # before checking the folded card preview — only the current screen matters.
+            captured.clear()
         wait_for(b'SMOKE_STREAM_OK')
-        wait_for(b'TODO')
+        wait_for(b'Todo')
         wait_for(b'Review parser')
-        assert b'"completed"' not in captured, 'tool details should start folded'
+        # Card preview shows the tool OUTPUT (Task JSON), but the INPUT JSON
+        # (with "action":"create") stays hidden until the block is expanded.
+        assert b'"action"' not in captured, 'tool input should start folded'
         os.write(master, b'\x1b[17~\x0f')  # F6 selects the tool; Ctrl-O opens only that block.
-        wait_for(b'"completed"')
+        wait_for(b'"action"')
         os.write(master, b'\x0f\x1b[1;5F')  # fold again and follow the latest output
         os.write(master, b'next question\r')
         wait_for(b'SMOKE_SECOND_OK')
@@ -209,9 +220,9 @@ with tempfile.TemporaryDirectory() as tmp:
         db.close()
         captured.clear()
         child = subprocess.Popen([str(binary), '--config', str(config), '--resume', session] + mode_args, stdin=slave, stdout=slave, stderr=slave, env=child_env)
-        wait_for(b'Conversation')
+        wait_for('✦ list tasks'.encode())  # session title persists in the header
         wait_for(b'SMOKE_SECOND_OK')  # history must be visible before a new request
-        wait_for(b'TODO')
+        wait_for(b'Todo')
         wait_for(b'Review parser')
         os.write(master, b'resume question\r')
         wait_for(b'SMOKE_RESUME_OK')
@@ -220,7 +231,7 @@ with tempfile.TemporaryDirectory() as tmp:
         child.wait(timeout=10)
         assert child.returncode == 0
         assert termios.tcgetattr(slave) == original
-        print(('YOLO ' if yolo else '') + 'PASS: mouse auto-copy -> theme/context -> multiline paste -> approval policy -> folded tool toggle -> TODO -> compact -> restored history/tasks -> clean exit')
+        print(('YOLO ' if yolo else '') + 'PASS: mouse auto-copy -> theme/context -> multiline paste -> approval policy -> folded tool toggle -> Todo -> compact -> restored history/tasks -> clean exit')
     finally:
         if child.poll() is None:
             child.kill()
