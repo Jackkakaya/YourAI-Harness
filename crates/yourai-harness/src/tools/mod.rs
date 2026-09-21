@@ -51,6 +51,12 @@ pub(crate) fn check_cancel(tc: &ToolContext<'_>) -> Result<(), YourAiError> {
         Ok(())
     }
 }
+/// serde_json cannot serialize non-UTF-8 paths (`json!` unwraps internally and
+/// would panic). Tool result JSON must only embed checked display strings.
+pub(crate) fn utf8_path<'a>(path: &'a Path, name: &str) -> Result<&'a str, YourAiError> {
+    path.to_str()
+        .ok_or_else(|| error(name, "path is not UTF-8"))
+}
 pub(crate) fn schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Tool {
     Tool::new(name).with_description(description).with_schema(json!({
         "type":"object", "properties":properties,"required":required,"additionalProperties":false
@@ -95,7 +101,10 @@ pub(crate) fn security(name: &str, cwd: &Path, input: &Value, write: bool) -> Se
         let raw = input.get(field).and_then(Value::as_str).unwrap_or(".");
         match resolve_path(cwd, Path::new(raw)) {
             Ok(path) => {
-                obj.insert(field.into(), json!(path));
+                // Approval context is descriptive only; lossy keeps non-UTF-8
+                // paths inspectable without panicking in json!. The executed
+                // path itself is guarded by utf8_path/file_permission.
+                obj.insert(field.into(), json!(path.to_string_lossy()));
             }
             Err(_) => {
                 obj.insert("path_resolution_failed".into(), json!(true));

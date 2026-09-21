@@ -14,6 +14,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
 
+#[derive(Clone)]
 pub struct HarnessConfig {
     pub root: PathBuf,
     pub cwd: PathBuf,
@@ -34,6 +35,8 @@ pub struct HarnessConfig {
     pub max_shared_model_calls: Option<u64>,
     pub max_known_tokens: Option<u64>,
     pub request_policy: crate::model::RequestPolicy,
+    pub model_header_timeout: Option<Duration>,
+    pub model_chunk_timeout: Option<Duration>,
 }
 impl HarnessConfig {
     pub fn new(root: PathBuf, cwd: PathBuf) -> Self {
@@ -55,6 +58,8 @@ impl HarnessConfig {
             max_shared_model_calls: Some(256),
             max_known_tokens: None,
             request_policy: Default::default(),
+            model_header_timeout: None,
+            model_chunk_timeout: None,
         }
     }
 }
@@ -186,12 +191,19 @@ impl Harness {
         if let Some(provider) = agent.ctx().try_memory() {
             crate::memory::register(hooks.as_ref(), provider, catalog.clone(), id.clone()).await?;
         }
+        let loop_defaults = crate::default_loop::LoopConfig::default();
         agent
             .ctx()
             .set_agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
                 crate::default_loop::LoopConfig {
                     memory_search_limit: config.memory_search_limit,
-                    ..Default::default()
+                    model_header_timeout: config
+                        .model_header_timeout
+                        .unwrap_or(loop_defaults.model_header_timeout),
+                    model_chunk_timeout: config
+                        .model_chunk_timeout
+                        .unwrap_or(loop_defaults.model_chunk_timeout),
+                    ..loop_defaults
                 },
             )));
         if let Some(provider) = config.skill_provider {
@@ -259,6 +271,40 @@ impl Harness {
             usage,
         })
     }
+    /// Replace the main model and its context policy at an idle boundary.
+    /// Admission/metrics keep the existing shared budget (including calls already
+    /// spent); active turns and compaction reject the switch without changes.
+    /// Existing hook and subagent executors retain their configured models.
+    pub async fn switch_model(
+        &self,
+        model: Arc<dyn ModelProvider>,
+        policy: ContextPolicy,
+    ) -> Result<(), YourAiError> {
+        policy.validate()?;
+        let _gate = self.host.try_operation()?;
+        let id = self.host.context().id;
+        let history = MemoryContext::new(
+            id.clone(),
+            crate::context::ContextServices {
+                store: Some(self.sessions.clone()),
+                policy,
+                ..Default::default()
+            },
+        );
+        // Prepare everything that can fail before publishing either provider.
+        history.restore().await?;
+        let mut meta = self.sessions.load_session(&id).await?;
+        meta.model = Some(model.model_iden().into());
+        self.sessions.save_session(&meta).await?;
+        let model = Arc::new(MeteredModel {
+            inner: model,
+            budget: self.budget.clone(),
+        });
+        self.host.agent.ctx().set_context_manager(history);
+        self.host.agent.ctx().set_model(model);
+        Ok(())
+    }
+
     pub async fn close(&self) -> Result<Vec<In>, YourAiError> {
         self.host.close(Duration::from_secs(15)).await
     }

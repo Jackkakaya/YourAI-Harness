@@ -134,20 +134,25 @@ impl CommandHandler {
             child: Some(child),
         };
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(format!("{json_input}\n").as_bytes())
-                .await
-                .map_err(|e| yourai_core::ErrorKind::Provider {
-                    name: "hook",
-                    message: format!("stdin write: {e}"),
-                })?;
-            stdin
-                .flush()
-                .await
-                .map_err(|e| yourai_core::ErrorKind::Provider {
-                    name: "hook",
-                    message: format!("stdin flush: {e}"),
-                })?;
+            let write = async {
+                stdin
+                    .write_all(format!("{json_input}\n").as_bytes())
+                    .await?;
+                stdin.flush().await
+            }
+            .await;
+            // Hooks may decide without reading stdin. An early close must not
+            // discard their stdout or exit-2 denial; still reap and interpret
+            // the process below. Other I/O failures remain errors.
+            if let Err(e) = write {
+                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(yourai_core::ErrorKind::Provider {
+                        name: "hook",
+                        message: format!("stdin write: {e}"),
+                    }
+                    .into());
+                }
+            }
         }
 
         Ok(child)
@@ -432,6 +437,29 @@ mod tests {
         );
         let result = handler.execute(&inv).await.unwrap();
         match result {
+            HookOutput::Command {
+                exit_code, stderr, ..
+            } => {
+                assert_eq!(exit_code, 2);
+                assert!(stderr.contains("blocked"));
+            }
+            _ => panic!("expected command output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn early_stdin_close_preserves_hook_exit_status_and_output() {
+        let handler = CommandHandler::new(
+            "exec 0<&-; echo blocked >&2; exit 2".into(),
+            Some(crate::hooks::config::HookShell::Bash),
+        );
+        let inv = HookInvocation::new(
+            BaseInput::new("sess", "/tmp"),
+            HookEvent::UserPromptSubmit {
+                prompt: "x".repeat(1024 * 1024),
+            },
+        );
+        match handler.execute(&inv).await.unwrap() {
             HookOutput::Command {
                 exit_code, stderr, ..
             } => {

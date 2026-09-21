@@ -15,7 +15,7 @@ use std::{
 use yourai_harness::GenaiModel;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -23,6 +23,10 @@ pub struct Config {
     #[serde(rename = "$schema")]
     pub _schema: Option<String>,
     pub model: String,
+    /// Runtime selection; persisted configuration still uses CLI / picker variants.
+    #[serde(skip)]
+    pub selected_variant: Option<String>,
+    pub max_model_calls: Option<u32>,
     pub provider: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub extensions: bool,
@@ -43,7 +47,7 @@ pub struct Config {
 fn sessions() -> PathBuf {
     ".yourai/sessions".into()
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     #[serde(alias = "npm")]
@@ -55,7 +59,7 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub models: BTreeMap<String, ModelConfig>,
 }
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConnectionOptions {
     #[serde(rename = "baseURL")]
@@ -63,10 +67,14 @@ pub struct ConnectionOptions {
     #[serde(rename = "apiKey")]
     pub api_key: Option<String>,
     pub timeout: Option<Value>,
+    #[serde(rename = "headerTimeout")]
+    pub header_timeout_ms: Option<u64>,
+    #[serde(rename = "chunkTimeout")]
+    pub chunk_timeout_ms: Option<u64>,
     pub requests: yourai_harness::model::RequestPolicy,
     pub headers: BTreeMap<String, String>,
 }
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub id: Option<String>,
@@ -80,8 +88,18 @@ pub struct ModelConfig {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub variants: BTreeMap<String, Map<String, Value>>,
+    /// Optional pricing: dollars per million tokens.
+    #[serde(default)]
+    pub pricing: Pricing,
 }
-#[derive(Default, Deserialize)]
+/// Per-model pricing for cost display. Prices are in USD per million tokens.
+#[derive(Default, Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Pricing {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+}
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub context: Option<u64>,
@@ -91,8 +109,12 @@ pub struct Limits {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, Error> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|_| "Cannot read config; copy yourai.example.json to yourai.json")?;
+        let text = std::fs::read_to_string(path).map_err(|_| {
+            format!(
+                "Cannot read config at {}; copy yourai.example.json to yourai.json",
+                path.display()
+            )
+        })?;
         // Never include source or serde values in errors: configuration can contain credentials.
         let raw: Value = serde_json::from_str(&text)
             .map_err(|_| "Invalid JSON config; see yourai.example.json")?;
@@ -123,23 +145,50 @@ impl Config {
         }
         Ok(config)
     }
-    pub fn request_policy(&self) -> Result<yourai_harness::model::RequestPolicy, Error> {
+    fn selected_provider(&self) -> Result<&ProviderConfig, Error> {
         let (provider, _) = self
             .model
             .split_once('/')
             .ok_or("model must be provider/model")?;
-        let policy = self
-            .provider
-            .get(provider)
-            .ok_or("Unknown provider")?
-            .options
-            .requests
-            .clone();
+        self.provider.get(provider).ok_or("Unknown provider".into())
+    }
+    /// Returns the pricing for the currently selected model, if configured.
+    pub fn pricing(&self) -> Pricing {
+        let Ok(provider) = self.selected_provider() else {
+            return Pricing::default();
+        };
+        let (_, model_key) = match self.model.split_once('/') {
+            Some(pair) => pair,
+            None => return Pricing::default(),
+        };
+        let model = provider.models.get(model_key);
+        model.map(|m| m.pricing.clone()).unwrap_or_default()
+    }
+    pub fn request_policy(&self) -> Result<yourai_harness::model::RequestPolicy, Error> {
+        let policy = self.selected_provider()?.options.requests.clone();
         policy.validate()?;
         Ok(policy)
     }
+    pub fn model_timeouts(&self) -> Result<(Option<Duration>, Option<Duration>), Error> {
+        let options = &self.selected_provider()?.options;
+        let parse = |name: &str, ms: Option<u64>| -> Result<Option<Duration>, Error> {
+            ms.map(|n| {
+                (n > 0)
+                    .then_some(Duration::from_millis(n))
+                    .ok_or_else(|| format!("{name} must be positive milliseconds").into())
+            })
+            .transpose()
+        };
+        Ok((
+            parse("headerTimeout", options.header_timeout_ms)?,
+            parse("chunkTimeout", options.chunk_timeout_ms)?,
+        ))
+    }
     pub fn resolve(&mut self, variant: Option<&str>) -> Result<Arc<GenaiModel>, Error> {
         self.request_policy()?;
+        if self.max_model_calls == Some(0) {
+            return Err("max_model_calls must be positive".into());
+        }
         let (provider_id, model_key) = self
             .model
             .split_once('/')
@@ -254,6 +303,37 @@ impl Config {
         ))
     }
 }
+/// Resolves the XDG base directory for configuration.
+///
+/// Returns `$XDG_CONFIG_HOME` when it is set and absolute, otherwise
+/// `$HOME/.config`. Per the XDG Base Directory Specification, a relative or
+/// empty `XDG_CONFIG_HOME` is ignored in favour of the home fallback. A
+/// missing or non-absolute home with no usable `XDG_CONFIG_HOME` is an error.
+fn config_dir(xdg_config_home: Option<&Path>, home: Option<&Path>) -> Result<PathBuf, Error> {
+    if let Some(dir) = xdg_config_home.filter(|dir| dir.is_absolute()) {
+        return Ok(dir.to_path_buf());
+    }
+    let home = home
+        .filter(|home| home.is_absolute())
+        .ok_or("Cannot locate config directory: set XDG_CONFIG_HOME or HOME")?;
+    Ok(home.join(".config"))
+}
+
+/// Returns the default config file path per the XDG Base Directory
+/// Specification: `$XDG_CONFIG_HOME/yourai/yourai.json`, or
+/// `$HOME/.config/yourai/yourai.json` when `XDG_CONFIG_HOME` is unset or
+/// relative. Override the location with `--config`.
+pub fn default_config_path() -> Result<PathBuf, Error> {
+    Ok(config_dir(
+        std::env::var_os("XDG_CONFIG_HOME")
+            .as_deref()
+            .map(Path::new),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )?
+    .join("yourai")
+    .join("yourai.json"))
+}
+
 fn merge(base: &mut Value, other: Value) {
     match (base, other) {
         (Value::Object(base), Value::Object(other)) => {
@@ -458,5 +538,24 @@ mod tests {
         assert!(serde_json::from_value::<Config>(example.clone()).is_ok());
         example["typo"] = json!(true);
         assert!(serde_json::from_value::<Config>(example).is_err());
+    }
+    #[test]
+    fn config_dir_prefers_absolute_xdg_config_home() {
+        let dir = config_dir(Some(Path::new("/tmp/xdg")), Some(Path::new("/home/u"))).unwrap();
+        assert_eq!(dir, PathBuf::from("/tmp/xdg"));
+    }
+    #[test]
+    fn config_dir_ignores_relative_xdg_config_home() {
+        let dir = config_dir(Some(Path::new("rel")), Some(Path::new("/home/u"))).unwrap();
+        assert_eq!(dir, PathBuf::from("/home/u/.config"));
+    }
+    #[test]
+    fn config_dir_falls_back_to_home() {
+        let dir = config_dir(None, Some(Path::new("/home/u"))).unwrap();
+        assert_eq!(dir, PathBuf::from("/home/u/.config"));
+    }
+    #[test]
+    fn config_dir_errors_without_home_or_xdg() {
+        assert!(config_dir(None, None).is_err());
     }
 }

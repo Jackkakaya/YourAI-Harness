@@ -1,6 +1,24 @@
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Whitespace,
+    Word,
+    Punct,
+}
+
+/// Classify a grapheme for readline-style word boundaries: whitespace, word
+/// (alphanumeric + underscore), or punctuation. Multi-char graphemes are
+/// classified by their first scalar.
+fn classify(g: &str) -> WordClass {
+    match g.chars().next() {
+        Some(c) if c.is_whitespace() => WordClass::Whitespace,
+        Some(c) if c.is_alphanumeric() || c == '_' => WordClass::Word,
+        _ => WordClass::Punct,
+    }
+}
+
 #[derive(Default)]
 pub struct Editor {
     pub text: String,
@@ -63,6 +81,109 @@ impl Editor {
             .find('\n')
             .map(|i| self.cursor + i)
             .unwrap_or(self.text.len());
+    }
+    /// Move the cursor left one readline word (Alt-B / Ctrl-Left).
+    /// Skips leading whitespace, then one run of a single non-whitespace class.
+    pub fn word_left(&mut self) {
+        let graphemes: Vec<(usize, &str)> = self.text.grapheme_indices(true).collect();
+        let mut idx = graphemes
+            .iter()
+            .position(|(i, _)| *i == self.cursor)
+            .unwrap_or(graphemes.len());
+        while idx > 0 && classify(graphemes[idx - 1].1) == WordClass::Whitespace {
+            idx -= 1;
+        }
+        if idx > 0 {
+            let c = classify(graphemes[idx - 1].1);
+            while idx > 0 && classify(graphemes[idx - 1].1) == c {
+                idx -= 1;
+            }
+        }
+        self.cursor = graphemes
+            .get(idx)
+            .map(|(i, _)| *i)
+            .unwrap_or(self.text.len());
+    }
+    /// Move the cursor right one readline word (Alt-F / Ctrl-Right).
+    /// Skips leading whitespace, then one run of a single non-whitespace class.
+    pub fn word_right(&mut self) {
+        let graphemes: Vec<(usize, &str)> = self.text.grapheme_indices(true).collect();
+        let mut idx = graphemes
+            .iter()
+            .position(|(i, _)| *i == self.cursor)
+            .unwrap_or(graphemes.len());
+        while idx < graphemes.len() && classify(graphemes[idx].1) == WordClass::Whitespace {
+            idx += 1;
+        }
+        if idx < graphemes.len() {
+            let c = classify(graphemes[idx].1);
+            while idx < graphemes.len() && classify(graphemes[idx].1) == c {
+                idx += 1;
+            }
+        }
+        self.cursor = graphemes
+            .get(idx)
+            .map(|(i, _)| *i)
+            .unwrap_or(self.text.len());
+    }
+    /// Delete backward one word using readline word boundaries
+    /// (Alt-Backspace / Ctrl-Backspace).
+    pub fn delete_word_back(&mut self) {
+        let end = self.cursor;
+        self.word_left();
+        self.text.replace_range(self.cursor..end, "");
+    }
+    /// Delete forward one word using readline word boundaries (Alt-D /
+    /// Ctrl-Delete).
+    pub fn delete_word_fwd(&mut self) {
+        let start = self.cursor;
+        self.word_right();
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+    /// Bash-style `unix-word-rubout` (Ctrl-W): delete backward using
+    /// whitespace as the only word boundary.
+    pub fn unix_word_rubout(&mut self) {
+        let graphemes: Vec<(usize, &str)> = self.text.grapheme_indices(true).collect();
+        let mut idx = graphemes
+            .iter()
+            .position(|(i, _)| *i == self.cursor)
+            .unwrap_or(graphemes.len());
+        while idx > 0 && classify(graphemes[idx - 1].1) == WordClass::Whitespace {
+            idx -= 1;
+        }
+        while idx > 0 && classify(graphemes[idx - 1].1) != WordClass::Whitespace {
+            idx -= 1;
+        }
+        let new_cursor = graphemes
+            .get(idx)
+            .map(|(i, _)| *i)
+            .unwrap_or(self.text.len());
+        self.text.replace_range(new_cursor..self.cursor, "");
+        self.cursor = new_cursor;
+    }
+    /// Delete from cursor to start of line (Ctrl-U / `unix-line-discard`).
+    pub fn kill_to_start(&mut self) {
+        let end = self.cursor;
+        self.home();
+        self.text.replace_range(self.cursor..end, "");
+    }
+    /// Delete from cursor to end of line (Ctrl-K / `kill-line`).
+    pub fn kill_to_end(&mut self) {
+        let start = self.cursor;
+        self.end();
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+    /// True iff the cursor sits on the first logical line of the buffer. Used
+    /// to decide whether Up navigates history or moves the cursor up a row.
+    pub fn on_first_line(&self) -> bool {
+        !self.text[..self.cursor].contains('\n')
+    }
+    /// True iff the cursor sits on the last logical line of the buffer. Used
+    /// to decide whether Down navigates history or moves the cursor down a row.
+    pub fn on_last_line(&self) -> bool {
+        !self.text[self.cursor..].contains('\n')
     }
     pub fn vertical(&mut self, delta: isize) {
         let start = self.text[..self.cursor]
@@ -205,5 +326,136 @@ mod tests {
         assert_eq!(e.cursor, "中".len());
         e.end();
         assert_eq!(e.cursor, "中文".len());
+    }
+    #[test]
+    fn word_movement_respects_word_classes() {
+        let mut e = Editor::default();
+        e.insert("foo, bar");
+        e.home(); // insert leaves the cursor at the end; rewind to test fwd-word.
+                  // forward-word from start: end of "foo".
+        e.word_right();
+        assert_eq!(e.cursor, "foo".len());
+        // forward-word: end of ",".
+        e.word_right();
+        assert_eq!(e.cursor, "foo,".len());
+        // forward-word: skip space, end of "bar".
+        e.word_right();
+        assert_eq!(e.cursor, "foo, bar".len());
+        // backward-word: start of "bar".
+        e.word_left();
+        assert_eq!(e.cursor, "foo, ".len());
+        // backward-word: start of ",".
+        e.word_left();
+        assert_eq!(e.cursor, "foo".len());
+        // backward-word: start of "foo".
+        e.word_left();
+        assert_eq!(e.cursor, 0);
+    }
+    #[test]
+    fn word_movement_skips_leading_whitespace() {
+        let mut e = Editor::default();
+        e.insert("  foo");
+        e.word_right();
+        assert_eq!(e.cursor, "  foo".len());
+        e.word_left();
+        assert_eq!(e.cursor, "  ".len());
+    }
+    #[test]
+    fn delete_word_back_vs_unix_word_rubout() {
+        // Alt+Backspace (readline backward-kill-word) stops at word boundaries.
+        let mut e = Editor::default();
+        e.insert("foo.bar");
+        e.delete_word_back();
+        assert_eq!(e.text, "foo.");
+        assert_eq!(e.cursor, "foo.".len());
+        // Ctrl+W (unix-word-rubout) deletes the whole whitespace-delimited chunk.
+        let mut e = Editor::default();
+        e.insert("foo.bar");
+        e.unix_word_rubout();
+        assert_eq!(e.text, "");
+        // Ctrl+W stops at whitespace.
+        let mut e = Editor::default();
+        e.insert("foo, bar");
+        e.unix_word_rubout();
+        assert_eq!(e.text, "foo, ");
+        e.unix_word_rubout();
+        assert_eq!(e.text, "");
+    }
+    #[test]
+    fn delete_word_fwd_kills_forward_word() {
+        let mut e = Editor::default();
+        e.insert("foo, bar");
+        e.home(); // start of line so there is a word ahead to kill.
+        e.delete_word_fwd();
+        assert_eq!(e.text, ", bar");
+        assert_eq!(e.cursor, 0);
+    }
+    #[test]
+    fn kill_to_start_and_end_of_line() {
+        let mut e = Editor::default();
+        e.insert("hello\nworld");
+        // cursor at end; Ctrl+U clears only the current line.
+        e.kill_to_start();
+        assert_eq!(e.text, "hello\n");
+        assert_eq!(e.cursor, "hello\n".len());
+        // Move to start of "hello" line, Ctrl+K clears to end of line.
+        e.home();
+        e.vertical(-1);
+        e.kill_to_end();
+        assert_eq!(e.text, "\n");
+        assert_eq!(e.cursor, 0);
+    }
+    #[test]
+    fn on_first_last_line_reflects_cursor_row() {
+        let mut e = Editor::default();
+        e.insert("aaa\nbbb\nccc");
+        assert!(!e.on_first_line());
+        assert!(e.on_last_line());
+        e.home();
+        e.vertical(-1);
+        e.vertical(-1);
+        assert!(e.on_first_line());
+        assert!(!e.on_last_line());
+    }
+    #[test]
+    fn up_down_history_only_on_boundary_lines() {
+        let mut e = Editor::default();
+        e.remember("older");
+        // Single line: Up navigates history.
+        e.insert("draft");
+        assert!(e.on_first_line() && e.on_last_line());
+        // emulate `edit` Up handler
+        if e.on_first_line() {
+            e.history(true);
+        } else {
+            e.vertical(-1);
+        }
+        assert_eq!(e.text, "older");
+        if e.on_last_line() {
+            e.history(false);
+        } else {
+            e.vertical(1);
+        }
+        assert_eq!(e.text, "draft");
+        // Multiline: Up on second line moves cursor, not history.
+        let mut e = Editor::default();
+        e.remember("older");
+        e.insert("line1\nline2");
+        assert_eq!(e.cursor, "line1\nline2".len());
+        // cursor on last line; Up should move to first line.
+        if e.on_first_line() {
+            e.history(true);
+        } else {
+            e.vertical(-1);
+        }
+        assert_eq!(e.cursor, "line1".len());
+        assert_eq!(e.text, "line1\nline2");
+        // Now on first line; Up navigates history.
+        if e.on_first_line() {
+            e.history(true);
+        } else {
+            e.vertical(-1);
+        }
+        assert_eq!(e.text, "older");
     }
 }

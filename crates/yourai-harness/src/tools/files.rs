@@ -162,6 +162,7 @@ impl ToolHandler for Read {
             }
             let path =
                 resolve_path(&self.cwd, Path::new(&i.path)).map_err(|e| error(self.name(), e))?;
+            let path_str = utf8_path(&path, self.name())?;
             file_permission(&tc, &path, false, self.name()).await?;
             let content = text(&path, self.name())?;
             let lines: Vec<_> = content.split_inclusive('\n').collect();
@@ -177,7 +178,7 @@ impl ToolHandler for Read {
                 .collect::<String>();
             check_cancel(&tc)?;
             Ok(
-                json!({"ok":true,"path":path,"offset":i.offset,"next_offset":(end<lines.len()).then_some(end+1),"content":body}),
+                json!({"ok":true,"path":path_str,"offset":i.offset,"next_offset":(end<lines.len()).then_some(end+1),"content":body}),
             )
         })
     }
@@ -200,11 +201,12 @@ impl ToolHandler for Write {
         Box::pin(async move {
             let i: WriteInput = serde_json::from_value(input).map_err(|e| error(self.name(), e))?;
             let path = target(&self.cwd, &i.path, self.name())?;
+            let path_str = utf8_path(&path, self.name())?;
             file_permission(&tc, &path, true, self.name()).await?;
             let lock = file_lock(&path);
             let _guard = tokio::select! {biased;_=tc.cancel.cancelled()=>return Err(AbortReason::Cancelled.into()),g=lock.lock()=>g};
             let created = save(&path, &i.content, &tc, self.name())?;
-            Ok(json!({"ok":true,"path":path,"created":created,"bytes_written":i.content.len()}))
+            Ok(json!({"ok":true,"path":path_str,"created":created,"bytes_written":i.content.len()}))
         })
     }
 }
@@ -229,6 +231,7 @@ impl ToolHandler for Edit {
                 return Err(error(self.name(), "old_text must be nonempty"));
             }
             let path = target(&self.cwd, &i.path, self.name())?;
+            let path_str = utf8_path(&path, self.name())?;
             file_permission(&tc, &path, true, self.name()).await?;
             let lock = file_lock(&path);
             let _guard = tokio::select! {biased;_=tc.cancel.cancelled()=>return Err(AbortReason::Cancelled.into()),g=lock.lock()=>g};
@@ -252,19 +255,19 @@ impl ToolHandler for Edit {
             }
             let after = before.replacen(&i.old_text, &i.new_text, 1);
             let changed = before != after;
-            let label = path.to_string_lossy();
+            let label = path_str;
             let diff = similar::TextDiff::configure()
                 .timeout(std::time::Duration::from_millis(200))
                 .diff_lines(&before, &after)
                 .unified_diff()
-                .header(&label, &label)
+                .header(label, label)
                 .to_string();
             if changed {
                 save(&path, &after, &tc, self.name())?;
             } else {
                 check_cancel(&tc)?;
             }
-            Ok(json!({"ok":true,"path":path,"changed":changed,"diff":diff}))
+            Ok(json!({"ok":true,"path":path_str,"changed":changed,"diff":diff}))
         })
     }
 }

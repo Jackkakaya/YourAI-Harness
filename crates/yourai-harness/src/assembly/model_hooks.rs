@@ -39,7 +39,7 @@ impl HookModelExecutor for DefaultHookModelExecutor {
                         .context_manager(history)
                         .agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
                             crate::default_loop::LoopConfig {
-                                max_model_calls: self.max_model_calls,
+                                max_model_calls: Some(self.max_model_calls),
                                 ..Default::default()
                             },
                         )));
