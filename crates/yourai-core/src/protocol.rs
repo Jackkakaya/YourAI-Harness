@@ -7,6 +7,20 @@ use serde_json::Value;
 
 // region:    --- In ---
 
+/// 用户消息附带的多媒体附件（图片等），由前端读取剪贴板/文件后以 base64 传入。
+///
+/// loop 侧将其转换为 genai 的 [`crate::chat::ContentPart::Binary`]，与文本一同
+/// 投递给模型。`data` 为标准 base64 编码（无 data-URL 前缀）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserAttachment {
+    /// MIME 类型，如 `image/png`、`image/jpeg`、`application/pdf`。
+    pub content_type: String,
+    /// base64 编码的字节内容。
+    pub data: String,
+    /// 可选的显示名/文件名。
+    pub name: Option<String>,
+}
+
 /// 外界 → loop 的消息（turn 作用域，走 inbox，loop 独占拉取消费）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -18,6 +32,10 @@ pub enum In {
         /// 旧 wire 消息缺省为 Steer。
         #[serde(default)]
         mode: InputMode,
+        /// 随消息附带的多媒体附件（图片/PDF 等）。旧 wire 消息缺省为空，
+        /// 因此反序列化历史消息时向后兼容。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<UserAttachment>,
     },
 
     /// 对一切 [`Out::Ask`] 的答复（审批/提问/表单/计划确认/MCP elicitation）
@@ -30,6 +48,7 @@ impl In {
         In::UserText {
             text: text.into(),
             mode: InputMode::Steer,
+            attachments: vec![],
         }
     }
 
@@ -37,6 +56,19 @@ impl In {
         In::UserText {
             text: text.into(),
             mode: InputMode::FollowUp,
+            attachments: vec![],
+        }
+    }
+
+    /// 便捷构造：用户输入 + 多媒体附件（图片等）。
+    pub fn user_text_with_attachments(
+        text: impl Into<String>,
+        attachments: Vec<UserAttachment>,
+    ) -> Self {
+        In::UserText {
+            text: text.into(),
+            mode: InputMode::Steer,
+            attachments,
         }
     }
 }

@@ -93,23 +93,17 @@ pub struct BudgetSnapshot {
 pub struct ModelBudget {
     state: Mutex<BudgetSnapshot>,
     starts: Mutex<std::collections::VecDeque<std::time::Instant>>,
-    max_calls: Option<u64>,
-    max_tokens: Option<u64>,
     control: control::RequestControl,
 }
 impl ModelBudget {
-    pub fn new(max_calls: Option<u64>, max_tokens: Option<u64>) -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(BudgetSnapshot::default()),
             starts: Mutex::new(std::collections::VecDeque::new()),
-            max_calls,
-            max_tokens,
             control: control::RequestControl::default(),
         })
     }
     pub fn configured(
-        max_calls: Option<u64>,
-        max_tokens: Option<u64>,
         policy: RequestPolicy,
         store: crate::SqliteStore,
     ) -> Result<Arc<Self>, YourAiError> {
@@ -117,8 +111,6 @@ impl ModelBudget {
         Ok(Arc::new(Self {
             state: Mutex::new(BudgetSnapshot::default()),
             starts: Mutex::new(std::collections::VecDeque::new()),
-            max_calls,
-            max_tokens,
             control: control::RequestControl::new(policy, Some(store)),
         }))
     }
@@ -131,19 +123,13 @@ impl ModelBudget {
         snapshot.requests.cooldown_seconds = self.control.remaining().as_secs_f64().ceil() as u64;
         snapshot
     }
-    fn reserve(&self) -> Result<(), YourAiError> {
+    fn reserve(&self) {
         let mut s = self.state.lock().unwrap();
-        if self.max_calls.is_some_and(|n| s.calls >= n)
-            || self.max_tokens.is_some_and(|n| s.usage.total_tokens >= n)
-        {
-            return Err(AbortReason::LimitReached(TurnLimit::ModelCalls).into());
-        }
         s.calls += 1;
         s.requests.active += 1;
         let mut starts = self.starts.lock().unwrap();
         starts.retain(|t| t.elapsed() < std::time::Duration::from_secs(60));
         starts.push_back(std::time::Instant::now());
-        Ok(())
     }
 }
 pub struct MeteredModel {

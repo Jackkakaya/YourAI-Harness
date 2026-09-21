@@ -58,7 +58,6 @@ impl State<'_> {
             )
             .into());
         }
-        self.check_model_budget()?;
         let request = prepared.request;
         let observed_request = request.clone();
         let options = self
