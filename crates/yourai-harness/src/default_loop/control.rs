@@ -167,8 +167,10 @@ impl State<'_> {
         index: usize,
         initial: bool,
     ) -> Result<bool, YourAiError> {
-        let text = match &self.queued[index] {
-            In::UserText { text, .. } => text.clone(),
+        let (text, attachments) = match &self.queued[index] {
+            In::UserText {
+                text, attachments, ..
+            } => (text.clone(), attachments.clone()),
             _ => return Ok(false),
         };
         let hook = self
@@ -183,7 +185,19 @@ impl State<'_> {
             return Ok(false);
         }
         let history = self.history.clone();
-        let mut record = StoredMessage::new(ChatMessage::user(&text));
+        // Build the user message. Attachments (images, PDFs, audio) are
+        // validated and converted to genai ContentPart::Binary — see
+        // `attachment_to_part` for the provider-specific handling.
+        let message = if attachments.is_empty() {
+            ChatMessage::user(&text)
+        } else {
+            let mut parts = vec![ContentPart::from_text(text.clone())];
+            for att in &attachments {
+                parts.push(attachment_to_part(att)?);
+            }
+            ChatMessage::user(MessageContent::from_parts(parts))
+        };
+        let mut record = StoredMessage::new(message);
         if initial && self.config.memory_search_limit > 0 && !text.trim().is_empty() {
             if let Some(memory) = self.tc.snap.memory.clone() {
                 let cancel = self.tc.cancel.clone();
@@ -325,5 +339,126 @@ impl State<'_> {
                 obs.increment("loop.cleanup_failed", &[]);
             }
         }
+    }
+}
+
+// ── attachment validation & genai Binary conversion ──────────────────
+
+/// Maximum decoded payload for a single attachment (20 MiB).
+///
+/// This is the most restrictive ceiling across the providers genai targets:
+/// - OpenAI accepts images up to ~20 MB.
+/// - Anthropic accepts base64 image data up to ~32 MB (~24 MB decoded).
+///
+/// 20 MiB decoded is safe for both.
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// Validate a [`UserAttachment`] and convert it to a genai
+/// [`ContentPart::Binary`].
+///
+/// ## How genai handles Binary per provider
+///
+/// Binary parts are **only** processed in **User-role** messages; genai's
+/// adapter code for assistant/tool roles silently ignores them. Since we
+/// always emit `ChatMessage::user(...)`, this is correct.
+///
+/// genai's `Binary::is_image()` / `is_audio()` / `is_pdf()` classify by
+/// `content_type` prefix, and each adapter translates accordingly:
+///
+/// | Provider   | image (base64)                    | audio (base64)              | PDF / other (base64)          |
+/// |------------|-----------------------------------|-----------------------------|-------------------------------|
+/// | OpenAI     | `image_url` + data URL            | `input_audio`               | `file` + file_data (data URL) |
+/// | Anthropic  | `image` + base64 source           | `document` + base64 source  | `document` + base64 source    |
+///
+/// URL-sourced binaries have provider gaps (Anthropic can't do image URLs;
+/// OpenAI can't do file URLs) — genai warns and skips those. We only emit
+/// `BinarySource::Base64`, so both providers are covered.
+///
+/// ## Validation
+///
+/// 1. `content_type` must be `image/*`, `audio/*`, or `application/pdf` —
+///    anything else is rejected with a clear error rather than silently
+///    dropped by an adapter.
+/// 2. The decoded payload (estimated from base64 length) must not exceed
+///    [`MAX_ATTACHMENT_BYTES`].
+fn attachment_to_part(att: &UserAttachment) -> Result<ContentPart, YourAiError> {
+    let ct = att.content_type.trim().to_ascii_lowercase();
+    if !(ct.starts_with("image/") || ct.starts_with("audio/") || ct == "application/pdf") {
+        return Err(ErrorKind::Config(format!(
+            "unsupported attachment type '{ct}'; only image/*, audio/*, and application/pdf are accepted"
+        ))
+        .into());
+    }
+    // Estimate decoded size from base64 length: 4 base64 chars ≈ 3 bytes.
+    // This is a slight over-estimate when padding is present, which is fine
+    // for a ceiling check.
+    let estimated_bytes = att.data.len().saturating_mul(3) / 4;
+    if estimated_bytes > MAX_ATTACHMENT_BYTES {
+        return Err(ErrorKind::Config(format!(
+            "attachment too large: ~{} MiB exceeds the {} MiB limit",
+            estimated_bytes / (1024 * 1024),
+            MAX_ATTACHMENT_BYTES / (1024 * 1024),
+        ))
+        .into());
+    }
+    Ok(ContentPart::from_binary_base64(
+        ct,
+        att.data.as_str(),
+        att.name.clone(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn att(content_type: &str, data: &str) -> UserAttachment {
+        UserAttachment {
+            content_type: content_type.into(),
+            data: data.into(),
+            name: Some("test.bin".into()),
+        }
+    }
+
+    #[test]
+    fn image_attachment_converts_to_binary_image() {
+        let part = attachment_to_part(&att("image/png", "iVBORw0KGgo=")).unwrap();
+        let binary = part.as_binary().unwrap();
+        assert!(binary.is_image());
+        assert_eq!(binary.content_type, "image/png");
+        assert_eq!(binary.name.as_deref(), Some("test.bin"));
+        // Base64 source is preserved verbatim.
+        assert!(matches!(&binary.source, BinarySource::Base64(b) if b.as_ref() == "iVBORw0KGgo="));
+    }
+
+    #[test]
+    fn pdf_and_audio_are_accepted() {
+        let pdf = attachment_to_part(&att("application/pdf", "JVBERi0=")).unwrap();
+        assert!(pdf.as_binary().unwrap().is_pdf());
+
+        let audio = attachment_to_part(&att("audio/wav", "UklGRiQ=")).unwrap();
+        assert!(audio.as_binary().unwrap().is_audio());
+    }
+
+    #[test]
+    fn unsupported_content_type_is_rejected() {
+        let err = attachment_to_part(&att("text/plain", "aGVsbG8=")).unwrap_err();
+        assert!(err.to_string().contains("unsupported attachment type"));
+    }
+
+    #[test]
+    fn oversized_attachment_is_rejected() {
+        // base64 length L → decoded ≈ L*3/4 (integer division).  We need
+        // estimated_bytes > MAX_ATTACHMENT_BYTES, so add enough margin to
+        // clear the integer-division boundary.
+        let big = "A".repeat(MAX_ATTACHMENT_BYTES * 4 / 3 + 100);
+        let err = attachment_to_part(&att("image/png", &big)).unwrap_err();
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn content_type_is_case_insensitive_and_trimmed() {
+        let part = attachment_to_part(&att("  IMAGE/PNG  ", "iVBORw0KGgo=")).unwrap();
+        assert_eq!(part.as_binary().unwrap().content_type, "image/png");
     }
 }

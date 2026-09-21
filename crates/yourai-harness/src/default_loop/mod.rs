@@ -13,16 +13,16 @@ use std::{
 };
 use yourai_core::{model::ModelRecovery, prelude::*};
 
-const MODEL_CALL_LIMIT_PROMPT: &str = r#"CRITICAL - MAXIMUM MODEL CALLS REACHED
+const MAX_STEPS_PROMPT: &str = r#"CRITICAL - MAXIMUM STEPS REACHED
 
-The maximum number of model calls allowed for this turn has been reached. Tools are disabled until the next user input. Respond with text only.
+The maximum number of steps allowed for this task has been reached. Tools are disabled until the next user input. Respond with text only.
 
 STRICT REQUIREMENTS:
 1. Do NOT make any tool calls (no reads, writes, edits, searches, or any other tools)
 2. MUST provide a text response summarizing work done so far
 
 Response must include:
-- Statement that the maximum number of model calls has been reached
+- Statement that the maximum number of steps for this agent has been reached
 - Summary of what has been accomplished so far
 - List of any remaining tasks that were not completed
 - Recommendations for what should be done next
@@ -36,8 +36,8 @@ pub struct LoopConfig {
     pub skill_ids: Vec<String>,
     pub memory_search_limit: usize,
     pub memory_max_chars: usize,
-    pub max_model_calls: Option<u32>,
-    pub max_tool_calls: u32,
+    /// OpenCode-compatible agentic iteration cap. None means unlimited.
+    pub steps: Option<u32>,
     pub max_model_retries: u32,
     pub max_overflow_compactions: u32,
     pub max_stop_continuations: u32,
@@ -59,9 +59,8 @@ impl Default for LoopConfig {
             skill_ids: vec![],
             memory_search_limit: 0,
             memory_max_chars: 8000,
-            max_model_calls: None,
-            max_tool_calls: 256,
-            max_model_retries: 2,
+            steps: None,
+            max_model_retries: 5,
             max_overflow_compactions: 1,
             max_stop_continuations: 3,
             max_permission_rechecks: 1,
@@ -119,8 +118,8 @@ impl AgentLoop for DefaultLoop {
                 queued: VecDeque::new(),
                 input_closed: false,
                 forced_final: false,
+                step: 0,
                 model_calls: 0,
-                tool_calls: 0,
                 stop_continuations: 0,
                 bound_tools: HashMap::new(),
                 call_ids: HashSet::new(),
@@ -155,8 +154,8 @@ struct State<'a> {
     queued: VecDeque<In>,
     input_closed: bool,
     forced_final: bool,
+    step: u32,
     model_calls: u32,
-    tool_calls: u32,
     stop_continuations: u32,
     unresolved: VecDeque<ToolCall>,
     bound_tools: HashMap<String, Arc<dyn ToolHandler>>,
@@ -196,29 +195,36 @@ impl State<'_> {
         if !self.accept_input(0, true).await? {
             return Ok(());
         }
+        if self.effective_steps() == Some(0) {
+            return Err(ErrorKind::Config("steps must be a positive integer".into()).into());
+        }
         let mut retries = 0;
         let mut overflow = 0;
         let mut force_compact = false;
+        let mut new_step = true;
         loop {
             self.checkpoint().await?;
             if force_compact {
                 self.compact(CompactionTrigger::Overflow).await?;
                 force_compact = false;
             }
-            self.check_model_budget()?;
-            if !self.forced_final
-                && self
-                    .effective_max()
-                    .is_some_and(|m| self.model_calls + 1 >= m)
-            {
-                self.add_context(&[MODEL_CALL_LIMIT_PROMPT.into()]).await?;
-                self.forced_final = true;
+            if new_step {
+                self.step += 1;
+                if !self.forced_final
+                    && self
+                        .effective_steps()
+                        .is_some_and(|max| self.step >= max)
+                {
+                    self.add_context(&[MAX_STEPS_PROMPT.into()]).await?;
+                    self.forced_final = true;
+                }
             }
             let attempt = self.model_step(retries + 1).await;
             let (message, calls) = match attempt {
                 Ok(value) => {
                     retries = 0;
                     overflow = 0;
+                    new_step = true;
                     value
                 }
                 Err((error, visible)) => {
@@ -232,6 +238,7 @@ impl State<'_> {
                             {
                                 overflow += 1;
                                 force_compact = true;
+                                new_step = false;
                                 self.notice(
                                     Level::Warning,
                                     "Context overflow; compacting before retry",
@@ -239,7 +246,7 @@ impl State<'_> {
                                 continue;
                             }
                             ModelRecovery::Retry if retries < self.config.max_model_retries => {
-                                self.check_model_budget()?;
+                                new_step = false;
                                 let base = self
                                     .config
                                     .retry_delay
@@ -305,11 +312,14 @@ impl State<'_> {
                 if !self.unresolved.is_empty() {
                     self.notice(
                         Level::Warning,
-                        "Model requested tools at the model-call limit; they were not executed.",
+                        "Model requested tools after maximum agent steps; they were not executed.",
                     )?;
                     // Keep persisted tool-call/result pairs complete for the next turn.
-                    self.cleanup(&AbortReason::LimitReached(TurnLimit::ModelCalls).into())
-                        .await;
+                    self.cleanup(
+                        &ErrorKind::Loop("tools are disabled after maximum agent steps".into())
+                            .into(),
+                    )
+                    .await;
                 }
                 return Ok(());
             }
@@ -349,22 +359,11 @@ impl State<'_> {
         }
     }
 
-    /// Retries and compaction calls consume the same hard per-turn budget.
-    fn check_model_budget(&self) -> Result<(), YourAiError> {
-        self.tc.check_control()?;
-        if self
-            .effective_max()
-            .is_some_and(|max| self.model_calls >= max)
-        {
-            return Err(AbortReason::LimitReached(TurnLimit::ModelCalls).into());
-        }
-        Ok(())
-    }
-    /// TurnLimits may only tighten the configured per-turn call budget.
-    fn effective_max(&self) -> Option<u32> {
-        let config = self.config.max_model_calls;
-        match self.tc.info.options.limits.max_model_calls {
-            Some(l) => Some(config.map_or(l, |c| c.min(l))),
+    /// Per-turn options may only tighten the configured agent step cap.
+    fn effective_steps(&self) -> Option<u32> {
+        let config = self.config.steps;
+        match self.tc.info.options.limits.steps {
+            Some(limit) => Some(config.map_or(limit, |configured| configured.min(limit))),
             None => config,
         }
     }
@@ -378,9 +377,6 @@ impl State<'_> {
             .as_ref()
             .map(|r| r.definitions())
             .unwrap_or_default();
-        if let Some(max) = self.effective_max() {
-            request.max_model_calls = max.saturating_sub(self.model_calls);
-        }
         let calls = request.calls.clone();
         let usage = request.usage.clone();
         let cancel = self.tc.cancel.child_token();

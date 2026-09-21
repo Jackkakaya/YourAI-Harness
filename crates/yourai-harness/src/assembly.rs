@@ -32,8 +32,6 @@ pub struct HarnessConfig {
     pub memory_provider: Option<Arc<dyn MemoryProvider>>,
     pub skill_provider: Option<Arc<dyn SkillProvider>>,
     pub memory_search_limit: usize,
-    pub max_shared_model_calls: Option<u64>,
-    pub max_known_tokens: Option<u64>,
     pub request_policy: crate::model::RequestPolicy,
     pub model_header_timeout: Option<Duration>,
     pub model_chunk_timeout: Option<Duration>,
@@ -55,8 +53,6 @@ impl HarnessConfig {
             memory_provider: None,
             skill_provider: None,
             memory_search_limit: 0,
-            max_shared_model_calls: Some(256),
-            max_known_tokens: None,
             request_policy: Default::default(),
             model_header_timeout: None,
             model_chunk_timeout: None,
@@ -130,12 +126,7 @@ impl Harness {
         meta.model = Some(model.model_iden().into());
         catalog.save_session(&meta).await?;
         let dir = catalog.directory(&id)?;
-        let budget = ModelBudget::configured(
-            config.max_shared_model_calls,
-            config.max_known_tokens,
-            config.request_policy,
-            (*catalog.store).clone(),
-        )?;
+        let budget = ModelBudget::configured(config.request_policy, (*catalog.store).clone())?;
         let model: Arc<dyn ModelProvider> = Arc::new(MeteredModel {
             inner: model,
             budget: budget.clone(),
@@ -150,7 +141,7 @@ impl Harness {
                 tools: None,
                 usage: Some(usage.clone()),
                 timeout: Duration::from_secs(60),
-                max_model_calls: 8,
+                steps: 8,
             },
         )));
         hooks

@@ -86,7 +86,7 @@ impl AgentLoop for MetadataLoop {
             tc.check_control()?;
             let _ = tc.inbox.recv().await;
             let session = tc.info.options.session.as_ref().unwrap();
-            assert_eq!(tc.info.options.limits.max_model_calls, Some(4));
+            assert_eq!(tc.info.options.limits.steps, Some(4));
             Ok(TurnOutput::new(format!("{}:{}", session.id, tc.info.id)))
         })
     }
@@ -97,7 +97,7 @@ async fn turn_metadata_reaches_loop_and_deadline_failure_retains_input() {
     let session = Arc::new(SessionContext::new(SessionId::new(), "/workspace"));
     let mut options = TurnOptions::default();
     options.session = Some(session.clone());
-    options.limits.max_model_calls = Some(4);
+    options.limits.steps = Some(4);
     let agent = Agent::builder().agent_loop(Arc::new(MetadataLoop)).build();
     let handle = agent
         .start_with(In::user_text("hello"), options.clone())
