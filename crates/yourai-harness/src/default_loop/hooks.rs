@@ -40,14 +40,13 @@ impl State<'_> {
             return Ok(HookDispatchResult::empty(kind));
         };
         let invocation = self.invocation(event);
-        let timeout = Some(
-            self.tc
-                .info
-                .options
-                .limits
-                .hook_timeout
-                .unwrap_or(self.config.hook_timeout),
-        );
+        let timeout = self
+            .tc
+            .info
+            .options
+            .limits
+            .hook_timeout
+            .or(self.config.hook_timeout);
         let result = self
             .wait(hooks.dispatch(&invocation), timeout, "hook")
             .await?;

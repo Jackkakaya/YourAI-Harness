@@ -19,6 +19,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex.workspace = true
 reqwest = { workspace = true, features = ["gzip", "brotli", "deflate"] }
+base64.workspace = true
 tempfile = "3"
 similar = "2"
 httpdate = "1"

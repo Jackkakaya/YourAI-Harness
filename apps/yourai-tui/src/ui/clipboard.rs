@@ -17,7 +17,10 @@ use std::{
     sync::OnceLock,
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, process::Command};
+use yourai_core::protocol::MAX_USER_ATTACHMENT_BYTES;
+
+const MAX_ATTACHMENT_BASE64_BYTES: usize = MAX_USER_ATTACHMENT_BYTES.div_ceil(3) * 4;
 
 // ── base64 ────────────────────────────────────────────────────────────
 
@@ -250,25 +253,31 @@ pub struct ClipboardImage {
     pub data: String,
 }
 
-/// Spawn a command and capture stdout as bytes. Any failure yields an empty
-/// buffer, mirroring opencode's `.catch(() => Buffer.alloc(0))`.
+/// Spawn a command and capture bounded stdout bytes. Any failure or output
+/// larger than `max_bytes` yields an empty buffer.
 #[allow(dead_code)] // not every platform uses capture (macOS shells out to osascript directly)
-async fn capture(program: &str, args: &[&str]) -> Vec<u8> {
+async fn capture(program: &str, args: &[&str], max_bytes: usize) -> Vec<u8> {
     tokio::time::timeout(Duration::from_secs(2), async {
-        Command::new(program)
+        let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
-            .output()
-            .await
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| o.stdout)
-            .unwrap_or_default()
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?.take(max_bytes.saturating_add(1) as u64);
+        let mut bytes = Vec::with_capacity(max_bytes.min(1024 * 1024));
+        stdout.read_to_end(&mut bytes).await.ok()?;
+        if bytes.len() > max_bytes {
+            let _ = child.kill().await;
+            return None;
+        }
+        child.wait().await.ok()?.success().then_some(bytes)
     })
     .await
+    .ok()
+    .flatten()
     .unwrap_or_default()
 }
 
@@ -297,7 +306,12 @@ pub async fn read_image() -> io::Result<Option<ClipboardImage>> {
             }
         }
         if std::env::var_os("WAYLAND_DISPLAY").is_some() && which("wl-paste").is_some() {
-            let bytes = capture("wl-paste", &["-t", "image/png"]).await;
+            let bytes = capture(
+                "wl-paste",
+                &["-t", "image/png"],
+                MAX_USER_ATTACHMENT_BYTES,
+            )
+            .await;
             if !bytes.is_empty() {
                 return Ok(Some(ClipboardImage {
                     mime: "image/png".into(),
@@ -308,7 +322,14 @@ pub async fn read_image() -> io::Result<Option<ClipboardImage>> {
         if which("xclip").is_some() {
             let bytes = capture(
                 "xclip",
-                &["-selection", "clipboard", "-t", "image/png", "-o"],
+                &[
+                    "-selection",
+                    "clipboard",
+                    "-t",
+                    "image/png",
+                    "-o",
+                ],
+                MAX_USER_ATTACHMENT_BYTES,
             )
             .await;
             if !bytes.is_empty() {
@@ -340,7 +361,8 @@ fn is_wsl() -> bool {
 
 #[cfg(target_os = "macos")]
 async fn read_image_macos() -> io::Result<Option<ClipboardImage>> {
-    let file = std::env::temp_dir().join("yourai-clipboard.png");
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("clipboard.png");
     let path = file.to_string_lossy().into_owned();
     let open_line =
         format!("set fileRef to open for access POSIX file \"{path}\" with write permission");
@@ -371,7 +393,11 @@ async fn read_image_macos() -> io::Result<Option<ClipboardImage>> {
     })
     .await
     .unwrap_or(false);
-    let result = if ok {
+    let result = if ok
+        && tokio::fs::metadata(&file)
+            .await
+            .is_ok_and(|meta| meta.len() <= MAX_USER_ATTACHMENT_BYTES as u64)
+    {
         tokio::fs::read(&file)
             .await
             .ok()
@@ -399,6 +425,7 @@ async fn read_image_windows() -> io::Result<Option<ClipboardImage>> {
     let out = capture(
         "powershell.exe",
         &["-NonInteractive", "-NoProfile", "-command", script],
+        MAX_ATTACHMENT_BASE64_BYTES,
     )
     .await;
     let text = String::from_utf8_lossy(&out).trim().to_owned();

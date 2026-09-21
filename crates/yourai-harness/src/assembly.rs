@@ -8,7 +8,7 @@ use crate::{
 use model_hooks::DefaultHookModelExecutor;
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -72,6 +72,7 @@ pub struct Harness {
     pub memory: Option<Arc<LocalMemory>>,
     pub skills: Option<Arc<LocalSkills>>,
     pub usage: Arc<LocalUsage>,
+    loop_config: Mutex<crate::default_loop::LoopConfig>,
 }
 impl Harness {
     pub async fn open(
@@ -183,19 +184,20 @@ impl Harness {
             crate::memory::register(hooks.as_ref(), provider, catalog.clone(), id.clone()).await?;
         }
         let loop_defaults = crate::default_loop::LoopConfig::default();
+        let loop_config = crate::default_loop::LoopConfig {
+            memory_search_limit: config.memory_search_limit,
+            model_header_timeout: config
+                .model_header_timeout
+                .unwrap_or(loop_defaults.model_header_timeout),
+            model_chunk_timeout: config
+                .model_chunk_timeout
+                .unwrap_or(loop_defaults.model_chunk_timeout),
+            ..loop_defaults
+        };
         agent
             .ctx()
             .set_agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
-                crate::default_loop::LoopConfig {
-                    memory_search_limit: config.memory_search_limit,
-                    model_header_timeout: config
-                        .model_header_timeout
-                        .unwrap_or(loop_defaults.model_header_timeout),
-                    model_chunk_timeout: config
-                        .model_chunk_timeout
-                        .unwrap_or(loop_defaults.model_chunk_timeout),
-                    ..loop_defaults
-                },
+                loop_config.clone(),
             )));
         if let Some(provider) = config.skill_provider {
             agent.ctx().set_skills(provider);
@@ -260,6 +262,7 @@ impl Harness {
             memory,
             skills,
             usage,
+            loop_config: Mutex::new(loop_config),
         })
     }
     /// Replace the main model and its context policy at an idle boundary.
@@ -270,8 +273,21 @@ impl Harness {
         &self,
         model: Arc<dyn ModelProvider>,
         policy: ContextPolicy,
+        model_header_timeout: Option<Duration>,
+        model_chunk_timeout: Option<Duration>,
     ) -> Result<(), YourAiError> {
         policy.validate()?;
+        let defaults = crate::default_loop::LoopConfig::default();
+        let mut loop_config = self
+            .loop_config
+            .lock()
+            .map_err(|_| ErrorKind::Other("loop config lock poisoned".into()))?
+            .clone();
+        loop_config.model_header_timeout =
+            model_header_timeout.unwrap_or(defaults.model_header_timeout);
+        loop_config.model_chunk_timeout =
+            model_chunk_timeout.unwrap_or(defaults.model_chunk_timeout);
+        let next_loop = Arc::new(crate::default_loop::DefaultLoop::new(loop_config.clone()));
         let _gate = self.host.try_operation()?;
         let id = self.host.context().id;
         let history = MemoryContext::new(
@@ -293,11 +309,16 @@ impl Harness {
         });
         self.host.agent.ctx().set_context_manager(history);
         self.host.agent.ctx().set_model(model);
+        self.host.agent.ctx().set_agent_loop(next_loop);
+        *self
+            .loop_config
+            .lock()
+            .map_err(|_| ErrorKind::Other("loop config lock poisoned".into()))? = loop_config;
         Ok(())
     }
 
     pub async fn close(&self) -> Result<Vec<In>, YourAiError> {
-        self.host.close(Duration::from_secs(15)).await
+        self.host.close(Some(Duration::from_secs(15))).await
     }
 }
 
