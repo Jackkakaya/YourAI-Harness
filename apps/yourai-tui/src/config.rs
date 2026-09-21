@@ -26,7 +26,9 @@ pub struct Config {
     /// Runtime selection; persisted configuration still uses CLI / picker variants.
     #[serde(skip)]
     pub selected_variant: Option<String>,
-    pub max_model_calls: Option<u32>,
+    /// Optional OpenCode-compatible maximum agentic iterations before a text-only final step.
+    #[serde(alias = "max_model_calls")]
+    pub steps: Option<u32>,
     pub provider: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub extensions: bool,
@@ -186,8 +188,8 @@ impl Config {
     }
     pub fn resolve(&mut self, variant: Option<&str>) -> Result<Arc<GenaiModel>, Error> {
         self.request_policy()?;
-        if self.max_model_calls == Some(0) {
-            return Err("max_model_calls must be positive".into());
+        if self.steps == Some(0) {
+            return Err("steps must be a positive integer".into());
         }
         let (provider_id, model_key) = self
             .model

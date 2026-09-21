@@ -2,6 +2,7 @@ mod clipboard;
 mod commands;
 mod editor;
 mod markdown;
+mod mention;
 mod render;
 mod selection;
 mod state;
@@ -19,7 +20,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, prelude::*};
 use render::{Metadata, Renderer};
-use state::{derive_title, Item, Role, View};
+use state::{derive_title, Item, PendingAttachment, Role, View};
 use std::{
     io::{self, Stdout, Write},
     sync::Arc,
@@ -240,6 +241,26 @@ fn edit(e: &mut editor::Editor, key: KeyEvent) {
         _ => {}
     }
 }
+/// Map an image file extension to its MIME type.
+fn image_mime(path: &std::path::Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "tiff" | "tif" => "image/tiff",
+        _ => "image/png",
+    }
+    .to_owned()
+}
+
 fn copy_selection(renderer: &Renderer, task: &mut Option<JoinHandle<std::io::Result<()>>>) {
     if let Some(text) = renderer.selection.text().filter(|text| !text.is_empty()) {
         if let Some(previous) = task.take() {
@@ -363,6 +384,7 @@ pub async fn run(
     let mut screen = Screen::open()?;
     let mut renderer = Renderer::default();
     let context = harness.host.context();
+    let cwd = context.cwd.clone();
     let mut meta = Metadata {
         session: context.id.0,
         cwd: context.cwd.to_string_lossy().into(),
@@ -547,7 +569,33 @@ pub async fn run(
                     },
                     Event::Mouse(_) => {}
                     Event::Paste(text) => {
-                        if let Some(a) = view.ask_mut() {
+                        if text.is_empty() {
+                            // Bracketed paste with empty text often means the
+                            // clipboard holds an image (most terminals can't
+                            // paste images as text). Best-effort: try reading
+                            // an image so Ctrl+V works even when the terminal
+                            // intercepts it as a bracketed paste rather than a
+                            // KeyEvent.
+                            match clipboard::read_image().await {
+                                Ok(Some(img)) => {
+                                    let n = view.pending_attachments.len() + 1;
+                                    view.pending_attachments.push(PendingAttachment {
+                                        mime: img.mime.clone(),
+                                        data: img.data,
+                                        name: format!("clipboard-{n}.png"),
+                                    });
+                                    view.notice(
+                                        Level::Info,
+                                        format!(
+                                            "Image attached ({}). Enter to send, Esc to clear.",
+                                            img.mime
+                                        ),
+                                    );
+                                }
+                                Ok(None) => {} // genuinely empty, stay quiet
+                                Err(_) => {}
+                            }
+                        } else if let Some(a) = view.ask_mut() {
                             a.editor.insert(&text);
                         } else {
                             view.editor.insert(&text);
@@ -565,9 +613,18 @@ pub async fn run(
                             copy_selection(&renderer, &mut clipboard_task);
                             continue;
                         }
-                        if key.code == KeyCode::Esc && renderer.selection.active() {
-                            renderer.selection.clear();
-                            continue;
+                        if key.code == KeyCode::Esc {
+                            if renderer.selection.active() {
+                                renderer.selection.clear();
+                                continue;
+                            }
+                            // No selection: Esc drops staged attachments before
+                            // falling through to the interrupt handler below.
+                            if !view.pending_attachments.is_empty() {
+                                view.pending_attachments.clear();
+                                view.notice(Level::Info, "Attachments cleared.");
+                                continue;
+                            }
                         }
                         renderer.selection.clear();
                         if view.help {
@@ -768,6 +825,175 @@ pub async fn run(
                                 _ => continue,
                             }
                         }
+                        // ── @ mention autocomplete ───────────────────────
+                        // When active, intercept navigation keys before the
+                        // command menu or editor sees them.
+                        if view.mention.active && view.asks_empty() && !ctrl && !alt {
+                            match key.code {
+                                KeyCode::Up => {
+                                    view.mention.step(true);
+                                    continue;
+                                }
+                                KeyCode::Down => {
+                                    view.mention.step(false);
+                                    continue;
+                                }
+                                KeyCode::Esc => {
+                                    view.mention.deactivate();
+                                    continue;
+                                }
+                                KeyCode::Tab => {
+                                    if let Some(entry) = view.mention.current().cloned() {
+                                        if entry.is_dir {
+                                            // Tab on directory: expand (down-drill).
+                                            let replace = format!("@{}", entry.display);
+                                            let anchor = view.mention.anchor;
+                                            let end = anchor + 1 + view.mention.query.len();
+                                            view.editor.cursor = anchor;
+                                            for _ in 0..(end - anchor) {
+                                                view.editor.delete();
+                                            }
+                                            view.editor.insert(&format!("{replace}/"));
+                                            if let Some((a, q)) = mention::MentionState::detect(
+                                                &view.editor.text,
+                                                view.editor.cursor,
+                                            ) {
+                                                view.mention.entries = mention::scan(&cwd, &q);
+                                                view.mention.activate(a, &q);
+                                            } else {
+                                                view.mention.deactivate();
+                                            }
+                                            continue;
+                                        }
+                                        // Tab on file: same as Enter (select).
+                                    } else {
+                                        continue;
+                                    }
+                                    // Fall through to Enter logic below.
+                                }
+                                KeyCode::Enter => {
+                                    // Entered when Tab also falls through for files.
+                                }
+                                _ => continue,
+                            }
+                            // ── File/directory selection (Tab or Enter) ──
+                            if let Some(entry) = view.mention.current().cloned() {
+                                let path = entry.path.clone();
+                                let display = entry.display.clone();
+                                let anchor = view.mention.anchor;
+                                let end = anchor + 1 + view.mention.query.len();
+                                view.mention.deactivate();
+                                if entry.is_dir {
+                                    // Enter on directory: read first-level listing,
+                                    // inline as structured text (aligned with
+                                    // opencode's Read tool directory output).
+                                    match mention::read_directory_listing(&path) {
+                                        Some(listing) => {
+                                            let block =
+                                                format!("\n@{display}\n```\n{listing}\n```\n");
+                                            view.editor.cursor = anchor;
+                                            for _ in 0..(end - anchor) {
+                                                view.editor.delete();
+                                            }
+                                            view.editor.insert(&block);
+                                            view.notice(
+                                                Level::Info,
+                                                format!("Listed directory {display}."),
+                                            );
+                                        }
+                                        None => {
+                                            view.notice(
+                                                Level::Error,
+                                                format!("Cannot read directory {display}."),
+                                            );
+                                        }
+                                    }
+                                    continue;
+                                }
+                                // File selected: classify and attach.
+                                let kind = mention::classify(&path);
+                                match kind {
+                                    mention::FileKind::Text => {
+                                        match std::fs::read_to_string(&path) {
+                                            Ok(content) => {
+                                                let ext = path
+                                                    .extension()
+                                                    .and_then(|e| e.to_str())
+                                                    .unwrap_or("");
+                                                let block = format!(
+                                                    "\n@{display}\n```{ext}\n{content}\n```\n"
+                                                );
+                                                view.editor.cursor = anchor;
+                                                for _ in 0..(end - anchor) {
+                                                    view.editor.delete();
+                                                }
+                                                view.editor.insert(&block);
+                                                view.notice(
+                                                    Level::Info,
+                                                    format!(
+                                                        "Inlined {display} ({} bytes)",
+                                                        content.len()
+                                                    ),
+                                                );
+                                            }
+                                            Err(e) => {
+                                                view.notice(
+                                                    Level::Error,
+                                                    format!("Read failed: {e}"),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    mention::FileKind::Image
+                                    | mention::FileKind::Pdf => {
+                                        let mime = if kind == mention::FileKind::Image {
+                                            image_mime(&path)
+                                        } else {
+                                            "application/pdf".to_owned()
+                                        };
+                                        match std::fs::read(&path) {
+                                            Ok(bytes) => {
+                                                let name = path
+                                                    .file_name()
+                                                    .and_then(|n| n.to_str())
+                                                    .unwrap_or("file")
+                                                    .to_owned();
+                                                view.pending_attachments.push(PendingAttachment {
+                                                    mime: mime.clone(),
+                                                    data: clipboard::base64_encode(&bytes),
+                                                    name,
+                                                });
+                                                let marker = format!("@{display} ");
+                                                view.editor.cursor = anchor;
+                                                for _ in 0..(end - anchor) {
+                                                    view.editor.delete();
+                                                }
+                                                view.editor.insert(&marker);
+                                                view.notice(
+                                                    Level::Info,
+                                                    format!("Attached {display} ({mime})."),
+                                                );
+                                            }
+                                            Err(e) => {
+                                                view.notice(
+                                                    Level::Error,
+                                                    format!("Read failed: {e}"),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    mention::FileKind::Other => {
+                                        view.notice(
+                                            Level::Warning,
+                                            format!(
+                                                "{display}: unsupported file type. Only text, images, and PDF are supported."
+                                            ),
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                         view.commands.sync(&view.editor.text, view.asks_empty());
                         let commands = view.commands.items();
                         if !commands.is_empty() && !ctrl && !alt {
@@ -821,6 +1047,37 @@ pub async fn run(
                             }
                             KeyCode::Char('b') if ctrl => view.stats = !view.stats,
                             KeyCode::Char('y') if ctrl => view.theme = view.theme.next(),
+                            // Ctrl+V: paste an image from the clipboard. Text
+                            // paste still arrives via bracketed-paste Event::Paste;
+                            // this reads image data that bracketed paste cannot carry.
+                            KeyCode::Char('v') if ctrl => {
+                                match clipboard::read_image().await {
+                                    Ok(Some(img)) => {
+                                        let n = view.pending_attachments.len() + 1;
+                                        view.pending_attachments.push(PendingAttachment {
+                                            mime: img.mime.clone(),
+                                            data: img.data,
+                                            name: format!("clipboard-{n}.png"),
+                                        });
+                                        view.notice(
+                                            Level::Info,
+                                            format!(
+                                                "Image attached ({}). Enter to send, Esc to clear.",
+                                                img.mime
+                                            ),
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        view.notice(Level::Info, "No image in clipboard.");
+                                    }
+                                    Err(e) => {
+                                        view.notice(
+                                            Level::Error,
+                                            format!("Clipboard read failed: {e}"),
+                                        );
+                                    }
+                                }
+                            }
                             KeyCode::End if ctrl => renderer.follow(&mut view),
                             KeyCode::PageUp if alt && !view.asks_empty() => {
                                 if let Some(ask) = view.ask_mut() {
@@ -1052,19 +1309,53 @@ pub async fn run(
                                 }
                                 let queued = text.starts_with("/queue ");
                                 let body = text.strip_prefix("/queue ").unwrap_or(&text);
-                                if body.trim().is_empty() {
+                                let n_images = view.pending_attachments.len();
+                                // /queue is a mid-turn steer; it cannot carry images.
+                                if queued && n_images > 0 {
+                                    view.notice(
+                                        Level::Warning,
+                                        "Attachments cannot be queued. Send without /queue, or press Esc to clear them.",
+                                    );
                                     continue;
                                 }
+                                // Allow image-only messages (no text body).
+                                if body.trim().is_empty() && n_images == 0 {
+                                    continue;
+                                }
+                                let atts: Vec<UserAttachment> = view
+                                    .pending_attachments
+                                    .iter()
+                                    .map(|a| UserAttachment {
+                                        content_type: a.mime.clone(),
+                                        data: a.data.clone(),
+                                        name: Some(a.name.clone()),
+                                    })
+                                    .collect();
                                 let input = if queued {
                                     In::follow_up(body)
-                                } else {
+                                } else if atts.is_empty() {
                                     In::user_text(body)
+                                } else {
+                                    In::user_text_with_attachments(body, atts)
                                 };
                                 match h.host.submit(input) {
                                     Ok(()) => {
+                                        // Clear attachments only after a successful submit,
+                                        // so a failure (e.g. turn-in-flight rejection)
+                                        // preserves them for retry.
+                                        view.pending_attachments.clear();
                                         view.editor.remember(&text);
                                         view.editor.take();
-                                        view.user(body, queued);
+                                        let display = if n_images > 0 {
+                                            if body.trim().is_empty() {
+                                                format!("[img×{n_images}]")
+                                            } else {
+                                                format!("{body} [img×{n_images}]")
+                                            }
+                                        } else {
+                                            body.to_string()
+                                        };
+                                        view.user(&display, queued);
                                         renderer.follow(&mut view);
                                         if driver.is_none() {
                                             driver = Some(drive(
@@ -1108,6 +1399,16 @@ pub async fn run(
                                     edit(&mut ask.editor, key);
                                 } else {
                                     edit(&mut view.editor, key);
+                                    // After each keystroke, check for @ mention trigger.
+                                    if let Some((anchor, query)) = mention::MentionState::detect(
+                                        &view.editor.text,
+                                        view.editor.cursor,
+                                    ) {
+                                        view.mention.entries = mention::scan(&cwd, &query);
+                                        view.mention.activate(anchor, &query);
+                                    } else if view.mention.active {
+                                        view.mention.deactivate();
+                                    }
                                 }
                             }
                         }
