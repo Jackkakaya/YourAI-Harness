@@ -47,10 +47,13 @@ impl State<'_> {
         let post = if aborted {
             if let Some(runtime) = &self.tc.snap.hooks {
                 let invocation = self.invocation(event);
-                tokio::time::timeout(self.config.cleanup_timeout, runtime.dispatch(&invocation))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
+                match self.config.cleanup_timeout {
+                    Some(t) => tokio::time::timeout(t, runtime.dispatch(&invocation))
+                        .await
+                        .ok()
+                        .and_then(Result::ok),
+                    None => runtime.dispatch(&invocation).await.ok(),
+                }
             } else {
                 None
             }
@@ -164,7 +167,10 @@ impl State<'_> {
                 biased;
                 _ = self.tc.cancel.cancelled() => return Err(AbortReason::Cancelled.into()),
                 _ = self.tc.outbox.closed() => return Err(AbortReason::Disconnected.into()),
-                _ = tokio::time::sleep_until(deadline.into()) => return Err(self.timeout_error("tool")),
+                _ = async { match deadline {
+                    Some(d) => tokio::time::sleep_until(d.into()).await,
+                    None => std::future::pending().await,
+                }} => return Err(self.timeout_error("tool")),
                 result = &mut future => return result,
                 Some(mut pending) = rx.recv() => {
                     if pending.reply.is_closed() { continue; }
@@ -172,7 +178,10 @@ impl State<'_> {
                         let _ = pending.reply.send(Err(ErrorKind::Config("invalid or duplicate interaction identity".into()).into()));
                         continue;
                     }
-                    pending.request.deadline = Some(pending.request.deadline.unwrap_or(deadline).min(deadline));
+                    pending.request.deadline = match (pending.request.deadline, deadline) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
                     let interaction_deadline = pending.request.deadline.unwrap();
                     let response = tokio::select! {
                         biased;
@@ -260,7 +269,7 @@ impl State<'_> {
                     let decision = match decision {
                         Some(decision) => decision,
                         None => {
-                            let reply = self.ask(uuid::Uuid::new_v4().to_string(), json!({"kind":"permission", "call_id":call.call_id, "tool_name":call.fn_name, "input":call.fn_arguments}), self.tc.info.options.limits.approval_timeout.unwrap_or(self.config.approval_timeout)).await;
+                            let reply = self.ask(uuid::Uuid::new_v4().to_string(), json!({"kind":"permission", "call_id":call.call_id, "tool_name":call.fn_name, "input":call.fn_arguments}), self.tc.info.options.limits.approval_timeout.or(self.config.approval_timeout)).await;
                             match reply {
                                 Ok(reply) => parse_decision(reply)?,
                                 Err(e @ YourAiError::Aborted(_)) => return Err(e),

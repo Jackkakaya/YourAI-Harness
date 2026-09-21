@@ -114,7 +114,9 @@ pub mod prelude {
     };
     pub use crate::model::{ModelEventStream, ModelProvider, ModelRecovery, ModelRequest};
     pub use crate::observability::{ObservabilityProvider, Span};
-    pub use crate::protocol::{In, InputMode, Level, Out, Usage, UserAttachment};
+    pub use crate::protocol::{
+        In, InputMode, Level, MAX_USER_ATTACHMENT_BYTES, Out, Usage, UserAttachment,
+    };
     pub use crate::sandbox::{SandboxPolicy, SandboxProvider, SandboxType};
     pub use crate::security::{
         ApprovalDecision, PolicyDecision, SecurityContext, SecurityProvider,

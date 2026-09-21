@@ -112,7 +112,7 @@ pub trait SessionRuntime: Send + Sync {
     ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>>;
 
     /// 幂等关闭：拒绝新输入，取消并清理当前执行，触发 SessionEnd，释放资源。
-    /// timeout 限制整个关闭过程；失败时不得伪报 Closed 或恢复接受任务。
+    /// timeout 限制整个关闭过程；None 表示无限制。失败时不得伪报 Closed 或恢复接受任务。
     /// 成功时移交未执行用户输入；调用方决定保存还是丢弃，不能静默丢失。
-    fn close<'a>(&'a self, timeout: Duration) -> BoxFuture<'a, Result<Vec<In>, YourAiError>>;
+    fn close<'a>(&'a self, timeout: Option<Duration>) -> BoxFuture<'a, Result<Vec<In>, YourAiError>>;
 }

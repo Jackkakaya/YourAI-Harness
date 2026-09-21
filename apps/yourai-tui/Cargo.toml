@@ -16,6 +16,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.2"
 url = "2"
+tempfile = "3"
 
 unicode-segmentation = "1"
 pulldown-cmark = { version = "0.13", default-features = false }

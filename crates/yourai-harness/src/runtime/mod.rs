@@ -20,8 +20,8 @@ use yourai_core::{
 
 #[derive(Clone)]
 pub struct HostConfig {
-    pub hook_timeout: Duration,
-    pub cleanup_timeout: Duration,
+    pub hook_timeout: Option<Duration>,
+    pub cleanup_timeout: Option<Duration>,
     pub allow_background_wake: bool,
     pub max_followups: usize,
     pub instruction_paths: Vec<PathBuf>,
@@ -30,8 +30,8 @@ pub struct HostConfig {
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
-            hook_timeout: Duration::from_secs(30),
-            cleanup_timeout: Duration::from_secs(10),
+            hook_timeout: None,
+            cleanup_timeout: None,
             allow_background_wake: true,
             max_followups: 64,
             instruction_paths: vec![],
@@ -330,9 +330,12 @@ impl SessionHost {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let invocation = HookInvocation::new(base, event);
-        let result = tokio::time::timeout(self.config.hook_timeout, hooks.dispatch(&invocation))
-            .await
-            .map_err(|_| error("hook", "host hook timed out"))??;
+        let result = match self.config.hook_timeout {
+            Some(t) => tokio::time::timeout(t, hooks.dispatch(&invocation))
+                .await
+                .map_err(|_| error("hook", "host hook timed out"))??,
+            None => hooks.dispatch(&invocation).await?,
+        };
         if result.event != invocation.event.kind() {
             return Err(error("hook", "mismatched event"));
         }
@@ -653,6 +656,7 @@ impl SessionRuntime for SessionHost {
                 let _gate = gate;
                 let mut cancelled_at = None;
                 let mut timed_out = false;
+                let mut cancel_consumed = false;
                 loop {
                     let timeout = async {
                         match cancelled_at {
@@ -662,7 +666,9 @@ impl SessionRuntime for SessionHost {
                     };
                     tokio::select! {biased;
                                            _=timeout=>{timed_out=true;break},
-                                           _=task_cancel.cancelled(),if cancelled_at.is_none()=>{cancelled_at=Some(tokio::time::Instant::now()+host.config.cleanup_timeout);},
+                                           // Consume the cancel once; an unlimited cleanup timeout (None)
+                                           // leaves cancelled_at unset, so this branch must not stay armed.
+                                           _=task_cancel.cancelled(),if !cancel_consumed=>{cancel_consumed=true;cancelled_at=host.config.cleanup_timeout.map(|t|tokio::time::Instant::now()+t);},
                                            event=handle.outbox.recv()=>match event{Some(event)=>{if let Out::Ask{id,..}=&event{host.live.lock().unwrap().asks.insert(id.clone());}
                     if tx.send(event).is_err(){task_cancel.cancel();}},None=>break}
                                        }
@@ -798,10 +804,9 @@ impl SessionRuntime for SessionHost {
             let _gate = self.try_operation()?;
             self.live.lock().unwrap().status = SessionStatus::Compacting;
             let _status = StatusGuard(self);
-            let deadline = request
-                .deadline
-                .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(120));
-            request.deadline = Some(deadline);
+            // No implicit compaction deadline (OpenCode parity): only an
+            // explicit request deadline arms the DeadlineExceeded branch.
+            let deadline = request.deadline;
             let token = cancel.child_token();
             let _cancel_guard = token.clone().drop_guard();
             let task = async {
@@ -826,10 +831,13 @@ impl SessionRuntime for SessionHost {
                 history.compact(request, &execution, &token).await
             };
             tokio::pin!(task);
-            tokio::select! { r=&mut task=>r, _=self.closing.cancelled()=>{ token.cancel(); task.await }, _=cancel.cancelled()=>Err(AbortReason::Cancelled.into()), _=tokio::time::sleep_until(deadline.into())=>Err(AbortReason::DeadlineExceeded.into()) }
+            tokio::select! { r=&mut task=>r, _=self.closing.cancelled()=>{ token.cancel(); task.await }, _=cancel.cancelled()=>Err(AbortReason::Cancelled.into()), _=async { match deadline {
+                Some(d) => tokio::time::sleep_until(d.into()).await,
+                None => std::future::pending().await,
+            }}=>Err(AbortReason::DeadlineExceeded.into()) }
         })
     }
-    fn close<'a>(&'a self, timeout: Duration) -> BoxFuture<'a, Result<Vec<In>, YourAiError>> {
+    fn close<'a>(&'a self, timeout: Option<Duration>) -> BoxFuture<'a, Result<Vec<In>, YourAiError>> {
         Box::pin(async move {
             if self.status() == SessionStatus::Closed {
                 return Ok(vec![]);
@@ -843,7 +851,8 @@ impl SessionRuntime for SessionHost {
                 }
                 live.status = SessionStatus::Closing;
             }
-            tokio::time::timeout(timeout, async {
+            let session_end_timeout = timeout.map(|t| t / 4);
+            let body = async {
                 let _gate = self.operation.lock().await;
                 if self.status() == SessionStatus::Closed {
                     return Ok(vec![]);
@@ -869,15 +878,23 @@ impl SessionRuntime for SessionHost {
                     let _ = t.await;
                 }
                 // Closing hooks may report errors, but cannot prevent resource release.
-                let hook_result = tokio::time::timeout(
-                    timeout / 4,
-                    self.dispatch(HookEvent::SessionEnd {
-                        reason: "shutdown".into(),
-                    }),
-                )
-                .await
-                .map_err(|_| error("hook", "SessionEnd cleanup deadline exceeded"))
-                .and_then(|r| r);
+                let hook_result = match session_end_timeout {
+                    Some(t) => tokio::time::timeout(
+                        t,
+                        self.dispatch(HookEvent::SessionEnd {
+                            reason: "shutdown".into(),
+                        }),
+                    )
+                    .await
+                    .map_err(|_| error("hook", "SessionEnd cleanup deadline exceeded"))
+                    .and_then(|r| r),
+                    None => {
+                        self.dispatch(HookEvent::SessionEnd {
+                            reason: "shutdown".into(),
+                        })
+                        .await
+                    }
+                };
                 if let Some(hooks) = self.agent.ctx().try_hooks() {
                     hooks.shutdown_session(&self.context().id.0).await?;
                 }
@@ -907,9 +924,13 @@ impl SessionRuntime for SessionHost {
                 FileExt::unlock(&self._lock).map_err(|e| error("host", e))?;
                 l.status = SessionStatus::Closed;
                 Ok(pending)
-            })
-            .await
-            .map_err(|_| error("host", "close timed out; session remains Closing"))?
+            };
+            match timeout {
+                Some(t) => tokio::time::timeout(t, body)
+                    .await
+                    .map_err(|_| error("host", "close timed out; session remains Closing"))?,
+                None => body.await,
+            }
         })
     }
 }

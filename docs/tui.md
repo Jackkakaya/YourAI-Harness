@@ -97,7 +97,7 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --resume 会话ID
 
 `--resume` 不带 ID 时进入启动会话选择器（launcher）：搜索框过滤 title/id/model，`↑↓`/`Ctrl-P/N` 移动，`Enter` 恢复选中会话，`Esc` 开启全新会话，`Ctrl-Q` 直接退出。恢复会话会继续使用原历史；界面不会重新展示旧消息。退出时尚未处理的输入由 close 交还，打印在终端，由调用者决定是否再次提交。
 
-TUI 复用 Harness → SessionHost → DefaultLoop，默认仅包含历史工具结果读取能力。顶层 `extensions = true` 才安装 tasks、subagent、工作区、记忆和技能扩展。不含通用 read、附件上传或 shell 工具，这些留到工具模块实现。请求错误显示在界面，修改配置后退出重启即可。真实模型连通性由你配置服务后验证。
+TUI 复用 Harness → SessionHost → DefaultLoop，默认仅包含历史工具结果读取能力。顶层 `extensions = true` 才安装 tasks、subagent、工作区、记忆和技能扩展。TUI 可通过剪贴板或 `@` 引用发送图片/PDF，也可内联有大小限制的文本文件；通用 read 与 shell 工具仍由工具模块或扩展提供。请求错误显示在界面，修改配置后退出重启即可。真实模型连通性由你配置服务后验证。
 
 离线终端冒烟测试使用本地模拟 HTTP 服务和伪终端，不调用外部模型：
 
