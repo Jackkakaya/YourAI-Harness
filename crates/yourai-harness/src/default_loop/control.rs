@@ -1,5 +1,5 @@
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use super::State;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use std::{
     future::Future,
     time::{Duration, Instant},
@@ -11,7 +11,9 @@ impl State<'_> {
         self.config.operation_timeout
     }
     pub(crate) fn deadline(&self, timeout: Option<Duration>) -> Option<Instant> {
-        let local = timeout.or(self.config.operation_timeout).map(|d| Instant::now() + d);
+        let local = timeout
+            .or(self.config.operation_timeout)
+            .map(|d| Instant::now() + d);
         match (local, self.tc.info.options.limits.deadline) {
             (Some(l), Some(total)) => Some(l.min(total)),
             (Some(l), None) => Some(l),
@@ -403,9 +405,9 @@ fn attachment_to_part(att: &UserAttachment) -> Result<ContentPart, YourAiError> 
         ))
         .into());
     }
-    let decoded = BASE64_STANDARD.decode(att.data.as_bytes()).map_err(|e| {
-        ErrorKind::Config(format!("attachment payload is not valid base64: {e}"))
-    })?;
+    let decoded = BASE64_STANDARD
+        .decode(att.data.as_bytes())
+        .map_err(|e| ErrorKind::Config(format!("attachment payload is not valid base64: {e}")))?;
     if decoded.len() > MAX_USER_ATTACHMENT_BYTES {
         return Err(ErrorKind::Config(format!(
             "attachment too large: {} MiB exceeds the {} MiB limit",
@@ -473,9 +475,7 @@ mod tests {
     fn invalid_or_empty_base64_is_rejected() {
         for data in ["", "not base64!"] {
             let err = attachment_to_part(&att("image/png", data)).unwrap_err();
-            assert!(
-                err.to_string().contains("empty") || err.to_string().contains("valid base64")
-            );
+            assert!(err.to_string().contains("empty") || err.to_string().contains("valid base64"));
         }
     }
 

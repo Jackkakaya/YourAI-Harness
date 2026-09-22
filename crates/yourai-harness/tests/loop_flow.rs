@@ -513,7 +513,7 @@ async fn invisible_failure_announces_structured_retry_status() {
             seen.push((attempt, max, wait_ms));
         }
     }
-    assert_eq!(seen, vec![(1, 5, 0)]);
+    assert_eq!(seen, vec![(1, 3, 0)]);
     assert_eq!(handle.join().await.unwrap().text, "resumed");
 }
 #[tokio::test]
@@ -599,7 +599,10 @@ async fn deadlines_and_zero_steps_stop_before_side_effects() {
         .run_with(In::user_text("go"), options)
         .await
         .unwrap_err();
-    assert!(matches!(*error.error, YourAiError::Error(ErrorKind::Config(_))));
+    assert!(matches!(
+        *error.error,
+        YourAiError::Error(ErrorKind::Config(_))
+    ));
     assert!(model.requests.lock().unwrap().is_empty());
 }
 
@@ -900,6 +903,72 @@ async fn permission_hook_modified_scope_is_rechecked_against_hard_policy() {
 }
 
 #[tokio::test]
+async fn doom_loop_gates_third_identical_tool_call() {
+    let h = Arc::new(Handler::new("tool", Mode::Return));
+    let registry = Arc::new(Registry::default());
+    registry.register(h.clone());
+    let hooks = Arc::new(Hooks::new(|_, r| {
+        if let HookPointOutcome::PermissionRequest(o) = &mut r.outcome {
+            o.decision = Some(PermissionRequestDecision {
+                behavior: PermissionRequestBehavior::Deny,
+                updated_input: None,
+                updated_permissions: vec![],
+                message: Some("doom loop".into()),
+                interrupt: false,
+            });
+        }
+    }));
+    let tool_step = |id: &str| events(vec![end("", vec![call(id, "tool")])]);
+    let model = Arc::new(Model::new(vec![
+        tool_step("c0"),
+        tool_step("c1"),
+        tool_step("c2"),
+        answer("recovered"),
+    ]));
+    let agent = builder(model, Arc::new(History::default()), LoopConfig::default())
+        .tools(registry)
+        .hooks(hooks)
+        .build();
+    let result = agent.run(In::user_text("go")).await.unwrap();
+    assert_eq!(result.text, "recovered");
+    // First two identical calls ran; the third was gated as a doom loop and denied.
+    assert_eq!(h.inputs.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn doom_loop_passes_when_approved() {
+    let h = Arc::new(Handler::new("tool", Mode::Return));
+    let registry = Arc::new(Registry::default());
+    registry.register(h.clone());
+    let hooks = Arc::new(Hooks::new(|_, r| {
+        if let HookPointOutcome::PermissionRequest(o) = &mut r.outcome {
+            o.decision = Some(PermissionRequestDecision {
+                behavior: PermissionRequestBehavior::Allow,
+                updated_input: None,
+                updated_permissions: vec![],
+                message: None,
+                interrupt: false,
+            });
+        }
+    }));
+    let tool_step = |id: &str| events(vec![end("", vec![call(id, "tool")])]);
+    let model = Arc::new(Model::new(vec![
+        tool_step("c0"),
+        tool_step("c1"),
+        tool_step("c2"),
+        answer("done"),
+    ]));
+    let agent = builder(model, Arc::new(History::default()), LoopConfig::default())
+        .tools(registry)
+        .hooks(hooks)
+        .build();
+    let result = agent.run(In::user_text("go")).await.unwrap();
+    assert_eq!(result.text, "done");
+    // All three identical calls executed after the doom-loop gate was approved.
+    assert_eq!(h.inputs.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn retry_respects_max_retries_limit() {
     let mut model = Model::new(vec![error_stream(), answer("must not run")]);
     model.recovery = ModelRecovery::Retry;
@@ -930,10 +999,7 @@ async fn compaction_does_not_consume_step() {
     let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
     let mut options = TurnOptions::default();
     options.limits.steps = Some(1);
-    let result = agent
-        .run_with(In::user_text("go"), options)
-        .await
-        .unwrap();
+    let result = agent.run_with(In::user_text("go"), options).await.unwrap();
     assert_eq!(result.text, "ok");
     assert_eq!(history.compactions.lock().unwrap().len(), 1);
     assert_eq!(model.requests.lock().unwrap().len(), 1);

@@ -89,8 +89,16 @@ async fn host_drives_durable_followups_and_close_is_idempotent() {
         .iter()
         .all(|r| r.result.as_ref().unwrap().pending.is_empty()));
     assert_eq!(h.status(), SessionStatus::Idle);
-    assert!(h.close(Some(Duration::from_secs(1))).await.unwrap().is_empty());
-    assert!(h.close(Some(Duration::from_secs(1))).await.unwrap().is_empty());
+    assert!(h
+        .close(Some(Duration::from_secs(1)))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(h
+        .close(Some(Duration::from_secs(1)))
+        .await
+        .unwrap()
+        .is_empty());
     assert!(h.submit(In::user_text("closed")).is_err());
     let seen = hooks.seen.lock().unwrap();
     assert!(seen.contains(&HookEventKind::SessionStart));
@@ -142,7 +150,10 @@ async fn dropping_driver_cancels_but_supervisor_preserves_followup() {
     .await
     .unwrap();
     assert_eq!(h.queued(), 1);
-    assert_eq!(h.close(Some(Duration::from_secs(1))).await.unwrap().len(), 1);
+    assert_eq!(
+        h.close(Some(Duration::from_secs(1))).await.unwrap().len(),
+        1
+    );
 }
 #[tokio::test]
 async fn queued_input_restores_and_runtime_events_are_deduplicated() {
@@ -1181,10 +1192,10 @@ async fn rate_limit_attempts_stop_at_retry_limit() {
     assert_eq!(metrics.calls, 3);
     assert_eq!(metrics.requests.rate_limited, 3);
     assert_eq!(metrics.requests.active, 0);
-    // OpenCode parity: the default policy retries immediately (no back-off delay).
+    // OpenCode parity: SessionRetry back-off — 2s initial, 2x, 30s ceiling.
     assert_eq!(
         yourai_harness::default_loop::LoopConfig::default().retry_delay,
-        Duration::ZERO
+        Duration::from_secs(2)
     );
 }
 
