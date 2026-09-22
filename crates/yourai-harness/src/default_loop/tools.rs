@@ -136,18 +136,6 @@ impl State<'_> {
         }
         self.approve(call, &handler, permission).await?;
         self.tc.check_control()?;
-        let limit = self
-            .tc
-            .info
-            .options
-            .limits
-            .max_tool_calls
-            .unwrap_or(self.config.max_tool_calls)
-            .min(self.config.max_tool_calls);
-        if self.tool_calls >= limit {
-            return Err(AbortReason::LimitReached(TurnLimit::ToolCalls).into());
-        }
-        self.tool_calls += 1;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let bridge = Bridge { tx };
         let cancel = self.tc.cancel.child_token();

@@ -114,7 +114,7 @@ pub mod prelude {
     };
     pub use crate::model::{ModelEventStream, ModelProvider, ModelRecovery, ModelRequest};
     pub use crate::observability::{ObservabilityProvider, Span};
-    pub use crate::protocol::{In, InputMode, Level, Out, Usage};
+    pub use crate::protocol::{In, InputMode, Level, Out, Usage, UserAttachment};
     pub use crate::sandbox::{SandboxPolicy, SandboxProvider, SandboxType};
     pub use crate::security::{
         ApprovalDecision, PolicyDecision, SecurityContext, SecurityProvider,
@@ -128,7 +128,7 @@ pub mod prelude {
     };
     pub use crate::skill::{SkillContent, SkillInfo, SkillProvider};
     pub use crate::tool::{ToolContext, ToolHandler, ToolRegistry};
-    pub use crate::turn::{TurnId, TurnInfo, TurnLimit, TurnLimits, TurnOptions};
+    pub use crate::turn::{TurnId, TurnInfo, TurnLimits, TurnOptions};
     pub use crate::ui::OutSink;
     pub use crate::usage::{UsageEvent, UsageStats, UsageTracker};
 }

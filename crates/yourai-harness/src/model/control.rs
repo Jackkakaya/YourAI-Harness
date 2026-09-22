@@ -117,7 +117,7 @@ impl ModelBudget {
                 let now = Instant::now();
                 let until = deadlines.0.max(deadlines.1);
                 if until <= now {
-                    self.reserve()?;
+                    self.reserve();
                     deadlines.0 = now
                         + self
                             .control
@@ -169,8 +169,6 @@ mod tests {
     use super::*;
     fn budget(policy: RequestPolicy) -> std::sync::Arc<ModelBudget> {
         ModelBudget::configured(
-            None,
-            None,
             policy,
             SqliteStore::open(std::path::Path::new(":memory:")).unwrap(),
         )

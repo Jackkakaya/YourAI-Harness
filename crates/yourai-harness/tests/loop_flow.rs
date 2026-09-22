@@ -42,6 +42,47 @@ async fn streamed_answer_commits_once_and_usage_is_delta() {
     );
 }
 #[tokio::test]
+async fn image_attachment_is_committed_as_binary_and_reaches_the_model() {
+    let history = Arc::new(History::default());
+    let model = Arc::new(Model::new(vec![answer("ok")]));
+    let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
+    let (_events, result) = collect(
+        agent
+            .start(In::user_text_with_attachments(
+                "describe this",
+                vec![UserAttachment {
+                    content_type: "image/png".into(),
+                    data: "iVBORw0KGgo=".into(),
+                    name: Some("clip.png".into()),
+                }],
+            ))
+            .unwrap(),
+    )
+    .await;
+    result.unwrap();
+
+    // The committed user message carries the text plus one Binary image part.
+    let user = &history.messages()[0];
+    assert_eq!(user.role, ChatRole::User);
+    assert_eq!(user.content.texts(), vec!["describe this"]);
+    let binaries = user.content.binaries();
+    assert_eq!(binaries.len(), 1);
+    assert_eq!(binaries[0].content_type, "image/png");
+    assert_eq!(binaries[0].name.as_deref(), Some("clip.png"));
+    assert!(binaries[0].is_image());
+
+    // The image reaches the model request unchanged (projection keeps User
+    // Binary parts when limit_tools is true, as build_request does).
+    let req = &model.requests.lock().unwrap()[0];
+    let req_user = req
+        .request
+        .messages
+        .iter()
+        .find(|m| m.role == ChatRole::User)
+        .unwrap();
+    assert_eq!(req_user.content.binaries().len(), 1);
+}
+#[tokio::test]
 async fn tools_record_success_and_failure_then_model_continues() {
     let history = Arc::new(History::default());
     let model = Arc::new(Model::new(vec![calls(&["ok", "bad"]), answer("done")]));
@@ -400,7 +441,7 @@ async fn model_call_limit_forces_final_text_only_summary() {
     .tools(registry)
     .build();
     let mut options = TurnOptions::default();
-    options.limits.max_model_calls = Some(2);
+    options.limits.steps = Some(2);
     let result = agent.run_with(In::user_text("go"), options).await.unwrap();
     assert_eq!(result.text, "final summary");
     let requests = model.requests.lock().unwrap();
@@ -433,7 +474,7 @@ async fn model_call_limit_never_executes_calls_from_the_final_step() {
     .tools(registry)
     .build();
     let mut options = TurnOptions::default();
-    options.limits.max_model_calls = Some(1);
+    options.limits.steps = Some(1);
     let result = agent.run_with(In::user_text("go"), options).await.unwrap();
     assert!(h.inputs.lock().unwrap().is_empty());
     assert_eq!(result.text, "");
@@ -472,7 +513,7 @@ async fn invisible_failure_announces_structured_retry_status() {
             seen.push((attempt, max, wait_ms));
         }
     }
-    assert_eq!(seen, vec![(1, 2, 0)]);
+    assert_eq!(seen, vec![(1, 5, 0)]);
     assert_eq!(handle.join().await.unwrap().text, "resumed");
 }
 #[tokio::test]
@@ -525,28 +566,41 @@ async fn visible_model_failure_is_not_retried_and_fires_stop_failure() {
         .contains(&HookEventKind::StopFailure));
 }
 #[tokio::test]
-async fn deadlines_and_zero_model_budget_stop_before_side_effects() {
-    for deadline in [false, true] {
-        let model = Arc::new(Model::new(vec![answer("never")]));
-        let agent = builder(
-            model.clone(),
-            Arc::new(History::default()),
-            LoopConfig::default(),
-        )
-        .build();
-        let mut options = TurnOptions::default();
-        if deadline {
-            options.limits.deadline = Some(Instant::now());
-        } else {
-            options.limits.max_model_calls = Some(0);
-        }
-        let error = agent
-            .run_with(In::user_text("go"), options)
-            .await
-            .unwrap_err();
-        assert!(matches!(*error.error, YourAiError::Aborted(_)));
-        assert!(model.requests.lock().unwrap().is_empty());
-    }
+async fn deadlines_and_zero_steps_stop_before_side_effects() {
+    let model = Arc::new(Model::new(vec![answer("never")]));
+    let agent = builder(
+        model.clone(),
+        Arc::new(History::default()),
+        LoopConfig::default(),
+    )
+    .build();
+    let mut options = TurnOptions::default();
+    options.limits.deadline = Some(Instant::now());
+    let error = agent
+        .run_with(In::user_text("go"), options)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        *error.error,
+        YourAiError::Aborted(AbortReason::DeadlineExceeded)
+    ));
+    assert!(model.requests.lock().unwrap().is_empty());
+
+    let model = Arc::new(Model::new(vec![answer("never")]));
+    let agent = builder(
+        model.clone(),
+        Arc::new(History::default()),
+        LoopConfig::default(),
+    )
+    .build();
+    let mut options = TurnOptions::default();
+    options.limits.steps = Some(0);
+    let error = agent
+        .run_with(In::user_text("go"), options)
+        .await
+        .unwrap_err();
+    assert!(matches!(*error.error, YourAiError::Error(ErrorKind::Config(_))));
+    assert!(model.requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -616,37 +670,6 @@ async fn invalid_hook_arguments_and_truncated_calls_never_execute() {
             );
         }
     }
-}
-#[tokio::test]
-async fn tool_budget_ends_turn_and_completes_remaining_call_records() {
-    let history = Arc::new(History::default());
-    let h = Arc::new(Handler::new("tool", Mode::Return));
-    let registry = Arc::new(Registry::default());
-    registry.register(h.clone());
-    let agent = builder(
-        Arc::new(Model::new(vec![calls(&["tool", "tool"])])),
-        history.clone(),
-        LoopConfig {
-            max_tool_calls: 1,
-            ..Default::default()
-        },
-    )
-    .tools(registry)
-    .build();
-    let failure = agent.run(In::user_text("go")).await.unwrap_err();
-    assert!(matches!(
-        *failure.error,
-        YourAiError::Aborted(AbortReason::LimitReached(TurnLimit::ToolCalls))
-    ));
-    assert_eq!(h.inputs.lock().unwrap().len(), 1);
-    assert_eq!(
-        history
-            .messages()
-            .iter()
-            .filter(|m| m.role == ChatRole::Tool)
-            .count(),
-        2
-    );
 }
 #[tokio::test(start_paused = true)]
 async fn tool_timeout_becomes_tool_result_and_continues() {
@@ -877,7 +900,7 @@ async fn permission_hook_modified_scope_is_rechecked_against_hard_policy() {
 }
 
 #[tokio::test]
-async fn retry_cannot_exceed_final_model_call_budget() {
+async fn retry_respects_max_retries_limit() {
     let mut model = Model::new(vec![error_stream(), answer("must not run")]);
     model.recovery = ModelRecovery::Retry;
     let model = Arc::new(model);
@@ -886,39 +909,32 @@ async fn retry_cannot_exceed_final_model_call_budget() {
         Arc::new(History::default()),
         LoopConfig {
             retry_delay: Duration::ZERO,
+            max_model_retries: 0,
             ..Default::default()
         },
     )
     .build();
-    let mut options = TurnOptions::default();
-    options.limits.max_model_calls = Some(1);
-    let err = agent
-        .run_with(In::user_text("go"), options)
-        .await
-        .unwrap_err();
+    let err = agent.run(In::user_text("go")).await.unwrap_err();
     assert!(matches!(
         *err.error,
-        YourAiError::Aborted(AbortReason::LimitReached(TurnLimit::ModelCalls))
+        YourAiError::Error(ErrorKind::Provider { name: "model", .. })
     ));
     assert_eq!(model.requests.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
-async fn compaction_consuming_budget_prevents_another_model_call() {
+async fn compaction_does_not_consume_step() {
     let history = Arc::new(History::default());
     history.tokens.store(100, Ordering::SeqCst);
-    let model = Arc::new(Model::new(vec![answer("must not run")]));
+    let model = Arc::new(Model::new(vec![answer("ok")]));
     let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
     let mut options = TurnOptions::default();
-    options.limits.max_model_calls = Some(1);
-    let err = agent
+    options.limits.steps = Some(1);
+    let result = agent
         .run_with(In::user_text("go"), options)
         .await
-        .unwrap_err();
-    assert!(matches!(
-        *err.error,
-        YourAiError::Aborted(AbortReason::LimitReached(TurnLimit::ModelCalls))
-    ));
+        .unwrap();
+    assert_eq!(result.text, "ok");
     assert_eq!(history.compactions.lock().unwrap().len(), 1);
-    assert!(model.requests.lock().unwrap().is_empty());
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
 }

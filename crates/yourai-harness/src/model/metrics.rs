@@ -158,14 +158,14 @@ mod tests {
     }
     #[test]
     fn counts_failures_cancellation_and_known_usage_exactly_once() {
-        let budget = ModelBudget::new(None, None);
-        budget.reserve().unwrap();
+        let budget = ModelBudget::new();
+        budget.reserve();
         let mut attempt = Attempt::new(budget.clone());
         attempt.fail(Some(&http_error("{}")));
         drop(attempt);
-        budget.reserve().unwrap();
+        budget.reserve();
         drop(Attempt::new(budget.clone()));
-        budget.reserve().unwrap();
+        budget.reserve();
         let mut attempt = Attempt::new(budget.clone());
         let raw = GenaiUsage {
             prompt_tokens: Some(100),
@@ -199,7 +199,7 @@ mod tests {
             .last_output_tokens_per_second
             .unwrap()
             .is_finite());
-        budget.reserve().unwrap();
+        budget.reserve();
         Attempt::new(budget.clone()).finish(None);
         assert!(budget
             .snapshot()
@@ -213,8 +213,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::SqliteStore::open(&dir.path().join("sessions.sqlite3")).unwrap();
         let budget = ModelBudget::configured(
-            None,
-            None,
             super::super::RequestPolicy {
                 rpm: None,
                 cooldown_seconds: 7,
@@ -222,7 +220,7 @@ mod tests {
             store,
         )
         .unwrap();
-        budget.reserve().unwrap();
+        budget.reserve();
         Attempt::new(budget.clone()).fail(Some(&http_error(
             r#"{"error":{"code":"rate_limit_exceeded"}}"#,
         )));
