@@ -52,7 +52,7 @@ run_next(limits, outbox, cancel)
 ```rust
 let mut options = TurnOptions::default();
 options.session = Some(Arc::new(SessionContext::new(session_id, cwd)));
-options.limits.max_model_calls = Some(32);
+options.limits.steps = Some(32);
 options.limits.deadline = Some(Instant::now() + Duration::from_secs(120));
 
 let handle = agent.start_with(In::user_text("任务"), options)?;

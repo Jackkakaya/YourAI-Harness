@@ -89,8 +89,8 @@ async fn host_drives_durable_followups_and_close_is_idempotent() {
         .iter()
         .all(|r| r.result.as_ref().unwrap().pending.is_empty()));
     assert_eq!(h.status(), SessionStatus::Idle);
-    assert!(h.close(Duration::from_secs(1)).await.unwrap().is_empty());
-    assert!(h.close(Duration::from_secs(1)).await.unwrap().is_empty());
+    assert!(h.close(Some(Duration::from_secs(1))).await.unwrap().is_empty());
+    assert!(h.close(Some(Duration::from_secs(1))).await.unwrap().is_empty());
     assert!(h.submit(In::user_text("closed")).is_err());
     let seen = hooks.seen.lock().unwrap();
     assert!(seen.contains(&HookEventKind::SessionStart));
@@ -142,7 +142,7 @@ async fn dropping_driver_cancels_but_supervisor_preserves_followup() {
     .await
     .unwrap();
     assert_eq!(h.queued(), 1);
-    assert_eq!(h.close(Duration::from_secs(1)).await.unwrap().len(), 1);
+    assert_eq!(h.close(Some(Duration::from_secs(1))).await.unwrap().len(), 1);
 }
 #[tokio::test]
 async fn queued_input_restores_and_runtime_events_are_deduplicated() {
@@ -289,7 +289,7 @@ async fn file_watcher_reports_actual_changes_and_stops_on_close() {
     })
     .await
     .unwrap();
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 #[tokio::test]
 async fn worktrees_are_created_and_removed_by_git() {
@@ -378,7 +378,7 @@ async fn crash_recovery_closes_unmatched_calls_without_executing() {
         )
         .await
         .unwrap();
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
     drop(h);
     let recovered = host(dir.path(), model, None).await;
     let rows = store
@@ -390,7 +390,7 @@ async fn crash_recovery_closes_unmatched_calls_without_executing() {
     assert!(rows[1].message.content.tool_responses()[0]
         .content
         .contains("unknown"));
-    recovered.close(Duration::from_secs(1)).await.unwrap();
+    recovered.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 
 struct SummaryModel;
@@ -578,7 +578,7 @@ async fn async_hook_completion_routes_to_own_session_and_wakes_host() {
             .content
             .first_text()
             .is_some_and(|t| t.contains("background-feedback"))));
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 #[tokio::test]
 async fn catalog_create_fork_list_delete_are_persistent() {
@@ -603,8 +603,8 @@ async fn concurrent_close_runs_session_end_once_and_releases_history_lock() {
     .await;
     h.submit(In::follow_up("handoff")).unwrap();
     let (a, b) = tokio::join!(
-        h.close(Duration::from_secs(1)),
-        h.close(Duration::from_secs(1))
+        h.close(Some(Duration::from_secs(1))),
+        h.close(Some(Duration::from_secs(1)))
     );
     assert_eq!(a.unwrap().len() + b.unwrap().len(), 1);
     assert_eq!(
@@ -620,7 +620,7 @@ async fn concurrent_close_runs_session_end_once_and_releases_history_lock() {
     // Reopen with the original Arc still alive: explicit close must release both locks.
     let next = host(dir.path(), Arc::new(Model::new(vec![])), None).await;
     assert_eq!(next.status(), SessionStatus::Idle);
-    next.close(Duration::from_secs(1)).await.unwrap();
+    next.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 #[tokio::test]
 async fn permission_updates_are_atomic_persistent_and_cannot_expand_scope() {
@@ -803,7 +803,7 @@ async fn watched_directory_detects_created_and_deleted_children() {
             std::fs::remove_file(&file).unwrap();
         }
     }
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 
 #[tokio::test]
@@ -822,7 +822,7 @@ async fn closing_session_cancels_its_background_command() {
         Some(runtime.clone()),
     )
     .await;
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(!marker.exists());
 }
@@ -869,7 +869,7 @@ async fn shared_hook_runtime_keeps_background_contexts_session_local() {
         .unwrap()
         .result
         .unwrap();
-        h.close(Duration::from_secs(1)).await.unwrap();
+        h.close(Some(Duration::from_secs(1))).await.unwrap();
     }
     for model in [a, b] {
         assert_eq!(
@@ -1090,7 +1090,7 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
         .unwrap()
         .contains(&HookEventKind::PreCompact));
     assert_eq!(usage.session_usage(&id).await.unwrap().request_count, 1);
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 
 #[tokio::test]
@@ -1181,8 +1181,10 @@ async fn rate_limit_attempts_stop_at_retry_limit() {
     assert_eq!(metrics.calls, 3);
     assert_eq!(metrics.requests.rate_limited, 3);
     assert_eq!(metrics.requests.active, 0);
-    assert!(
-        yourai_harness::default_loop::LoopConfig::default().retry_delay >= Duration::from_secs(2)
+    // OpenCode parity: the default policy retries immediately (no back-off delay).
+    assert_eq!(
+        yourai_harness::default_loop::LoopConfig::default().retry_delay,
+        Duration::ZERO
     );
 }
 
@@ -1214,7 +1216,9 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
         output_reserve: 2048,
         ..ContextPolicy::default()
     };
-    h.switch_model(new.clone(), policy).await.unwrap();
+    h.switch_model(new.clone(), policy, None, None)
+        .await
+        .unwrap();
     let usage = h.host.context_usage().unwrap();
     assert_eq!(usage.context_window, Some(32_000));
     assert_eq!(usage.output_reserve, 2048);
@@ -1281,7 +1285,7 @@ async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
     };
     let new = Arc::new(Model::new(vec![answer("new")]));
     assert!(h
-        .switch_model(new.clone(), policy)
+        .switch_model(new.clone(), policy, None, None)
         .await
         .unwrap_err()
         .to_string()

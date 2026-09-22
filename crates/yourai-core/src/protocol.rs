@@ -7,6 +7,11 @@ use serde_json::Value;
 
 // region:    --- In ---
 
+/// Maximum decoded size accepted for one user attachment (20 MiB).
+/// Frontends should enforce this before reading/encoding files; loops must
+/// enforce it again because protocol inputs are untrusted.
+pub const MAX_USER_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
 /// 用户消息附带的多媒体附件（图片等），由前端读取剪贴板/文件后以 base64 传入。
 ///
 /// loop 侧将其转换为 genai 的 [`crate::chat::ContentPart::Binary`]，与文本一同

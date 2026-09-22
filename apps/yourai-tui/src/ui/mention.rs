@@ -117,6 +117,10 @@ const SKIP_DIRS: &[&str] = &[
 /// Maximum number of entries to list.
 const MAX_ENTRIES: usize = 50;
 
+/// Maximum number of directory entries inspected by one query. This bounds
+/// worst-case work when the query has no matches.
+const MAX_SCANNED_ENTRIES: usize = 2_000;
+
 /// Maximum scan depth (relative to cwd).
 const MAX_DEPTH: usize = 4;
 
@@ -128,7 +132,16 @@ const MAX_DEPTH: usize = 4;
 pub fn scan(cwd: &Path, query: &str) -> Vec<MentionEntry> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    scan_dir(cwd, cwd, query, 0, &mut dirs, &mut files);
+    let mut scanned = 0;
+    scan_dir(
+        cwd,
+        cwd,
+        query,
+        0,
+        &mut scanned,
+        &mut dirs,
+        &mut files,
+    );
     dirs.sort_by(|a, b| a.display.cmp(&b.display));
     files.sort_by(|a, b| a.display.cmp(&b.display));
     dirs.extend(files);
@@ -141,19 +154,24 @@ fn scan_dir(
     dir: &Path,
     query: &str,
     depth: usize,
+    scanned: &mut usize,
     dirs: &mut Vec<MentionEntry>,
     files: &mut Vec<MentionEntry>,
 ) {
-    if depth > MAX_DEPTH || dirs.len() + files.len() >= MAX_ENTRIES {
+    if depth > MAX_DEPTH
+        || *scanned >= MAX_SCANNED_ENTRIES
+        || dirs.len() + files.len() >= MAX_ENTRIES
+    {
         return;
     }
     let Ok(read_dir) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in read_dir.flatten() {
-        if dirs.len() + files.len() >= MAX_ENTRIES {
+        if *scanned >= MAX_SCANNED_ENTRIES || dirs.len() + files.len() >= MAX_ENTRIES {
             return;
         }
+        *scanned += 1;
         let path = entry.path();
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
@@ -182,10 +200,9 @@ fn scan_dir(
             .replace('\\', "/");
         // Filter: the display path must contain the query (case-insensitive).
         if !query.is_empty() && !display.to_lowercase().contains(&query.to_lowercase()) {
-            // Even if the file doesn't match, recurse into dirs — a child
-            // might match. But only if the dir name itself is a prefix-ish.
+            // Even if the directory itself does not match, a child might.
             if is_dir && depth < MAX_DEPTH {
-                scan_dir(cwd, &path, query, depth + 1, dirs, files);
+                scan_dir(cwd, &path, query, depth + 1, scanned, dirs, files);
             }
             continue;
         }
@@ -196,7 +213,7 @@ fn scan_dir(
                 is_dir: true,
             });
             // Recurse into matching directories too.
-            scan_dir(cwd, &path, query, depth + 1, dirs, files);
+            scan_dir(cwd, &path, query, depth + 1, scanned, dirs, files);
         } else {
             files.push(MentionEntry {
                 display,
@@ -388,19 +405,21 @@ mod tests {
 
     #[test]
     fn mention_step_wraps_around() {
-        let mut m = MentionState::default();
-        m.entries = vec![
-            MentionEntry {
-                display: "a".into(),
-                path: PathBuf::from("a"),
-                is_dir: false,
-            },
-            MentionEntry {
-                display: "b".into(),
-                path: PathBuf::from("b"),
-                is_dir: false,
-            },
-        ];
+        let mut m = MentionState {
+            entries: vec![
+                MentionEntry {
+                    display: "a".into(),
+                    path: PathBuf::from("a"),
+                    is_dir: false,
+                },
+                MentionEntry {
+                    display: "b".into(),
+                    path: PathBuf::from("b"),
+                    is_dir: false,
+                },
+            ],
+            ..Default::default()
+        };
         assert_eq!(m.selected, 0);
         m.step(false);
         assert_eq!(m.selected, 1);

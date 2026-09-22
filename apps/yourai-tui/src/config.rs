@@ -27,8 +27,12 @@ pub struct Config {
     #[serde(skip)]
     pub selected_variant: Option<String>,
     /// Optional OpenCode-compatible maximum agentic iterations before a text-only final step.
-    #[serde(alias = "max_model_calls")]
+    #[serde(default)]
     pub steps: Option<u32>,
+    /// Deprecated legacy spelling. Kept separate so loading it can emit a
+    /// warning instead of silently pretending the old call-count semantics are identical.
+    #[serde(default, rename = "max_model_calls")]
+    legacy_max_model_calls: Option<u32>,
     pub provider: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub extensions: bool,
@@ -127,8 +131,17 @@ impl Config {
                 }
             }
         }
+        if raw.get("steps").is_some() && raw.get("max_model_calls").is_some() {
+            return Err("configure only one of steps or deprecated max_model_calls".into());
+        }
+        let used_legacy_steps = raw.get("max_model_calls").is_some();
         let mut config: Self = serde_json::from_value(raw)
             .map_err(|_| "Invalid config fields; see yourai.example.json")?;
+        if used_legacy_steps {
+            eprintln!(
+                "Warning: max_model_calls is deprecated and now maps to agent steps, not raw model calls; rename it to steps."
+            );
+        }
         let base = path.canonicalize()?.parent().unwrap().to_owned();
         if config.session_dir.is_relative() {
             config.session_dir = base.join(&config.session_dir);
@@ -146,6 +159,12 @@ impl Config {
             }
         }
         Ok(config)
+    }
+    pub fn configured_steps(&self) -> Result<Option<u32>, Error> {
+        if self.steps.is_some() && self.legacy_max_model_calls.is_some() {
+            return Err("configure only one of steps or deprecated max_model_calls".into());
+        }
+        Ok(self.steps.or(self.legacy_max_model_calls))
     }
     fn selected_provider(&self) -> Result<&ProviderConfig, Error> {
         let (provider, _) = self
@@ -188,7 +207,7 @@ impl Config {
     }
     pub fn resolve(&mut self, variant: Option<&str>) -> Result<Arc<GenaiModel>, Error> {
         self.request_policy()?;
-        if self.steps == Some(0) {
+        if self.configured_steps()? == Some(0) {
             return Err("steps must be a positive integer".into());
         }
         let (provider_id, model_key) = self
@@ -446,6 +465,26 @@ mod tests {
             "soul_file": "./SOUL.md", "yolo": true
         })).unwrap()
     }
+    #[test]
+    fn legacy_model_call_limit_is_explicitly_mapped_and_conflicts_are_rejected() {
+        let legacy: Config = serde_json::from_value(json!({
+            "model": "gateway/glm",
+            "max_model_calls": 7,
+            "provider": {"gateway": {"options": {"apiKey": "test"}}}
+        }))
+        .unwrap();
+        assert_eq!(legacy.configured_steps().unwrap(), Some(7));
+
+        let both: Config = serde_json::from_value(json!({
+            "model": "gateway/glm",
+            "steps": 4,
+            "max_model_calls": 7,
+            "provider": {"gateway": {"options": {"apiKey": "test"}}}
+        }))
+        .unwrap();
+        assert!(both.configured_steps().is_err());
+    }
+
     #[tokio::test]
     async fn minimal_gateway_config_uses_model_name_and_default_prompt() {
         use yourai_core::model::ModelProvider;

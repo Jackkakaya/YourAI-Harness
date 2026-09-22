@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use super::State;
 use std::{
     future::Future,
@@ -7,16 +8,16 @@ use yourai_core::prelude::*;
 
 impl State<'_> {
     pub(crate) fn op_timeout(&self) -> Option<Duration> {
-        Some(self.config.operation_timeout)
+        self.config.operation_timeout
     }
-    pub(crate) fn deadline(&self, timeout: Option<Duration>) -> Instant {
-        let local = Instant::now() + timeout.unwrap_or(self.config.operation_timeout);
-        self.tc
-            .info
-            .options
-            .limits
-            .deadline
-            .map_or(local, |total| local.min(total))
+    pub(crate) fn deadline(&self, timeout: Option<Duration>) -> Option<Instant> {
+        let local = timeout.or(self.config.operation_timeout).map(|d| Instant::now() + d);
+        match (local, self.tc.info.options.limits.deadline) {
+            (Some(l), Some(total)) => Some(l.min(total)),
+            (Some(l), None) => Some(l),
+            (None, Some(total)) => Some(total),
+            (None, None) => None,
+        }
     }
     pub(crate) fn timeout_error(&self, phase: &'static str) -> YourAiError {
         if self
@@ -93,7 +94,10 @@ impl State<'_> {
                 biased;
                 _ = self.tc.cancel.cancelled() => return Err(AbortReason::Cancelled.into()),
                 _ = self.tc.outbox.closed() => return Err(AbortReason::Disconnected.into()),
-                _ = tokio::time::sleep_until(deadline.into()) => return Err(self.timeout_error(phase)),
+                _ = async { match deadline {
+                    Some(d) => tokio::time::sleep_until(d.into()).await,
+                    None => std::future::pending().await,
+                }} => return Err(self.timeout_error(phase)),
                 result = &mut future => return result,
                 input = self.tc.inbox.recv(), if !self.input_closed => match input {
                     Some(input) => self.route(input), None => self.input_closed = true,
@@ -323,10 +327,16 @@ impl State<'_> {
             }
             Ok::<_, YourAiError>(())
         };
-        let failure = match tokio::time::timeout(self.config.cleanup_timeout, cleanup).await {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e.to_string()),
-            Err(_) => Some("cleanup timed out".into()),
+        let failure = match self.config.cleanup_timeout {
+            Some(t) => match tokio::time::timeout(t, cleanup).await {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(_) => Some("cleanup timed out".into()),
+            },
+            None => match cleanup.await {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            },
         };
         if let Some(message) = failure {
             outbox.send(Out::Notice {
@@ -343,15 +353,6 @@ impl State<'_> {
 }
 
 // ── attachment validation & genai Binary conversion ──────────────────
-
-/// Maximum decoded payload for a single attachment (20 MiB).
-///
-/// This is the most restrictive ceiling across the providers genai targets:
-/// - OpenAI accepts images up to ~20 MB.
-/// - Anthropic accepts base64 image data up to ~32 MB (~24 MB decoded).
-///
-/// 20 MiB decoded is safe for both.
-const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
 /// Validate a [`UserAttachment`] and convert it to a genai
 /// [`ContentPart::Binary`].
@@ -379,8 +380,8 @@ const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 /// 1. `content_type` must be `image/*`, `audio/*`, or `application/pdf` —
 ///    anything else is rejected with a clear error rather than silently
 ///    dropped by an adapter.
-/// 2. The decoded payload (estimated from base64 length) must not exceed
-///    [`MAX_ATTACHMENT_BYTES`].
+/// 2. The payload must be valid standard base64 and its decoded size must not
+///    exceed [`MAX_USER_ATTACHMENT_BYTES`].
 fn attachment_to_part(att: &UserAttachment) -> Result<ContentPart, YourAiError> {
     let ct = att.content_type.trim().to_ascii_lowercase();
     if !(ct.starts_with("image/") || ct.starts_with("audio/") || ct == "application/pdf") {
@@ -389,15 +390,27 @@ fn attachment_to_part(att: &UserAttachment) -> Result<ContentPart, YourAiError> 
         ))
         .into());
     }
-    // Estimate decoded size from base64 length: 4 base64 chars ≈ 3 bytes.
-    // This is a slight over-estimate when padding is present, which is fine
-    // for a ceiling check.
+    if att.data.is_empty() {
+        return Err(ErrorKind::Config("attachment payload is empty".into()).into());
+    }
+    // Reject clearly oversized inputs before allocating a decoded buffer.
     let estimated_bytes = att.data.len().saturating_mul(3) / 4;
-    if estimated_bytes > MAX_ATTACHMENT_BYTES {
+    if estimated_bytes > MAX_USER_ATTACHMENT_BYTES {
         return Err(ErrorKind::Config(format!(
             "attachment too large: ~{} MiB exceeds the {} MiB limit",
             estimated_bytes / (1024 * 1024),
-            MAX_ATTACHMENT_BYTES / (1024 * 1024),
+            MAX_USER_ATTACHMENT_BYTES / (1024 * 1024),
+        ))
+        .into());
+    }
+    let decoded = BASE64_STANDARD.decode(att.data.as_bytes()).map_err(|e| {
+        ErrorKind::Config(format!("attachment payload is not valid base64: {e}"))
+    })?;
+    if decoded.len() > MAX_USER_ATTACHMENT_BYTES {
+        return Err(ErrorKind::Config(format!(
+            "attachment too large: {} MiB exceeds the {} MiB limit",
+            decoded.len() / (1024 * 1024),
+            MAX_USER_ATTACHMENT_BYTES / (1024 * 1024),
         ))
         .into());
     }
@@ -449,11 +462,21 @@ mod tests {
     #[test]
     fn oversized_attachment_is_rejected() {
         // base64 length L → decoded ≈ L*3/4 (integer division).  We need
-        // estimated_bytes > MAX_ATTACHMENT_BYTES, so add enough margin to
+        // estimated_bytes > MAX_USER_ATTACHMENT_BYTES, so add enough margin to
         // clear the integer-division boundary.
-        let big = "A".repeat(MAX_ATTACHMENT_BYTES * 4 / 3 + 100);
+        let big = "A".repeat(MAX_USER_ATTACHMENT_BYTES * 4 / 3 + 100);
         let err = attachment_to_part(&att("image/png", &big)).unwrap_err();
         assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn invalid_or_empty_base64_is_rejected() {
+        for data in ["", "not base64!"] {
+            let err = attachment_to_part(&att("image/png", data)).unwrap_err();
+            assert!(
+                err.to_string().contains("empty") || err.to_string().contains("valid base64")
+            );
+        }
     }
 
     #[test]
