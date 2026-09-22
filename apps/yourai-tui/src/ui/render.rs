@@ -497,10 +497,7 @@ impl Renderer {
             );
             f.render_widget(Clear, rect);
             let visible = height.saturating_sub(2) as usize;
-            let start = v
-                .mention
-                .selected
-                .saturating_sub(visible.saturating_sub(1));
+            let start = v.mention.selected.saturating_sub(visible.saturating_sub(1));
             let lines = entries
                 .iter()
                 .enumerate()

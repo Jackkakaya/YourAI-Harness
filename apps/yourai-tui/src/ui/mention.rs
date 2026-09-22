@@ -133,15 +133,7 @@ pub fn scan(cwd: &Path, query: &str) -> Vec<MentionEntry> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     let mut scanned = 0;
-    scan_dir(
-        cwd,
-        cwd,
-        query,
-        0,
-        &mut scanned,
-        &mut dirs,
-        &mut files,
-    );
+    scan_dir(cwd, cwd, query, 0, &mut scanned, &mut dirs, &mut files);
     dirs.sort_by(|a, b| a.display.cmp(&b.display));
     files.sort_by(|a, b| a.display.cmp(&b.display));
     dirs.extend(files);
@@ -188,10 +180,7 @@ fn scan_dir(
         if SKIP_DIRS.contains(&name.as_str()) {
             continue;
         }
-        let is_dir = entry
-            .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or(false);
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let display = path
             .strip_prefix(cwd)
             .ok()
@@ -290,18 +279,21 @@ pub fn classify(path: &Path) -> FileKind {
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "tiff" | "tif" => FileKind::Image,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "tiff" | "tif" => {
+            FileKind::Image
+        }
         "pdf" => FileKind::Pdf,
         // Common text/code extensions.
         "rs" | "go" | "py" | "js" | "ts" | "tsx" | "jsx" | "java" | "c" | "cpp" | "h" | "hpp"
-        | "cs" | "rb" | "php" | "swift" | "kt" | "scala" | "clj" | "ex" | "exs" | "erl"
-        | "lua" | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" | "sql" | "graphql"
-        | "proto" | "thrift" | "toml" | "yaml" | "yml" | "json" | "xml" | "html" | "css"
-        | "scss" | "sass" | "less" | "md" | "markdown" | "rst" | "txt" | "log" | "ini"
-        | "cfg" | "conf" | "env" | "gitignore" | "dockerignore" | "dockerfile" | "makefile"
-        | "cmake" | "gradle" | "csv" | "tsv" | "lock" | "diff" | "patch" | "vim" | "el"
-        | "lisp" | "hs" | "ml" | "nim" | "zig" | "v" | "dart" | "r" | "jl" | "pl" | "asm"
-        | "s" | "wasm" | "wat" => FileKind::Text,
+        | "cs" | "rb" | "php" | "swift" | "kt" | "scala" | "clj" | "ex" | "exs" | "erl" | "lua"
+        | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" | "sql" | "graphql" | "proto"
+        | "thrift" | "toml" | "yaml" | "yml" | "json" | "xml" | "html" | "css" | "scss"
+        | "sass" | "less" | "md" | "markdown" | "rst" | "txt" | "log" | "ini" | "cfg" | "conf"
+        | "env" | "gitignore" | "dockerignore" | "dockerfile" | "makefile" | "cmake" | "gradle"
+        | "csv" | "tsv" | "lock" | "diff" | "patch" | "vim" | "el" | "lisp" | "hs" | "ml"
+        | "nim" | "zig" | "v" | "dart" | "r" | "jl" | "pl" | "asm" | "s" | "wasm" | "wat" => {
+            FileKind::Text
+        }
         _ => {
             // No extension or unknown: try reading a prefix to detect text.
             if ext.is_empty() {
@@ -319,10 +311,7 @@ mod tests {
 
     #[test]
     fn detect_at_at_line_start() {
-        assert_eq!(
-            MentionState::detect("@foo", 4),
-            Some((0, "foo".to_owned()))
-        );
+        assert_eq!(MentionState::detect("@foo", 4), Some((0, "foo".to_owned())));
     }
 
     #[test]
