@@ -1,4 +1,5 @@
 use super::editor::Editor;
+use super::mention;
 use ratatui::text::{Line, Span};
 use serde_json::{json, Value};
 use std::{
@@ -170,6 +171,14 @@ pub struct SessionPickerState {
     pub selected: usize,
 }
 
+/// A clipboard image staged for sending, read via Ctrl+V and committed on Enter.
+/// `data` is base64-encoded, matching [`UserAttachment`].
+pub struct PendingAttachment {
+    pub mime: String,
+    pub data: String,
+    pub name: String,
+}
+
 pub struct View {
     pub model_metrics: yourai_harness::model::BudgetSnapshot,
     pub retry: Option<RetryState>,
@@ -183,6 +192,10 @@ pub struct View {
     items: VecDeque<Item>,
     pub editor: Editor,
     asks: VecDeque<Ask>,
+    /// Staged clipboard images, sent with the next submitted message.
+    pub pending_attachments: Vec<PendingAttachment>,
+    /// `@` file-mention autocomplete state.
+    pub mention: mention::MentionState,
     assistant: Option<usize>,
     thinking: Option<usize>,
     pub scroll: usize,
@@ -228,6 +241,8 @@ impl Default for View {
             items: VecDeque::new(),
             editor: Editor::default(),
             asks: VecDeque::new(),
+            pending_attachments: vec![],
+            mention: mention::MentionState::default(),
             assistant: None,
             thinking: None,
             scroll: 0,
@@ -1679,5 +1694,139 @@ mod tests {
         assert_eq!(t.adds, Some(2));
         assert!(t.created);
         assert!(t.content_hl.is_some());
+    }
+
+    #[test]
+    fn websearch_parses_json_markdown_links_and_bare_urls() {
+        // The Exa provider has returned text blocks, JSON arrays, markdown links
+        // and bare URLs at different times; search_brief must handle all of them
+        // and deduplicate by URL.
+        let mut v = View::default();
+        let content = "Title: First\nURL: https://a.example/\n\n[Second](https://b.example/path)\n\nhttps://c.example/page";
+        v.event(Out::ToolStarted {
+            id: "w".into(),
+            name: "websearch".into(),
+            input: json!({"query":"q"}),
+        });
+        v.event(Out::ToolDone {
+            id: "w".into(),
+            name: "websearch".into(),
+            output: json!({"provider":"exa","query":"q","content":content}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        assert_eq!(
+            t.brief,
+            vec![
+                "First — a.example".to_owned(),
+                "Second — b.example".to_owned(),
+                "c.example · https://c.example/page".to_owned(),
+            ]
+        );
+
+        // JSON result-array shape.
+        let mut v = View::default();
+        let content = r#"{"results":[{"title":"JSON Title","url":"https://d.example/"},{"url":"https://e.example/x"}]}"#;
+        v.event(Out::ToolDone {
+            id: "j".into(),
+            name: "websearch".into(),
+            output: json!({"content":content}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        assert_eq!(
+            t.brief,
+            vec![
+                "JSON Title — d.example".to_owned(),
+                "e.example · https://e.example/x".to_owned()
+            ]
+        );
+
+        // Duplicate URLs are collapsed.
+        let mut v = View::default();
+        let content = "URL: https://a.example/\nURL: https://a.example/";
+        v.event(Out::ToolDone {
+            id: "d".into(),
+            name: "websearch".into(),
+            output: json!({"content":content}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        assert_eq!(t.brief.len(), 1);
+    }
+
+    #[test]
+    fn webfetch_highlights_structured_content_and_builds_brief() {
+        let mut v = View::default();
+        v.event(Out::ToolStarted {
+            id: "f".into(),
+            name: "webfetch".into(),
+            input: json!({"url":"https://api.example/data","format":"json"}),
+        });
+        v.event(Out::ToolDone {
+            id: "f".into(),
+            name: "webfetch".into(),
+            output: json!({"ok":true,"url":"https://api.example/data","content_type":"application/json","format":"json","content":"{\"name\":\"demo\",\"count\":3}"}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        // JSON content gets syntax highlighting (more than one color).
+        let hl = t.content_hl.as_ref().expect("highlighted json");
+        let colors: std::collections::HashSet<_> = hl
+            .iter()
+            .flat_map(|l| l.spans.iter().filter_map(|s| s.style.fg))
+            .collect();
+        assert!(colors.len() >= 2, "json syntax colors: {colors:?}");
+        assert_eq!(t.content_format.as_deref(), Some("json"));
+        // A quiet page teaser is built from the body lines.
+        assert!(!t.brief.is_empty());
+
+        // Markdown format keeps the text unhighlighted (None) with a page brief.
+        let mut v = View::default();
+        v.event(Out::ToolDone {
+            id: "m".into(),
+            name: "webfetch".into(),
+            output: json!({"ok":true,"format":"markdown","content":"# Heading\nbody text"}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        assert!(t.content_hl.is_none(), "markdown not syntax-highlighted");
+        assert_eq!(t.content_format.as_deref(), Some("markdown"));
+        assert!(t
+            .brief
+            .first()
+            .is_some_and(|s| s.contains("Heading") || s.contains("body")));
+    }
+
+    #[test]
+    fn tool_errors_render_as_readable_diagnostics_not_pretty_json() {
+        let mut v = View::default();
+        v.event(Out::ToolDone {
+            id: "e".into(),
+            name: "shell".into(),
+            output: json!({"error":{"message":"command not found","code":127},"tool":"shell"}),
+            is_error: true,
+        });
+        let t = only_tool(&v);
+        assert!(
+            t.output.contains("Error: command not found"),
+            "body: {}",
+            t.output
+        );
+        assert!(t.output.contains("Code: 127"), "body: {}", t.output);
+        assert!(!t.output.contains('{'), "no json braces: {}", t.output);
+        assert!(!t.output.contains("\"error\""), "no raw keys: {}", t.output);
+
+        // A bare string error degrades cleanly.
+        let mut v = View::default();
+        v.event(Out::ToolDone {
+            id: "s".into(),
+            name: "read".into(),
+            output: json!({"error":"permission denied"}),
+            is_error: true,
+        });
+        let t = only_tool(&v);
+        assert!(t.output.contains("permission denied"), "body: {}", t.output);
+        assert!(!t.output.contains('{'));
     }
 }
