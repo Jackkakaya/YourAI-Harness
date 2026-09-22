@@ -68,5 +68,8 @@ fn attachments_round_trip_and_default_empty_for_old_wire() {
     // Empty attachments are omitted from the wire (skip_serializing_if),
     // keeping the format identical to pre-attachment messages.
     let wire2 = serde_json::to_value(In::user_text("plain")).unwrap();
-    assert_eq!(wire2, json!({"UserText": {"text": "plain", "mode": "steer"}}));
+    assert_eq!(
+        wire2,
+        json!({"UserText": {"text": "plain", "mode": "steer"}})
+    );
 }

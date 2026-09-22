@@ -164,7 +164,10 @@ async fn shell_exit_cwd_timeout_and_output_bound() {
     let r = call(&shell, json!({"command":"yes x"})).await.unwrap();
     assert_eq!(r["termination"], "output_limit");
     assert_eq!(r["output_complete"], false);
-    assert!(r["stdout"].as_str().unwrap().len() <= MAX_OUTPUT_BYTES);
+    // opencode-aligned truncation: the model-facing result is capped at
+    // MAX_BYTES (50KB) / MAX_LINES (2000), well under the 8MB capture ceiling.
+    assert!(r["stdout"].as_str().unwrap().len() <= MAX_BYTES);
+    assert!(r["stdout_truncated"].is_string());
     let r = call(
         &shell,
         json!({"command":"export YOURAI_TEST_TEMP=hello; cd /"}),

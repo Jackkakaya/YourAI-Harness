@@ -17,7 +17,10 @@ use std::{
     sync::OnceLock,
     time::Duration,
 };
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, process::Command};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 use yourai_core::protocol::MAX_USER_ATTACHMENT_BYTES;
 
 const MAX_ATTACHMENT_BASE64_BYTES: usize = MAX_USER_ATTACHMENT_BYTES.div_ceil(3) * 4;
@@ -266,7 +269,10 @@ async fn capture(program: &str, args: &[&str], max_bytes: usize) -> Vec<u8> {
             .kill_on_drop(true)
             .spawn()
             .ok()?;
-        let mut stdout = child.stdout.take()?.take(max_bytes.saturating_add(1) as u64);
+        let mut stdout = child
+            .stdout
+            .take()?
+            .take(max_bytes.saturating_add(1) as u64);
         let mut bytes = Vec::with_capacity(max_bytes.min(1024 * 1024));
         stdout.read_to_end(&mut bytes).await.ok()?;
         if bytes.len() > max_bytes {
@@ -306,12 +312,7 @@ pub async fn read_image() -> io::Result<Option<ClipboardImage>> {
             }
         }
         if std::env::var_os("WAYLAND_DISPLAY").is_some() && which("wl-paste").is_some() {
-            let bytes = capture(
-                "wl-paste",
-                &["-t", "image/png"],
-                MAX_USER_ATTACHMENT_BYTES,
-            )
-            .await;
+            let bytes = capture("wl-paste", &["-t", "image/png"], MAX_USER_ATTACHMENT_BYTES).await;
             if !bytes.is_empty() {
                 return Ok(Some(ClipboardImage {
                     mime: "image/png".into(),
@@ -322,13 +323,7 @@ pub async fn read_image() -> io::Result<Option<ClipboardImage>> {
         if which("xclip").is_some() {
             let bytes = capture(
                 "xclip",
-                &[
-                    "-selection",
-                    "clipboard",
-                    "-t",
-                    "image/png",
-                    "-o",
-                ],
+                &["-selection", "clipboard", "-t", "image/png", "-o"],
                 MAX_USER_ATTACHMENT_BYTES,
             )
             .await;

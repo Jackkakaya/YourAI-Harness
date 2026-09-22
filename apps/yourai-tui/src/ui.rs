@@ -911,22 +911,15 @@ pub async fn run(
                                             let replace = format!("@{}", entry.display);
                                             let anchor = view.mention.anchor;
                                             let end = anchor + 1 + view.mention.query.len();
-                                            view.editor.replace_range(
-                                                anchor..end,
-                                                &format!("{replace}/"),
-                                            );
+                                            view.editor
+                                                .replace_range(anchor..end, &format!("{replace}/"));
                                             if let Some((a, q)) = mention::MentionState::detect(
                                                 &view.editor.text,
                                                 view.editor.cursor,
                                             ) {
                                                 view.mention.activate(a, &q);
                                                 view.mention.entries.clear();
-                                                start_mention_scan(
-                                                    &mut mention_scan,
-                                                    &cwd,
-                                                    a,
-                                                    q,
-                                                );
+                                                start_mention_scan(&mut mention_scan, &cwd, a, q);
                                             } else {
                                                 view.mention.deactivate();
                                             }
@@ -1003,8 +996,7 @@ pub async fn run(
                                             }
                                         }
                                     }
-                                    mention::FileKind::Image
-                                    | mention::FileKind::Pdf => {
+                                    mention::FileKind::Image | mention::FileKind::Pdf => {
                                         let mime = if kind == mention::FileKind::Image {
                                             image_mime(&path)
                                         } else {
@@ -1105,34 +1097,32 @@ pub async fn run(
                             // Ctrl+V: paste an image from the clipboard. Text
                             // paste still arrives via bracketed-paste Event::Paste;
                             // this reads image data that bracketed paste cannot carry.
-                            KeyCode::Char('v') if ctrl => {
-                                match clipboard::read_image().await {
-                                    Ok(Some(img)) => {
-                                        let n = view.pending_attachments.len() + 1;
-                                        view.pending_attachments.push(PendingAttachment {
-                                            mime: img.mime.clone(),
-                                            data: img.data,
-                                            name: format!("clipboard-{n}.png"),
-                                        });
-                                        view.notice(
-                                            Level::Info,
-                                            format!(
-                                                "Image attached ({}). Enter to send, Esc to clear.",
-                                                img.mime
-                                            ),
-                                        );
-                                    }
-                                    Ok(None) => {
-                                        view.notice(Level::Info, "No image in clipboard.");
-                                    }
-                                    Err(e) => {
-                                        view.notice(
-                                            Level::Error,
-                                            format!("Clipboard read failed: {e}"),
-                                        );
-                                    }
+                            KeyCode::Char('v') if ctrl => match clipboard::read_image().await {
+                                Ok(Some(img)) => {
+                                    let n = view.pending_attachments.len() + 1;
+                                    view.pending_attachments.push(PendingAttachment {
+                                        mime: img.mime.clone(),
+                                        data: img.data,
+                                        name: format!("clipboard-{n}.png"),
+                                    });
+                                    view.notice(
+                                        Level::Info,
+                                        format!(
+                                            "Image attached ({}). Enter to send, Esc to clear.",
+                                            img.mime
+                                        ),
+                                    );
                                 }
-                            }
+                                Ok(None) => {
+                                    view.notice(Level::Info, "No image in clipboard.");
+                                }
+                                Err(e) => {
+                                    view.notice(
+                                        Level::Error,
+                                        format!("Clipboard read failed: {e}"),
+                                    );
+                                }
+                            },
                             KeyCode::End if ctrl => renderer.follow(&mut view),
                             KeyCode::PageUp if alt && !view.asks_empty() => {
                                 if let Some(ask) = view.ask_mut() {
@@ -1461,12 +1451,7 @@ pub async fn run(
                                     ) {
                                         view.mention.activate(anchor, &query);
                                         view.mention.entries.clear();
-                                        start_mention_scan(
-                                            &mut mention_scan,
-                                            &cwd,
-                                            anchor,
-                                            query,
-                                        );
+                                        start_mention_scan(&mut mention_scan, &cwd, anchor, query);
                                     } else if view.mention.active {
                                         view.mention.deactivate();
                                     }

@@ -1,5 +1,5 @@
 //! Small, read-only web tools. Approval and durable result paging remain in the Loop.
-use super::{check_cancel, error, schema, MAX_OUTPUT_BYTES};
+use super::{check_cancel, error, footnote, schema, truncate_output, MAX_OUTPUT_BYTES};
 use pulldown_cmark::{Event, Parser, TagEnd};
 use reqwest::{header, Client, Response, Url};
 use serde::Deserialize;
@@ -89,7 +89,23 @@ async fn bounded<T>(
         result = tokio::time::timeout(Duration::from_secs(seconds), work) => result.unwrap_or_else(|_| Err(error(name, "request timed out"))),
     }
 }
-fn output(value: Value, name: &str) -> Result<Value, YourAiError> {
+fn output(value: Value, name: &str, call_id: &str) -> Result<Value, YourAiError> {
+    // opencode routes tool results through `Truncate.output` (MAX_LINES=2000,
+    // MAX_BYTES=50KB). Apply the same model-facing budget to web results: a
+    // large page is truncated with a footnote rather than rejected outright.
+    if let Some(content) = value.get("content").and_then(Value::as_str) {
+        let t = truncate_output(content, call_id);
+        if t.is_truncated() {
+            let mut value = value;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("content".into(), json!(t.content));
+                obj.insert("truncated".into(), json!(footnote(&t).unwrap_or_default()));
+            }
+            return Ok(value);
+        }
+    }
+    // Still reject pathological JSON that exceeds the raw capture ceiling even
+    // after truncation (e.g. a content field that is not a string).
     if value.to_string().len() > MAX_OUTPUT_BYTES {
         return Err(error(name, "converted output exceeds tool result limit"));
     }
@@ -126,7 +142,7 @@ impl WebFetch {
             client: client(true)?,
         })
     }
-    async fn fetch(&self, input: FetchInput) -> Result<Value, YourAiError> {
+    async fn fetch(&self, input: FetchInput, call_id: &str) -> Result<Value, YourAiError> {
         let url = valid_url(&input.url)?;
         let mut response = self.client.get(url).header(header::ACCEPT, "text/markdown, text/html, text/plain, application/json;q=0.9, application/xml;q=0.8").send().await.map_err(|e| http_error("webfetch", e))?;
         check_response("webfetch", &response)?;
@@ -202,6 +218,7 @@ impl WebFetch {
         output(
             json!({"url":url,"content_type":content_type,"format":format,"content":content}),
             "webfetch",
+            call_id,
         )
     }
 }
@@ -230,7 +247,13 @@ impl ToolHandler for WebFetch {
             if !(1..=120).contains(&input.timeout) {
                 return Err(error(self.name(), "timeout must be 1..120 seconds"));
             }
-            bounded(&tc, self.name(), input.timeout, self.fetch(input)).await
+            bounded(
+                &tc,
+                self.name(),
+                input.timeout,
+                self.fetch(input, &tc.call_id),
+            )
+            .await
         })
     }
 }
@@ -274,7 +297,7 @@ impl WebSearch {
             endpoint: Url::parse(SEARCH_ENDPOINT).expect("static search URL"),
         })
     }
-    async fn search(&self, input: SearchInput) -> Result<Value, YourAiError> {
+    async fn search(&self, input: SearchInput, call_id: &str) -> Result<Value, YourAiError> {
         let mut response = self.client.post(self.endpoint.clone())
             .header(header::ACCEPT, "application/json, text/event-stream")
             .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"web_search_exa","arguments":{"query":input.query,"numResults":input.num_results,"type":"auto","livecrawl":"fallback","contextMaxCharacters":10000}}}))
@@ -292,6 +315,7 @@ impl WebSearch {
                     return output(
                         json!({"provider":"exa","query":input.query,"content":content}),
                         "websearch",
+                        call_id,
                     );
                 }
             }
@@ -381,7 +405,7 @@ impl ToolHandler for WebSearch {
                     "query must be 1..4000 characters and num_results 1..20",
                 ));
             }
-            bounded(&tc, self.name(), 25, self.search(input)).await
+            bounded(&tc, self.name(), 25, self.search(input, &tc.call_id)).await
         })
     }
 }
