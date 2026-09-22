@@ -3,11 +3,12 @@
 # Trigger: runs after the CI workflow completes (workflow_run).
 # Behaviour:
 #   1. Only fires when CI ran on `main` (push event, not PR).
-#   2. If CI conclusion == "failure", revert the HEAD commit on main.
-#   3. Push the revert directly to main and open a tracking PR.
-#
-# Why direct push + PR (not PR-only):
-#   main is broken — we want to restore green ASAP.  The PR is for audit trail.
+#   2. If CI conclusion == "failure", revert the breaking commit on main.
+#      - Handles both regular and merge commits (uses -m 1 for merges).
+#   3. Push the revert directly to main to restore green ASAP.
+#   4. Open a tracking PR for audit trail (requires repo setting:
+#      Settings → Actions → General → "Allow GitHub Actions to create
+#      and approve pull requests").
 
 name: Auto-rollback
 
@@ -33,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
-          fetch-depth: 5
+          fetch-depth: 10
 
       - name: Identify and revert the breaking commit
         id: revert
@@ -47,8 +48,16 @@ jobs:
           SUBJECT=$(git log -1 --format='%s' "$BREAKING_SHA")
           echo "Original subject: $SUBJECT"
 
-          # Create the revert.  --no-commit lets us craft a single clean commit.
-          git revert --no-edit "$BREAKING_SHA" || {
+          # Detect whether this is a merge commit and use -m 1 if so.
+          PARENT_COUNT=$(git rev-list --no-walk --count --merges "$BREAKING_SHA" 2>/dev/null || echo 0)
+          REVERT_ARGS=""
+          if [ "$PARENT_COUNT" -gt 0 ]; then
+            echo "Merge commit detected; using -m 1"
+            REVERT_ARGS="-m 1"
+          fi
+
+          # Create the revert.
+          git revert --no-edit $REVERT_ARGS "$BREAKING_SHA" || {
             echo "::error::Revert produced conflicts; manual intervention required."
             exit 1
           }
@@ -89,4 +98,4 @@ jobs:
           - If the revert is incorrect, manually revert it.
           - Fix the underlying issue and re-merge the original change with passing CI." \
             --base main \
-            --head "$ROLLBACK_BRANCH" || echo "PR creation skipped (may already exist)"
+            --head "$ROLLBACK_BRANCH" || echo "PR creation skipped (may already exist or Actions lacks PR permission)"
