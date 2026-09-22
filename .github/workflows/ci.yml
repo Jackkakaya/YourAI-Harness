@@ -1,0 +1,91 @@
+# CI — runs on every PR and push to main.
+#
+# Jobs:
+#   1. lint   — cargo fmt --check + cargo clippy (-D warnings)
+#   2. test   — cargo test --workspace (unit + integration tests)
+#   3. smoke  — build TUI binary, run offline POSIX smoke tests
+#
+# All three jobs run in parallel.  A PR is mergeable only when all three pass.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same PR/branch to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ────────────────────────────── lint ──────────────────────────────
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets
+
+  # ────────────────────────────── test ──────────────────────────────
+  test:
+    name: unit + integration tests
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        # Run tests single-threaded first (deterministic), then multi-threaded.
+        # Single-threaded catches logic errors; multi-threaded catches data races.
+        threads: ["1", "default"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: |
+          if [ "${{ matrix.threads }}" = "1" ]; then
+            cargo test --workspace --tests -- --test-threads=1
+          else
+            cargo test --workspace --tests
+          fi
+
+  # ────────────────────────────── smoke ─────────────────────────────
+  smoke:
+    name: TUI smoke tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build TUI binary
+        run: cargo build -p yourai-tui
+
+      - name: Run smoke tests
+        working-directory: apps/yourai-tui/tests
+        run: |
+          set -e
+          python3 smoke.py
+          python3 smoke_launcher.py
+          python3 smoke_models.py

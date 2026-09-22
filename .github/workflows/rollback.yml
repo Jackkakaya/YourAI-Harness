@@ -1,0 +1,92 @@
+# Auto-rollback — if CI fails on `main`, automatically revert the breaking commit.
+#
+# Trigger: runs after the CI workflow completes (workflow_run).
+# Behaviour:
+#   1. Only fires when CI ran on `main` (push event, not PR).
+#   2. If CI conclusion == "failure", revert the HEAD commit on main.
+#   3. Push the revert directly to main and open a tracking PR.
+#
+# Why direct push + PR (not PR-only):
+#   main is broken — we want to restore green ASAP.  The PR is for audit trail.
+
+name: Auto-rollback
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  rollback:
+    name: Revert breaking commit
+    # Only act when CI failed AND it ran on the main branch.
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 5
+
+      - name: Identify and revert the breaking commit
+        id: revert
+        run: |
+          BREAKING_SHA="${{ github.event.workflow_run.head_sha }}"
+          SHORT_SHA="${BREAKING_SHA::7}"
+
+          echo "Breaking commit: $BREAKING_SHA"
+
+          # Get the commit subject line for the revert message.
+          SUBJECT=$(git log -1 --format='%s' "$BREAKING_SHA")
+          echo "Original subject: $SUBJECT"
+
+          # Create the revert.  --no-commit lets us craft a single clean commit.
+          git revert --no-edit "$BREAKING_SHA" || {
+            echo "::error::Revert produced conflicts; manual intervention required."
+            exit 1
+          }
+
+          # Push the revert to main.
+          git push origin main
+
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
+
+      - name: Open tracking PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHORT_SHA="${{ steps.revert.outputs.short_sha }}"
+          SUBJECT="${{ steps.revert.outputs.subject }}"
+
+          # Create a tracking PR from a rollback branch so there's an audit trail.
+          # (The revert is already on main; this branch mirrors it for discussion.)
+          ROLLBACK_BRANCH="rollback/auto-$SHORT_SHA"
+          git checkout -b "$ROLLBACK_BRANCH"
+          git push -u origin "$ROLLBACK_BRANCH"
+
+          gh pr create \
+            --title "🤖 Auto-rollback: revert $SHORT_SHA ($SUBJECT)" \
+            --body "## Automated Rollback
+
+          CI failed on \`main\` after commit \`$SHORT_SHA\`.
+
+          **Reverted commit:** \`$SHORT_SHA\` — $SUBJECT
+
+          The revert has been pushed directly to \`main\` to restore a green build.
+          This PR exists as an audit trail and for discussion.
+
+          ### Action required
+          - Investigate the CI failure on the [original CI run](${{ github.event.workflow_run.html_url }}).
+          - If the revert is incorrect, manually revert it.
+          - Fix the underlying issue and re-merge the original change with passing CI." \
+            --base main \
+            --head "$ROLLBACK_BRANCH" || echo "PR creation skipped (may already exist)"
