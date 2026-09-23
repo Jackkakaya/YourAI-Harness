@@ -52,7 +52,7 @@ async fn run() -> Result<(), Error> {
             "--yolo" => yolo = true,
             "--import-json-sessions" => import_json = true,
             "--help" | "-h" => {
-                println!("yourai-tui [--config PATH] [--resume [SESSION_ID]] [--check-config] [--import-json-sessions] [--yolo] [--model PROVIDER/MODEL] [--variant NAME]\n--resume with no ID opens a session picker; Esc starts a fresh session.\nEnter send/reply | Ctrl-J newline | Up/Down·Ctrl-P/N history | Ctrl-A/E/W/U/K line edit | Click tool/thinking to expand | F6 select | Ctrl-O toggle | Ctrl-T todo panel | Ctrl-B stats\nEsc cancel/overlay | Ctrl-Q quit | PgUp/PgDn scroll | Ctrl-End follow\n/queue TEXT | /compact | /continue | /clear | /theme NAME | /models | /sessions | /status | /help");
+                println!("yourai-tui [--config PATH] [--resume [SESSION_ID]] [--check-config] [--import-json-sessions] [--yolo] [--model PROVIDER/MODEL] [--variant NAME]\n--resume with no ID opens a session picker; Esc starts a fresh session.\nEnter send/reply | Ctrl-J newline | Up/Down·Ctrl-P/N history | Ctrl-A/E/W/U/K line edit | Click tool/thinking to expand | F6 select | Ctrl-O toggle | Ctrl-T todo panel | Ctrl-B stats\nEsc cancel/overlay | Ctrl-Q quit | PgUp/PgDn scroll | Ctrl-End follow | Ctrl-Home latest question | Ctrl-Up/Down browse questions | Ctrl-G YOLO\n/new | /clear (fresh context, saved history retained) | /yolo [on|off] | /queue TEXT | /compact | /continue | /theme NAME | /models | /sessions | /status | /help");
                 return Ok(());
             }
             _ => return Err(format!("Unknown argument: {arg}").into()),
