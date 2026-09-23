@@ -176,14 +176,16 @@ impl Renderer {
             v.theme.apply(f.buffer_mut());
             return;
         }
+        let content_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
         // Todo panel appears only when there are tasks to inspect.
         // Below 80 columns use a one-line dock above the input.
         let sidebar_visible = v.todo_panel && !v.todos.is_empty() && area.width >= 80;
         let panel_w = (area.width / 3).clamp(28, 40);
         let cols = if sidebar_visible {
-            Layout::horizontal([Constraint::Min(50), Constraint::Length(panel_w)]).split(area)
+            Layout::horizontal([Constraint::Min(50), Constraint::Length(panel_w)])
+                .split(content_area)
         } else {
-            Layout::horizontal([Constraint::Percentage(100)]).split(area)
+            Layout::horizontal([Constraint::Percentage(100)]).split(content_area)
         };
         let width = cols[0].width.saturating_sub(4).max(2) as usize;
         let (editor_lines, _, _) = v.editor.layout(width);
@@ -195,8 +197,7 @@ impl Renderer {
             )
             .min(area.height.saturating_sub(6));
         let input_height = if v.asks_empty() { input_height } else { 0 };
-        let footer_lines = footer_lines(cols[0].width as usize, v, m, queued);
-        let footer_height = footer_lines.len() as u16;
+        let footer_lines = footer_lines(area.width as usize, v, m, queued);
         let busy = v.active || compact || !v.asks_empty();
         let activity_height = if busy { 1 } else { 0 };
         let narrow_dock = if !sidebar_visible && !v.todos.is_empty() && v.todo_panel {
@@ -210,8 +211,9 @@ impl Renderer {
             (area.height / 2).clamp(4, 13)
         };
         let ask_height = ask_height.min(
-            area.height
-                .saturating_sub(input_height + activity_height + narrow_dock + footer_height + 1),
+            content_area
+                .height
+                .saturating_sub(input_height + activity_height + narrow_dock + 1),
         );
         let rows = Layout::vertical([
             Constraint::Min(1),
@@ -219,7 +221,6 @@ impl Renderer {
             Constraint::Length(activity_height),
             Constraint::Length(narrow_dock),
             Constraint::Length(input_height),
-            Constraint::Length(footer_height),
         ])
         .split(cols[0]);
         let inner = rows[0];
@@ -418,7 +419,7 @@ impl Renderer {
             draw_narrow_todo_dock(f, rows[3], v);
             self.todo_hit = Some(rows[3]);
         }
-        let footer = rows[5];
+        let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
         f.render_widget(Paragraph::new(footer_lines), footer);
         v.commands
             .sync(&v.editor.text, v.asks_empty() && !v.overlay.is_open());
@@ -773,7 +774,7 @@ fn sidebar(f: &mut Frame<'_>, area: Rect, v: &View) -> (Option<Rect>, Option<Rec
     let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(PANEL));
+        .style(Style::default().bg(BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let done = v.todos.iter().filter(|t| t.completed).count();
@@ -893,27 +894,11 @@ fn draw_activity_bar(f: &mut Frame<'_>, area: Rect, v: &View, compact: bool, tic
     );
 }
 
-/// Measure semantic fields before allocating rows; never rely on Paragraph clipping.
+/// One full-width row. Drop optional metrics before clipping a value or its unit.
+/// Truncated labels and the overflow mark point to the full details in Ctrl-B.
 fn footer_lines(width: usize, v: &View, m: &Metadata, queued: usize) -> Vec<Line<'static>> {
     let muted = Style::default().fg(MUTED);
     let permission = permission_label(m.yolo, m.trusted_shell);
-    let permission_style = Style::default()
-        .fg(if m.yolo { YELLOW } else { MUTED })
-        .bold();
-    let title = v.title.as_deref().unwrap_or("New session");
-    // Both labels get their full text when it fits. Otherwise preserve the path's
-    // meaningful tail and explicitly elide both labels within measured budgets.
-    let cwd_budget = if title.width() + m.cwd.width() + 3 <= width {
-        m.cwd.width()
-    } else {
-        width.saturating_sub(3) / 2
-    };
-    let cwd = elide_tail(&m.cwd, cwd_budget);
-    let title = elide(title, width.saturating_sub(cwd.width() + 3));
-    let mut lines = vec![Line::from(vec![
-        Span::styled(title, Style::default().fg(TEXT)),
-        Span::styled(format!(" · {cwd}"), muted),
-    ])];
     let context = ctx_pressure(v)
         .map(|n| {
             if n * 100.0 > 999.0 {
@@ -930,47 +915,67 @@ fn footer_lines(width: usize, v: &View, m: &Metadata, queued: usize) -> Vec<Line
         .filter(|n| n.is_finite() && *n >= 0.0)
         .map(compact_number)
         .unwrap_or_else(|| "—".into());
-    let mut fields = vec![
-        format!("tok {}", tokens(v.usage.total_tokens)),
-        format!("ctx {context}"),
-        format!("{rate} tok/s"),
+    let mut fields = vec![(1, format!("ctx {context}"))];
+    let label_reserve = if width >= 60 { 16 } else { 8 };
+    let metrics_budget = width.saturating_sub(label_reserve + permission.width() + 6);
+    let mut omitted = false;
+    let mut optional = vec![
+        (0, format!("tok {}", tokens(v.usage.total_tokens))),
+        (2, format!("{rate} tok/s")),
     ];
     if queued > 0 {
-        fields.push(format!(
-            "{} queued",
-            if queued < 1000 {
-                queued.to_string()
-            } else {
-                compact_number(queued as f64)
-            }
+        optional.push((
+            3,
+            format!(
+                "{} queued",
+                if queued < 1000 {
+                    queued.to_string()
+                } else {
+                    compact_number(queued as f64)
+                }
+            ),
         ));
     }
-    // Keep a field's value and unit together; wrap only between fields.
-    let mut row = Line::default();
-    for field in fields {
-        if !row.spans.is_empty() && row.width() + 3 + field.width() > width {
-            lines.push(row);
-            row = Line::default();
+    for field in optional {
+        let used: usize = fields.iter().map(|(_, text)| text.width() + 3).sum();
+        if used + field.1.width() <= metrics_budget {
+            fields.push(field);
+        } else {
+            omitted = true;
         }
-        if !row.spans.is_empty() {
-            row.spans.push(Span::styled(" · ", muted));
-        }
-        row.spans.push(Span::styled(field, muted));
     }
-    let model_budget = width.saturating_sub(permission.width() + 3);
-    let model = elide(&v.model_label, model_budget);
-    if row.width() + model.width() + permission.width() + 6 > width {
-        lines.push(row);
-        row = Line::default();
-    } else if !model.is_empty() {
-        row.spans.push(Span::styled(" · ", muted));
-    }
-    row.spans.push(Span::styled(model, muted));
-    let gap = width.saturating_sub(row.width() + permission.width());
-    row.spans.push(Span::raw(" ".repeat(gap)));
-    row.spans.push(Span::styled(permission, permission_style));
-    lines.push(row);
-    lines
+    fields.sort_by_key(|(order, _)| *order);
+    let metrics = fields
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let overflow = if omitted { " …" } else { "" };
+    let right_width = metrics.width() + overflow.width() + 3 + permission.width();
+    let left_width = width.saturating_sub(right_width + 2);
+    let title = v.title.as_deref().unwrap_or("New session");
+    let title_budget = if title.width() + 3 + m.cwd.width() <= left_width {
+        title.width()
+    } else {
+        title.width().min(left_width.saturating_sub(3) / 2)
+    };
+    let left = format!(
+        "{} · {}",
+        elide(title, title_budget),
+        elide_tail(&m.cwd, left_width.saturating_sub(title_budget + 3))
+    );
+    let gap = width.saturating_sub(left.width() + right_width);
+    vec![Line::from(vec![
+        Span::styled(left, muted),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(metrics, muted),
+        Span::styled(overflow, muted),
+        Span::styled(" · ", Style::default().fg(BORDER)),
+        Span::styled(
+            permission,
+            Style::default().fg(if m.yolo { YELLOW } else { MUTED }),
+        ),
+    ])]
 }
 
 fn compact_number(value: f64) -> String {
@@ -1460,7 +1465,7 @@ mod tests {
         let screen = rows(&terminal);
         // Welcome now shows neofetch-style logo + info (no robot).
         assert!(screen.iter().any(|r| r.contains("yourai")));
-        assert!(screen[31].contains("test-model"));
+        assert!(screen[31].contains("New session"));
 
         assert!(!v.overlay.is_open());
         if let Ok(path) = std::env::var("YOURAI_WELCOME_SNAPSHOT") {
@@ -2055,7 +2060,7 @@ mod regression_tests {
         };
         for width in 30..=160 {
             let lines = footer_lines(width, &v, &m, usize::MAX);
-            assert!(lines.len() <= 4);
+            assert_eq!(lines.len(), 1);
             for line in &lines {
                 assert!(line.width() <= width, "width {width}: {line}");
             }
@@ -2064,7 +2069,7 @@ mod regression_tests {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join("\n");
-            for field in ["tok ", "ctx ", "tok/s", "YOLO", "queued"] {
+            for field in ["ctx ", "YOLO"] {
                 assert!(text.contains(field));
             }
         }
@@ -2073,7 +2078,7 @@ mod regression_tests {
         v.usage.total_tokens = 1200;
         v.model_metrics.requests.last_output_tokens_per_second = Some(47.5);
         let lines = footer_lines(120, &v, &m, 0);
-        assert_eq!(lines.len(), 2, "wide terminals should not spend extra rows");
+        assert_eq!(lines.len(), 1, "footer must always use one row");
         assert!(
             lines[0].to_string().contains(&m.cwd),
             "a fitting path stays complete"
@@ -2139,12 +2144,16 @@ mod regression_tests {
                 .map(|x| buffer[(x, 19)].symbol())
                 .collect::<String>();
             assert!(footer.contains("YOLO"), "{footer}");
-            assert!(footer.contains("provider/model"), "{footer}");
+            assert!(footer.contains("ctx 90%"), "{footer}");
             let footer_rows = footer_lines(width as usize, &v, &m, 0).len() as u16;
             let details = (20 - footer_rows..20)
                 .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
                 .collect::<String>();
-            for field in ["/workspace", "tok", "ctx 90%", "tok/s"] {
+            for field in if width >= 80 {
+                vec!["/workspace", "tok", "ctx 90%", "tok/s"]
+            } else {
+                vec!["ctx 90%"]
+            } {
                 assert!(details.contains(field), "missing {field}: {details}");
             }
             assert!(

@@ -156,7 +156,7 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'16.0K')
         os.write(master, b'\x02')  # Close the dashboard.
         time.sleep(0.3)
-        os.write(master, b'\x1b[<0;1;34M\x1b[<32;11;34M\x1b[<0;11;34m')
+        os.write(master, b'\x1b[<0;1;35M\x1b[<32;11;35M\x1b[<0;11;35m')
         wait_for(b'Copied')
         assert clipboard_file.read_text() == 'New session', repr(clipboard_file.read_text())
         os.write(master, b'/')

@@ -16,31 +16,31 @@ const fn rgb(value: u32) -> Color {
 
 // Baseline slot constants = the Dark palette. Renderers build every span from
 // these (and only these) colors.
-pub(crate) const BG: Color = rgb(0x151A22);
-pub(crate) const PANEL: Color = rgb(0x2A3443);
-pub(crate) const TEXT: Color = rgb(0xEDF2F7);
-pub(crate) const MUTED: Color = rgb(0xA7B4C7);
-pub(crate) const FAINT: Color = rgb(0x656F7D);
-pub(crate) const YELLOW: Color = rgb(0xE0C796);
-pub(crate) const ACCENT: Color = rgb(0x9FC5EF);
-pub(crate) const GREEN: Color = rgb(0xA2C8A8);
-pub(crate) const RED: Color = rgb(0xEAA0A0);
-pub(crate) const BLUE: Color = rgb(0x97B7DC);
-pub(crate) const CYAN: Color = rgb(0x9ACFD0);
-pub(crate) const BORDER: Color = rgb(0x586A82);
-pub(crate) const DIFF_ADD_BG: Color = rgb(0x2A3436);
-pub(crate) const DIFF_DEL_BG: Color = rgb(0x352E35);
+pub(crate) const BG: Color = rgb(0x18191B);
+pub(crate) const PANEL: Color = rgb(0x292C30);
+pub(crate) const TEXT: Color = rgb(0xF1F0EA);
+pub(crate) const MUTED: Color = rgb(0xB0B1AA);
+pub(crate) const FAINT: Color = rgb(0x6C6D6A);
+pub(crate) const YELLOW: Color = rgb(0xD6B583);
+pub(crate) const ACCENT: Color = rgb(0xB7C9AD);
+pub(crate) const GREEN: Color = rgb(0x9DBD9E);
+pub(crate) const RED: Color = rgb(0xD8948F);
+pub(crate) const BLUE: Color = rgb(0xA6B9D0);
+pub(crate) const CYAN: Color = rgb(0x9DBFC0);
+pub(crate) const BORDER: Color = rgb(0x555A60);
+pub(crate) const DIFF_ADD_BG: Color = rgb(0x2C322F);
+pub(crate) const DIFF_DEL_BG: Color = rgb(0x352B2C);
 // Syntax highlight slots (Dark baseline values, derived in `Palette::derive`
 // with fixed mixes; keep in sync: test `dark_baseline_slots_match_palette`).
-pub(crate) const SY_KEYWORD: Color = rgb(0xC8B1C4);
-pub(crate) const SY_STRING: Color = rgb(0xE5B49B);
-pub(crate) const SY_FUNCTION: Color = rgb(0xE6DAC2);
-pub(crate) const SY_TYPE: Color = rgb(0x9CCBDC);
-pub(crate) const SY_NUMBER: Color = rgb(0xA1C7BC);
-pub(crate) const SY_COMMENT: Color = rgb(0xA5BDB9);
-pub(crate) const SY_OPERATOR: Color = rgb(0xE8E3D5);
-pub(crate) const SY_PUNCT: Color = rgb(0xCAD3DF);
-pub(crate) const SY_VARIABLE: Color = rgb(0xC6D7EB);
+pub(crate) const SY_KEYWORD: Color = rgb(0xC9AC9D);
+pub(crate) const SY_STRING: Color = rgb(0xD7A589);
+pub(crate) const SY_FUNCTION: Color = rgb(0xE2D0B1);
+pub(crate) const SY_TYPE: Color = rgb(0xA7C3B8);
+pub(crate) const SY_NUMBER: Color = rgb(0xA4C0A2);
+pub(crate) const SY_COMMENT: Color = rgb(0xA7B6A5);
+pub(crate) const SY_OPERATOR: Color = rgb(0xE8DBC6);
+pub(crate) const SY_PUNCT: Color = rgb(0xD1D1CA);
+pub(crate) const SY_VARIABLE: Color = rgb(0xCFD7DE);
 
 /// Lookup ordering must match `Palette::slots()` exactly.
 pub(crate) const SLOTS: [Color; 23] = [
@@ -261,12 +261,12 @@ impl Theme {
     pub fn palette(self) -> Palette {
         match self.effective() {
             Self::Dark | Self::System => Palette::derive(
-                0x151A22, 0x2A3443, 0xEDF2F7, 0xA7B4C7, 0x9FC5EF, 0xA2C8A8, 0xEAA0A0, 0xE0C796,
-                0x97B7DC, 0x9ACFD0, 0x586A82,
+                0x18191B, 0x292C30, 0xF1F0EA, 0xB0B1AA, 0xB7C9AD, 0x9DBD9E, 0xD8948F, 0xD6B583,
+                0xA6B9D0, 0x9DBFC0, 0x555A60,
             ),
             Self::Light => Palette::derive(
-                0xF5F7FA, 0xE4EAF2, 0x19212D, 0x49586B, 0x345E9E, 0x1A7F37, 0xD1242F, 0x9A6700,
-                0x0969DA, 0x0A7EA4, 0x9DAABD,
+                0xF7F6F2, 0xEAE8E1, 0x252823, 0x60665B, 0x4F684D, 0x3F704C, 0xA8433C, 0x876622,
+                0x4A6787, 0x3C7175, 0xB3B7AD,
             ),
             Self::OneDark => Palette::derive(
                 0x282C34, 0x21252B, 0xABB2BF, 0x5C6370, 0xC678DD, 0x98C379, 0xE06C75, 0xE5C07B,
