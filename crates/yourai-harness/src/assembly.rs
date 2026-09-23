@@ -76,6 +76,7 @@ pub struct ModelSettings {
     pub chunk_timeout: Option<Duration>,
 }
 pub struct Harness {
+    normal_security: Arc<dyn SecurityProvider>,
     provider_budgets: Mutex<HashMap<(String, crate::model::RequestPolicy), Arc<ModelBudget>>>,
     current_budget: Mutex<Arc<ModelBudget>>,
     main_loop_config: crate::default_loop::LoopConfig,
@@ -183,6 +184,7 @@ impl Harness {
             config.context_policy,
         )
         .await?;
+        let normal_security = agent.ctx().security()?;
         if config.yolo {
             agent
                 .ctx()
@@ -274,6 +276,7 @@ impl Harness {
             tools.register(subagents.clone());
         }
         Ok(Self {
+            normal_security,
             provider_budgets: Mutex::new(HashMap::from([(
                 (config.model_provider, config.request_policy),
                 budget.clone(),
@@ -292,6 +295,17 @@ impl Harness {
             skills,
             usage,
         })
+    }
+    /// Change permissions only between turns, preserving the original policy.
+    /// In-flight tool snapshots and approval questions must finish or be cancelled first.
+    pub fn set_yolo(&self, enabled: bool) -> Result<(), YourAiError> {
+        let _gate = self.host.try_operation()?;
+        self.host.agent.ctx().set_security(if enabled {
+            Arc::new(crate::security::YoloSecurity)
+        } else {
+            self.normal_security.clone()
+        });
+        Ok(())
     }
     /// Replace the main model and its context policy at an idle boundary.
     /// Admission/metrics keep the existing shared budget (including calls already

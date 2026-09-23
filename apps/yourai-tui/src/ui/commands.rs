@@ -7,6 +7,16 @@ pub struct Command {
 }
 const COMMANDS: &[Command] = &[
     Command {
+        text: "/new",
+        description: "Start a fresh session",
+        argument: false,
+    },
+    Command {
+        text: "/yolo",
+        description: "Toggle permissions (or /yolo on|off) · Ctrl-G",
+        argument: false,
+    },
+    Command {
         text: "/help",
         description: "Show keyboard shortcuts",
         argument: false,
@@ -23,7 +33,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         text: "/clear",
-        description: "Clear screen, keep history",
+        description: "Reset context in a new session; keep saved history",
         argument: false,
     },
     Command {
@@ -175,7 +185,7 @@ mod tests {
     fn filter_navigation_dismissal_and_arguments() {
         let mut menu = Menu::default();
         menu.sync("/", true);
-        assert_eq!(menu.items().len(), 10);
+        assert_eq!(menu.items().len(), 12);
         menu.step(true);
         assert_eq!(menu.items()[menu.selected].text, "/quit");
         menu.sync("/co", true);

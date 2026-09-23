@@ -47,6 +47,8 @@ pub struct Renderer {
     panel: Option<Rect>,
     anchor: Option<(u64, usize)>,
     reveal: Option<u64>,
+    turn_target: Option<u64>,
+    question_hit: Option<(Rect, u64)>,
     /// 40ms tick frame index shared by the breathing bar and card spinners.
     tick: u64,
 }
@@ -66,6 +68,12 @@ impl Renderer {
 
     pub fn click(&mut self, view: &mut View, x: u16, y: u16) {
         let point = Position::new(x, y);
+        if let Some((area, id)) = self.question_hit {
+            if area.contains(point) {
+                self.turn_target = Some(id);
+                return;
+            }
+        }
         if self.command_area.is_some_and(|r| r.contains(point)) {
             if let Some((_, command)) = self.command_hits.iter().find(|(r, _)| r.contains(point)) {
                 view.editor.take();
@@ -107,7 +115,35 @@ impl Renderer {
             }
         }
     }
+    pub fn latest_turn(&mut self) {
+        self.turn_target = self.timeline.turns.last().map(|(_, id)| *id);
+    }
+    pub fn jump_turn(&mut self, view: &mut View, previous: bool) {
+        let start = self
+            .lines
+            .len()
+            .saturating_sub(view.scroll + self.transcript.height as usize);
+        self.turn_target = if previous {
+            self.timeline
+                .turns
+                .iter()
+                .rev()
+                .find(|(line, _)| *line < start)
+                .or_else(|| self.timeline.turns.first())
+                .map(|(_, id)| *id)
+        } else {
+            self.timeline
+                .turns
+                .iter()
+                .find(|(line, _)| *line > start)
+                .map(|(_, id)| *id)
+        };
+        if !previous && self.turn_target.is_none() {
+            self.follow(view);
+        }
+    }
     pub fn follow(&mut self, view: &mut View) {
+        self.turn_target = None;
         self.anchor = None;
         self.reveal = None;
         view.follow();
@@ -158,9 +194,15 @@ impl Renderer {
         };
         let width = cols[0].width.saturating_sub(4).max(2) as usize;
         let (editor_lines, _, _) = v.editor.layout(width);
-        let input_height = (editor_lines.len() as u16 + 2)
-            .clamp(3, (area.height * 3 / 10).clamp(3, 14))
+        let input_padding = if area.height >= 16 { 4 } else { 2 };
+        let input_height = (editor_lines.len() as u16 + input_padding)
+            .clamp(
+                input_padding + 1,
+                (area.height * 3 / 10).clamp(input_padding + 1, 14),
+            )
             .min(area.height.saturating_sub(6));
+        let input_height = if v.asks_empty() { input_height } else { 0 };
+        let footer_height = if cols[0].width < 64 { 4 } else { 3 };
         let busy = v.active || compact || !v.asks_empty();
         let activity_height = if busy { 1 } else { 0 };
         let narrow_dock = if !sidebar_visible && !v.todos.is_empty() && v.todo_panel {
@@ -175,7 +217,7 @@ impl Renderer {
         };
         let ask_height = ask_height.min(
             area.height
-                .saturating_sub(input_height + activity_height + narrow_dock + 6),
+                .saturating_sub(input_height + activity_height + narrow_dock + footer_height + 1),
         );
         let rows = Layout::vertical([
             Constraint::Min(1),
@@ -183,7 +225,7 @@ impl Renderer {
             Constraint::Length(activity_height),
             Constraint::Length(narrow_dock),
             Constraint::Length(input_height),
-            Constraint::Length(1),
+            Constraint::Length(footer_height),
         ])
         .split(cols[0]);
         let transcript = rows[0];
@@ -258,9 +300,53 @@ impl Renderer {
                 }
             }
         }
+        if let Some(id) = self.turn_target.take() {
+            if let Some((line, _)) = self.timeline.turns.iter().find(|(_, key)| *key == id) {
+                v.scroll = self.lines.len().saturating_sub(*line + height);
+            }
+        }
         v.scroll = v.scroll.min(self.lines.len().saturating_sub(height));
         let end = self.lines.len().saturating_sub(v.scroll);
         let start = end.saturating_sub(height);
+        self.question_hit = None;
+        let question = if v.scroll == 0 {
+            self.timeline.turns.last()
+        } else {
+            self.timeline
+                .turns
+                .iter()
+                .rev()
+                .find(|(line, _)| *line <= start)
+                .or_else(|| self.timeline.turns.first())
+        };
+        if let Some((_, id)) = question {
+            let index = id.saturating_sub(v.item_id(0)) as usize;
+            if let Some(Item::Text {
+                role: Role::User,
+                text,
+            }) = v.items().get(index)
+            {
+                let hint = if transcript.width >= 75 {
+                    " · Ctrl-Home latest · Ctrl-↑/↓ browse "
+                } else {
+                    " · Ctrl-Home "
+                };
+                let label = format!(
+                    " YOU · {}{}",
+                    elide(
+                        &text.replace('\n', " "),
+                        (transcript.width as usize).saturating_sub(hint.width() + 7)
+                    ),
+                    hint
+                );
+                let area = Rect::new(transcript.x, transcript.y, transcript.width, 1);
+                f.render_widget(
+                    Paragraph::new(label).style(Style::default().fg(ACCENT).bg(PANEL)),
+                    area,
+                );
+                self.question_hit = Some((area, *id));
+            }
+        }
         f.render_widget(Paragraph::new(self.lines[start..end].to_vec()), inner);
         for (line, id) in &self.headers {
             if *line >= start && *line < end {
@@ -293,12 +379,12 @@ impl Renderer {
             welcome(f, inner);
         }
         let mode = if v.active {
-            " Steer current turn · Esc interrupts "
+            " Steer · Esc stops "
         } else {
             " Message "
         };
         let input_title_right = if cols[0].width >= 70 {
-            " ^T tasks · ^B stats · F1 help "
+            " Enter send · Alt-Enter newline · / commands "
         } else {
             " F1 help "
         };
@@ -695,8 +781,17 @@ fn draw_editor(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if focus { color } else { BORDER }))
-        .style(Style::default().bg(PANEL))
-        .title(format!(" {title} "))
+        .style(Style::default().bg(PANEL).fg(TEXT))
+        .padding(ratatui::widgets::Padding::new(
+            1,
+            1,
+            u16::from(area.height >= 5),
+            u16::from(area.height >= 5),
+        ))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(color).bold(),
+        ))
         .title(
             Line::from(Span::styled(
                 title_right.to_owned(),
@@ -706,19 +801,27 @@ fn draw_editor(
         );
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if e.text.is_empty() && !inner.is_empty() {
+        f.render_widget(
+            Paragraph::new("Ask anything, or / for commands…").style(Style::default().fg(MUTED)),
+            inner,
+        );
+    }
     let (lines, row, col) = e.layout(inner.width as usize);
     let top = row.saturating_sub(inner.height.saturating_sub(1) as usize);
-    f.render_widget(
-        Paragraph::new(
-            lines
-                .into_iter()
-                .skip(top)
-                .take(inner.height as usize)
-                .map(Line::from)
-                .collect::<Vec<_>>(),
-        ),
-        inner,
-    );
+    if !e.text.is_empty() {
+        f.render_widget(
+            Paragraph::new(
+                lines
+                    .into_iter()
+                    .skip(top)
+                    .take(inner.height as usize)
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+            ),
+            inner,
+        );
+    }
     if focus && inner.width > 0 && inner.height > 0 {
         f.set_cursor_position((
             inner.x + col.min(inner.width.saturating_sub(1) as usize) as u16,
@@ -853,37 +956,70 @@ fn draw_activity_bar(f: &mut Frame<'_>, area: Rect, v: &View, compact: bool, tic
 
 /// Essential model/permission information survives narrow terminals.
 fn draw_footer(f: &mut Frame<'_>, area: Rect, v: &View, m: &Metadata, queued: usize) {
+    let width = area.width as usize;
     let permission = permission_label(m.yolo, m.trusted_shell);
-    let permission_color = if m.yolo { YELLOW } else { TEXT };
-    let budget = (area.width as usize).saturating_sub(permission.width() + 3);
-    let model = elide(&v.model_label, budget);
-    let mut spans = vec![Span::styled(model, Style::default().fg(TEXT))];
-    let ctx = ctx_pressure(v).map(|ratio| {
-        (
-            format!(" · ctx {}%", (ratio * 100.0) as u64),
-            ctx_color(ratio),
-        )
-    });
-    if let Some((text, color)) = ctx {
-        if spans.iter().map(|s| s.width()).sum::<usize>() + text.width() <= budget {
-            spans.push(Span::styled(text, Style::default().fg(color)));
-        }
+    let status_style = Style::default().fg(if m.yolo { YELLOW } else { MUTED });
+    let title = v.title.as_deref().unwrap_or("New session");
+    let cwd_budget = width.saturating_sub(3) / 2;
+    let cwd = if m.cwd.width() > cwd_budget {
+        let name = std::path::Path::new(&m.cwd)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&m.cwd);
+        elide(&format!("…/{name}"), cwd_budget)
+    } else {
+        m.cwd.clone()
+    };
+    let context = ctx_pressure(v)
+        .map(|n| format!("{:.0}%", n * 100.0))
+        .unwrap_or_else(|| "—".into());
+    let rate = v
+        .model_metrics
+        .requests
+        .last_output_tokens_per_second
+        .map(|n| format!("{n:.1}"))
+        .unwrap_or_else(|| "—".into());
+    let metrics = format!(
+        "tok {} · ctx {context} · {rate} tok/s",
+        tokens(v.usage.total_tokens)
+    );
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            elide(title, width.saturating_sub(cwd.width() + 3)),
+            Style::default().fg(TEXT),
+        ),
+        Span::styled(format!(" · {cwd}"), Style::default().fg(MUTED)),
+    ])];
+    if width < 64 {
+        lines.push(
+            Line::from(format!(
+                "tok {} · ctx {context}",
+                tokens(v.usage.total_tokens)
+            ))
+            .style(Style::default().fg(MUTED)),
+        );
+        let queue = if queued > 0 {
+            format!(" · {queued} queued")
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(format!("{rate} tok/s{queue}")).style(Style::default().fg(MUTED)));
+    } else {
+        let queue = if queued > 0 {
+            format!(" · {queued} queued")
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(format!("{metrics}{queue}")).style(Style::default().fg(MUTED)));
     }
-    if queued > 0 {
-        let text = format!(" · {queued} queued");
-        if spans.iter().map(|s| s.width()).sum::<usize>() + text.width() <= budget {
-            spans.push(Span::styled(text, Style::default().fg(MUTED)));
-        }
-    }
-    let used = spans.iter().map(|s| s.width()).sum::<usize>();
-    spans.push(Span::raw(" ".repeat(
-        (area.width as usize).saturating_sub(used + permission.width() + 2),
-    )));
-    spans.push(Span::styled(
-        format!("· {permission}"),
-        Style::default().fg(permission_color).bold(),
-    ));
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let model = elide(&v.model_label, width.saturating_sub(permission.width() + 3));
+    let gap = width.saturating_sub(model.width() + permission.width());
+    lines.push(Line::from(vec![
+        Span::styled(model, Style::default().fg(MUTED)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(permission, status_style.bold()),
+    ]));
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn tokens(value: u64) -> String {
@@ -911,7 +1047,7 @@ fn label(s: &str, color: Color) -> Line<'static> {
 }
 fn help(f: &mut Frame<'_>, area: Rect, scroll: u16) {
     let rect = crate::picker::centered(area, 78, area.height.saturating_sub(2) as usize);
-    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/compact        Compact idle conversation\n/clear          Clear screen only (history unchanged)\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y/n + Enter. No automatic or permanent grants.";
+    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y/n + Enter (YOLO skips approvals).";
     let lines: Vec<_> = text
         .lines()
         .flat_map(|line| {
@@ -1241,7 +1377,7 @@ mod tests {
             terminal
                 .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
                 .unwrap();
-            assert_eq!(terminal.backend().buffer()[(0, 0)].bg, theme.color(BG));
+            assert_eq!(terminal.backend().buffer()[(0, 0)].bg, theme.color(PANEL));
             let text = terminal
                 .backend()
                 .buffer()
@@ -1860,6 +1996,88 @@ mod regression_tests {
     use super::*;
     use ratatui::backend::TestBackend;
     #[test]
+    fn questions_remain_reachable_after_long_replies_and_resize() {
+        let mut view = View::default();
+        let meta = Metadata {
+            session: "test".into(),
+            cwd: "/workspace".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        for question in ["First short question", "Second short question"] {
+            view.user(question, false);
+            view.event(Out::Message {
+                text: "A long response paragraph.\n\n".repeat(80),
+            });
+            view.settle();
+        }
+        let mut renderer = Renderer::default();
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        let draw =
+            |terminal: &mut Terminal<TestBackend>, renderer: &mut Renderer, view: &mut View| {
+                terminal
+                    .draw(|f| renderer.draw(f, view, &meta, &SessionStatus::Idle, 0, false))
+                    .unwrap();
+            };
+        draw(&mut terminal, &mut renderer, &mut view);
+        let latest = renderer.timeline.turns.last().unwrap().1;
+        assert_eq!(renderer.question_hit.unwrap().1, latest);
+        renderer.latest_turn();
+        draw(&mut terminal, &mut renderer, &mut view);
+        let start = renderer.lines.len() - view.scroll - renderer.transcript.height as usize;
+        assert_eq!(start, renderer.timeline.turns[1].0);
+        renderer.jump_turn(&mut view, true);
+        draw(&mut terminal, &mut renderer, &mut view);
+        let start = renderer.lines.len() - view.scroll - renderer.transcript.height as usize;
+        assert_eq!(start, renderer.timeline.turns[0].0);
+        renderer.jump_turn(&mut view, false);
+        draw(&mut terminal, &mut renderer, &mut view);
+        assert_eq!(renderer.question_hit.unwrap().1, latest);
+        terminal.backend_mut().resize(40, 20);
+        terminal.autoresize().unwrap();
+        draw(&mut terminal, &mut renderer, &mut view);
+        renderer.latest_turn();
+        draw(&mut terminal, &mut renderer, &mut view);
+        let start = renderer.lines.len() - view.scroll - renderer.transcript.height as usize;
+        assert_eq!(start, renderer.timeline.turns[1].0);
+        renderer.follow(&mut view);
+        draw(&mut terminal, &mut renderer, &mut view);
+        assert_eq!(view.scroll, 0);
+    }
+    #[test]
+    fn tiny_approval_keeps_error_and_reply_visible() {
+        let mut view = View::default();
+        view.event(Out::Ask {
+            id: "ask".into(),
+            payload: serde_json::json!({"kind":"permission", "tool_name":"shell"}),
+        });
+        let ask = view.ask_mut().unwrap();
+        ask.error = Some(ask.answer().unwrap_err());
+        ask.editor.insert("n");
+        let meta = Metadata {
+            session: "test".into(),
+            cwd: "/workspace".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        terminal
+            .draw(|f| Renderer::default().draw(f, &mut view, &meta, &SessionStatus::Idle, 0, false))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Enter y to allow once"), "{text}");
+        assert!(
+            !text.contains("Message"),
+            "inactive composer should not displace approval"
+        );
+    }
+    #[test]
     fn narrow_footer_preserves_permissions_and_all_dashboard_sizes_fit() {
         let mut v = View::default();
         v.model_label = "provider/model".into();
@@ -1887,6 +2105,13 @@ mod regression_tests {
                 .collect::<String>();
             assert!(footer.contains("YOLO"), "{footer}");
             assert!(footer.contains("provider/model"), "{footer}");
+            let footer_rows = if width < 64 { 4 } else { 3 };
+            let details = (20 - footer_rows..20)
+                .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
+                .collect::<String>();
+            for field in ["/workspace", "tok", "ctx 90%", "tok/s"] {
+                assert!(details.contains(field), "missing {field}: {details}");
+            }
             assert!(
                 renderer.panel.is_none(),
                 "no tasks means full-width conversation"

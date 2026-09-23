@@ -374,6 +374,7 @@ impl View {
         self.selected = Some(ids[next]);
         self.touch();
     }
+    #[cfg(test)]
     pub fn clear_timeline(&mut self) {
         self.first_item_id += self.items.len() as u64;
         self.items.clear();

@@ -370,7 +370,7 @@ pub async fn run(
     let mut compact: Option<JoinHandle<()>> = None;
     let mut clipboard_task: Option<JoinHandle<std::io::Result<()>>> = None;
     let mut context_refreshed = Instant::now() - Duration::from_secs(2);
-    let mut pending_switch: Option<SessionId> = None;
+    let mut pending_switch: Option<SessionTarget> = None;
     let ui_future = async {
         let mut tick = tokio::time::interval(Duration::from_millis(40));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -379,12 +379,19 @@ pub async fn run(
             tick.tick().await;
             // Prepare and restore the target before shutting down the current
             // session, so failure leaves the current driver and view usable.
-            if let Some(new_id) = pending_switch.take() {
+            if let Some(target) = pending_switch.take() {
+                let new_id = match target {
+                    SessionTarget::New => None,
+                    SessionTarget::Resume(id) => Some(id),
+                };
                 // Prepare the target before stopping the old session. A failed
                 // resolve/open leaves the current session and its UI intact.
                 let prepared = prepare_session(&config, &config_template, new_id);
                 let new_h = match prepared {
-                    Ok((hc, model)) => Harness::open(hc, model).await.map_err(Error::from),
+                    Ok((mut hc, model)) => {
+                        hc.yolo = meta.yolo;
+                        Harness::open(hc, model).await.map_err(Error::from)
+                    }
                     Err(e) => Err(e),
                 };
                 let new_h = match new_h {
@@ -446,7 +453,10 @@ pub async fn run(
                 harness_opt = Some(new_h);
                 renderer = Renderer::default();
                 last_snap = None;
-                view.notice(Level::Info, "Session switched.");
+                view.notice(
+                    Level::Info,
+                    "Session ready. Previous sessions remain in /sessions.",
+                );
             }
             let h = harness_opt.as_ref().expect("harness missing");
             let mut drained = 0u32;
@@ -594,7 +604,7 @@ pub async fn run(
                                     if view.active || !view.asks_empty() {
                                         view.notice(Level::Warning, "Wait for the current turn, or press Esc to cancel it first.");
                                     } else if id != h.host.context().id {
-                                        pending_switch = Some(id);
+                                        pending_switch = Some(SessionTarget::Resume(id));
                                     }
                                 }
                                 OverlayAction::Delete(id) => {
@@ -677,6 +687,13 @@ pub async fn run(
                                 view.overlay = Overlay::Stats { scroll: 0 }
                             }
                             KeyCode::Char('y') if ctrl => view.theme = view.theme.next(),
+                            KeyCode::Home if ctrl => renderer.latest_turn(),
+                            KeyCode::Up if ctrl => renderer.jump_turn(&mut view, true),
+                            KeyCode::Down if ctrl => renderer.jump_turn(&mut view, false),
+                            KeyCode::Char('g') if ctrl => {
+                                let enabled = !meta.yolo;
+                                toggle_yolo(h, &mut meta, &mut view, enabled);
+                            }
                             KeyCode::End if ctrl => renderer.follow(&mut view),
                             KeyCode::PageUp if alt && !view.asks_empty() => {
                                 if let Some(ask) = view.ask_mut() {
@@ -766,13 +783,35 @@ pub async fn run(
                                         view.editor.take();
                                         continue;
                                     }
-                                    "/clear" => {
-                                        view.clear_timeline();
+                                    "/clear" | "/new" => {
                                         view.editor.take();
-                                        view.notice(
-                                            Level::Info,
-                                            "Screen cleared; saved history unchanged.",
-                                        );
+                                        if view.active
+                                            || compact.is_some()
+                                            || !view.asks_empty()
+                                            || h.host.queued() > 0
+                                        {
+                                            view.notice(Level::Warning, "Finish or cancel the current turn and queued inputs before starting a new session.");
+                                        } else {
+                                            pending_switch = Some(SessionTarget::New);
+                                        }
+                                        continue;
+                                    }
+                                    s if s == "/yolo" || s.starts_with("/yolo ") => {
+                                        view.editor.take();
+                                        let enabled = match s.strip_prefix("/yolo").unwrap().trim()
+                                        {
+                                            "" => !meta.yolo,
+                                            "on" => true,
+                                            "off" => false,
+                                            _ => {
+                                                view.notice(
+                                                    Level::Warning,
+                                                    "Usage: /yolo [on|off]",
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        toggle_yolo(h, &mut meta, &mut view, enabled);
                                         continue;
                                     }
                                     "/continue" => {
@@ -1103,11 +1142,36 @@ async fn switch_model(
     Ok(label)
 }
 
+enum SessionTarget {
+    New,
+    Resume(SessionId),
+}
+
+fn toggle_yolo(h: &Harness, meta: &mut Metadata, view: &mut View, enabled: bool) {
+    match h.set_yolo(enabled) {
+        Ok(()) => {
+            meta.yolo = enabled;
+            view.notice(
+                Level::Info,
+                if enabled {
+                    "YOLO enabled for subsequent turns. /yolo off restores approvals."
+                } else {
+                    "YOLO disabled. Original approval policy restored."
+                },
+            );
+        }
+        Err(_) => view.notice(
+            Level::Warning,
+            "Permission mode can change between turns. Press Esc to cancel, then Ctrl-G or /yolo.",
+        ),
+    }
+}
+
 /// Rebuild model-dependent settings from the structured runtime selection.
 fn prepare_session(
     config: &Arc<std::sync::Mutex<Config>>,
     template: &HarnessConfig,
-    id: SessionId,
+    id: Option<SessionId>,
 ) -> Result<(HarnessConfig, Arc<dyn ModelProvider>), Error> {
     let mut candidate = config
         .lock()
@@ -1116,7 +1180,7 @@ fn prepare_session(
     let variant = candidate.selected_variant.clone();
     let model = candidate.resolve(variant.as_deref())?;
     let mut hc = template.clone();
-    hc.resume = Some(id);
+    hc.resume = id;
     hc.context_policy = candidate.context.clone();
     hc.model_provider = candidate
         .model
@@ -1179,7 +1243,7 @@ mod switch_tests {
             .await
             .unwrap();
         assert_eq!(h.host.context_usage().unwrap().output_reserve, 2048);
-        let (resume, _) = prepare_session(&config, &hc, h.host.context().id).unwrap();
+        let (resume, _) = prepare_session(&config, &hc, Some(h.host.context().id)).unwrap();
         assert_eq!(resume.context_policy.context_window, Some(32000));
         // This differs from the default model's 4096, proving variant resolution.
         assert_eq!(resume.context_policy.output_reserve, 2048);

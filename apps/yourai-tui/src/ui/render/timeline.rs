@@ -18,6 +18,7 @@ struct Entry {
 #[derive(Default)]
 pub(super) struct TimelineCache {
     entries: HashMap<u64, Entry>,
+    pub turns: Vec<(usize, u64)>,
     #[cfg(test)]
     pub builds: usize,
 }
@@ -29,6 +30,7 @@ impl TimelineCache {
         edit_preview_rows: usize,
         tick: u64,
     ) -> (Vec<Line<'static>>, Vec<(usize, u64)>) {
+        self.turns.clear();
         let mut lines = Vec::new();
         let mut headers = Vec::new();
         let first = v.item_id(0);
@@ -58,6 +60,15 @@ impl TimelineCache {
                 {
                     self.builds += 1;
                 }
+            }
+            if matches!(
+                item,
+                Item::Text {
+                    role: Role::User,
+                    ..
+                }
+            ) {
+                self.turns.push((lines.len(), id));
             }
             if View::foldable(item) {
                 headers.push((lines.len(), id));
@@ -138,14 +149,25 @@ fn item_lines(
             role: Role::User,
             text,
         } => {
+            lines.push(Line::from(Span::styled(
+                format!("  YOU {}", "─".repeat(width.saturating_sub(7))),
+                Style::default().fg(ACCENT).bold(),
+            )));
+            lines.push(Line::from(" ".repeat(width)).style(Style::default().bg(PANEL)));
             for line in text.lines() {
-                lines.extend(wrap(
+                for row in wrap(
                     line,
-                    Style::default().fg(TEXT).bg(PANEL),
-                    width,
-                    "  ▎ ",
-                ));
+                    Style::default().fg(TEXT).bold(),
+                    width.saturating_sub(2),
+                    "  ",
+                ) {
+                    let padding = width.saturating_sub(row.width());
+                    let mut row = row;
+                    row.spans.push(Span::raw(" ".repeat(padding)));
+                    lines.push(row.style(Style::default().bg(PANEL)));
+                }
             }
+            lines.push(Line::from(" ".repeat(width)).style(Style::default().bg(PANEL)));
         }
         Item::Text { text, .. } => lines.extend(crate::ui::markdown::render(text, width)),
         Item::Notice { level, text } => {

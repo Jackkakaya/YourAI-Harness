@@ -101,6 +101,39 @@ with tempfile.TemporaryDirectory() as tmp:
         assert 'after stats' in json.dumps(requests[0][1])
         assert 'LEAK' not in json.dumps(requests[0][1])
         db = sqlite3.connect(Path(tmp) / '.yourai/sessions/sessions.sqlite3')
+        # Local commands must reset the actual model context, retain old sessions,
+        # and preserve the process permission selection across a session switch.
+        time.sleep(0.2)
+        captured.clear()
+        os.write(master, b'/yolo on\r')
+        wait_for(b'YOLO enabled')
+        before_new = db.execute('SELECT count(*) FROM sessions').fetchone()[0]
+        captured.clear()
+        os.write(master, b'/new\r')
+        wait_for(b'Session ready')
+        assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before_new + 1
+        captured.clear()
+        os.write(master, b'\x07')
+        wait_for(b'YOLO disabled')
+        captured.clear()
+        os.write(master, b'fresh context\r')
+        wait_for(b'MODELS_OK')
+        assert len(requests) == 2
+        assert 'after stats' not in json.dumps(requests[-1][1])
+        assert 'fresh context' in json.dumps(requests[-1][1])
+        assert '/new' not in json.dumps(requests[-1][1])
+        time.sleep(0.2)
+        captured.clear()
+        os.write(master, b'/clear\r')
+        wait_for(b'Untitled session')
+        assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before_new + 2
+        captured.clear()
+        os.write(master, b'after reset\r')
+        wait_for(b'MODELS_OK')
+        assert len(requests) == 3
+        assert 'fresh context' not in json.dumps(requests[-1][1])
+        assert 'after reset' in json.dumps(requests[-1][1])
+        time.sleep(0.2)
         old_id = str(uuid.uuid4())
         db.execute("INSERT INTO sessions(session_id,title,created_at,updated_at) VALUES (?, 'Old review', 1, 1)", (old_id,))
         db.commit()
@@ -137,7 +170,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert wait_exit(child, master) == 0
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before
         db.close()
-        print('PASS: default model picker -> running dashboard Esc isolation -> confirmed deletion -> 35-column stats -> launcher Ctrl-Q')
+        print('PASS: default model picker -> running dashboard Esc isolation -> new/clear context + runtime YOLO -> confirmed deletion -> 35-column stats -> launcher Ctrl-Q')
     finally:
         if child.poll() is None:
             child.kill()

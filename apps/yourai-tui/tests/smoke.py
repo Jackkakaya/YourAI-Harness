@@ -170,7 +170,7 @@ with tempfile.TemporaryDirectory() as tmp:
         if yolo:
             wait_for(b'YOLO')
         else:
-            wait_for(b'permission')
+            wait_for(b'Allow tasks?')
             os.write(master, b'\r')
             wait_for(b'Enter y to allow once')
             assert len(requests) == 1, 'empty reply approved a tool'
@@ -221,7 +221,7 @@ with tempfile.TemporaryDirectory() as tmp:
         db.close()
         captured.clear()
         child = subprocess.Popen([str(binary), '--config', str(config), '--resume', session] + mode_args, stdin=slave, stdout=slave, stderr=slave, env=child_env)
-        wait_for('✦ list tasks'.encode())  # session title persists in the header
+        wait_for(b'list tasks')  # session title persists in the footer
         wait_for(b'SMOKE_SECOND_OK')  # history must be visible before a new request
         wait_for(b'Todo')
         wait_for(b'Review parser')
