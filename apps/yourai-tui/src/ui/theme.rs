@@ -16,11 +16,11 @@ const fn rgb(value: u32) -> Color {
 
 // Baseline slot constants = the Dark palette. Renderers build every span from
 // these (and only these) colors.
-pub(crate) const BG: Color = rgb(0x101214);
+pub(crate) const BG: Color = rgb(0x000000);
 pub(crate) const PANEL: Color = rgb(0x2C3035);
 pub(crate) const TEXT: Color = rgb(0xFFFFFF);
 pub(crate) const MUTED: Color = rgb(0xC3C7C0);
-pub(crate) const FAINT: Color = rgb(0x727673);
+pub(crate) const FAINT: Color = rgb(0x6B6D6A);
 pub(crate) const YELLOW: Color = rgb(0xE7C797);
 pub(crate) const ACCENT: Color = rgb(0xC7DEB9);
 pub(crate) const GREEN: Color = rgb(0xAED0AD);
@@ -28,8 +28,8 @@ pub(crate) const RED: Color = rgb(0xE5A19A);
 pub(crate) const BLUE: Color = rgb(0xBACDE4);
 pub(crate) const CYAN: Color = rgb(0xAED5D5);
 pub(crate) const BORDER: Color = rgb(0x7E898A);
-pub(crate) const DIFF_ADD_BG: Color = rgb(0x282F2B);
-pub(crate) const DIFF_DEL_BG: Color = rgb(0x302728);
+pub(crate) const DIFF_ADD_BG: Color = rgb(0x1A1F1A);
+pub(crate) const DIFF_DEL_BG: Color = rgb(0x221817);
 // Syntax highlight slots (Dark baseline values, derived in `Palette::derive`
 // with fixed mixes; keep in sync: test `dark_baseline_slots_match_palette`).
 pub(crate) const SY_KEYWORD: Color = rgb(0xD8BCA8);
@@ -261,7 +261,7 @@ impl Theme {
     pub fn palette(self) -> Palette {
         match self.effective() {
             Self::Dark | Self::System => Palette::derive(
-                0x101214, 0x2C3035, 0xFFFFFF, 0xC3C7C0, 0xC7DEB9, 0xAED0AD, 0xE5A19A, 0xE7C797,
+                0x000000, 0x2C3035, 0xFFFFFF, 0xC3C7C0, 0xC7DEB9, 0xAED0AD, 0xE5A19A, 0xE7C797,
                 0xBACDE4, 0xAED5D5, 0x7E898A,
             ),
             Self::Light => Palette::derive(
