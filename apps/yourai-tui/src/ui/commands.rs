@@ -7,60 +7,125 @@ pub struct Command {
 }
 const COMMANDS: &[Command] = &[
     Command {
+        text: "/new",
+        description: "Start a fresh session",
+        argument: false,
+    },
+    Command {
+        text: "/yolo",
+        description: "Toggle permissions (or /yolo on|off) · Ctrl-G",
+        argument: false,
+    },
+    Command {
         text: "/help",
-        description: "查看快捷键",
+        description: "Show keyboard shortcuts",
         argument: false,
     },
     Command {
         text: "/compact",
-        description: "压缩当前上下文",
+        description: "Compact current context",
         argument: false,
     },
     Command {
         text: "/continue",
-        description: "继续处理待执行输入",
+        description: "Resume pending inputs",
         argument: false,
     },
     Command {
         text: "/clear",
-        description: "清屏，保留会话历史",
+        description: "Reset context in a new session; keep saved history",
         argument: false,
     },
     Command {
         text: "/queue",
-        description: "添加后续任务",
+        description: "Schedule a follow-up turn",
         argument: true,
     },
     Command {
         text: "/theme",
-        description: "选择颜色主题",
-        argument: true,
+        description: "Theme picker (or /theme NAME)",
+        argument: false,
+    },
+    Command {
+        text: "/models",
+        description: "Switch model (picker; or /models p/m [variant])",
+        argument: false,
+    },
+    Command {
+        text: "/sessions",
+        description: "List and switch sessions",
+        argument: false,
+    },
+    Command {
+        text: "/status",
+        description: "Toggle stats dashboard",
+        argument: false,
     },
     Command {
         text: "/quit",
-        description: "退出",
+        description: "Quit",
         argument: false,
     },
 ];
 const THEMES: &[Command] = &[
     Command {
+        text: "/theme system",
+        description: "Follow OS",
+        argument: false,
+    },
+    Command {
         text: "/theme dark",
-        description: "深色",
+        description: "Dark",
         argument: false,
     },
     Command {
         text: "/theme light",
-        description: "浅色",
+        description: "Light",
+        argument: false,
+    },
+    Command {
+        text: "/theme one-dark",
+        description: "Atom One Dark",
+        argument: false,
+    },
+    Command {
+        text: "/theme monokai",
+        description: "Monokai",
+        argument: false,
+    },
+    Command {
+        text: "/theme solarized-dark",
+        description: "Solarized Dark",
+        argument: false,
+    },
+    Command {
+        text: "/theme solarized-light",
+        description: "Solarized Light",
         argument: false,
     },
     Command {
         text: "/theme nord",
-        description: "冷色",
+        description: "Cool tones",
         argument: false,
     },
     Command {
         text: "/theme dracula",
-        description: "紫色",
+        description: "Purple",
+        argument: false,
+    },
+    Command {
+        text: "/theme catppuccin",
+        description: "Catppuccin Mocha",
+        argument: false,
+    },
+    Command {
+        text: "/theme tokyo-night",
+        description: "Tokyo Night",
+        argument: false,
+    },
+    Command {
+        text: "/theme gruvbox",
+        description: "Gruvbox",
         argument: false,
     },
 ];
@@ -120,7 +185,7 @@ mod tests {
     fn filter_navigation_dismissal_and_arguments() {
         let mut menu = Menu::default();
         menu.sync("/", true);
-        assert_eq!(menu.items().len(), 7);
+        assert_eq!(menu.items().len(), 12);
         menu.step(true);
         assert_eq!(menu.items()[menu.selected].text, "/quit");
         menu.sync("/co", true);
@@ -128,7 +193,7 @@ mod tests {
         menu.dismiss();
         assert!(menu.items().is_empty());
         menu.sync("/theme ", true);
-        assert_eq!(menu.items().len(), 4);
+        assert_eq!(menu.items().len(), 12);
         menu.sync("/queue work", true);
         assert!(menu.items().is_empty());
         menu.sync("/", false);

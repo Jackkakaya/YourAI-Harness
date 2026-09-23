@@ -1,6 +1,6 @@
 use super::State;
 use futures_util::StreamExt;
-use std::{collections::HashSet, time::Instant};
+use std::collections::HashSet;
 use yourai_core::prelude::*;
 
 impl State<'_> {
@@ -19,7 +19,7 @@ impl State<'_> {
     ) -> Result<(ChatMessage, Vec<ToolCall>), YourAiError> {
         self.bound_tools.clear();
         let mut tools = vec![];
-        if let Some(registry) = &self.tc.snap.tools {
+        if let (false, Some(registry)) = (self.forced_final, &self.tc.snap.tools) {
             let mut definitions = registry.definitions();
             definitions.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
             for definition in definitions {
@@ -69,21 +69,16 @@ impl State<'_> {
             .with_capture_usage(true)
             .with_capture_reasoning_content(true);
         let model = self.model.clone();
-        let timeout = self
-            .tc
-            .info
-            .options
-            .limits
-            .model_timeout
-            .unwrap_or(self.config.operation_timeout);
-        let deadline = self.deadline(Some(timeout));
+        let model_timeout = self.tc.info.options.limits.model_timeout;
+        let header_timeout = model_timeout.unwrap_or(self.config.model_header_timeout);
+        let chunk_timeout = model_timeout.unwrap_or(self.config.model_chunk_timeout);
         self.model_calls += 1;
         let mut request = ModelRequest::new(request, options);
         request.session_id = Some(self.history.session_id().0.clone());
         request.turn_id = Some(self.tc.info.id.to_string());
         request.attempt = attempt;
         let mut stream = self
-            .wait(model.stream_events(request), Some(timeout), "model")
+            .wait(model.stream_events(request), Some(header_timeout), "model")
             .await?;
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -92,7 +87,7 @@ impl State<'_> {
             let next = self
                 .wait(
                     async { stream.next().await.transpose() },
-                    Some(deadline.saturating_duration_since(Instant::now())),
+                    Some(chunk_timeout),
                     "model",
                 )
                 .await?;

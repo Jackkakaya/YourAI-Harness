@@ -1,9 +1,12 @@
+mod tool_output;
 use super::editor::Editor;
+use ratatui::text::{Line, Span};
 use serde_json::{json, Value};
 use std::{
     collections::{HashSet, VecDeque},
-    time::Instant,
+    time::{Duration, Instant},
 };
+use tool_output::*;
 use yourai_core::prelude::*;
 const MAX_TEXT: usize = 32_000;
 const MAX_ITEMS: usize = 1000;
@@ -26,16 +29,89 @@ pub struct ToolView {
     pub name: String,
     pub input: String,
     pub summary: String,
+    /// Result body with all headers stripped (stdout for shell, diff for
+    /// edit, file body for read, first-meaningful-field text otherwise).
     pub output: String,
+    /// Shell stderr, kept separate from `output` so previews never mix them.
+    pub stderr: String,
+    /// Pre-built list preview rows (websearch: "title — host"); may be empty.
+    pub brief: Vec<String>,
+    /// Syntax-highlighted file/page content (read/write/webfetch); file gutters
+    /// are included where appropriate. Colors remain baseline palette slots.
+    pub content_hl: Option<Vec<Line<'static>>>,
+    /// Structured output format for content-bearing tools (notably webfetch).
+    pub content_format: Option<String>,
     pub progress: String,
     pub status: ToolStatus,
     pub started: Option<Instant>,
     pub seconds: Option<u64>,
+    pub exit_code: Option<i64>,
+    pub adds: Option<usize>,
+    pub dels: Option<usize>,
+    /// write: whether the file was created (vs overwritten).
+    pub created: bool,
+    /// edit: parsed + per-hunk syntax-highlighted diff rows, built once when
+    /// the result lands so rendering stays width-agnostic (unified or split).
+    pub diff_rows: Option<Vec<DiffRow>>,
+}
+
+/// One display row of a parsed unified diff. Syntax spans hold baseline
+/// palette slot colors; subtle desaturation happens at render time.
+#[derive(Clone, Debug)]
+pub struct DiffRow {
+    /// "@@ -40,6 +40,7 @@" style header label.
+    pub hunk: Option<String>,
+    /// Unchanged line (identical on both sides).
+    pub ctx: Option<Vec<Span<'static>>>,
+    /// Removed line + its source line number.
+    pub old: Option<(usize, Vec<Span<'static>>)>,
+    /// Added line + its source line number.
+    pub new: Option<(usize, Vec<Span<'static>>)>,
+}
+impl DiffRow {
+    fn hunk(label: &str) -> Self {
+        Self {
+            hunk: Some(label.to_owned()),
+            ctx: None,
+            old: None,
+            new: None,
+        }
+    }
+    fn ctx(spans: Vec<Span<'static>>) -> Self {
+        Self {
+            hunk: None,
+            ctx: Some(spans),
+            old: None,
+            new: None,
+        }
+    }
+    fn change(
+        old: Option<(usize, Vec<Span<'static>>)>,
+        new: Option<(usize, Vec<Span<'static>>)>,
+    ) -> Self {
+        Self {
+            hunk: None,
+            ctx: None,
+            old,
+            new,
+        }
+    }
+    /// Number of changed lines this row accounts for (for "N more" hints).
+    pub fn changes(&self) -> usize {
+        usize::from(self.old.is_some()) + usize::from(self.new.is_some())
+    }
 }
 pub enum Item {
-    Text { role: Role, text: String },
-    Tool(ToolView),
-    Notice { level: Level, text: String },
+    Text {
+        role: Role,
+        text: String,
+    },
+    /// Boxed: ToolView (highlighted content, diff rows) dwarfs the others.
+    Tool(Box<ToolView>),
+    Notice {
+        level: Level,
+        text: String,
+    },
 }
 pub struct Ask {
     pub id: String,
@@ -81,27 +157,56 @@ pub struct Todo {
     pub completed: bool,
 }
 
+pub struct RetryState {
+    pub attempt: u32,
+    pub max: u32,
+    pub reason: String,
+    pub until: Instant,
+}
+
+/// `/sessions` overlay state. Rows are loaded once on open; the filter query
+/// and selected index mutate freely while the overlay is open.
+#[derive(Clone, Debug)]
+pub struct SessionPickerState {
+    pub pending_delete: Option<crate::sessions::SessionRow>,
+    pub rows: Vec<crate::sessions::SessionRow>,
+    pub query: String,
+    pub selected: usize,
+}
+
 pub struct View {
     pub model_metrics: yourai_harness::model::BudgetSnapshot,
+    pub retry: Option<RetryState>,
     pub recorded_responses: u64,
     pub commands: super::commands::Menu,
     pub toast: Option<(String, Instant)>,
     pub theme: super::theme::Theme,
     pub context_usage: Option<yourai_harness::runtime::ContextUsage>,
-    pub items: VecDeque<Item>,
+    // Timeline state: mutate only through methods so item identities, folds and
+    // the render revision (touch) cannot drift apart.
+    items: VecDeque<Item>,
+    item_versions: VecDeque<u64>,
     pub editor: Editor,
-    pub asks: VecDeque<Ask>,
+    asks: VecDeque<Ask>,
     assistant: Option<usize>,
     thinking: Option<usize>,
     pub scroll: usize,
     first_item_id: u64,
-    pub expanded: HashSet<u64>,
-    pub selected: Option<u64>,
+    expanded: HashSet<u64>,
+    selected: Option<u64>,
+    /// Session title shown in the conversation header; derived from the first prompt.
+    pub title: Option<String>,
     pub todos: Vec<Todo>,
-    pub todos_expanded: bool,
+    /// Optional Todo panel. Default on; toggled by ^T.
+    pub todo_panel: bool,
     pub todo_scroll: usize,
-    pub sidebar: bool,
-    pub help: bool,
+    pub overlay: super::overlay::Overlay,
+    /// Candidate labels for the model picker.
+    pub model_choices: Vec<String>,
+    /// Current model display label (updated by /models switch).
+    pub model_label: String,
+    /// Optional per-model pricing for cost display (input $/M, output $/M).
+    pub pricing: Option<(f64, f64)>,
     pub usage: Usage,
     pub unseen: usize,
     pub revision: u64,
@@ -112,12 +217,14 @@ impl Default for View {
     fn default() -> Self {
         Self {
             model_metrics: Default::default(),
+            retry: None,
             recorded_responses: 0,
             commands: Default::default(),
             toast: None,
             theme: Default::default(),
             context_usage: None,
             items: VecDeque::new(),
+            item_versions: VecDeque::new(),
             editor: Editor::default(),
             asks: VecDeque::new(),
             assistant: None,
@@ -126,11 +233,14 @@ impl Default for View {
             first_item_id: 0,
             expanded: HashSet::new(),
             selected: None,
+            title: None,
             todos: vec![],
-            todos_expanded: true,
+            todo_panel: true,
             todo_scroll: 0,
-            sidebar: true,
-            help: false,
+            overlay: Default::default(),
+            model_choices: vec![],
+            model_label: String::new(),
+            pricing: None,
             usage: Usage::default(),
             unseen: 0,
             revision: 0,
@@ -150,8 +260,50 @@ impl View {
         }
     }
 
+    /// Whether the item at `index` is the currently streaming thinking block.
+    pub fn is_thinking_at(&self, index: usize) -> bool {
+        self.thinking == Some(index)
+    }
+
+    /// Stable identity independent of front-of-history eviction.
     pub fn item_id(&self, index: usize) -> u64 {
         self.first_item_id + index as u64
+    }
+    /// Read-only timeline access; the render cache assumes mutation goes
+    /// through the methods below (they maintain ids, folds and `revision`).
+    pub fn items(&self) -> &VecDeque<Item> {
+        &self.items
+    }
+    pub fn item_version(&self, index: usize) -> u64 {
+        self.item_versions[index]
+    }
+    fn item_mut(&mut self, index: usize) -> Option<&mut Item> {
+        if let Some(version) = self.item_versions.get_mut(index) {
+            *version = version.wrapping_add(1);
+        }
+        self.items.get_mut(index)
+    }
+    pub fn expanded(&self, id: u64) -> bool {
+        self.expanded.contains(&id)
+    }
+    pub fn selected(&self) -> Option<u64> {
+        self.selected
+    }
+    /// Asks are answered strictly in arrival order; only the front one is editable.
+    pub fn asks_empty(&self) -> bool {
+        self.asks.is_empty()
+    }
+    pub fn ask(&self) -> Option<&Ask> {
+        self.asks.front()
+    }
+    pub fn ask_mut(&mut self) -> Option<&mut Ask> {
+        self.asks.front_mut()
+    }
+    pub fn dismiss_ask(&mut self) {
+        self.asks.pop_front();
+    }
+    pub fn dismiss_asks(&mut self) {
+        self.asks.clear();
     }
     pub fn foldable(item: &Item) -> bool {
         matches!(
@@ -222,19 +374,31 @@ impl View {
         self.selected = Some(ids[next]);
         self.touch();
     }
+    #[cfg(test)]
     pub fn clear_timeline(&mut self) {
         self.first_item_id += self.items.len() as u64;
         self.items.clear();
+        self.item_versions.clear();
         self.expanded.clear();
         self.selected = None;
         self.settle();
         self.follow();
     }
+    /// Todos render outside the cached timeline (sidebar repaints every frame),
+    /// so changes must not bump `revision`; `touch` would also inflate `unseen`.
     pub fn set_todos(&mut self, todos: Vec<Todo>) {
         if self.todos != todos {
             self.todos = todos;
-            self.touch();
         }
+    }
+    /// Derive a display title from a prompt; the first non-empty derivation wins.
+    pub fn note_title(&mut self, text: &str) -> Option<String> {
+        if self.title.is_some() {
+            return None;
+        }
+        let derived = derive_title(text)?;
+        self.title = Some(derived.clone());
+        Some(derived)
     }
 
     pub fn touch(&mut self) {
@@ -245,8 +409,10 @@ impl View {
     }
     fn push(&mut self, item: Item) {
         self.items.push_back(item);
+        self.item_versions.push_back(0);
         if self.items.len() > MAX_ITEMS {
             self.items.pop_front();
+            self.item_versions.pop_front();
             self.expanded.remove(&self.first_item_id);
             if self.selected == Some(self.first_item_id) {
                 self.selected = None;
@@ -280,7 +446,7 @@ impl View {
             self.thinking
         };
         if let Some(i) = index {
-            if let Some(Item::Text { text: body, .. }) = self.items.get_mut(i) {
+            if let Some(Item::Text { text: body, .. }) = self.item_mut(i) {
                 append(body, text);
                 self.touch();
                 return;
@@ -302,17 +468,20 @@ impl View {
     pub fn idle(&mut self) {
         self.active = false;
         self.since = None;
+        self.retry = None;
         self.asks.clear();
     }
     pub fn settle(&mut self) {
+        self.retry = None;
         self.assistant = None;
         self.thinking = None;
         self.asks.clear();
         self.active = false;
         self.since = None;
-        for item in &mut self.items {
+        for (i, item) in self.items.iter_mut().enumerate() {
             if let Item::Tool(t) = item {
                 if t.status == ToolStatus::Running {
+                    self.item_versions[i] = self.item_versions[i].wrapping_add(1);
                     t.status = ToolStatus::Interrupted;
                     t.seconds = t.started.map(|s| s.elapsed().as_secs());
                 }
@@ -326,11 +495,18 @@ impl View {
     }
     pub fn event(&mut self, event: Out) {
         match event {
-            Out::Chunk { text } => self.delta(Role::Assistant, &text),
-            Out::Reasoning { text } => self.delta(Role::Thinking, &text),
+            Out::Chunk { text } => {
+                self.retry = None;
+                self.delta(Role::Assistant, &text);
+            }
+            Out::Reasoning { text } => {
+                self.retry = None;
+                self.delta(Role::Thinking, &text);
+            }
             Out::Message { text } => {
+                self.retry = None;
                 if let Some(i) = self.assistant.take() {
-                    if let Some(Item::Text { text: body, .. }) = self.items.get_mut(i) {
+                    if let Some(Item::Text { text: body, .. }) = self.item_mut(i) {
                         *body = bounded(&text);
                     }
                 } else {
@@ -342,16 +518,43 @@ impl View {
                 self.thinking = None;
                 self.touch();
             }
+            Out::Retry {
+                attempt,
+                max,
+                reason,
+                wait_ms,
+            } => {
+                self.retry = Some(RetryState {
+                    attempt,
+                    max,
+                    reason: bounded(&reason),
+                    until: Instant::now() + Duration::from_millis(wait_ms),
+                });
+                self.touch();
+            }
             Out::ToolStarted { id, name, input } => {
+                self.retry = None;
                 self.assistant = None;
                 self.thinking = None;
-                self.push(Item::Tool(ToolView {
+                // write: highlight the incoming content right away so the card
+                // previews the change while it runs.
+                let content_hl = (name == "write").then(|| {
+                    let path = input["path"].as_str().unwrap_or("");
+                    let content = input["content"].as_str().unwrap_or("");
+                    hl_lines(content, path, "+ ")
+                });
+                let adds = (name == "write")
+                    .then(|| input["content"].as_str().unwrap_or("").lines().count());
+                let created = name == "write";
+                self.push(Item::Tool(Box::new(ToolView {
                     id,
                     name,
                     summary: bounded(
                         input
                             .get("command")
                             .or_else(|| input.get("path"))
+                            .or_else(|| input.get("query"))
+                            .or_else(|| input.get("url"))
                             .or_else(|| input.get("subject"))
                             .or_else(|| input.get("action"))
                             .and_then(Value::as_str)
@@ -359,11 +562,20 @@ impl View {
                     ),
                     input: pretty(&input),
                     output: String::new(),
+                    stderr: String::new(),
+                    brief: Vec::new(),
+                    content_hl,
+                    content_format: None,
                     progress: String::new(),
                     status: ToolStatus::Running,
                     started: Some(Instant::now()),
                     seconds: None,
-                }));
+                    exit_code: None,
+                    adds,
+                    dels: None,
+                    created,
+                    diff_rows: None,
+                })));
             }
             Out::ToolProgress { id, payload } => {
                 if let Some(t) = self.tool_mut(&id) {
@@ -374,7 +586,10 @@ impl View {
                             }
                         }
                     } else {
-                        append_progress(&mut t.progress, &format!("{}\n", pretty(&payload)));
+                        append_progress(
+                            &mut t.progress,
+                            &format!("{}\n", summarize_output(&payload)),
+                        );
                     }
                     self.touch();
                 } else {
@@ -388,32 +603,144 @@ impl View {
                 is_error,
             } => {
                 let failed = is_error || (name == "shell" && output["ok"] == false);
-                let body = tool_output(&name, &output);
+                // Known results have typed previews. Unknown results retain bounded
+                // structured values so expanded cards remain inspectable.
+                let mut body = String::new();
+                let mut stderr = String::new();
+                let mut brief = Vec::new();
+                let mut content_hl = None;
+                let mut content_format = None;
+                let mut exit_code = None;
+                let mut adds = None;
+                let mut dels = None;
+                let mut diff_rows = None;
+                let mut created = false;
+                if let Some(error) = output.get("error") {
+                    body = format_error(error, &output);
+                } else {
+                    match name.as_str() {
+                        "shell" => {
+                            exit_code = output["exit_code"].as_i64();
+                            let mut out = clean(output["stdout"].as_str().unwrap_or(""));
+                            stderr = clean(output["stderr"].as_str().unwrap_or(""));
+                            if output["output_complete"] == false {
+                                if !out.is_empty() {
+                                    out.push('\n');
+                                }
+                                out.push_str("[output incomplete]");
+                            }
+                            body = bounded(&out);
+                        }
+                        "read" if output.get("content").is_some() => {
+                            let path = output["path"].as_str().unwrap_or("");
+                            let content = output["content"].as_str().unwrap_or("");
+                            content_hl = Some(hl_read(content, path));
+                            body = bounded(content);
+                        }
+                        "edit" if output.get("diff").is_some() => {
+                            let diff = bounded(output["diff"].as_str().unwrap_or(""));
+                            let (a, d) = diff_stats(&diff);
+                            adds = Some(a);
+                            dels = Some(d);
+                            diff_rows = Some(build_diff_rows(
+                                &diff,
+                                output["path"].as_str().unwrap_or(""),
+                            ));
+                            body = diff;
+                        }
+                        "write" => {
+                            created = output["created"] == true;
+                            // Content was highlighted at ToolStarted.
+                        }
+                        "websearch" => {
+                            let content = output["content"].as_str().unwrap_or("");
+                            brief = search_brief(content);
+                            body = bounded(content);
+                        }
+                        "webfetch" => {
+                            let content = output["content"].as_str().unwrap_or("");
+                            let format = output["format"].as_str().unwrap_or("text");
+                            content_format = Some(format.to_owned());
+                            let hint = match format {
+                                "html" => Some("html"),
+                                "json" => Some("json"),
+                                "xml" => Some("xml"),
+                                _ => None,
+                            };
+                            if let Some(hint) = hint {
+                                content_hl = super::syntax::highlight(capped(content), hint);
+                            }
+                            brief = page_brief(content, format);
+                            body = bounded(content);
+                        }
+                        _ => {
+                            body = summarize_output(&output);
+                            let summary =
+                                ["content", "result", "message", "text", "summary", "output"]
+                                    .iter()
+                                    .find_map(|key| output.get(*key).and_then(Value::as_str));
+                            brief.push(summary.map(bounded).unwrap_or_else(|| {
+                                if output.is_object() || output.is_array() {
+                                    "Structured result · ^O to inspect".into()
+                                } else {
+                                    body.clone()
+                                }
+                            }));
+                        }
+                    }
+                }
+                let status = if failed {
+                    ToolStatus::Failed
+                } else {
+                    ToolStatus::Done
+                };
                 if let Some(t) = self.tool_mut(&id) {
                     t.output = body;
+                    t.stderr = stderr;
+                    t.brief = brief;
+                    t.exit_code = exit_code;
+                    if adds.is_some() {
+                        t.adds = adds;
+                    }
+                    if dels.is_some() {
+                        t.dels = dels;
+                    }
+                    if content_hl.is_some() {
+                        t.content_hl = content_hl;
+                    }
+                    if content_format.is_some() {
+                        t.content_format = content_format;
+                    }
+                    if diff_rows.is_some() {
+                        t.diff_rows = diff_rows;
+                    }
+                    if t.name == "write" {
+                        t.created = created;
+                    }
                     t.progress.clear();
-                    t.status = if failed {
-                        ToolStatus::Failed
-                    } else {
-                        ToolStatus::Done
-                    };
+                    t.status = status;
                     t.seconds = t.started.map(|s| s.elapsed().as_secs());
                 } else {
-                    self.push(Item::Tool(ToolView {
+                    self.push(Item::Tool(Box::new(ToolView {
                         id: id.clone(),
-                        name,
+                        name: name.clone(),
                         input: String::new(),
-                        summary: String::new(),
+                        summary: bounded(output["path"].as_str().unwrap_or(&name)),
                         output: body,
+                        stderr,
+                        brief,
+                        content_hl,
+                        content_format,
                         progress: String::new(),
-                        status: if failed {
-                            ToolStatus::Failed
-                        } else {
-                            ToolStatus::Done
-                        },
+                        status,
                         started: None,
                         seconds: None,
-                    }));
+                        exit_code,
+                        adds,
+                        dels,
+                        created,
+                        diff_rows,
+                    })));
                 }
                 self.asks
                     .retain(|a| a.payload["call_id"].as_str() != Some(&id));
@@ -445,10 +772,14 @@ impl View {
         }
     }
     fn tool_mut(&mut self, id: &str) -> Option<&mut ToolView> {
-        self.items.iter_mut().rev().find_map(|i| match i {
-            Item::Tool(t) if t.id == id => Some(t),
+        let index = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, Item::Tool(t) if t.id == id))?;
+        match self.item_mut(index)? {
+            Item::Tool(t) => Some(t.as_mut()),
             _ => None,
-        })
+        }
     }
     pub fn restore(&mut self, rows: Vec<StoredMessage>) {
         for row in rows {
@@ -509,6 +840,24 @@ impl View {
         self.settle();
         self.follow();
     }
+}
+/// Title from the first line of a prompt: whitespace-collapsed, truncated.
+pub fn derive_title(text: &str) -> Option<String> {
+    let mut title = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        return None;
+    }
+    if title.chars().count() > 48 {
+        title = title.chars().take(47).collect();
+        title.push('…');
+    }
+    Some(title)
 }
 pub fn clean(text: &str) -> String {
     // Strip terminal controls, including ANSI CSI/OSC sequences, from untrusted output.
@@ -573,41 +922,6 @@ fn append_progress(body: &mut String, text: &str) {
 }
 pub fn pretty(v: &Value) -> String {
     bounded(&serde_json::to_string_pretty(v).unwrap_or_default())
-}
-fn tool_output(name: &str, v: &Value) -> String {
-    if v.get("error").is_some() {
-        return pretty(v);
-    }
-    bounded(&match name {
-        "shell" => format!(
-            "exit {} · {}{}\n{}{}",
-            v["exit_code"],
-            v["termination"].as_str().unwrap_or("unknown"),
-            if v["output_complete"] == false {
-                " · output incomplete"
-            } else {
-                ""
-            },
-            v["stdout"].as_str().unwrap_or(""),
-            v["stderr"].as_str().unwrap_or("")
-        ),
-        "edit" if v.get("diff").is_some() => format!(
-            "{}\n{}",
-            v["path"].as_str().unwrap_or(""),
-            v["diff"].as_str().unwrap_or("")
-        ),
-        "write" if v.get("bytes_written").is_some() => format!(
-            "{} · {} bytes written",
-            v["path"].as_str().unwrap_or(""),
-            v["bytes_written"]
-        ),
-        "read" if v.get("content").is_some() => format!(
-            "{}\n{}",
-            v["path"].as_str().unwrap_or(""),
-            v["content"].as_str().unwrap_or("")
-        ),
-        _ => pretty(v),
-    })
 }
 #[cfg(test)]
 mod tests {
@@ -774,6 +1088,28 @@ mod tests {
         assert_eq!(v.editor.text, "draft");
     }
     #[test]
+    fn retry_status_sticks_until_progress_or_settle() {
+        let mut v = View::default();
+        v.event(Out::Retry {
+            attempt: 1,
+            max: 2,
+            reason: "HTTP 429".into(),
+            wait_ms: 5000,
+        });
+        assert_eq!(v.retry.as_ref().map(|r| r.attempt), Some(1));
+        assert!(v.retry.as_ref().unwrap().until > Instant::now());
+        v.event(Out::Reasoning { text: "r".into() });
+        assert!(v.retry.is_none());
+        v.event(Out::Retry {
+            attempt: 2,
+            max: 2,
+            reason: "HTTP 500".into(),
+            wait_ms: 1000,
+        });
+        v.settle();
+        assert!(v.retry.is_none());
+    }
+    #[test]
     fn bounded_output_and_ansi() {
         assert_eq!(clean("\x1b[31mred\x1b[0m\x1b]0;bad\x07"), "red");
         let text = bounded(&"中".repeat(40000));
@@ -783,5 +1119,188 @@ mod tests {
         append_progress(&mut progress, "latest progress");
         assert!(progress.ends_with("latest progress"));
         assert_eq!(progress.chars().count(), MAX_TEXT);
+    }
+
+    fn only_tool(v: &View) -> &ToolView {
+        let tools: Vec<&ToolView> = v
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Tool(t) => Some(t.as_ref()),
+                _ => None,
+            })
+            .collect();
+        let [t] = tools.as_slice() else {
+            panic!("expected a single tool item, got {}", tools.len());
+        };
+        t
+    }
+
+    #[test]
+    fn shell_result_splits_streams_and_keeps_exit_code() {
+        let mut v = View::default();
+        v.event(Out::ToolStarted {
+            id: "s".into(),
+            name: "shell".into(),
+            input: json!({"command":"cargo test"}),
+        });
+        v.event(Out::ToolDone {
+            id: "s".into(),
+            name: "shell".into(),
+            output: json!({"ok":true,"exit_code":0,"termination":"exit","output_complete":true,"stdout":"one\ntwo\n","stderr":"warning: unused\n"}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        assert_eq!(t.output, "one\ntwo\n");
+        assert_eq!(t.stderr, "warning: unused\n");
+        assert_eq!(t.exit_code, Some(0));
+        // No machine headers leak into the body the card renders.
+        assert!(!t.output.contains("exit 0"));
+        assert!(!t.output.contains("termination"));
+    }
+
+    #[test]
+    fn unknown_tool_output_preserves_structured_values() {
+        let mut v = View::default();
+        v.event(Out::ToolDone {
+            id: "x".into(),
+            name: "mcp__jira__create".into(),
+            output: json!({"result":"Issue YOUR-47 created","ok":true}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        assert!(t.output.contains("Issue YOUR-47 created"));
+
+        // Opaque object without a text field degrades to a key listing.
+        let mut v = View::default();
+        v.event(Out::ToolDone {
+            id: "y".into(),
+            name: "mcp__x".into(),
+            output: json!({"ok":true,"id":7,"url":"https://x"}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        assert!(t.output.contains("https://x"));
+        assert!(t.output.contains("7"));
+        assert!(t.output.contains("ok"));
+    }
+
+    #[test]
+    fn websearch_builds_title_host_rows() {
+        let mut v = View::default();
+        v.event(Out::ToolStarted {
+            id: "w".into(),
+            name: "websearch".into(),
+            input: json!({"query":"ratatui diff"}),
+        });
+        v.event(Out::ToolDone {
+            id: "w".into(),
+            name: "websearch".into(),
+            output: json!({"provider":"exa","query":"ratatui diff","content":"Title: Ratatui widgets\nURL: https://docs.rs/ratatui\n\nTitle: Repo\nURL: https://github.com/ratatui/ratatui\n"}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        assert_eq!(
+            t.brief,
+            vec![
+                "Ratatui widgets — docs.rs".to_owned(),
+                "Repo — github.com".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn read_result_highlights_with_line_number_gutter() {
+        let mut v = View::default();
+        v.event(Out::ToolStarted {
+            id: "r".into(),
+            name: "read".into(),
+            input: json!({"path":"crates/x/src/main.rs","offset":40,"limit":2}),
+        });
+        v.event(Out::ToolDone {
+            id: "r".into(),
+            name: "read".into(),
+            output: json!({"ok":true,"path":"crates/x/src/main.rs","offset":40,"content":"40|fn main() {\n41|    let s = \"hi\";\n"}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        let hl = t.content_hl.as_ref().expect("highlighted content");
+        assert_eq!(hl.len(), 2);
+        // Gutter: right-aligned source line number comes first.
+        assert_eq!(hl[0].spans[0].content.as_ref(), "  40 ");
+        // Code itself no longer carries the "40|" prefix.
+        let code: String = hl[0].spans[1..]
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(code, "fn main() {");
+        // And it picked up at least two syntax colors.
+        let colors: std::collections::HashSet<_> =
+            hl[0].spans[1..].iter().filter_map(|s| s.style.fg).collect();
+        assert!(colors.len() >= 2, "syntax colors: {colors:?}");
+    }
+
+    #[test]
+    fn edit_diff_parses_into_paired_highlighted_rows() {
+        let mut v = View::default();
+        v.event(Out::ToolStarted {
+            id: "e".into(),
+            name: "edit".into(),
+            input: json!({"path":"src/main.rs","old_text":"    old();","new_text":"    new();\n    more();"}),
+        });
+        v.event(Out::ToolDone {
+            id: "e".into(),
+            name: "edit".into(),
+            output: json!({"ok":true,"path":"src/main.rs","changed":true,"diff":"--- src/main.rs\n+++ src/main.rs\n@@ -40,3 +40,4 @@\n fn main() {\n-    old();\n+    new();\n+    more();\n }\n"}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        assert_eq!((t.adds, t.dels), (Some(2), Some(1)));
+        let rows = t.diff_rows.as_ref().expect("parsed diff rows");
+        // [hunk][ctx fn main][pair 41↔41][gap↔42][ctx }]
+        assert_eq!(rows[0].hunk.as_deref(), Some("@@ -40,3 +40,4 @@"));
+        assert!(rows[1].ctx.is_some());
+        assert_eq!(rows[2].old.as_ref().map(|(n, _)| *n), Some(41));
+        assert_eq!(rows[2].new.as_ref().map(|(n, _)| *n), Some(41));
+        assert!(rows[3].old.is_none());
+        assert_eq!(rows[3].new.as_ref().map(|(n, _)| *n), Some(42));
+        // Both sides got syntax colors (more than one distinct fg).
+        let new_colors: std::collections::HashSet<_> = rows[2]
+            .new
+            .as_ref()
+            .unwrap()
+            .1
+            .iter()
+            .filter_map(|s| s.style.fg)
+            .collect();
+        assert!(new_colors.len() >= 2, "highlighted: {new_colors:?}");
+        let ctx_text: String = rows[1]
+            .ctx
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(ctx_text, "fn main() {");
+    }
+
+    #[test]
+    fn write_recognizes_created_and_line_count() {
+        let mut v = View::default();
+        v.event(Out::ToolStarted {
+            id: "w".into(),
+            name: "write".into(),
+            input: json!({"path":"notes.md","content":"# hi\nbody\n"}),
+        });
+        v.event(Out::ToolDone {
+            id: "w".into(),
+            name: "write".into(),
+            output: json!({"ok":true,"path":"notes.md","created":true,"bytes_written":9}),
+            is_error: false,
+        });
+        let t = only_tool(&v);
+        assert_eq!(t.adds, Some(2));
+        assert!(t.created);
+        assert!(t.content_hl.is_some());
     }
 }

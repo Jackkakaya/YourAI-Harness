@@ -1,5 +1,7 @@
 # YourAI 架构设计文档
 
+> 当前 workspace 已合并为 `yourai-core`、`yourai-harness`、`yourai-tui` 三个包。下文较早章节中的 `yourai-protocol`、`yourai-hooks`、`yourai-loop-default`、`yourai-runtime` 等名称表示历史 crate 或逻辑模块；当前实现分别位于 `yourai-core::protocol` 与 `crates/yourai-harness/src/` 的对应模块中。
+
 > 最新存储设计见 [会话存储与内存上下文](./session-storage-design.md)。ContextManager 管内存，SessionManager 管持久化，默认 SQLite，以全局唯一 session_id 定位，不引入 tenant_id。SQLite 主链已实现；下文早期示例仅展示运输接口，自持久化 ContextManager 示例已经废止，真实提交路径见存储文档。
 
 > 后续流程设计见 [DefaultLoop 完整执行流程与组件设计入口](./default-loop-flow.md)。

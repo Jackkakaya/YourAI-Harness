@@ -4,7 +4,7 @@
 
 记录日期：2026-09-18。
 
-**状态：五张图对应的默认实现已落地。主循环在 yourai-loop，宿主、存储、compact 与扩展在 yourai-runtime，Hook 执行器在 yourai-hooks。**
+**状态：五张图对应的默认实现已落地，并已合并到 `yourai-harness`：主循环在 `default_loop/`，宿主在 `runtime/`，存储与 compact 在 `storage/`、`context/`，Hook 执行器在 `hooks/`。下文保留的旧 crate 名仅表示历史模块边界。**
 
 实际模块、配置、保证边界与测试见 [DefaultLoop 实现](./default-loop-implementation.md)。本文保留完整目标流程，已落地范围以实现文档为准。
 
@@ -729,10 +729,10 @@ inbox（Loop 独占消费）
 - [Core 组件接口契约](./core-contracts.md)：已定义接口、执行保证边界和迁移说明。
 - [架构文档](./architecture.md)：整体分层、既有接口与设计背景。其部分图和示例仍为早期设计，涉及会话宿主和新默认执行流程时结合本文阅读。
 - [Hook 协议规范](./hook-protocol.md)：Hook 类型、wire 协议和 runtime 聚合语义。
-- [Core 运行机制](../yourai-core/src/context.rs)：当前 Agent、TurnContext、TurnHandle、快照和通道实现。
-- [ContextManager 接口](../yourai-core/src/context_manager.rs)：当前历史与压缩接口。
-- [工具接口](../yourai-core/src/tool.rs)：当前 ToolContext、ToolHandler、ToolRegistry。
-- [Hook 类型与接口](../yourai-core/src/hooks.rs)：当前 27 个事件及结果类型。
-- [消息协议](../yourai-protocol/src/lib.rs)：当前 2 个 In 与 9 个 Out。
+- [Core 运行机制](../crates/yourai-core/src/context.rs)：当前 Agent、TurnContext、TurnHandle、快照和通道实现。
+- [ContextManager 接口](../crates/yourai-core/src/context_manager.rs)：当前历史与压缩接口。
+- [工具接口](../crates/yourai-core/src/tool.rs)：当前 ToolContext、ToolHandler、ToolRegistry。
+- [Hook 类型与接口](../crates/yourai-core/src/hooks.rs)：当前 27 个事件及结果类型。
+- [消息协议](../crates/yourai-core/src/protocol.rs)：当前 `In` / `Out` 词汇。
 
 本文约束完整流程；默认策略、实际组件与保证边界见 [Runtime 实现与验收](./runtime-implementation.md)。

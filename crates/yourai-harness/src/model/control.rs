@@ -6,7 +6,7 @@ use std::{sync::Mutex, time::Duration};
 use tokio::time::Instant;
 use yourai_core::prelude::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RequestPolicy {
     /// Optional known provider quota. Requests are paced evenly, without a burst allowance.
@@ -269,5 +269,36 @@ mod tests {
         assert_eq!(budget.snapshot().calls, 0);
         waiting.await.unwrap();
         assert_eq!(budget.snapshot().calls, 1);
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn provider_gates_are_independent_but_hard_budget_is_shared() {
+        let store = SqliteStore::open(std::path::Path::new(":memory:")).unwrap();
+        let a = ModelBudget::configured(
+            Some(2),
+            None,
+            RequestPolicy {
+                rpm: Some(1),
+                ..Default::default()
+            },
+            store.clone(),
+        )
+        .unwrap();
+        let b = a.for_provider(RequestPolicy::default(), store).unwrap();
+        a.admit().await.unwrap();
+        a.control.cool_down(None);
+        tokio::time::timeout(Duration::from_millis(1), b.admit())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.snapshot().calls, 2);
+        assert_eq!(b.snapshot().calls, 2);
+        assert!(b.admit().await.is_err());
+        assert!(!a.control.remaining().is_zero());
+        assert!(b.control.remaining().is_zero());
     }
 }

@@ -89,6 +89,14 @@ pub enum Out {
     /// 一切"loop 问外界"（审批/提问/表单/计划确认/MCP elicitation）
     Ask { id: String, payload: Value },
 
+    /// 模型请求失败后的自动重试预告（含重试序号、上限与等待毫秒）。
+    Retry {
+        attempt: u32,
+        max: u32,
+        reason: String,
+        wait_ms: u64,
+    },
+
     /// token 用量
     Usage { usage: Usage },
 

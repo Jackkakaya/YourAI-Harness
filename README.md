@@ -15,38 +15,34 @@ YourAI separates an agent harness into three responsibilities:
 Everything behind the core seams is replaceable. The loop itself is a provider, not a hard-coded framework policy.
 
 > [!IMPORTANT]
-> YourAI implements the core contracts, hooks, DefaultLoop, session hosting, durable history, model-backed compaction and optional extensions. A simple TUI and model configuration are included; a Web frontend and OS sandbox are not included.
+> YourAI implements the core contracts, hooks, DefaultLoop, session hosting, durable history, model-backed compaction and optional extensions. The included TUI supports streaming, approvals, model/session switching, SQLite resume, Markdown, syntax highlighting and themes; a Web frontend and OS sandbox are not included.
 
 ## Highlights
 
 - **Pluggable by design** — model, context, session, memory, tools, skills, sandbox, security, usage, observability, hooks, and the agent loop are trait-based providers.
 - **Turn-scoped transport** — `Agent::start` returns a `TurnHandle` with inbox, outbox, cancellation, and join semantics.
 - **Stable provider snapshots** — providers can be hot-swapped without changing the implementation seen by an in-flight turn.
-- **Typed interaction vocabulary** — `yourai-protocol` defines the complete `In` / `Out` language shared by loops and frontends.
+- **Typed interaction vocabulary** — `yourai-core::protocol` defines the complete `In` / `Out` language shared by loops and frontends.
 - **Claude-compatible Hooks** — 27 hook events, typed outcomes, command and HTTP transports, parallel execution, deterministic aggregation, async completion, and runtime registration.
 - **Small object-safe interfaces** — boxed futures keep provider traits usable behind `Arc<dyn Trait>` without `async_trait`.
 
 ## Workspace
 
-| Crate | Responsibility |
+| Package | Responsibility |
 |---|---|
-| `yourai-protocol` | Leaf crate containing the external `In`, `Out`, and usage vocabulary. |
-| `yourai-core` | Provider interfaces plus turn transport, lifecycle, cancellation, and snapshots. |
-| `yourai-hooks` | Claude-compatible Hook wire protocol and command/HTTP/native runtime adapters. |
-| `yourai-loop` | Default single-turn loop: streaming, hooks, compaction coordination, tools, approvals, interaction, limits, and cleanup. |
-| `yourai-runtime` | Harness assembly, session host, durable providers, workspace, subagent and task extensions. |
-| `yourai-tui` | Simple terminal chat, streaming output, approvals and TOML model configuration. |
+| `yourai-core` | Typed `In` / `Out` protocol, provider interfaces, and turn transport, lifecycle, cancellation, and snapshots. |
+| `yourai-harness` | DefaultLoop, hooks, model adapters and metering, context/session persistence, tools, workspace, tasks, and subagents. |
+| `yourai-tui` | Terminal client with streaming, approvals, model/session pickers, SQLite resume, themes, Markdown, and JSON model configuration. |
 
 Dependency direction stays one-way:
 
 ```text
-yourai-protocol  ←  yourai-core  ←  yourai-hooks
-                               ←  yourai-loop
+yourai-core  ←  yourai-harness  ←  yourai-tui
 ```
 
 ## Quick start
 
-To test a real model, copy `yourai.example.toml` to `yourai.toml`, configure the model, endpoint and key environment variable, then run `cargo run -p yourai-tui`. See [TUI usage](./docs/tui.md).
+To test a real model, copy `yourai.example.json` to `$XDG_CONFIG_HOME/yourai/yourai.json` (or `~/.config/yourai/yourai.json` by default), configure the model, endpoint and key environment variable, then run `cargo run -p yourai-tui`. Override the location with `--config PATH`. See [TUI usage](./docs/tui.md).
 
 See [Runtime implementation and verification](./docs/runtime-implementation.md) for all five flow diagrams and the runnable example.
 
@@ -114,6 +110,10 @@ The core deliberately does not choose a model vendor, persistence engine, tool s
 
 ## Documentation
 
+- [TUI usage and JSON model configuration](./docs/tui.md)
+- [TUI redesign implementation notes (Chinese)](./docs/tui-redesign.md)
+- [Runtime implementation and verification](./docs/runtime-implementation.md)
+- [Session storage design](./docs/session-storage-design.md)
 - [Architecture and design decisions](./docs/architecture.md)
 - [DefaultLoop flow and component design baseline (Chinese)](./docs/default-loop-flow.md)
 - [Core component contracts and API migration (Chinese)](./docs/core-contracts.md)

@@ -253,6 +253,39 @@ async fn collaboration_hooks_guard_task_transitions_and_tasks_persist() {
     }
 }
 #[tokio::test]
+async fn task_board_lists_in_creation_order_across_reloads() {
+    let dir = TempDir::new().unwrap();
+    let hooks = Arc::new(Hooks::new(|_, _| {}));
+    let h = host(dir.path(), Arc::new(Model::new(vec![])), Some(hooks)).await;
+    let board = TaskBoard::new(&h, "team").unwrap();
+    for subject in ["first", "second", "third"] {
+        board.create(subject.into(), None, None).await.unwrap();
+    }
+    let subjects = |b: &TaskBoard| b.list().into_iter().map(|t| t.subject).collect::<Vec<_>>();
+    // Creation order, not the random UUID order of the underlying map.
+    assert_eq!(subjects(&board), ["first", "second", "third"]);
+    // Reload from disk keeps the order (tasks.json is a HashMap, so the
+    // sequence numbers, not the file layout, carry it).
+    let reloaded = TaskBoard::new(&h, "team").unwrap();
+    assert_eq!(subjects(&reloaded), ["first", "second", "third"]);
+    // New tasks continue after the persisted sequence.
+    reloaded.create("fourth".into(), None, None).await.unwrap();
+    assert_eq!(subjects(&reloaded), ["first", "second", "third", "fourth"]);
+    // Completing keeps the board position.
+    reloaded.complete(&reloaded.list()[0].id).await.unwrap();
+    assert_eq!(subjects(&reloaded), ["first", "second", "third", "fourth"]);
+    assert!(reloaded.list()[0].completed);
+    // Files written before `seq` existed load with 0 and keep id order.
+    let legacy = r#"{"b":{"id":"b","subject":"legacy-b","description":null,"owner":null,"completed":false},
+                     "a":{"id":"a","subject":"legacy-a","description":null,"owner":null,"completed":false}}"#;
+    // host() opens the SessionHost on dir.path(), which is where tasks.json lives.
+    std::fs::write(dir.path().join("tasks.json"), legacy).unwrap();
+    let board = TaskBoard::new(&h, "team").unwrap();
+    assert_eq!(subjects(&board), ["legacy-a", "legacy-b"]);
+    board.create("fresh".into(), None, None).await.unwrap();
+    assert_eq!(subjects(&board), ["legacy-a", "legacy-b", "fresh"]);
+}
+#[tokio::test]
 async fn file_watcher_reports_actual_changes_and_stops_on_close() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("watched.txt");
@@ -1168,6 +1201,181 @@ async fn rate_limit_attempts_stop_at_retry_limit() {
     assert_eq!(metrics.requests.rate_limited, 3);
     assert_eq!(metrics.requests.active, 0);
     assert!(
-        yourai_harness::default_loop::LoopConfig::default().retry_delay >= Duration::from_secs(5)
+        yourai_harness::default_loop::LoopConfig::default().retry_delay >= Duration::from_secs(2)
     );
+}
+
+#[tokio::test]
+async fn harness_model_switch_preserves_budget_history_and_updates_context() {
+    let dir = TempDir::new().unwrap();
+    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+    config.system_prompt = Some("test".into());
+    config.context_policy.context_window = Some(64_000);
+    config.max_shared_model_calls = Some(2);
+    let old = Arc::new(Model::new(vec![answer("first")]));
+    let h = Harness::open(config, old.clone()).await.unwrap();
+    h.host.submit(In::user_text("one")).unwrap();
+    h.host
+        .run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(h.budget.snapshot().calls, 1);
+
+    let new = Arc::new(Model::new(vec![answer("second"), answer("over budget")]));
+    let policy = ContextPolicy {
+        context_window: Some(32_000),
+        output_reserve: 2048,
+        ..ContextPolicy::default()
+    };
+    h.switch_model_with_settings(
+        new.clone(),
+        policy,
+        yourai_harness::assembly::ModelSettings {
+            provider: "other".into(),
+            requests: Default::default(),
+            header_timeout: Some(Duration::from_secs(1)),
+            chunk_timeout: Some(Duration::from_secs(1)),
+        },
+    )
+    .await
+    .unwrap();
+    let usage = h.host.context_usage().unwrap();
+    assert_eq!(usage.context_window, Some(32_000));
+    assert_eq!(usage.output_reserve, 2048);
+    assert_eq!(
+        h.sessions
+            .load_session(&h.host.context().id)
+            .await
+            .unwrap()
+            .model
+            .as_deref(),
+        Some(new.model_iden())
+    );
+    h.host.submit(In::user_text("two")).unwrap();
+    h.host
+        .run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(h.budget.snapshot().calls, 2);
+    assert_eq!(h.budget.snapshot().requests.completed, 2);
+    assert_eq!(old.requests.lock().unwrap().len(), 1);
+    assert!(new.requests.lock().unwrap()[0]
+        .request
+        .messages
+        .iter()
+        .any(|m| m.content.first_text() == Some("first")));
+    h.host.submit(In::user_text("three")).unwrap();
+    assert!(h
+        .host
+        .run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .is_err());
+    assert_eq!(new.requests.lock().unwrap().len(), 1);
+    h.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
+    let dir = TempDir::new().unwrap();
+    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+    config.system_prompt = Some("test".into());
+    config.context_policy.context_window = Some(64_000);
+    let old = Arc::new(Model::new(vec![Box::pin(futures_util::stream::pending())]));
+    let h = Harness::open(config, old.clone()).await.unwrap();
+    h.host.submit(In::user_text("wait")).unwrap();
+    let host = h.host.clone();
+    let turn = tokio::spawn(async move {
+        host.run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while old.requests.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let policy = ContextPolicy {
+        context_window: Some(32_000),
+        ..ContextPolicy::default()
+    };
+    let new = Arc::new(Model::new(vec![answer("new")]));
+    assert!(h
+        .switch_model(new.clone(), policy)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("busy"));
+    assert_eq!(h.host.context_usage().unwrap().context_window, Some(64_000));
+    assert!(new.requests.lock().unwrap().is_empty());
+    h.host.interrupt();
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    h.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn model_switch_publishes_chunk_timeout_with_model() {
+    let dir = TempDir::new().unwrap();
+    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+    config.system_prompt = Some("test".into());
+    let h = Harness::open(config, Arc::new(Model::new(vec![answer("old")])))
+        .await
+        .unwrap();
+    let next = Arc::new(Model::new(vec![hangs_after("partial")]));
+    h.switch_model_with_settings(
+        next,
+        ContextPolicy::default(),
+        yourai_harness::assembly::ModelSettings {
+            provider: "new".into(),
+            requests: Default::default(),
+            header_timeout: Some(Duration::from_millis(20)),
+            chunk_timeout: Some(Duration::from_millis(20)),
+        },
+    )
+    .await
+    .unwrap();
+    h.host.submit(In::user_text("hello")).unwrap();
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        h.host.run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("new timeout must replace the old 300-second default")
+    .unwrap()
+    .unwrap();
+    assert!(report.result.is_err());
+    h.close().await.unwrap();
 }

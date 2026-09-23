@@ -2,6 +2,10 @@
 /target/
 Cargo.lock.bak
 
+# Python
+__pycache__/
+*.py[cod]
+
 # macOS
 .DS_Store
 

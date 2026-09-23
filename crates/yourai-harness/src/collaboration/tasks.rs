@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, Weak,
+    },
 };
 use yourai_core::prelude::*;
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,11 +20,16 @@ pub struct Task {
     pub description: Option<String>,
     pub owner: Option<String>,
     pub completed: bool,
+    /// Monotonic creation order. Files written before this field existed
+    /// load with 0; they sort first and keep their id order as tie-break.
+    #[serde(default)]
+    pub seq: u64,
 }
 pub struct TaskBoard {
     host: Weak<SessionHost>,
     tasks: Mutex<HashMap<String, Task>>,
     gate: tokio::sync::Mutex<()>,
+    seq: AtomicU64,
     pub team: String,
 }
 impl TaskBoard {
@@ -32,16 +40,22 @@ impl TaskBoard {
         } else {
             HashMap::new()
         };
+        // Continue the sequence after the highest persisted task so a reload
+        // never reuses an order slot.
+        let seq = tasks.values().map(|t: &Task| t.seq).max().unwrap_or(0);
         Ok(Arc::new(Self {
             host: Arc::downgrade(host),
             tasks: Mutex::new(tasks),
             gate: tokio::sync::Mutex::new(()),
+            seq: AtomicU64::new(seq),
             team: team.into(),
         }))
     }
     pub fn list(&self) -> Vec<Task> {
         let mut v: Vec<_> = self.tasks.lock().unwrap().values().cloned().collect();
-        v.sort_by(|a, b| a.id.cmp(&b.id));
+        // Creation order, not UUID order: a todo board read top-to-bottom
+        // should reflect the order work was planned in.
+        v.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.id.cmp(&b.id)));
         v
     }
     pub async fn create(
@@ -61,6 +75,11 @@ impl TaskBoard {
             description,
             owner,
             completed: false,
+            seq: self
+                .seq
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .map_err(|_| error("tasks", "task creation sequence exhausted"))?
+                + 1,
         };
         let result = host
             .dispatch(HookEvent::TaskCreated {

@@ -405,3 +405,68 @@ async fn yolo_skips_all_permissions_including_children_but_preserves_questions()
     task.await.unwrap().unwrap().unwrap().result.unwrap();
     h.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn runtime_yolo_can_be_disabled_and_rejects_changes_during_approval() {
+    let dir = TempDir::new().unwrap();
+    let model = Arc::new(Model::new(vec![
+        invoke("first", "shell", json!({"command":"printf first"})),
+        answer("first done"),
+        invoke("second", "shell", json!({"command":"printf second"})),
+        answer("second done"),
+    ]));
+    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+    config.yolo = true;
+    let h = Harness::open(config, model).await.unwrap();
+    // Even CLI-selected YOLO can restore the original permission provider.
+    h.set_yolo(false).unwrap();
+    h.set_yolo(true).unwrap();
+    h.host.submit(In::user_text("first")).unwrap();
+    let capture = Capture(Mutex::new(vec![]));
+    h.host
+        .run_next(TurnLimits::default(), &capture, &CancellationToken::new())
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+    assert!(!capture
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| matches!(event, Out::Ask { .. })));
+    h.set_yolo(false).unwrap();
+    h.host.submit(In::user_text("second")).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let host = h.host.clone();
+    let task = tokio::spawn(async move {
+        host.run_next(TurnLimits::default(), &tx, &CancellationToken::new())
+            .await
+    });
+    let mut approvals = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(event) = rx.recv().await {
+            if let Out::Ask { id, payload } = event {
+                assert_eq!(payload["kind"], "permission");
+                approvals += 1;
+                assert!(
+                    h.set_yolo(true).is_err(),
+                    "a live approval cannot change permissions"
+                );
+                h.host
+                    .submit(In::Reply {
+                        id,
+                        payload: json!({"behavior":"deny"}),
+                    })
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    task.await.unwrap().unwrap().unwrap().result.unwrap();
+    assert_eq!(approvals, 1);
+    h.set_yolo(true).unwrap();
+    h.close().await.unwrap();
+}

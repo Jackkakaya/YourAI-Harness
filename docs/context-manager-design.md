@@ -248,10 +248,10 @@ SQLite v2 增加 nullable `messages.tool_output_pruned_at`（UTC 毫秒），启
 
 ## 8. 实现位置与配置
 
-- `yourai-core/src/context_manager.rs`：四个操作及只读视图/身份查询。
-- `yourai-runtime/src/memory_context.rs`：装配、串行写入、不确定提交恢复。
-- `yourai-runtime/src/memory_context/projection.rs`：请求预算、usage 基线、输出预览。
-- `yourai-runtime/src/memory_context/compact.rs`：选区、内部清理、分批摘要、Hook 与提交。
-- `yourai-runtime/src/tool_result.rs`：会话范围内的原始工具结果分页读取。
+- `crates/yourai-core/src/context_manager.rs`：四个操作及只读视图/身份查询。
+- `crates/yourai-harness/src/context/mod.rs`：装配、串行写入、不确定提交恢复。
+- `crates/yourai-harness/src/context/projection.rs`：请求预算、usage 基线、输出预览。
+- `crates/yourai-harness/src/context/compact.rs`：选区、内部清理、分批摘要、Hook 与提交。
+- `crates/yourai-harness/src/tools/result.rs`：会话范围内的原始工具结果分页读取。
 
-TUI 使用 `yourai.toml` 的 `[context]` 配置；示例见 `yourai.example.toml`。必须按实际模型填写 context_window 或 input_limit。MemoryContext::memory 仅用于无持久化需求的临时评估 Agent；正式会话通过 ContextServices 注入 SessionManager 和策略，Loop / Host 从当前 ProviderSnapshot 构造 ContextExecution。
+TUI 使用 JSON 配置；示例见 `yourai.example.json`。模型容量必须在 `provider.*.models.*.limit.context` 或 `limit.input` 中按实际模型填写，输出预留由 `limit.output` / `options.maxOutputTokens` 解析。MemoryContext::memory 仅用于无持久化需求的临时评估 Agent；正式会话通过 ContextServices 注入 SessionManager 和策略，Loop / Host 从当前 ProviderSnapshot 构造 ContextExecution。

@@ -1,8 +1,8 @@
 # DefaultLoop 实现
 
-> 当前实现的历史写入接口将按 [会话存储设计](./session-storage-design.md) 迁移为统一提交路径。该设计尚未落地，本文仍描述迁移前行为。
+> 会话存储与统一提交路径已经落地，当前行为以 [会话存储设计](./session-storage-design.md) 和源码为准。
 
-`yourai-loop::DefaultLoop` 对应流程图 2、3，复用图 5 的 HookRuntime。实现依赖 `yourai-core`，core 不反向依赖 Loop。图 1、4 及具体 Provider 已在 yourai-runtime 实现，见 [Runtime 实现与验收](./runtime-implementation.md)。
+`yourai_harness::DefaultLoop` 对应流程图 2、3，并复用同一包中的 HookRuntime。实现依赖 `yourai-core`，core 不反向依赖 Loop。图 1、4 及具体 Provider 也统一位于 `yourai-harness`，见 [Runtime 实现与验收](./runtime-implementation.md)。
 
 ## 入口和模块
 
@@ -22,12 +22,12 @@ Agent.start / run
 
 | 文件 | 职责 |
 |---|---|
-| `yourai-loop/src/lib.rs` | DefaultLoop、LoopConfig、TurnState、主流程、compact、技能与记忆准备 |
-| `control.rs` | 可取消等待、超时、输入队列、历史、用量与失败收尾 |
-| `model.rs` | 请求装配、工具绑定、流式事件、完整消息、截断与工具 ID 校验 |
-| `tools.rs` | 参数校验、Hook、安全审批、串行执行、结果提交 |
-| `interaction.rs` | 工具请求通道、oneshot 回复、Ask/Reply 路由、MCP 回复校验 |
-| `hooks.rs` | Hook 调用、通用效果、展示与可观测性 |
+| `crates/yourai-harness/src/default_loop/mod.rs` | DefaultLoop、LoopConfig、TurnState、主流程、compact、技能与记忆准备 |
+| `default_loop/control.rs` | 可取消等待、超时、输入队列、历史、用量与失败收尾 |
+| `default_loop/model.rs` | 请求装配、工具绑定、流式事件、完整消息、截断与工具 ID 校验 |
+| `default_loop/tools.rs` | 参数校验、Hook、安全审批、串行执行、结果提交 |
+| `default_loop/interaction.rs` | 工具请求通道、oneshot 回复、Ask/Reply 路由、MCP 回复校验 |
+| `default_loop/hooks.rs` | Hook 调用、通用效果、展示与可观测性 |
 
 这些是内部模块，没有再增加 ToolExecutor、队列或调度器 Provider。
 
@@ -36,7 +36,7 @@ Agent.start / run
 ```rust
 use std::sync::Arc;
 use yourai_core::prelude::*;
-use yourai_loop::{DefaultLoop, LoopConfig};
+use yourai_harness::default_loop::{DefaultLoop, LoopConfig};
 
 fn assemble(model: Arc<dyn ModelProvider>, history: Arc<dyn ContextManager>) -> Arc<Agent> {
     let config = LoopConfig {
@@ -73,9 +73,9 @@ fn assemble(model: Arc<dyn ModelProvider>, history: Arc<dyn ContextManager>) -> 
 
 ## 超时、预算和收尾
 
-默认最多 64 次模型调用额度、256 次工具执行、2 次请求重试、1 次连续溢出恢复、3 次 Stop 继续、1 次权限重审。配置可以调整；TurnLimits 的次数与配置取较小值。
+模型调用额度默认不限（None）；配置限额时达到限额的第 N 次调用为强制收尾步——注入提示词要求仅文本总结、不再提供工具，随后正常结束 Turn，而不是硬中止。显式 0 仍表示不允许调用，在首次调用前硬中止。工具执行默认 256 次、2 次请求重试、1 次连续溢出恢复、3 次 Stop 继续、1 次权限重审。配置可以调整；TurnLimits 的次数与配置取较小值。重试退避初始 2 秒逐次倍增（25% 抖动、封顶 30 秒），服务器 retry-after 优先。
 
-总截止时间不因重试、审批或压缩重置。模型单次时限覆盖建立流与整个读取过程；工具单次时限覆盖执行及内部提问。默认普通操作 120 秒、审批 300 秒、Hook 30 秒、一次收尾等待 5 秒，可配置。
+总截止时间不因重试、审批或压缩重置。模型时限分两段：请求到建立流（TTLB）与流式相邻事件的空闲间隔，各默认 300 秒，不含整段响应总时长；工具单次时限覆盖执行及内部提问。默认普通操作 120 秒、审批 300 秒、Hook 30 秒、一次收尾等待 5 秒，可配置。
 
 模型请求前按完整请求预算触发 compact；provider 明确报告 overflow 时有界重试。ContextManager 内部清理/摘要和提交，Loop 只重建请求。分批摘要按实际尝试调用计数，包括失败和取消；只清理不消耗模型额度。ContextManager 记账，Loop 汇总 Turn 用量。Harness 的共享 MeteredModel 另统一限制主模型、摘要、Hook 模型及子 Agent。
 
@@ -97,8 +97,8 @@ MCP 请求依次经过 Elicitation、用户回复（或 Hook 答复）、Elicita
 
 SessionStart/SessionEnd、工作区、配置、指令文件、子 Agent、协作任务等事件仍归会话宿主或对应扩展。ConcreteHookRuntime 自主管理后台 Hook；宿主订阅其完成事件与唤醒策略不属于 DefaultLoop。Loop 的内部 Notice 不递归触发 Notification。
 
-yourai-runtime 已提供 SessionHost、GenaiModel、文件持久化、模型摘要、宿主后台事件订阅和扩展。它们与 DefaultLoop 分层实现；完整装配入口是 Harness::open。
+`yourai-harness` 还提供 SessionHost、GenaiModel、SQLite 持久化、模型摘要、宿主后台事件订阅和扩展。它们与 DefaultLoop 在模块层分离，完整装配入口是 `Harness::open`。
 
 ## 验证
 
-`yourai-loop/tests/flow.rs` 使用可控制事件流和内存历史验证完整主链，覆盖审批、Hook 参数修改、硬拒绝、JSON Schema、普通/MCP 交互、压缩、有限重试、Stop、steer/follow-up、取消、断开、超时、预算以及批次收尾；包含真实 ConcreteHookRuntime 注册与效果消费测试。不依赖在线模型或 API Key。
+`crates/yourai-harness/tests/loop_flow.rs` 使用可控制事件流和内存历史验证完整主链，覆盖审批、Hook 参数修改、硬拒绝、JSON Schema、普通/MCP 交互、压缩、有限重试、Stop、steer/follow-up、取消、断开、超时、预算以及批次收尾；包含真实 ConcreteHookRuntime 注册与效果消费测试。不依赖在线模型或 API Key。

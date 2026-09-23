@@ -3,7 +3,7 @@
 
 运行时补充接口：`TurnOptions.events` 绑定内部事件队列；ContextManager 内部协调持久化并维护归档身份索引；`SecurityProvider::update_permissions` 消费权限变更；`HookRuntime::subscribe_background / shutdown_session` 提供按会话订阅和后台回收。`TurnHandle::abort` 用于协作取消超时后的任务回收，宿主必须记录被强制中止执行的不确定状态。
 
-对应 [完整流程图](./default-loop-flow.md)。本文定义公共边界和运输机制。DefaultLoop 已在 yourai-loop 实现，见 [实现文档](./default-loop-implementation.md)；会话宿主、compact 摘要和业务扩展已在 yourai-runtime 实现，见 [Runtime 文档](./runtime-implementation.md)。
+对应 [完整流程图](./default-loop-flow.md)。本文定义公共边界和运输机制。DefaultLoop、会话宿主、compact 摘要和业务扩展现已统一实现在 `yourai-harness`，见 [实现文档](./default-loop-implementation.md) 与 [Runtime 文档](./runtime-implementation.md)。下文出现的 `yourai-loop` / `yourai-runtime` 是合并前的历史包名。
 
 ## 图与代码的对应
 
