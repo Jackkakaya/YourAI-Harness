@@ -253,6 +253,39 @@ async fn collaboration_hooks_guard_task_transitions_and_tasks_persist() {
     }
 }
 #[tokio::test]
+async fn task_board_lists_in_creation_order_across_reloads() {
+    let dir = TempDir::new().unwrap();
+    let hooks = Arc::new(Hooks::new(|_, _| {}));
+    let h = host(dir.path(), Arc::new(Model::new(vec![])), Some(hooks)).await;
+    let board = TaskBoard::new(&h, "team").unwrap();
+    for subject in ["first", "second", "third"] {
+        board.create(subject.into(), None, None).await.unwrap();
+    }
+    let subjects = |b: &TaskBoard| b.list().into_iter().map(|t| t.subject).collect::<Vec<_>>();
+    // Creation order, not the random UUID order of the underlying map.
+    assert_eq!(subjects(&board), ["first", "second", "third"]);
+    // Reload from disk keeps the order (tasks.json is a HashMap, so the
+    // sequence numbers, not the file layout, carry it).
+    let reloaded = TaskBoard::new(&h, "team").unwrap();
+    assert_eq!(subjects(&reloaded), ["first", "second", "third"]);
+    // New tasks continue after the persisted sequence.
+    reloaded.create("fourth".into(), None, None).await.unwrap();
+    assert_eq!(subjects(&reloaded), ["first", "second", "third", "fourth"]);
+    // Completing keeps the board position.
+    reloaded.complete(&reloaded.list()[0].id).await.unwrap();
+    assert_eq!(subjects(&reloaded), ["first", "second", "third", "fourth"]);
+    assert!(reloaded.list()[0].completed);
+    // Files written before `seq` existed load with 0 and keep id order.
+    let legacy = r#"{"b":{"id":"b","subject":"legacy-b","description":null,"owner":null,"completed":false},
+                     "a":{"id":"a","subject":"legacy-a","description":null,"owner":null,"completed":false}}"#;
+    // host() opens the SessionHost on dir.path(), which is where tasks.json lives.
+    std::fs::write(dir.path().join("tasks.json"), legacy).unwrap();
+    let board = TaskBoard::new(&h, "team").unwrap();
+    assert_eq!(subjects(&board), ["legacy-a", "legacy-b"]);
+    board.create("fresh".into(), None, None).await.unwrap();
+    assert_eq!(subjects(&board), ["legacy-a", "legacy-b", "fresh"]);
+}
+#[tokio::test]
 async fn file_watcher_reports_actual_changes_and_stops_on_close() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("watched.txt");

@@ -245,8 +245,8 @@
 
 ### 4.4 输入区与提示归位
 
-- 标题左：空闲 ` Message `；忙碌 ` Steer current turn · Esc interrupts `（补 Esc 提示；现在只有 `Message · steer current turn`）。
-- 标题右（右对齐 title，不占行）：` ^T todo · ^B stats · F1 help `。
+- 标题左：空闲 ` Message `；忙碌 ` Steer · Esc stops `（状态提示，仅此一个标题）。
+- 标题右：无。键位提示不常驻输入框（`F1` 帮助与 `/help` 承担），输入区只保留状态标题与空态提示。
 - **动态高度**：`input_height = (editor_lines + 2).clamp(3, (area.height * 3 / 10).clamp(3, 14))`，上限从现在的固定 8 行改为屏高 30%（最高 14 行）；空闲/忙碌同规则。现状代码已有 `(lines+2).clamp(3,8)` 雏形（render.rs 约 156 行），本次只调整上限公式；行内滚动（top offset）保持现状。
 - 审批/提问面板（ask）现状良好，不动。
 

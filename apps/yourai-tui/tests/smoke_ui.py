@@ -153,6 +153,10 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'Session deleted')
         assert db.execute('SELECT count(*) FROM sessions WHERE session_id=?', (old_id,)).fetchone()[0] == 0
         os.write(master, b'\x1b')
+        # Give the app time to consume the Esc on its own: sent back-to-back,
+        # ESC + Ctrl-B coalesce into Alt+Ctrl+B in the input parser and the
+        # overlay stays open.
+        time.sleep(0.5)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 20, 35, 0, 0))
         os.kill(child.pid, signal.SIGWINCH)
         captured.clear()

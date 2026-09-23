@@ -58,7 +58,7 @@ impl Write for SyncWriter {
     }
 }
 
-struct Screen(Terminal<CrosstermBackend<SyncWriter>>);
+struct Screen(Terminal<crate::terminal::SizedBackend<SyncWriter>>);
 impl Screen {
     fn open() -> Result<Self, Error> {
         enable_raw_mode()?;
@@ -69,10 +69,12 @@ impl Screen {
                 EnableBracketedPaste,
                 EnableMouseCapture
             )?;
-            Terminal::new(CrosstermBackend::new(SyncWriter {
-                inner: io::stdout(),
-                buffer: Vec::with_capacity(1 << 16),
-            }))
+            Terminal::new(crate::terminal::SizedBackend(CrosstermBackend::new(
+                SyncWriter {
+                    inner: io::stdout(),
+                    buffer: Vec::with_capacity(1 << 16),
+                },
+            )))
         })();
         match result {
             Ok(t) => Ok(Self(t)),

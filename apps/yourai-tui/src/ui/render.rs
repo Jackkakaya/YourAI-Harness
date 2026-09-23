@@ -14,10 +14,7 @@ use super::{
 use cards::*;
 use ratatui::{
     prelude::*,
-    widgets::{
-        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState,
-    },
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -189,12 +186,9 @@ impl Renderer {
         };
         let width = cols[0].width.saturating_sub(4).max(2) as usize;
         let (editor_lines, _, _) = v.editor.layout(width);
-        let input_padding = if area.height >= 16 { 4 } else { 2 };
-        let input_height = (editor_lines.len() as u16 + input_padding)
-            .clamp(
-                input_padding + 1,
-                (area.height * 3 / 10).clamp(input_padding + 1, 14),
-            )
+        // One quiet padding row above/below the text; no decorative frame.
+        let input_height = (editor_lines.len() as u16 + 2)
+            .clamp(3, (area.height * 3 / 10).clamp(3, 14))
             .min(area.height.saturating_sub(6));
         let input_height = if v.asks_empty() { input_height } else { 0 };
         let footer_lines = footer_lines(area.width as usize, v, m, queued);
@@ -290,52 +284,14 @@ impl Renderer {
                 ));
             }
         }
-        // Right-edge scrollbar: only render when content overflows the viewport.
-        // Scroll position is top-anchored; `v.scroll` is bottom-anchored, so the
-        // top index = lines.len() - scroll - height.
-        if self.lines.len() > height {
-            let mut state = ScrollbarState::new(self.lines.len())
-                .viewport_content_length(height)
-                .position(start);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .thumb_symbol("█")
-                    .track_symbol(Some("▐"))
-                    .begin_symbol(None)
-                    .end_symbol(None)
-                    .thumb_style(Style::default().fg(ACCENT))
-                    .track_style(Style::default().fg(MUTED)),
-                inner,
-                &mut state,
-            );
-        }
         if v.items().is_empty() {
             welcome(f, inner);
         }
-        let mode = if v.active {
-            " Steer · Esc stops "
-        } else {
-            " Message "
-        };
-        let input_title_right = if v.scroll > 0 {
-            if cols[0].width >= 70 {
-                " Ctrl-Home question · Ctrl-End latest "
-            } else {
-                " ^End latest "
-            }
-        } else if cols[0].width >= 70 {
-            " Enter send · Alt-Enter newline · / commands "
-        } else {
-            " F1 help "
-        };
         draw_editor(
             f,
             &v.editor,
             rows[4],
-            mode,
-            input_title_right,
             v.asks_empty() && !v.overlay.is_open(),
-            ACCENT,
         );
         if let Some(ask) = v.ask() {
             let title = if ask.permission() {
@@ -708,44 +664,34 @@ fn welcome(f: &mut Frame<'_>, area: Rect) {
     }
 }
 
-fn draw_editor(
-    f: &mut Frame<'_>,
-    e: &Editor,
-    area: Rect,
-    title: &str,
-    title_right: &str,
-    focus: bool,
-    color: Color,
-) {
+fn draw_editor(f: &mut Frame<'_>, e: &Editor, area: Rect, focus: bool) {
+    if area.is_empty() {
+        return;
+    }
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if focus { color } else { BORDER }))
         .style(Style::default().bg(PANEL).fg(TEXT))
-        .padding(ratatui::widgets::Padding::new(
-            1,
-            1,
-            u16::from(area.height >= 5),
-            u16::from(area.height >= 5),
-        ))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(color).bold(),
-        ))
-        .title(
-            Line::from(Span::styled(
-                title_right.to_owned(),
-                Style::default().fg(MUTED),
-            ))
-            .alignment(Alignment::Right),
-        );
+        .padding(ratatui::widgets::Padding::new(3, 1, 1, 1));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    if e.text.is_empty() && !inner.is_empty() {
+    if !inner.is_empty() {
         f.render_widget(
-            Paragraph::new("Ask anything, or / for commands…").style(Style::default().fg(MUTED)),
-            inner,
+            Paragraph::new("›").style(
+                Style::default()
+                    .fg(if focus { ACCENT } else { MUTED })
+                    .bold(),
+            ),
+            Rect::new(area.x + 1, inner.y, 1, 1),
         );
+        if e.text.is_empty() {
+            f.render_widget(
+                Paragraph::new(elide(
+                    "Ask anything · / commands · F1 help",
+                    inner.width as usize,
+                ))
+                .style(Style::default().fg(MUTED)),
+                inner,
+            );
+        }
     }
     let (lines, row, col) = e.layout(inner.width as usize);
     let top = row.saturating_sub(inner.height.saturating_sub(1) as usize);
@@ -772,8 +718,7 @@ fn draw_editor(
 /// Todo-only panel; diagnostics are available in the dashboard.
 fn sidebar(f: &mut Frame<'_>, area: Rect, v: &View) -> (Option<Rect>, Option<Rect>) {
     let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(Style::default().fg(BORDER))
+        .padding(ratatui::widgets::Padding::new(2, 0, 0, 0))
         .style(Style::default().bg(BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -855,8 +800,16 @@ fn wrap_todo_text(text: &str, width: usize) -> Vec<String> {
     for g in text.graphemes(true) {
         let gw = g.width();
         if used + gw > width && !line.is_empty() {
-            result.push(std::mem::take(&mut line));
+            // Trailing whitespace at the break point is invisible padding;
+            // drop it so wrapped lines carry only their real text.
+            result.push(std::mem::take(&mut line).trim_end().to_string());
             used = 0;
+            // The whitespace that triggered the break belongs to the end of
+            // the previous line; keeping it would shift the continuation one
+            // column past the 4-space indent and misalign wrapped rows.
+            if g.chars().all(char::is_whitespace) {
+                continue;
+            }
         }
         line.push_str(g);
         used += gw;
@@ -1389,7 +1342,7 @@ mod tests {
             terminal
                 .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
                 .unwrap();
-            assert_eq!(terminal.backend().buffer()[(0, 0)].bg, theme.color(BG));
+            assert_eq!(terminal.backend().buffer()[(0, 0)].bg, theme.color(PANEL));
             let text = terminal
                 .backend()
                 .buffer()
@@ -1716,6 +1669,33 @@ mod tests {
     }
 
     #[test]
+    fn todo_wrap_keeps_continuations_aligned_with_indent() {
+        // 120-col layout -> 40-col panel -> 35 columns of todo text.
+        let width = 35;
+        let lines = wrap_todo_text(
+            "Update documentation with examples that are long enough to wrap inside the todo sidebar",
+            width,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Update documentation with examples",
+                "that are long enough to wrap inside",
+                "the todo sidebar",
+            ]
+        );
+        // The space that triggers a break must not leak into the next line...
+        assert!(!lines[1..].iter().any(|l| l.starts_with(' ')));
+        // ...and every line still fits the panel text width.
+        assert!(lines.iter().all(|l| l.width() <= width));
+        // Exact-fit and no-space cases keep their text.
+        assert_eq!(wrap_todo_text("exact fit", 9), vec!["exact fit"]);
+        assert_eq!(wrap_todo_text("nospaces", 3), vec!["nos", "pac", "es"]);
+        // Leading whitespace of the original text is preserved.
+        assert_eq!(wrap_todo_text("  keep", 4), vec!["  ke", "ep"]);
+    }
+
+    #[test]
     fn layouts_fit_narrow_and_wide_terminals() {
         for (w, h) in [(20, 6), (50, 16), (120, 36)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -1771,7 +1751,9 @@ mod tests {
             if w == 120 {
                 // Card preview shows output by design (§4.3); full input only when expanded.
                 assert!(!content.contains("YOURAI"));
-                assert!(!content.contains("YOU  "));
+                assert!(content.contains("AGENT"));
+                assert!(content.contains("›"));
+                assert!(!content.contains("╭"), "composer has no rounded frame");
                 if let Ok(path) = std::env::var("YOURAI_TUI_SNAPSHOT") {
                     let cells=terminal.backend().buffer().content().iter().map(|c|json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD)})).collect::<Vec<_>>();
                     std::fs::write(

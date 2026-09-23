@@ -116,9 +116,9 @@ fn item_lines(
                 MUTED
             };
             let title = if first_line.is_empty() {
-                format!("┃ {glyph} Thinking · {size}")
+                format!("  {glyph} Thinking · {size}")
             } else {
-                format!("┃ {glyph} Thinking · {size} · {first_line}")
+                format!("  {glyph} Thinking · {size} · {first_line}")
             };
             lines.push(Line::from(Span::styled(
                 title,
@@ -149,14 +149,10 @@ fn item_lines(
             role: Role::User,
             text,
         } => {
-            lines.push(Line::from(vec![
-                Span::styled("  YOU ", Style::default().fg(ACCENT).bold()),
-                Span::styled(
-                    "─".repeat(width.saturating_sub(7)),
-                    Style::default().fg(BORDER),
-                ),
-            ]));
-            lines.push(Line::from(" ".repeat(width)).style(Style::default().bg(PANEL)));
+            lines.push(Line::from(Span::styled(
+                format!("  YOU{}", " ".repeat(width.saturating_sub(5))),
+                Style::default().fg(ACCENT).bg(PANEL).bold(),
+            )));
             for line in text.lines() {
                 for row in wrap(
                     line,
@@ -172,7 +168,16 @@ fn item_lines(
             }
             lines.push(Line::from(" ".repeat(width)).style(Style::default().bg(PANEL)));
         }
-        Item::Text { text, .. } => lines.extend(crate::ui::markdown::render(text, width)),
+        Item::Text { role, text } => {
+            if matches!(role, Role::Assistant) {
+                lines.push(Line::from(Span::styled(
+                    "  AGENT",
+                    Style::default().fg(TEXT).bold(),
+                )));
+            }
+            // Markdown already owns the shared two-column body inset.
+            lines.extend(crate::ui::markdown::render(text, width));
+        }
         Item::Notice { level, text } => {
             let color = match level {
                 Level::Error => RED,

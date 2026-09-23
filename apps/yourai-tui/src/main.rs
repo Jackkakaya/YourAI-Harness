@@ -3,6 +3,7 @@ mod launcher;
 mod models;
 mod picker;
 mod sessions;
+mod terminal;
 mod ui;
 use config::{Config, Error};
 use std::{io::IsTerminal, path::PathBuf, sync::Arc};

@@ -48,7 +48,7 @@ pub async fn pick(catalog: &SessionCatalog) -> Result<Choice, Error> {
     let _screen = Screen::open()?;
     let mut query = String::new();
     let mut selected: usize = 0;
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = crate::terminal::SizedBackend(CrosstermBackend::new(io::stdout()));
     let mut terminal = Terminal::new(backend)?;
     loop {
         let filtered = filter_sessions(&rows, &query);
