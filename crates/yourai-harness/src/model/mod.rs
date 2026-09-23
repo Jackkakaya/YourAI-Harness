@@ -91,8 +91,8 @@ pub struct BudgetSnapshot {
 }
 /// Shared by main model, compact, model hooks and subagents; admission is atomic.
 pub struct ModelBudget {
-    state: Mutex<BudgetSnapshot>,
-    starts: Mutex<std::collections::VecDeque<std::time::Instant>>,
+    state: Arc<Mutex<BudgetSnapshot>>,
+    starts: Arc<Mutex<std::collections::VecDeque<std::time::Instant>>>,
     max_calls: Option<u64>,
     max_tokens: Option<u64>,
     control: control::RequestControl,
@@ -100,8 +100,8 @@ pub struct ModelBudget {
 impl ModelBudget {
     pub fn new(max_calls: Option<u64>, max_tokens: Option<u64>) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(BudgetSnapshot::default()),
-            starts: Mutex::new(std::collections::VecDeque::new()),
+            state: Arc::new(Mutex::new(BudgetSnapshot::default())),
+            starts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             max_calls,
             max_tokens,
             control: control::RequestControl::default(),
@@ -115,10 +115,25 @@ impl ModelBudget {
     ) -> Result<Arc<Self>, YourAiError> {
         policy.validate()?;
         Ok(Arc::new(Self {
-            state: Mutex::new(BudgetSnapshot::default()),
-            starts: Mutex::new(std::collections::VecDeque::new()),
+            state: Arc::new(Mutex::new(BudgetSnapshot::default())),
+            starts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             max_calls,
             max_tokens,
+            control: control::RequestControl::new(policy, Some(store)),
+        }))
+    }
+    /// Provider-specific admission, retaining shared accounting and hard limits.
+    pub(crate) fn for_provider(
+        &self,
+        policy: RequestPolicy,
+        store: crate::SqliteStore,
+    ) -> Result<Arc<Self>, YourAiError> {
+        policy.validate()?;
+        Ok(Arc::new(Self {
+            state: self.state.clone(),
+            starts: self.starts.clone(),
+            max_calls: self.max_calls,
+            max_tokens: self.max_tokens,
             control: control::RequestControl::new(policy, Some(store)),
         }))
     }

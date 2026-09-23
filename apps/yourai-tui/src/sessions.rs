@@ -55,7 +55,6 @@ pub fn filter_sessions(rows: &[SessionRow], query: &str) -> Vec<usize> {
         .filter(|(_, r)| {
             r.title.to_lowercase().contains(&q)
                 || r.id.0.to_lowercase().contains(&q)
-                || (r.id.0.len() >= 8 && r.id.0[..8].to_lowercase().contains(&q))
                 || r.model.to_lowercase().contains(&q)
         })
         .map(|(i, _)| i)

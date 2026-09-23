@@ -34,12 +34,12 @@ const COMMANDS: &[Command] = &[
     Command {
         text: "/theme",
         description: "Theme picker (or /theme NAME)",
-        argument: true,
+        argument: false,
     },
     Command {
         text: "/models",
         description: "Switch model (picker; or /models p/m [variant])",
-        argument: true,
+        argument: false,
     },
     Command {
         text: "/sessions",

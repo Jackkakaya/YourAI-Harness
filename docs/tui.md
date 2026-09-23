@@ -1,4 +1,6 @@
-# 简易 TUI 与模型配置
+# TUI 与模型配置
+
+当前产品布局与交互规范见 [TUI review 修订设计](./tui-review-design.md)。
 
 默认按 XDG Base Directory 规范查找配置文件：`$XDG_CONFIG_HOME/yourai/yourai.json`，未设置时回退到 `~/.config/yourai/yourai.json`。可用 `--config PATH` 指定任意路径覆盖。
 
@@ -77,17 +79,24 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --check-config
 | `/queue 内容` | 排队为后续 Turn |
 | `/compact` | 手动压缩；运行中会拒绝并提示 busy |
 | `/models [provider/model [variant]]` | 打开模型选择器或直接切换；仅空闲时可切换，模型与上下文限制一起更新，失败保留原选择 |
-| `/sessions` | 打开会话选择器，过滤/切换；当前 turn 进行中会拒绝；Ctrl-D 删除选中会话 |
+| `/sessions` | 打开会话选择器，过滤/切换；当前 turn 进行中会拒绝；Ctrl-D 请求删除，Y 确认，N/Esc 保留 |
 | `/status` | 切换仪表盘覆盖层（等价 `^B`） |
 | PgUp / PgDn | 滚动输出 |
 | Ctrl-B | 开关仪表盘覆盖层（任意宽度） |
-| Ctrl-T | 开关右侧侧边栏（Todo + 遥测；宽度 <110 时回退为单行 dock） |
+| Ctrl-T | 开关 Todo 面板（有任务且宽度 ≥80 时显示，窄屏回退单行 dock） |
 | Ctrl-Q / `/quit` | 有序关闭并退出 |
 | `/help` | 查看帮助 |
 
 支持流式正文、reasoning、工具事件、token 用量和中文输入/粘贴。编辑器支持多行输入、Unicode 光标移动、Home/End、按词移动与删除、历史导航；`Ctrl-J` 或 `Alt-Enter` 插入换行。完整键位可在 TUI 中按 `F1` 查看。
 
-界面结构：顶部标题栏显示会话标题（自动取自首条输入的首行，写回 SQLite；`--resume` 恢复时沿用）。左侧为时间线——过程与结果有明确区分：reasoning 展开后为暗淡斜体，工具输入为暗色、输出为独立配色、运行中的流式进度为暗色斜体。工具默认以卡片形态渲染（类型化预览：edit 显示带行号槽和着底色的 diff，shell 跟随滚动输出）。输入框上方常驻运行指示条（呼吸灯，忙碌时显示）。底部状态栏一行承载模型 / context 进度 / token / todo 计数 / 权限 / queued / 429。右侧为常驻侧边栏（宽度 ≥110 列时显示，`^T` 切换）：上半部分是 Todo 列表（存在 todos 时），下半部分是遥测信息（会话信息、上下文估算、请求与 token 指标、权限、主题）。窄屏回退为输入框上方单行 Todo dock。`Ctrl-B` 打开仪表盘覆盖层，整合更详细的会话信息。
+界面以对话和修改结果为主。顶部显示会话标题；工具卡片展示命令结果、退出状态和文件 diff，未知工具展开后保留结构化字段值。输入框支持多行和 Unicode，忙碌时其上方显示当前动作、耗时和 Esc 停止提示。
+
+底栏优先保留当前模型和权限（YOLO / trusted / ask），空间允许时显示 context 压力与排队数量。右侧仅在有 Todo 且宽度 ≥80 时出现任务面板，Ctrl-T 收起；没有任务时对话全宽。token、请求次数、缓存和速度指标统一放到 Ctrl-B 仪表盘，↑↓/PgUp/PgDn 滚动。当前模型有配置价格时只显示其单价，不把混合模型会话的累计 token 当作费用依据。
+
+所有弹层独占输入：Esc 关闭弹层，Ctrl-Q 退出。弹层里的文本、粘贴和鼠标不会操作背后的任务；仅会话搜索接受粘贴。删除会话显示标题和 ID，必须按 Y 确认，Enter 不会删除。帮助支持滚动。最小主界面为 30×10，所有弹层限制在实际终端内。
+
+模型切换在空闲边界同时更新模型、上下文限制及主模型超时；provider 请求 gate 按 provider 与请求策略复用，切回时保留已有冷却/节流状态。主模型、Hook 和子代理仍共享总调用/token 预算；Hook 和子代理保持各自已绑定的模型与 gate。配置没有枚举 models 时，选择器仍包含当前模型。
+
 
 退出时打印会话 ID，可恢复上下文：
 
@@ -95,9 +104,9 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --check-config
 cargo run -p yourai-tui -- --config /path/to/yourai.json --resume 会话ID
 ```
 
-`--resume` 不带 ID 时进入启动会话选择器（launcher）：搜索框过滤 title/id/model，`↑↓`/`Ctrl-P/N` 移动，`Enter` 恢复选中会话，`Esc` 开启全新会话，`Ctrl-Q` 直接退出。恢复会话会继续使用原历史；界面不会重新展示旧消息。退出时尚未处理的输入由 close 交还，打印在终端，由调用者决定是否再次提交。
+`--resume` 不带 ID 时进入启动会话选择器（launcher）：搜索框过滤 title/id/model，`↑↓`/`Ctrl-P/N` 移动，`Enter` 恢复选中会话，`Esc` 开启全新会话，`Ctrl-Q` 直接退出。恢复会话会继续使用原历史；界面恢复原始历史消息（不重复展示压缩摘要）。退出时尚未处理的输入由 close 交还，打印在终端，由调用者决定是否再次提交。
 
-TUI 复用 Harness → SessionHost → DefaultLoop，默认仅包含历史工具结果读取能力。顶层 `extensions = true` 才安装 tasks、subagent、工作区、记忆和技能扩展。不含通用 read、附件上传或 shell 工具，这些留到工具模块实现。请求错误显示在界面，修改配置后退出重启即可。真实模型连通性由你配置服务后验证。
+TUI 复用 Harness → SessionHost → DefaultLoop，默认安装代码读写、shell、Web、历史工具结果读取和任务板；`extensions = true` 安装子代理、工作区、记忆和技能扩展。请求错误显示在界面，修改配置后退出重启即可。真实模型连通性由你配置服务后验证。
 
 离线终端冒烟测试使用本地模拟 HTTP 服务和伪终端，不调用外部模型：
 
@@ -106,6 +115,7 @@ cargo build -p yourai-tui
 python3 apps/yourai-tui/tests/smoke.py
 python3 apps/yourai-tui/tests/smoke_launcher.py
 python3 apps/yourai-tui/tests/smoke_models.py
+python3 apps/yourai-tui/tests/smoke_ui.py
 ```
 
 这些脚本覆盖自定义地址、认证、工具审批、流式响应、手动 compact、SQLite 摘要提交、重启恢复、启动会话选择器、模型切换与终端模式恢复。

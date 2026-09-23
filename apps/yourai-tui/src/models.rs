@@ -39,6 +39,19 @@ pub fn model_choices(config: &Config) -> Vec<ModelChoice> {
             }
         }
     }
+    if !choices
+        .iter()
+        .any(|choice| choice.id == config.model && choice.variant.is_none())
+    {
+        choices.insert(
+            0,
+            ModelChoice {
+                id: config.model.clone(),
+                variant: None,
+                label: config.model.clone(),
+            },
+        );
+    }
     choices
 }
 

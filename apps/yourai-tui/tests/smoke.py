@@ -1,3 +1,4 @@
+from smoke_support import wait_exit
 """Offline POSIX TUI smoke test. Run cargo build -p yourai-tui first."""
 import fcntl
 import http.server
@@ -138,7 +139,7 @@ with tempfile.TemporaryDirectory() as tmp:
                 # shared 7s cooldown dominates both attempts.
                 assert all(gap >= 7 for gap in gaps), gaps
             os.write(master,b'\x11')
-            child.wait(timeout=10)
+            wait_exit(child, master)
             assert child.returncode == 0
             assert termios.tcgetattr(slave) == original
             db = sqlite3.connect(Path(tmp) / '.yourai/sessions/sessions.sqlite3')
@@ -198,7 +199,7 @@ with tempfile.TemporaryDirectory() as tmp:
         os.write(master, b'/compact\r')
         wait_for(b'Summarized')
         os.write(master, b'\x11')
-        child.wait(timeout=10)
+        wait_exit(child, master)
         assert child.returncode == 0
         assert termios.tcgetattr(slave) == original, 'terminal mode was not restored'
         assert len(requests) == 4
@@ -228,7 +229,7 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'SMOKE_RESUME_OK')
         assert any('Prior task list is complete.' in str(m.get('content')) for m in requests[-1][2]['messages'])
         os.write(master, b'\x11')
-        child.wait(timeout=10)
+        wait_exit(child, master)
         assert child.returncode == 0
         assert termios.tcgetattr(slave) == original
         print(('YOLO ' if yolo else '') + 'PASS: mouse auto-copy -> theme/context -> multiline paste -> approval policy -> folded tool toggle -> Todo -> compact -> restored history/tasks -> clean exit')

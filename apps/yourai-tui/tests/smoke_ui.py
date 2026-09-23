@@ -1,5 +1,5 @@
 from smoke_support import wait_exit
-"""Smoke test for /models switching: verify the second request hits the switched model."""
+"""UI regression flows: modal isolation, model defaults, deletion, narrow stats and launcher quit."""
 import fcntl
 import http.server
 import json
@@ -9,6 +9,9 @@ import pty
 import re
 import select
 import struct
+import sqlite3
+import signal
+import uuid
 import sys
 import subprocess
 import tempfile
@@ -36,6 +39,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        time.sleep(0.5)
         events = [
             {'choices': [{'index': 0, 'delta': {'content': 'MODELS_OK'}, 'finish_reason': None}]},
             {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}],
@@ -58,10 +62,7 @@ with tempfile.TemporaryDirectory() as tmp:
         "provider": {"mock": {
             "npm": "@ai-sdk/openai-compatible",
             "options": {"baseURL": f"http://127.0.0.1:{server.server_port}/v1", "apiKey": "x"},
-            "models": {
-                "smoke": {"id": "smoke-model", "limit": {"context": 16000, "output": 4096}},
-                "alt": {"id": "alt-model", "limit": {"context": 16000, "output": 4096}}
-            }
+            "models": {}
         }},
         "context": {"keep_recent_tokens": 0, "summary_min_savings": 1}
     }))
@@ -85,30 +86,58 @@ with tempfile.TemporaryDirectory() as tmp:
 
     try:
         wait_for(b'Untitled session')
-        # Send first message with default model (smoke-model).
-        os.write(master, b'first message\r')
-        wait_for(b'MODELS_OK')
-        assert len(requests) >= 1, 'first request missing'
-        assert requests[0][1]['model'] == 'smoke-model', f'expected smoke-model, got {requests[0][1]["model"]}'
-        # Switch to alt model via direct command.
-        os.write(master, b'/models mock/alt\r')
-        time.sleep(0.5)
-        # Verify the footer shows the new model label.
-        wait_for(b'mock/alt')
-        # Clear captured so the second MODELS_OK wait doesn't match the first.
+        os.write(master, b'/models\r')
+        wait_for(b'Models')
+        os.write(master, b'\r')
+        wait_for(b'Model switched to mock/smoke')
         captured.clear()
-        # Send second message; should use alt-model.
-        os.write(master, b'second message\r')
+        # Open a dashboard while work is in flight. Text and Esc belong to it.
+        os.write(master, b'after stats\r\x02')
+        wait_for(b'Session')
+        os.write(master, b'LEAK\x1b')
         wait_for(b'MODELS_OK')
-        # Find the second streaming request (skip any non-streaming ones).
-        stream_reqs = [r for r in requests if r[1].get('stream')]
-        assert len(stream_reqs) >= 2, f'expected 2 stream requests, got {len(stream_reqs)}'
-        assert stream_reqs[1][1]['model'] == 'alt-model', f'expected alt-model, got {stream_reqs[1][1]["model"]}'
-        os.write(master, b'\x11')  # Ctrl-Q
-        wait_exit(child, master)
-        assert child.returncode == 0
-        assert termios.tcgetattr(slave) == original, 'terminal mode was not restored'
-        print('PASS: /models switch — first request smoke-model, second request alt-model')
+        assert b'Cancellation requested' not in captured
+        assert len(requests) == 1
+        assert 'after stats' in json.dumps(requests[0][1])
+        assert 'LEAK' not in json.dumps(requests[0][1])
+        db = sqlite3.connect(Path(tmp) / '.yourai/sessions/sessions.sqlite3')
+        old_id = str(uuid.uuid4())
+        db.execute("INSERT INTO sessions(session_id,title,created_at,updated_at) VALUES (?, 'Old review', 1, 1)", (old_id,))
+        db.commit()
+        captured.clear()
+        os.write(master, b'/sessions\r')
+        wait_for(b'Sessions')
+        os.write(master, b'\x1b[200~Old review\x1b[201~\x04')
+        wait_for(b'Confirm deletion')
+        captured.clear()
+        os.write(master, b'\r\x1b')  # Enter cannot delete; Esc returns to list.
+        wait_for(b'Sessions')
+        assert db.execute('SELECT count(*) FROM sessions WHERE session_id=?', (old_id,)).fetchone()[0] == 1
+        captured.clear()
+        os.write(master, b'\x04')
+        wait_for(b'Confirm deletion')
+        os.write(master, b'y')
+        wait_for(b'Session deleted')
+        assert db.execute('SELECT count(*) FROM sessions WHERE session_id=?', (old_id,)).fetchone()[0] == 0
+        os.write(master, b'\x1b')
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 20, 35, 0, 0))
+        os.kill(child.pid, signal.SIGWINCH)
+        captured.clear()
+        os.write(master, b'\x02')
+        wait_for(b'Session')
+        os.write(master, b'\x1b\x11')
+        assert wait_exit(child, master) == 0
+        assert termios.tcgetattr(slave) == original
+        before = db.execute('SELECT count(*) FROM sessions').fetchone()[0]
+        captured.clear()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
+        child = subprocess.Popen([str(binary), '--config', str(config), '--resume'], stdin=slave, stdout=slave, stderr=slave, env=os.environ)
+        wait_for(b'Sessions')
+        os.write(master, b'\x11')
+        assert wait_exit(child, master) == 0
+        assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before
+        db.close()
+        print('PASS: default model picker -> running dashboard Esc isolation -> confirmed deletion -> 35-column stats -> launcher Ctrl-Q')
     finally:
         if child.poll() is None:
             child.kill()
@@ -116,6 +145,3 @@ with tempfile.TemporaryDirectory() as tmp:
         os.close(master)
         os.close(slave)
         server.shutdown()
-
-# Keep modal/session regressions in the existing CI smoke entry point.
-subprocess.run([sys.executable, str(Path(__file__).with_name('smoke_ui.py'))], check=True)

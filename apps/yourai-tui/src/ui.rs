@@ -2,6 +2,8 @@ mod clipboard;
 mod commands;
 mod editor;
 mod markdown;
+mod overlay;
+use overlay::{Action as OverlayAction, Overlay};
 mod render;
 mod selection;
 mod state;
@@ -263,11 +265,7 @@ struct FrameSnap {
     queued: usize,
     active: bool,
     compacting: bool,
-    help: bool,
-    stats: bool,
-    model_picker: Option<usize>,
-    session_picker: Option<(String, usize)>,
-    theme_picker: Option<usize>,
+    overlay: overlay::Snapshot,
     theme: theme::Theme,
     todos: Vec<state::Todo>,
     todo_panel: bool,
@@ -297,14 +295,7 @@ impl FrameSnap {
             queued,
             active: v.active,
             compacting,
-            help: v.help,
-            stats: v.stats,
-            model_picker: v.model_picker,
-            session_picker: v
-                .session_picker
-                .as_ref()
-                .map(|s| (s.query.clone(), s.selected)),
-            theme_picker: v.theme_picker,
+            overlay: v.overlay.snapshot(),
             theme: v.theme,
             todos: v.todos.clone(),
             todo_panel: v.todo_panel,
@@ -519,7 +510,7 @@ pub async fn run(
                 }
                 match received {
                     Event::Resize(_, _) => {}
-                    Event::Mouse(e) if !view.help => match e.kind {
+                    Event::Mouse(e) if !view.overlay.is_open() => match e.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
                             renderer.begin_selection(e.column, e.row)
                         }
@@ -546,6 +537,9 @@ pub async fn run(
                         _ => {}
                     },
                     Event::Mouse(_) => {}
+                    Event::Paste(text) if view.overlay.is_open() => {
+                        view.overlay.paste(&text);
+                    }
                     Event::Paste(text) => {
                         if let Some(a) = view.ask_mut() {
                             a.editor.insert(&text);
@@ -570,203 +564,63 @@ pub async fn run(
                             continue;
                         }
                         renderer.selection.clear();
-                        if view.help {
-                            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::F(1)) {
-                                view.help = false;
-                            }
-                            continue;
-                        }
-                        // Model picker keyboard routing (before command menu).
-                        if let Some(idx) = view.model_picker {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    view.model_picker = None;
-                                    continue;
-                                }
-                                KeyCode::Up => {
-                                    view.model_picker = Some(idx.saturating_sub(1));
-                                    continue;
-                                }
-                                KeyCode::Down => {
-                                    view.model_picker =
-                                        Some((idx + 1).min(choices.len().saturating_sub(1)));
-                                    continue;
-                                }
-                                KeyCode::Enter => {
-                                    let choice = &choices[idx.min(choices.len() - 1)];
-                                    match switch_model(
-                                        &config,
-                                        h,
-                                        &mut view,
-                                        &choice.id,
-                                        choice.variant.clone(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(label) => {
-                                            view.notice(
+                        if let Some(action) = view.overlay.key(key, choices.len()) {
+                            match action {
+                                OverlayAction::None => {}
+                                OverlayAction::Model(index) => {
+                                    if let Some(choice) = choices.get(index) {
+                                        match switch_model(
+                                            &config,
+                                            h,
+                                            &mut view,
+                                            &choice.id,
+                                            choice.variant.clone(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(label) => view.notice(
                                                 Level::Info,
                                                 format!("Model switched to {label}"),
-                                            );
-                                        }
-                                        Err(e) => {
-                                            view.notice(
+                                            ),
+                                            Err(e) => view.notice(
                                                 Level::Error,
                                                 format!("Model switch failed: {e}"),
-                                            );
+                                            ),
                                         }
                                     }
-                                    view.model_picker = None;
-                                    continue;
                                 }
-                                _ => continue,
-                            }
-                        }
-                        // Session picker keyboard routing (after models picker, before commands).
-                        let mut session_delete: Option<SessionId> = None;
-                        if let Some(picker) = view.session_picker.as_mut() {
-                            let filtered =
-                                crate::sessions::filter_sessions(&picker.rows, &picker.query);
-                            match key.code {
-                                KeyCode::Esc => {
-                                    view.session_picker = None;
-                                    continue;
-                                }
-                                KeyCode::Up => {
-                                    picker.selected = picker.selected.saturating_sub(1);
-                                    continue;
-                                }
-                                KeyCode::Down => {
-                                    let max = filtered.len().saturating_sub(1);
-                                    picker.selected = (picker.selected + 1).min(max);
-                                    continue;
-                                }
-                                KeyCode::Char('p') if ctrl => {
-                                    picker.selected = picker.selected.saturating_sub(1);
-                                    continue;
-                                }
-                                KeyCode::Char('n') if ctrl => {
-                                    let max = filtered.len().saturating_sub(1);
-                                    picker.selected = (picker.selected + 1).min(max);
-                                    continue;
-                                }
-                                KeyCode::Backspace => {
-                                    picker.query.pop();
-                                    picker.selected = 0;
-                                    continue;
-                                }
-                                KeyCode::Char('d') if ctrl => {
-                                    // Ctrl-D deletes the selected session (not the current one).
-                                    if let Some(&idx) = filtered.get(picker.selected) {
-                                        let row = &picker.rows[idx];
-                                        if row.is_current {
-                                            view.notice(
-                                                Level::Warning,
-                                                "Cannot delete the current session.",
-                                            );
-                                            continue;
-                                        } else {
-                                            session_delete = Some(row.id.clone());
-                                        }
-                                    } else {
-                                        continue;
+                                OverlayAction::Theme(theme) => view.theme = theme,
+                                OverlayAction::Session(id) => {
+                                    if view.active || !view.asks_empty() {
+                                        view.notice(Level::Warning, "Wait for the current turn, or press Esc to cancel it first.");
+                                    } else if id != h.host.context().id {
+                                        pending_switch = Some(id);
                                     }
                                 }
-                                KeyCode::Enter => {
-                                    // Resolve selection against the (possibly filtered) list.
-                                    let pick_idx = filtered.get(picker.selected).copied();
-                                    let target_id = pick_idx.map(|i| picker.rows[i].id.clone());
-                                    // Drop the overlay before awaiting, so re-entry is clean.
-                                    view.session_picker = None;
-                                    if let Some(id) = target_id {
-                                        // Guard: refuse while a turn is in flight.
-                                        if view.active || !view.asks_empty() {
-                                            view.notice(
-                                                Level::Warning,
-                                                "Wait for the current turn, or press Esc to cancel it first.",
-                                            );
-                                        } else if id == h.host.context().id {
-                                            view.notice(Level::Info, "Already on this session.");
-                                        } else {
-                                            // Schedule the swap for the next loop iteration;
-                                            // the actual close/re-open happens outside the
-                                            // key handler to avoid holding a borrow of `h`.
-                                            pending_switch = Some(id);
+                                OverlayAction::Delete(id) => {
+                                    match h.sessions.delete_session(&id).await {
+                                        Ok(()) => {
+                                            if let Overlay::Sessions(picker) = &mut view.overlay {
+                                                picker.rows.retain(|r| r.id != id);
+                                                picker.selected = picker.selected.min(
+                                                    crate::sessions::filter_sessions(
+                                                        &picker.rows,
+                                                        &picker.query,
+                                                    )
+                                                    .len()
+                                                    .saturating_sub(1),
+                                                );
+                                            }
+                                            view.toast =
+                                                Some(("Session deleted".into(), Instant::now()));
+                                        }
+                                        Err(e) => {
+                                            view.notice(Level::Error, format!("Delete failed: {e}"))
                                         }
                                     }
-                                    continue;
-                                }
-                                KeyCode::Char(c)
-                                    if !key
-                                        .modifiers
-                                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                                {
-                                    picker.query.push(c);
-                                    picker.selected = 0;
-                                    continue;
-                                }
-                                _ => continue,
-                            }
-                        }
-                        // Handle session deletion outside the picker borrow.
-                        if let Some(delete_id) = session_delete.take() {
-                            match h.sessions.delete_session(&delete_id).await {
-                                Ok(()) => {
-                                    view.notice(Level::Info, "Session deleted.");
-                                    if let Some(picker) = view.session_picker.as_mut() {
-                                        picker.rows.retain(|r| r.id != delete_id);
-                                        let max = crate::sessions::filter_sessions(
-                                            &picker.rows,
-                                            &picker.query,
-                                        )
-                                        .len()
-                                        .saturating_sub(1);
-                                        picker.selected = picker.selected.min(max);
-                                    }
-                                }
-                                Err(e) => {
-                                    view.notice(Level::Error, format!("Delete failed: {e}"));
                                 }
                             }
                             continue;
-                        }
-                        // Theme picker keyboard routing (after sessions, before commands).
-                        if let Some(idx) = view.theme_picker {
-                            let count = theme::Theme::ALL.len();
-                            match key.code {
-                                KeyCode::Esc => {
-                                    view.theme_picker = None;
-                                    continue;
-                                }
-                                KeyCode::Up => {
-                                    view.theme_picker = Some(idx.saturating_sub(1));
-                                    continue;
-                                }
-                                KeyCode::Down => {
-                                    view.theme_picker =
-                                        Some((idx + 1).min(count.saturating_sub(1)));
-                                    continue;
-                                }
-                                KeyCode::Char('p') if ctrl => {
-                                    view.theme_picker = Some(idx.saturating_sub(1));
-                                    continue;
-                                }
-                                KeyCode::Char('n') if ctrl => {
-                                    view.theme_picker =
-                                        Some((idx + 1).min(count.saturating_sub(1)));
-                                    continue;
-                                }
-                                KeyCode::Enter => {
-                                    let picked = theme::Theme::ALL
-                                        .get(idx)
-                                        .copied()
-                                        .unwrap_or(theme::Theme::System);
-                                    view.theme = picked;
-                                    view.theme_picker = None;
-                                    continue;
-                                }
-                                _ => continue,
-                            }
                         }
                         view.commands.sync(&view.editor.text, view.asks_empty());
                         let commands = view.commands.items();
@@ -803,7 +657,7 @@ pub async fn run(
                             }
                         }
                         match key.code {
-                            KeyCode::F(1) => view.help = true,
+                            KeyCode::F(1) => view.overlay = Overlay::Help { scroll: 0 },
                             KeyCode::F(6) => {
                                 view.select_next(key.modifiers.contains(KeyModifiers::SHIFT));
                                 renderer.reveal(view.selected());
@@ -819,7 +673,9 @@ pub async fn run(
                                 view.toggle_recent(true);
                                 renderer.reveal(view.selected());
                             }
-                            KeyCode::Char('b') if ctrl => view.stats = !view.stats,
+                            KeyCode::Char('b') if ctrl => {
+                                view.overlay = Overlay::Stats { scroll: 0 }
+                            }
                             KeyCode::Char('y') if ctrl => view.theme = view.theme.next(),
                             KeyCode::End if ctrl => renderer.follow(&mut view),
                             KeyCode::PageUp if alt && !view.asks_empty() => {
@@ -891,7 +747,7 @@ pub async fn run(
                                             .iter()
                                             .position(|t| *t == view.theme)
                                             .unwrap_or(0);
-                                        view.theme_picker = Some(current_idx);
+                                        view.overlay = Overlay::Themes(current_idx);
                                     } else if let Some(theme) = theme::Theme::parse(name) {
                                         view.theme = theme;
                                     } else {
@@ -906,7 +762,7 @@ pub async fn run(
                                 match text.trim() {
                                     "/quit" => return Ok(()),
                                     "/help" => {
-                                        view.help = true;
+                                        view.overlay = Overlay::Help { scroll: 0 };
                                         view.editor.take();
                                         continue;
                                     }
@@ -932,7 +788,7 @@ pub async fn run(
                                         continue;
                                     }
                                     "/status" => {
-                                        view.stats = !view.stats;
+                                        view.overlay = Overlay::Stats { scroll: 0 };
                                         view.editor.take();
                                         continue;
                                     }
@@ -942,7 +798,7 @@ pub async fn run(
                                         let arg = s.strip_prefix("/models").unwrap().trim();
                                         if arg.is_empty() {
                                             // Open picker.
-                                            view.model_picker = Some(0);
+                                            view.overlay = Overlay::Models(0);
                                         } else {
                                             // Direct switch: /models provider/model [variant]
                                             let parts: Vec<&str> = arg.splitn(2, ' ').collect();
@@ -979,7 +835,7 @@ pub async fn run(
                                             );
                                             continue;
                                         }
-                                        // Load sessions off the main loop; populate the overlay.
+                                        // Load the session metadata before opening the picker.
                                         let metas = match h.sessions.list_sessions().await {
                                             Ok(m) => m,
                                             Err(e) => {
@@ -993,11 +849,13 @@ pub async fn run(
                                         let current = h.host.context().id.clone();
                                         let rows =
                                             crate::sessions::rows_from(metas, Some(&current));
-                                        view.session_picker = Some(state::SessionPickerState {
-                                            rows,
-                                            query: String::new(),
-                                            selected: 0,
-                                        });
+                                        view.overlay =
+                                            Overlay::Sessions(state::SessionPickerState {
+                                                pending_delete: None,
+                                                rows,
+                                                query: String::new(),
+                                                selected: 0,
+                                            });
                                         continue;
                                     }
 
@@ -1136,7 +994,7 @@ pub async fn run(
                 };
                 view.toast = Some((message, Instant::now()));
             }
-            view.model_metrics = h.budget.snapshot();
+            view.model_metrics = h.model_snapshot();
             let mut context_tick = false;
             if context_refreshed.elapsed() >= Duration::from_secs(1) {
                 let context_next = h.host.context_usage().ok();
@@ -1214,8 +1072,20 @@ async fn switch_model(
         .resolve(variant.as_deref())
         .map_err(|e| e.to_string())?;
     candidate.selected_variant = variant.clone();
+    let (header_timeout, chunk_timeout) = candidate.model_timeouts().map_err(|e| e.to_string())?;
+    let settings = yourai_harness::assembly::ModelSettings {
+        provider: candidate
+            .model
+            .split_once('/')
+            .map(|(p, _)| p)
+            .unwrap_or_default()
+            .into(),
+        requests: candidate.request_policy().map_err(|e| e.to_string())?,
+        header_timeout,
+        chunk_timeout,
+    };
     harness
-        .switch_model(model, candidate.context.clone())
+        .switch_model_with_settings(model, candidate.context.clone(), settings)
         .await
         .map_err(|e| e.to_string())?;
     let p = candidate.pricing();
@@ -1248,6 +1118,12 @@ fn prepare_session(
     let mut hc = template.clone();
     hc.resume = Some(id);
     hc.context_policy = candidate.context.clone();
+    hc.model_provider = candidate
+        .model
+        .split_once('/')
+        .map(|(p, _)| p)
+        .unwrap_or_default()
+        .into();
     hc.request_policy = candidate.request_policy()?;
     (hc.model_header_timeout, hc.model_chunk_timeout) = candidate.model_timeouts()?;
     Ok((hc, model))

@@ -1,3 +1,4 @@
+from smoke_support import wait_exit
 """Launcher smoke test: bare `--resume` opens the session picker."""
 import fcntl
 import http.server
@@ -81,7 +82,7 @@ with tempfile.TemporaryDirectory() as tmp:
         os.write(master, b'seed message\r')
         wait_for(b'LAUNCHER_OK')
         os.write(master, b'\x11')  # Ctrl-Q
-        child.wait(timeout=10)
+        wait_exit(child, master)
     finally:
         if child.poll() is None:
             child.kill()
@@ -103,7 +104,7 @@ with tempfile.TemporaryDirectory() as tmp:
         os.write(master, b'\r')
         wait_for(b'LAUNCHER_OK')
         os.write(master, b'\x11')  # Ctrl-Q
-        child.wait(timeout=10)
+        wait_exit(child, master)
         assert child.returncode == 0
         assert termios.tcgetattr(slave) == original, 'terminal mode was not restored'
         print('PASS: launcher --resume shows picker, Enter resumes, terminal mode restored')

@@ -1,3 +1,8 @@
+mod overlays;
+use overlays::*;
+mod cards;
+mod timeline;
+use super::overlay::Overlay;
 use super::{
     editor::Editor,
     state::{DiffRow, Item, Role, ToolStatus, View},
@@ -6,6 +11,7 @@ use super::{
         GREEN, MUTED, PANEL, RED, TEXT, YELLOW,
     },
 };
+use cards::*;
 use ratatui::{
     prelude::*,
     widgets::{
@@ -13,7 +19,6 @@ use ratatui::{
         ScrollbarState,
     },
 };
-use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 #[cfg(test)]
@@ -29,7 +34,8 @@ pub struct Metadata {
 #[derive(Default)]
 pub struct Renderer {
     pub selection: super::selection::Selection,
-    key: Option<(u64, u16, u16, u8)>,
+    key: Option<(u64, u16, u16, Theme)>,
+    timeline: timeline::TimelineCache,
     lines: Vec<Line<'static>>,
     headers: Vec<(usize, u64)>,
     hits: Vec<(Rect, u64)>,
@@ -41,11 +47,8 @@ pub struct Renderer {
     panel: Option<Rect>,
     anchor: Option<(u64, usize)>,
     reveal: Option<u64>,
-    animation_start: Option<std::time::Instant>,
     /// 40ms tick frame index shared by the breathing bar and card spinners.
     tick: u64,
-    /// Cached git branch for the footer idle slot; refreshed every ~5s.
-    git_branch: Option<(String, std::time::Instant)>,
 }
 impl Renderer {
     pub fn begin_selection(&mut self, x: u16, y: u16) {
@@ -113,28 +116,12 @@ impl Renderer {
         self.reveal = id;
     }
 
-    /// Returns the current git branch (or short detached-HEAD hash) for the
-    /// given cwd, cached for ~5s to avoid re-reading `.git/HEAD` every frame.
-    /// Returns an empty string when not in a git repo.
-    fn git_branch(&mut self, cwd: &str) -> &str {
-        let now = std::time::Instant::now();
-        let refresh = self
-            .git_branch
-            .as_ref()
-            .is_some_and(|(_, ts)| now.duration_since(*ts) < Duration::from_secs(5));
-        if !refresh {
-            let branch = read_git_branch(cwd);
-            self.git_branch = Some((branch, now));
-        }
-        self.git_branch.as_ref().unwrap().0.as_str()
-    }
-
     pub fn draw(
         &mut self,
         f: &mut Frame<'_>,
         v: &mut View,
         m: &Metadata,
-        status: &SessionStatus,
+        _status: &SessionStatus,
         queued: usize,
         compact: bool,
     ) {
@@ -160,12 +147,10 @@ impl Renderer {
             v.theme.apply(f.buffer_mut());
             return;
         }
-        // Sidebar = Todo list (top, when todos exist) + telemetry (bottom).
-        // Visible when enabled and terminal is wide enough (≥110 cols, matching
-        // the original sidebar threshold). Below that, fall back to a single-line
-        // Todo dock above the input.
-        let sidebar_visible = v.todo_panel && area.width >= 110;
-        let panel_w = (area.width / 4).clamp(30, 44);
+        // Todo panel appears only when there are tasks to inspect.
+        // Below 80 columns use a one-line dock above the input.
+        let sidebar_visible = v.todo_panel && !v.todos.is_empty() && area.width >= 80;
+        let panel_w = (area.width / 3).clamp(28, 40);
         let cols = if sidebar_visible {
             Layout::horizontal([Constraint::Min(50), Constraint::Length(panel_w)]).split(area)
         } else {
@@ -201,20 +186,6 @@ impl Renderer {
             Constraint::Length(1),
         ])
         .split(cols[0]);
-        let status_text: &str = if !v.asks_empty() {
-            "approval / reply"
-        } else if compact {
-            "compacting"
-        } else {
-            match status {
-                SessionStatus::Idle => "ready",
-                SessionStatus::Running { .. } => "working",
-                SessionStatus::Compacting => "compacting",
-                SessionStatus::Closing => "stopping",
-                SessionStatus::Closed => "closed",
-                _ => "working",
-            }
-        };
         let transcript = rows[0];
         let title = v.title.as_deref().unwrap_or("Untitled session");
         let block = Block::default()
@@ -239,20 +210,11 @@ impl Renderer {
         let inner = block.inner(transcript);
         f.render_widget(block, transcript);
         self.transcript = inner;
-        let running_tool = v
-            .items()
-            .iter()
-            .any(|item| matches!(item, Item::Tool(t) if t.status == ToolStatus::Running));
-        let spinner = if running_tool {
-            (self.tick as usize % SPINNER.len()) as u8
-        } else {
-            0
-        };
         let preview_rows = edit_preview_quota(inner.height);
-        let key = (v.revision, inner.width, inner.height, spinner);
+        let key = (v.revision, inner.width, inner.height, v.theme);
         if self.key != Some(key) {
             let old = self.lines.len();
-            (self.lines, self.headers) = timeline_at(
+            (self.lines, self.headers) = self.timeline.layout(
                 v,
                 inner.width.saturating_sub(2) as usize,
                 preview_rows,
@@ -264,6 +226,20 @@ impl Renderer {
                     .saturating_add(self.lines.len().saturating_sub(old));
             }
             self.key = Some(key);
+        }
+        // Animation updates only running headers, never static Markdown/code bodies.
+        for (line, id) in &self.headers {
+            let index = id.saturating_sub(v.item_id(0)) as usize;
+            if let Some(Item::Tool(tool)) = v.items().get(index) {
+                if tool.status == ToolStatus::Running {
+                    self.lines[*line] = tool_title(
+                        tool,
+                        v.selected() == Some(*id),
+                        inner.width.saturating_sub(2) as usize,
+                        self.tick,
+                    );
+                }
+            }
         }
         let height = inner.height as usize;
         if let Some((id, offset)) = self.anchor.take() {
@@ -321,14 +297,18 @@ impl Renderer {
         } else {
             " Message "
         };
-        let input_title_right = " ^T sidebar · ^B stats · F1 help ";
+        let input_title_right = if cols[0].width >= 70 {
+            " ^T tasks · ^B stats · F1 help "
+        } else {
+            " F1 help "
+        };
         draw_editor(
             f,
             &v.editor,
             rows[4],
             mode,
             input_title_right,
-            v.asks_empty(),
+            v.asks_empty() && !v.overlay.is_open(),
             ACCENT,
         );
         if let Some(ask) = v.ask() {
@@ -397,7 +377,7 @@ impl Renderer {
                 Paragraph::new(line).style(Style::default().fg(TEXT)),
                 parts[2],
             );
-            if parts[2].width > 0 && parts[2].height > 0 {
+            if parts[2].width > 0 && parts[2].height > 0 && !v.overlay.is_open() {
                 f.set_cursor_position((
                     parts[2].x + col.min(parts[2].width.saturating_sub(1) as usize) as u16,
                     parts[2].y,
@@ -414,8 +394,9 @@ impl Renderer {
             self.todo_hit = Some(rows[3]);
         }
         let footer = rows[5];
-        draw_footer(f, footer, v, m, status_text, busy, compact, queued, self);
-        v.commands.sync(&v.editor.text, v.asks_empty() && !v.help);
+        draw_footer(f, footer, v, m, queued);
+        v.commands
+            .sync(&v.editor.text, v.asks_empty() && !v.overlay.is_open());
         let commands = v.commands.items();
         if !commands.is_empty() {
             let height = (commands.len() as u16 + 2).min(rows[4].y.saturating_sub(area.y));
@@ -479,27 +460,20 @@ impl Renderer {
             );
         }
         if let Some(side) = cols.get(1) {
-            let hits = sidebar(f, *side, v, m, queued);
+            let hits = sidebar(f, *side, v);
             self.panel = Some(*side);
             self.todo_hit = hits.0;
             self.todo_area = hits.1;
         } else {
             self.panel = None;
         }
-        if v.stats {
-            stats_overlay(f, area, v, m, queued);
-        }
-        if v.model_picker.is_some() {
-            model_picker_overlay(f, area, v);
-        }
-        if v.session_picker.is_some() {
-            sessions_overlay(f, area, v);
-        }
-        if v.theme_picker.is_some() {
-            theme_picker_overlay(f, area, v);
-        }
-        if v.help {
-            help(f, area);
+        match &v.overlay {
+            Overlay::None => {}
+            Overlay::Stats { .. } => stats_overlay(f, area, v, m, queued),
+            Overlay::Models(_) => model_picker_overlay(f, area, v),
+            Overlay::Sessions(_) => sessions_overlay(f, area, v),
+            Overlay::Themes(_) => theme_picker_overlay(f, area, v),
+            Overlay::Help { scroll } => help(f, area, *scroll),
         }
         v.theme.apply(f.buffer_mut());
         self.selection
@@ -534,28 +508,6 @@ impl Renderer {
     }
 }
 
-/// Read the current git branch from `.git/HEAD` by walking up from `cwd`.
-/// Returns an empty string if not in a git repo. On detached HEAD, returns
-/// the first 7 chars of the commit hash.
-fn read_git_branch(cwd: &str) -> String {
-    let mut path = std::path::PathBuf::from(cwd);
-    loop {
-        let head = path.join(".git").join("HEAD");
-        if let Ok(content) = std::fs::read_to_string(&head) {
-            let trimmed = content.trim();
-            if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
-                return branch.to_string();
-            }
-            // Detached HEAD: show short hash.
-            return trimmed.chars().take(7).collect();
-        }
-        if !path.pop() {
-            return String::new();
-        }
-    }
-}
-
-// Time-based brightness keeps the indicator smooth without changing its width.
 fn pulse_color(seconds: f32, theme: super::theme::Theme) -> Color {
     let intensity = (1.0 - (seconds * std::f32::consts::PI).cos()) * 0.5;
     lerp_color(theme.color(MUTED), theme.color(ACCENT), intensity)
@@ -654,8 +606,6 @@ fn welcome(f: &mut Frame<'_>, area: Rect) {
         r"   |_|\___/ \__,_|_|/_/   \_\___|",
     ];
     let logo_w = logo[0].len() as u16;
-    let palette = f.area().width; // just to avoid unused; real palette via theme
-    let _ = palette;
     let wide = area.width >= 56 && area.height >= 12;
     if wide {
         let info_w = 38u16;
@@ -711,7 +661,7 @@ fn welcome(f: &mut Frame<'_>, area: Rect) {
         info("yourai", "your coding companion");
         info("", "──────────────────────");
         info("", "");
-        info("hint", "/help · ^T sidebar · ^B stats");
+        info("hint", "/help · ^T tasks · ^B stats");
         info("", "/models · /sessions");
     } else {
         let lines = vec![
@@ -776,236 +726,76 @@ fn draw_editor(
         ));
     }
 }
-/// Right sidebar: Todo list (top, when todos exist) + telemetry (bottom).
-/// Returns (title hit box, todo scroll area).
-fn sidebar(
-    f: &mut Frame<'_>,
-    area: Rect,
-    v: &View,
-    m: &Metadata,
-    queued: usize,
-) -> (Option<Rect>, Option<Rect>) {
+/// Todo-only panel; diagnostics are available in the dashboard.
+fn sidebar(f: &mut Frame<'_>, area: Rect, v: &View) -> (Option<Rect>, Option<Rect>) {
     let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(BORDER))
         .style(Style::default().bg(PANEL));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let has_todos = !v.todos.is_empty();
     let done = v.todos.iter().filter(|t| t.completed).count();
-    let total = v.todos.len();
-    let mut lines: Vec<Line<'static>> = vec![];
-    let title_hit = Some(Rect::new(inner.x, inner.y, inner.width, 1));
-    let scroll_start;
-    if has_todos {
-        lines.push(Line::from(Span::styled(
-            format!(" Todo · {done}/{total} · ^T "),
-            Style::default().fg(ACCENT).bold(),
-        )));
-        lines.push(Line::default());
-        scroll_start = lines.len();
-        // Stable board order; three-state markers.
-        let first_pending = v.todos.iter().position(|t| !t.completed);
-        let todo_capacity = inner.height as usize / 2;
-        let skip = v
-            .todo_scroll
-            .min(v.todos.len().saturating_sub(todo_capacity));
-        for (i, todo) in v.todos.iter().enumerate().skip(skip).take(todo_capacity) {
-            let (mark, mark_color, text_color) = if todo.completed {
-                ("✓", GREEN, MUTED)
-            } else if first_pending == Some(i) {
-                ("•", ACCENT, TEXT)
-            } else {
-                (" ", MUTED, TEXT)
-            };
-            let prefix = format!("[{mark}] ");
-            let indent = "    ";
-            let avail = (inner.width as usize).saturating_sub(prefix.width());
-            let wrapped = wrap_todo_text(&todo.text.replace('\n', " "), avail);
-            for (wi, wline) in wrapped.iter().enumerate() {
-                let p = if wi == 0 { &prefix } else { indent };
-                lines.push(Line::from(vec![
-                    Span::styled(p.to_owned(), Style::default().fg(mark_color)),
-                    Span::styled(wline.clone(), Style::default().fg(text_color)),
-                ]));
-            }
-        }
-        let hidden = v.todos.len().saturating_sub(skip + todo_capacity);
-        if skip > 0 || hidden > 0 {
-            lines.push(Line::from(Span::styled(
-                format!(" {skip}↑ {hidden}↓ · wheel scrolls"),
-                Style::default().fg(FAINT),
-            )));
-        }
-        let todo_area = Some(Rect::new(
-            inner.x,
-            inner.y + scroll_start as u16,
-            inner.width,
-            lines.len().saturating_sub(scroll_start) as u16,
-        ));
-        lines.push(Line::default());
-        // Telemetry section below todos.
-        lines.extend(sidebar_telemetry(v, m, queued));
-        f.render_widget(Paragraph::new(lines), inner);
-        (title_hit, todo_area)
-    } else {
-        // No todos: telemetry fills the whole sidebar.
-        lines.push(Line::from(Span::styled(
-            " Session · ^T ",
-            Style::default().fg(ACCENT).bold(),
-        )));
-        lines.push(Line::default());
-        lines.extend(sidebar_telemetry(v, m, queued));
-        f.render_widget(Paragraph::new(lines), inner);
-        (title_hit, None)
-    }
-}
-
-/// Telemetry lines shared by the sidebar and the ^B overlay.
-fn sidebar_telemetry(v: &View, m: &Metadata, queued: usize) -> Vec<Line<'static>> {
+    f.render_widget(
+        Paragraph::new(format!(" Todo · {done}/{} · ^T", v.todos.len()))
+            .style(Style::default().fg(ACCENT)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let body = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let current = v.todos.iter().position(|t| !t.completed);
     let mut lines = Vec::new();
-    // Session section.
-    lines.push(label(&v.model_label.clone(), TEXT));
-    lines.push(label(&format!("cwd {}", abbreviate_home(&m.cwd)), MUTED));
-    lines.push(label(
-        &format!(
-            "session {} · {} calls",
-            m.session.chars().take(8).collect::<String>(),
-            v.model_metrics.calls
-        ),
-        MUTED,
-    ));
-    if queued > 0 {
-        lines.push(label(&format!("{queued} queued"), YELLOW));
-    }
-    lines.push(Line::default());
-    // Context section.
-    lines.push(label("Context", MUTED));
-    if let Some(usage) = &v.context_usage {
-        let used = usage.estimated_tokens;
-        if let Some(window) = usage.context_window.filter(|w| *w > 0) {
-            let ratio = used as f64 / window as f64;
-            lines.push(label(
-                &format!(
-                    "{} / {} ({:.0}%)",
-                    tokens(used),
-                    tokens(window),
-                    ratio * 100.0
-                ),
-                TEXT,
-            ));
-            lines.push(label(&ctx_bar(ratio), ctx_color(ratio)));
+    for (i, todo) in v.todos.iter().enumerate() {
+        let (mark, color) = if todo.completed {
+            ("✓", GREEN)
+        } else if current == Some(i) {
+            ("•", ACCENT)
         } else {
-            lines.push(label(
-                &format!("{} used · limit unknown", tokens(used)),
-                TEXT,
-            ));
-        }
-        if let Some(budget) = usage.input_budget {
-            lines.push(label(
-                &format!(
-                    "{} of {} budget",
-                    tokens(budget.saturating_sub(used)),
-                    tokens(budget)
+            (" ", MUTED)
+        };
+        for (row, text) in wrap_todo_text(
+            &todo.text.replace('\n', " "),
+            inner.width.saturating_sub(4) as usize,
+        )
+        .into_iter()
+        .enumerate()
+        {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if row == 0 {
+                        format!("[{mark}] ")
+                    } else {
+                        "    ".into()
+                    },
+                    Style::default().fg(color),
                 ),
-                MUTED,
-            ));
+                Span::styled(
+                    text,
+                    Style::default().fg(if todo.completed { MUTED } else { TEXT }),
+                ),
+            ]));
         }
-        lines.push(label(
-            &format!("reserve {}", tokens(usage.output_reserve)),
-            MUTED,
-        ));
-    } else {
-        lines.push(label("Estimate unavailable", MUTED));
     }
-    let metrics = &v.model_metrics.requests;
-    if metrics.journal_errors > 0 {
-        lines.push(label("Request log write failed", RED));
-    }
-    lines.push(Line::default());
-    // Requests section.
-    lines.push(label("Requests · this run", MUTED));
-    lines.push(label(
-        &format!(
-            "{} calls · {} in 60s",
-            v.model_metrics.calls, metrics.attempts_last_minute
+    let scroll = v
+        .todo_scroll
+        .min(lines.len().saturating_sub(body.height as usize));
+    f.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(scroll)
+                .take(body.height as usize)
+                .collect::<Vec<_>>(),
         ),
-        TEXT,
-    ));
-    lines.push(label(
-        &format!(
-            "{} active · {} cancelled",
-            metrics.active, metrics.cancelled
-        ),
-        MUTED,
-    ));
-    let failed_line = format!("{} failed", metrics.failed);
-    let rate_line = if metrics.rate_limited > 0 {
-        format!(" · {} 429", metrics.rate_limited)
-    } else {
-        String::new()
-    };
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("  {failed_line}"),
-            Style::default().fg(if metrics.failed > 0 { RED } else { MUTED }),
-        ),
-        Span::styled(
-            rate_line,
-            Style::default().fg(if metrics.rate_limited > 0 { RED } else { MUTED }),
-        ),
-    ]));
-    lines.push(label(
-        &metrics
-            .last_output_tokens_per_second
-            .map(|n| format!("{n:.1} tok/s"))
-            .unwrap_or_else(|| "tok/s · awaiting".into()),
-        TEXT,
-    ));
-    lines.push(label(
-        &metrics
-            .cache_hit_percent()
-            .map(|n| {
-                format!(
-                    "cache {:.1}% ({}/{})",
-                    n, metrics.cache_reported_responses, metrics.completed
-                )
-            })
-            .unwrap_or_else(|| "cache · not reported".into()),
-        TEXT,
-    ));
-    lines.push(Line::default());
-    // Tokens section.
-    lines.push(label("Tokens · session", MUTED));
-    lines.push(label(
-        &format!(
-            "{} in · {} out",
-            tokens(v.usage.input_tokens),
-            tokens(v.usage.output_tokens)
-        ),
-        TEXT,
-    ));
-    if let Some((pin, pout)) = v.pricing {
-        let cost =
-            (v.usage.input_tokens as f64 * pin + v.usage.output_tokens as f64 * pout) / 1_000_000.0;
-        lines.push(label(&format!("${cost:.4} (${pin}/{pout} per M)"), YELLOW));
-    }
-    lines.push(label(&format!("{} responses", v.recorded_responses), MUTED));
-    lines.push(Line::default());
-    // Permissions.
-    lines.push(label("Permissions", MUTED));
-    lines.push(label(
-        if m.yolo {
-            "YOLO · approvals skipped"
-        } else if m.trusted_shell {
-            "Trusted local execution"
-        } else {
-            "Ask before commands"
-        },
-        if m.yolo { ACCENT } else { TEXT },
-    ));
-    lines.push(label(&format!("theme {}", v.theme.label()), MUTED));
-    lines
+        body,
+    );
+    (
+        Some(Rect::new(inner.x, inner.y, inner.width, 1)),
+        Some(body),
+    )
 }
 
 fn wrap_todo_text(text: &str, width: usize) -> Vec<String> {
@@ -1039,53 +829,15 @@ fn draw_narrow_todo_dock(f: &mut Frame<'_>, area: Rect, v: &View) {
         .map(|t| t.text.replace('\n', " "))
         .unwrap_or_default();
     let text = format!(" Todo {done}/{total} · ^T · ► {}", next);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(PANEL));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
     f.render_widget(
-        Paragraph::new(elide(&text, inner.width as usize)).style(Style::default().fg(MUTED)),
-        inner,
+        Paragraph::new(elide(&text, area.width as usize)).style(Style::default().fg(MUTED)),
+        area,
     );
-}
-
-/// Breathing bar: spinner + activity + elapsed + Esc hint.
-/// Rotating status phrases that make the wait feel like a conversation.
-/// Indexed by elapsed seconds; cycles every ~8s so it never feels stale.
-fn fun_phrase(v: &View, tick: u64) -> Option<&'static str> {
-    if v.is_thinking() {
-        // Thinking phase — the model is reasoning before producing output.
-        const PHRASES: &[&str] = &[
-            "正在思考",
-            "梳理思路",
-            "组织逻辑",
-            "斟酌措辞",
-            "推演方案",
-            "检索知识",
-            "权衡取舍",
-            "灵感涌现",
-        ];
-        // Rotate every ~1.5s (25 ticks at 40ms).
-        Some(PHRASES[((tick / 25) as usize) % PHRASES.len()])
-    } else if v.is_responding() {
-        // Responding phase — streaming tokens.
-        const PHRASES: &[&str] = &["正在回复", "敲敲键盘", "奋笔疾书", "逐字输出", "整理答案"];
-        Some(PHRASES[((tick / 30) as usize) % PHRASES.len()])
-    } else {
-        None
-    }
 }
 
 fn draw_activity_bar(f: &mut Frame<'_>, area: Rect, v: &View, compact: bool, tick: u64) {
     let spinner = spinner_frame(tick);
-    let mut act = activity(v, compact);
-    // Replace the generic "Thinking"/"Responding" with rotating phrases.
-    if let Some(phrase) = fun_phrase(v, tick) {
-        act = phrase.into();
-    }
+    let act = activity(v, compact);
     let elapsed = elapsed_str(v);
     let text = if elapsed.is_empty() {
         format!("{spinner} {act} · Esc 打断")
@@ -1099,484 +851,48 @@ fn draw_activity_bar(f: &mut Frame<'_>, area: Rect, v: &View, compact: bool, tic
     );
 }
 
-/// Two-segment status bar (footer, left column bottom row).
-/// Rendering inputs are kept explicit because they come from separate UI subsystems.
-#[allow(clippy::too_many_arguments)]
-fn draw_footer(
-    f: &mut Frame<'_>,
-    area: Rect,
-    v: &View,
-    m: &Metadata,
-    status_text: &str,
-    busy: bool,
-    compact: bool,
-    queued: usize,
-    renderer: &mut Renderer,
-) {
-    let model_label = &v.model_label;
-    let perm = permission_label(m.yolo, m.trusted_shell);
-    // Right segments (right-to-left): permission, todo count, tokens, ctx bar.
-    let metrics = &v.model_metrics.requests;
-    let todo_seg = if !v.todos.is_empty() {
-        let done = v.todos.iter().filter(|t| t.completed).count();
-        format!(" · {}/{}", done, v.todos.len())
-    } else {
-        String::new()
-    };
-    let token_seg = format!(
-        " · ↑{} ↓{}",
-        tokens(v.usage.input_tokens),
-        tokens(v.usage.output_tokens)
-    );
-    let ctx_seg = if let Some(ratio) = ctx_pressure(v) {
-        format!(" {} {}%", ctx_bar(ratio), (ratio * 100.0) as u64)
-    } else {
-        String::new()
-    };
-    let rate_seg = if metrics.rate_limited > 0 {
-        format!(" · 429×{}", metrics.rate_limited)
-    } else {
-        String::new()
-    };
-    let cost_seg = if let Some((pin, pout)) = v.pricing {
-        let cost =
-            (v.usage.input_tokens as f64 * pin + v.usage.output_tokens as f64 * pout) / 1_000_000.0;
-        if cost >= 0.01 {
-            format!(" · ${cost:.2}")
-        } else if cost > 0.0 {
-            format!(" · ${cost:.4}")
-        } else {
-            String::new()
+/// Essential model/permission information survives narrow terminals.
+fn draw_footer(f: &mut Frame<'_>, area: Rect, v: &View, m: &Metadata, queued: usize) {
+    let permission = permission_label(m.yolo, m.trusted_shell);
+    let permission_color = if m.yolo { YELLOW } else { TEXT };
+    let budget = (area.width as usize).saturating_sub(permission.width() + 3);
+    let model = elide(&v.model_label, budget);
+    let mut spans = vec![Span::styled(model, Style::default().fg(TEXT))];
+    let ctx = ctx_pressure(v).map(|ratio| {
+        (
+            format!(" · ctx {}%", (ratio * 100.0) as u64),
+            ctx_color(ratio),
+        )
+    });
+    if let Some((text, color)) = ctx {
+        if spans.iter().map(|s| s.width()).sum::<usize>() + text.width() <= budget {
+            spans.push(Span::styled(text, Style::default().fg(color)));
         }
-    } else {
-        String::new()
-    };
-    let right = format!("{ctx_seg}{rate_seg}{token_seg}{cost_seg}{todo_seg} · {perm}");
-    let right_w = right.width();
-    // Left segment.
-    let left = if busy {
-        let act = activity(v, compact);
-        let elapsed = elapsed_str(v);
-        let q = if queued > 0 {
-            format!(" · {queued} queued")
-        } else {
-            String::new()
-        };
-        format!("● {act}{elapsed}{q}")
-    } else {
-        let branch = renderer.git_branch(&m.cwd);
-        if branch.is_empty() {
-            format!("{model_label} · {status_text}")
-        } else {
-            format!("{model_label} ·  {branch} · {status_text}")
-        }
-    };
-    let left_color = if busy && v.asks_empty() {
-        let seconds = renderer
-            .animation_start
-            .get_or_insert_with(std::time::Instant::now)
-            .elapsed()
-            .as_secs_f32();
-        pulse_color(seconds, v.theme)
-    } else {
-        renderer.animation_start = None;
-        TEXT
-    };
-    // Render: left (elided if needed), right (fixed).
-    let avail = area.width as usize;
-    let left_max = avail.saturating_sub(right_w + 2);
-    let left_text = elide(&left, left_max);
-    let left_w = left_text.width();
-    let mut spans = vec![Span::styled(left_text, Style::default().fg(left_color))];
-    if right_w + 2 <= avail {
-        let pad = avail - left_w - right_w;
-        spans.push(Span::raw(" ".repeat(pad)));
-        // Color the ctx bar segment.
-        let right_spans = if let Some(ratio) = ctx_pressure(v) {
-            vec![
-                Span::styled(ctx_bar(ratio), Style::default().fg(ctx_color(ratio))),
-                Span::styled(
-                    format!(" {}%", (ratio * 100.0) as u64),
-                    Style::default().fg(ctx_color(ratio)),
-                ),
-                Span::styled(
-                    right.trim_start_matches(['▓', '░', ' ']),
-                    Style::default().fg(MUTED),
-                ),
-            ]
-        } else {
-            // ctx_seg is empty; just render right without the bar prefix.
-            let rest = right.trim_start();
-            vec![Span::styled(rest, Style::default().fg(MUTED))]
-        };
-        // Permission segment color is secondary for now; render right as MUTED.
-        let _ = right_spans;
-        spans.push(Span::styled(right.trim_start(), Style::default().fg(MUTED)));
     }
+    if queued > 0 {
+        let text = format!(" · {queued} queued");
+        if spans.iter().map(|s| s.width()).sum::<usize>() + text.width() <= budget {
+            spans.push(Span::styled(text, Style::default().fg(MUTED)));
+        }
+    }
+    let used = spans.iter().map(|s| s.width()).sum::<usize>();
+    spans.push(Span::raw(" ".repeat(
+        (area.width as usize).saturating_sub(used + permission.width() + 2),
+    )));
+    spans.push(Span::styled(
+        format!("· {permission}"),
+        Style::default().fg(permission_color).bold(),
+    ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// ^B dashboard overlay (replaces the old sidebar content).
-fn stats_overlay(f: &mut Frame<'_>, area: Rect, v: &View, m: &Metadata, queued: usize) {
-    let _ = queued;
-    let width = area.width.clamp(40, 64);
-    let mut lines: Vec<Line<'static>> = vec![];
-    // Session section.
-    lines.push(label(&v.model_label, TEXT));
-    lines.push(label(&format!("cwd {}", abbreviate_home(&m.cwd)), MUTED));
-    lines.push(label(
-        &format!(
-            "session {} · {} calls",
-            m.session.chars().take(8).collect::<String>(),
-            v.model_metrics.calls
-        ),
-        MUTED,
-    ));
-    lines.push(Line::default());
-    // Context section.
-    lines.push(label("Context", MUTED));
-    if let Some(usage) = &v.context_usage {
-        let used = usage.estimated_tokens;
-        if let Some(window) = usage.context_window.filter(|w| *w > 0) {
-            let ratio = used as f64 / window as f64;
-            lines.push(label(
-                &format!(
-                    "{} / {} ({:.0}%)",
-                    tokens(used),
-                    tokens(window),
-                    ratio * 100.0
-                ),
-                TEXT,
-            ));
-            lines.push(label(&ctx_bar(ratio), ctx_color(ratio)));
-        } else {
-            lines.push(label(
-                &format!("{} used · limit unknown", tokens(used)),
-                TEXT,
-            ));
-        }
-        if let Some(budget) = usage.input_budget {
-            lines.push(label(
-                &format!(
-                    "{} input remaining of {} budget",
-                    tokens(budget.saturating_sub(used)),
-                    tokens(budget)
-                ),
-                MUTED,
-            ));
-        }
-        lines.push(label(
-            &format!("reserve {}", tokens(usage.output_reserve)),
-            MUTED,
-        ));
-    } else {
-        lines.push(label("Estimate unavailable", MUTED));
-    }
-    let metrics = &v.model_metrics.requests;
-    if metrics.journal_errors > 0 {
-        lines.push(label("Request log write failed", RED));
-    }
-    lines.push(Line::default());
-    // Requests section.
-    lines.push(label("Requests · this run", MUTED));
-    lines.push(label(
-        &format!(
-            "{} calls · {} in last 60s",
-            v.model_metrics.calls, metrics.attempts_last_minute
-        ),
-        TEXT,
-    ));
-    lines.push(label(
-        &format!(
-            "{} active · {} cancelled",
-            metrics.active, metrics.cancelled
-        ),
-        MUTED,
-    ));
-    let failed_line = format!("{} failed", metrics.failed);
-    let rate_line = if metrics.rate_limited > 0 {
-        format!(" · {} HTTP 429", metrics.rate_limited)
-    } else {
-        String::new()
-    };
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("  {failed_line}"),
-            Style::default().fg(if metrics.failed > 0 { RED } else { MUTED }),
-        ),
-        Span::styled(
-            rate_line,
-            Style::default().fg(if metrics.rate_limited > 0 { RED } else { MUTED }),
-        ),
-    ]));
-    lines.push(label(
-        &metrics
-            .last_output_tokens_per_second
-            .map(|n| format!("{n:.1} tok/s last response"))
-            .unwrap_or_else(|| "tok/s · awaiting usage".into()),
-        TEXT,
-    ));
-    lines.push(label(
-        &metrics
-            .cache_hit_percent()
-            .map(|n| {
-                format!(
-                    "cache hit {:.1}% ({}/{})",
-                    n, metrics.cache_reported_responses, metrics.completed
-                )
-            })
-            .unwrap_or_else(|| "cache hit · not reported".into()),
-        TEXT,
-    ));
-    lines.push(Line::default());
-    // Tokens section.
-    lines.push(label("Tokens · session", MUTED));
-    lines.push(label(
-        &format!(
-            "{} in · {} out · {} total",
-            tokens(v.usage.input_tokens),
-            tokens(v.usage.output_tokens),
-            tokens(v.usage.total_tokens)
-        ),
-        TEXT,
-    ));
-    if let Some((pin, pout)) = v.pricing {
-        let cost =
-            (v.usage.input_tokens as f64 * pin + v.usage.output_tokens as f64 * pout) / 1_000_000.0;
-        lines.push(label(
-            &format!("${cost:.4} est. cost (${pin}/{pout} per M)"),
-            YELLOW,
-        ));
-    }
-    lines.push(label(&format!("{} responses", v.recorded_responses), MUTED));
-    lines.push(Line::default());
-    // Permissions.
-    lines.push(label("Permissions", MUTED));
-    lines.push(label(
-        if m.yolo {
-            "YOLO · approvals skipped"
-        } else if m.trusted_shell {
-            "Trusted local execution"
-        } else {
-            "Ask before commands"
-        },
-        if m.yolo { ACCENT } else { TEXT },
-    ));
-    // Theme line.
-    lines.push(label(&format!("theme {}", v.theme.label()), MUTED));
-    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
-    let rect = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
-    f.render_widget(Clear, rect);
-    f.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(PANEL).fg(TEXT))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(ACCENT))
-                    .title(" Session · esc / ^B "),
-            ),
-        rect,
-    );
-}
-
-fn abbreviate_home(path: &str) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        if path.starts_with(&home) {
-            return format!("~{}", &path[home.len()..]);
-        }
-    }
-    path.to_string()
-}
-
-/// `/models` picker overlay.
-fn model_picker_overlay(f: &mut Frame<'_>, area: Rect, v: &View) {
-    let choices = &v.model_choices;
-    if choices.is_empty() {
-        return;
-    }
-    let selected = v.model_picker.unwrap_or(0);
-    let current_label = &v.model_label;
-    let rect = crate::picker::centered(area, 56, choices.len().saturating_add(2));
-    f.render_widget(Clear, rect);
-    let lines: Vec<Line<'static>> = choices
-        .iter()
-        .enumerate()
-        .skip(
-            crate::picker::visible_rows(choices.len(), selected, rect.height.saturating_sub(2))
-                .start,
-        )
-        .take(usize::from(rect.height.saturating_sub(2)))
-        .map(|(i, label)| {
-            let is_current = label == current_label;
-            let prefix = if i == selected { "► " } else { "  " };
-            let mark = if is_current { "●" } else { "○" };
-            let color = if i == selected { ACCENT } else { TEXT };
-            Line::from(vec![
-                Span::styled(prefix.to_owned(), Style::default().fg(ACCENT)),
-                Span::styled(format!("{mark} {label}"), Style::default().fg(color)),
-            ])
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(PANEL).fg(TEXT))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(ACCENT))
-                    .title(" Models · ↑↓ · Enter · Esc "),
-            ),
-        rect,
-    );
-}
-
-/// `/sessions` picker overlay. Rows are pre-loaded into the picker state;
-/// filtering is computed per-frame via the shared `filter_sessions` helper.
-fn sessions_overlay(f: &mut Frame<'_>, area: Rect, v: &View) {
-    let Some(picker) = v.session_picker.as_ref() else {
-        return;
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let filtered = crate::sessions::filter_sessions(&picker.rows, &picker.query);
-    let rect = crate::picker::centered(area, 80, filtered.len().saturating_add(6).min(24));
-    let width = rect.width;
-    f.render_widget(Clear, rect);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let hint = if picker.query.is_empty() {
-        "type to filter · ↑↓ move · Enter switch · Esc close"
-    } else {
-        ""
-    };
-    lines.push(Line::from(vec![
-        Span::styled("filter ", Style::default().fg(MUTED)),
-        Span::styled(picker.query.clone(), Style::default().fg(TEXT)),
-        Span::styled(hint.to_owned(), Style::default().fg(MUTED)),
-    ]));
-    lines.push(Line::default());
-    if filtered.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No sessions match.",
-            Style::default().fg(YELLOW),
-        )));
-    } else {
-        let inner_w = (width.saturating_sub(4)) as usize;
-        for rank in crate::picker::visible_rows(
-            filtered.len(),
-            picker.selected,
-            rect.height.saturating_sub(4),
-        ) {
-            let idx = filtered[rank];
-            let row = &picker.rows[idx];
-            let is_selected = rank == picker.selected;
-            let marker = if is_selected { "►" } else { " " };
-            let current = if row.is_current { "●" } else { "○" };
-            let title_w = inner_w.saturating_sub(36).clamp(8, 32);
-            let title = elide(&row.title, title_w);
-            let id8: String = row.id.0.chars().take(8).collect();
-            let model = if row.model.is_empty() {
-                "—".to_string()
-            } else {
-                elide(&row.model, 16)
-            };
-            let time = crate::sessions::relative_time(row.updated_at, now);
-            let prefix = format!("{marker} {current} ");
-            let body = format!("{title:<title_w$} {id8} · {model:<16} · {time}");
-            let color = if is_selected {
-                ACCENT
-            } else if row.is_current {
-                GREEN
-            } else {
-                TEXT
-            };
-            let style = if is_selected {
-                Style::default().fg(color).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(color)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(prefix, Style::default().fg(ACCENT)),
-                Span::styled(body, style),
-            ]));
-        }
-    }
-    f.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(PANEL).fg(TEXT))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(ACCENT))
-                    .title(" Sessions · filter · ↑↓ · Enter · Ctrl-D del · Esc "),
-            ),
-        rect,
-    );
-}
-
-/// `/theme` picker overlay: lists every theme in `Theme::ALL` with the
-/// currently active one marked. Enter applies immediately (live preview).
-fn theme_picker_overlay(f: &mut Frame<'_>, area: Rect, v: &View) {
-    let all = super::theme::Theme::ALL;
-    let selected = v.theme_picker.unwrap_or(0);
-    let rect = crate::picker::centered(area, 40, all.len().saturating_add(2));
-    f.render_widget(Clear, rect);
-    let lines: Vec<Line<'static>> = all
-        .iter()
-        .enumerate()
-        .skip(crate::picker::visible_rows(all.len(), selected, rect.height.saturating_sub(2)).start)
-        .take(usize::from(rect.height.saturating_sub(2)))
-        .map(|(i, t)| {
-            let is_current = *t == v.theme;
-            let is_selected = i == selected;
-            let prefix = if is_selected { "► " } else { "  " };
-            let mark = if is_current { "●" } else { "○" };
-            let label = t.label();
-            let color = if is_selected {
-                ACCENT
-            } else if is_current {
-                GREEN
-            } else {
-                TEXT
-            };
-            let style = if is_selected {
-                Style::default().fg(color).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(color)
-            };
-            Line::from(vec![
-                Span::styled(prefix.to_owned(), Style::default().fg(ACCENT)),
-                Span::styled(format!("{mark} {label}"), style),
-            ])
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(PANEL).fg(TEXT))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(ACCENT))
-                    .title(" Themes · ↑↓ · Enter · Esc "),
-            ),
-        rect,
-    );
-}
 fn tokens(value: u64) -> String {
     format!("{:.1}K", value as f64 / 1000.0)
 }
 fn elide(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     if text.width() <= width {
         return text.into();
     }
@@ -1593,17 +909,37 @@ fn elide(text: &str, width: usize) -> String {
 fn label(s: &str, color: Color) -> Line<'static> {
     Line::from(Span::styled(format!("  {s}"), Style::default().fg(color)))
 }
-fn help(f: &mut Frame<'_>, area: Rect) {
-    let width = area.width.saturating_sub(4).min(78);
-    let height = area.height.saturating_sub(2).min(30);
-    let rect = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
+fn help(f: &mut Frame<'_>, area: Rect, scroll: u16) {
+    let rect = crate::picker::centered(area, 78, area.height.saturating_sub(2) as usize);
+    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/compact        Compact idle conversation\n/clear          Clear screen only (history unchanged)\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y/n + Enter. No automatic or permanent grants.";
+    let lines: Vec<_> = text
+        .lines()
+        .flat_map(|line| {
+            super::markdown::wrap_spans(
+                vec![Span::raw(line.to_owned())],
+                rect.width.saturating_sub(2) as usize,
+                "",
+            )
+        })
+        .collect();
+    let offset = (scroll as usize).min(
+        lines
+            .len()
+            .saturating_sub(rect.height.saturating_sub(2) as usize),
+    ) as u16;
     f.render_widget(Clear, rect);
-    f.render_widget(Paragraph::new("Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle right sidebar (Todo + telemetry)\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/compact        Compact idle conversation\n/clear          Clear screen only (history unchanged)\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       List and switch sessions (Ctrl-D deletes)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y/n + Enter. No automatic or permanent grants.").style(Style::default().bg(PANEL).fg(TEXT)).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(ACCENT)).title(" Help ")),rect);
+    f.render_widget(
+        Paragraph::new(lines)
+            .scroll((offset, 0))
+            .style(Style::default().bg(PANEL).fg(TEXT))
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(" Help · Esc · ↑↓ scroll "),
+            ),
+        rect,
+    );
 }
 fn edit_preview_quota(height: u16) -> usize {
     match height {
@@ -1617,670 +953,9 @@ fn edit_preview_quota(height: u16) -> usize {
 
 #[cfg(test)]
 fn timeline(v: &View, width: usize) -> (Vec<Line<'static>>, Vec<(usize, u64)>) {
-    timeline_at(v, width, 3, 0)
+    timeline::TimelineCache::default().layout(v, width, 3, 0)
 }
 
-fn timeline_at(
-    v: &View,
-    width: usize,
-    edit_preview_rows: usize,
-    tick: u64,
-) -> (Vec<Line<'static>>, Vec<(usize, u64)>) {
-    let mut lines = Vec::new();
-    let mut headers = Vec::new();
-    for (index, item) in v.items().iter().enumerate() {
-        let id = v.item_id(index);
-        let expanded = v.expanded(id);
-        let selected = v.selected() == Some(id);
-        match item {
-            Item::Text {
-                role: Role::Thinking,
-                text,
-            } => {
-                headers.push((lines.len(), id));
-                let chars = text.chars().count();
-                let size = if chars >= 1000 {
-                    format!("{:.1}K", chars as f64 / 1000.0)
-                } else {
-                    format!("{chars}")
-                };
-                let first_line = text
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("")
-                    .chars()
-                    .take(40)
-                    .collect::<String>();
-                let is_running = v.is_thinking_at(index);
-                let glyph = "✦";
-                let color = if selected || is_running {
-                    ACCENT
-                } else {
-                    MUTED
-                };
-                let title = if first_line.is_empty() {
-                    format!("┃ {glyph} Thinking · {size}")
-                } else {
-                    format!("┃ {glyph} Thinking · {size} · {first_line}")
-                };
-                lines.push(Line::from(Span::styled(
-                    title,
-                    Style::default().fg(color).add_modifier(Modifier::ITALIC),
-                )));
-                if expanded {
-                    let dim = |line: Line<'static>| {
-                        Line::from(
-                            line.spans
-                                .into_iter()
-                                .map(|s| {
-                                    Span::styled(
-                                        s.content,
-                                        s.style.fg(MUTED).add_modifier(Modifier::ITALIC),
-                                    )
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    };
-                    lines.extend(super::markdown::render(text, width).into_iter().map(dim));
-                }
-            }
-            Item::Text {
-                role: Role::User,
-                text,
-            } => {
-                for line in text.lines() {
-                    lines.extend(wrap(
-                        line,
-                        Style::default().fg(TEXT).bg(PANEL),
-                        width,
-                        "  ▎ ",
-                    ));
-                }
-            }
-            Item::Text { text, .. } => lines.extend(super::markdown::render(text, width)),
-            Item::Notice { level, text } => {
-                let color = match level {
-                    Level::Error => RED,
-                    Level::Warning => ACCENT,
-                    _ => MUTED,
-                };
-                for line in text.lines() {
-                    lines.extend(wrap(line, Style::default().fg(color), width, "  · "));
-                }
-            }
-            Item::Tool(t) => {
-                headers.push((lines.len(), id));
-                lines.push(tool_title(t, selected, width, tick));
-                if expanded {
-                    tool_expanded(t, &mut lines, width, v.theme);
-                } else {
-                    tool_preview(t, &mut lines, width, v.theme, edit_preview_rows);
-                }
-            }
-        }
-        lines.push(Line::default());
-    }
-    (lines, headers)
-}
-/// Card title: "{▸ cursor} {status glyph} {subject}{pad}{meta}". The glyph
-/// carries the status color; the subject is bright and is the only elidable
-/// span; the right-hand meta always survives intact.
-fn tool_title(
-    t: &super::state::ToolView,
-    selected: bool,
-    width: usize,
-    tick: u64,
-) -> Line<'static> {
-    let (glyph, color) = match t.status {
-        ToolStatus::Running => (spinner_frame(tick).to_string(), ACCENT),
-        ToolStatus::Done => ("✓".into(), GREEN),
-        ToolStatus::Failed => ("✗".into(), RED),
-        ToolStatus::Interrupted => ("■".into(), MUTED),
-    };
-    let mut meta = tool_meta(t);
-    // Sub-second runs stay silent: "0s" is pure noise on fast tools.
-    if let Some(n) = t.seconds.filter(|n| *n > 0) {
-        if !meta.is_empty() {
-            meta.push_str(" · ");
-        }
-        meta.push_str(&format!("{n}s"));
-    }
-    let subject = t
-        .summary
-        .lines()
-        .next()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(t.name.as_str());
-    // cursor(2) + glyph+space(2) + ≥2 pad + meta; subject gets the remainder.
-    let budget = width.saturating_sub(6 + meta.width()).max(4);
-    let subject = elide(subject, budget);
-    let pad = width
-        .saturating_sub(4 + subject.width() + meta.width())
-        .max(2);
-    Line::from(vec![
-        Span::styled(
-            if selected { "▸ " } else { "  " },
-            Style::default().fg(ACCENT),
-        ),
-        Span::styled(format!("{glyph} "), Style::default().fg(color)),
-        Span::styled(subject, Style::default().fg(TEXT)),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(meta, Style::default().fg(FAINT)),
-    ])
-}
-
-/// Right-hand title metadata, from structured state only (never parsed text).
-fn tool_meta(t: &super::state::ToolView) -> String {
-    match t.name.as_str() {
-        "shell" if t.status != ToolStatus::Running => {
-            t.exit_code.map(|c| format!("exit {c}")).unwrap_or_default()
-        }
-        "edit" if t.status != ToolStatus::Running => match (t.adds, t.dels) {
-            (Some(a), Some(d)) => format!("+{a} −{d}"),
-            _ => String::new(),
-        },
-        // write knows its line count up front (content is in the input);
-        // "new" only once the server confirmed creation.
-        "write" => {
-            let mut meta = t.adds.map(|a| format!("+{a}")).unwrap_or_default();
-            if t.created && t.status == ToolStatus::Done {
-                if !meta.is_empty() {
-                    meta.push_str(" · ");
-                }
-                meta.push_str("new");
-            }
-            meta
-        }
-        "read" if t.status != ToolStatus::Running => {
-            format!("{} lines", t.output.lines().count())
-        }
-        "websearch" if t.status != ToolStatus::Running && !t.brief.is_empty() => {
-            format!("{} results", t.brief.len())
-        }
-        "webfetch" if t.status != ToolStatus::Running => {
-            t.content_format.as_deref().unwrap_or("text").to_owned()
-        }
-        _ => String::new(),
-    }
-}
-
-/// "⋯ N more · ^O" footer shared by previews.
-fn more_hint(lines: &mut Vec<Line<'static>>, hidden: usize, width: usize) {
-    if hidden > 0 {
-        lines.extend(wrap(
-            &format!("⋯ {hidden} more · ^O"),
-            Style::default().fg(FAINT),
-            width,
-            "  ",
-        ));
-    }
-}
-
-/// One diff row: + green / − red / context muted, tinted full-width bg;
-/// file/hunk headers stay quiet.
-fn diff_line(line: &str, width: usize, prefix: &str) -> Vec<Line<'static>> {
-    let (fg, bg) = if line.starts_with("++") || line.starts_with("--") || line.starts_with("@@") {
-        (FAINT, BG)
-    } else if line.starts_with('+') {
-        (GREEN, DIFF_ADD_BG)
-    } else if line.starts_with('-') {
-        (RED, DIFF_DEL_BG)
-    } else {
-        (MUTED, BG)
-    };
-    wrap_bg(line, Style::default().fg(fg).bg(bg), width, prefix)
-}
-
-/// Width budget above which diffs render side-by-side (opencode's <diff>
-/// component uses the same 120-column threshold).
-const SPLIT_DIFF_MIN_WIDTH: usize = 120;
-
-/// Render parsed diff rows width-adaptively: side-by-side columns at ≥120
-/// cols, unified −/+ lines below. Hunk headers only appear in expanded bodies
-/// (previews stay dense). Returns the lines plus how many changed lines were
-/// rendered (drives the "⋯ N more" hint).
-fn diff_render(
-    rows: &[DiffRow],
-    width: usize,
-    theme: Theme,
-    max_rows: usize,
-    show_hunks: bool,
-) -> (Vec<Line<'static>>, usize) {
-    fn hunk_line(h: &str, width: usize) -> Vec<Line<'static>> {
-        wrap(h, Style::default().fg(FAINT), width, "  ")
-    }
-    let mut out = Vec::new();
-    let (mut shown, mut changes) = (0usize, 0usize);
-    for row in rows {
-        if let Some(h) = &row.hunk {
-            if show_hunks {
-                out.extend(hunk_line(h, width));
-            }
-            continue;
-        }
-        if shown >= max_rows {
-            break;
-        }
-        if width >= SPLIT_DIFF_MIN_WIDTH {
-            // Side-by-side: context spans the row, changes get two cells.
-            if let Some(ctx) = &row.ctx {
-                out.push(clipped_plain_line(ctx, width, "    "));
-            } else if row.old.is_some() || row.new.is_some() {
-                let cw = (width.saturating_sub(3)) / 2;
-                let mut spans = diff_cell(cw, &row.old, DIFF_DEL_BG, theme);
-                spans.push(Span::styled(" │ ", Style::default().fg(FAINT)));
-                spans.extend(diff_cell(cw, &row.new, DIFF_ADD_BG, theme));
-                out.push(Line::from(spans));
-            }
-        } else {
-            // Unified: sign gutter + tinted full-width lines.
-            if let Some(ctx) = &row.ctx {
-                out.push(clipped_plain_line(ctx, width, "  "));
-            } else {
-                if let Some((_, spans)) = &row.old {
-                    out.push(unified_change_line('-', spans, DIFF_DEL_BG, width, theme));
-                }
-                if let Some((_, spans)) = &row.new {
-                    out.push(unified_change_line('+', spans, DIFF_ADD_BG, width, theme));
-                }
-            }
-        }
-        shown += 1;
-        changes += row.changes();
-    }
-    (out, changes)
-}
-
-/// One split-view cell, exactly `cw` columns: " 41 " gutter + subdued syntax
-/// text on the tinted bg. A missing side is an untinted gap (vimdiff look).
-fn diff_cell(
-    cw: usize,
-    side: &Option<(usize, Vec<Span<'static>>)>,
-    tint: Color,
-    theme: Theme,
-) -> Vec<Span<'static>> {
-    let bg = if side.is_some() { tint } else { BG };
-    let mut out = Vec::new();
-    let mut used = 0usize;
-    if let Some((no, spans)) = side {
-        let gutter = format!("{no:>3} ");
-        out.push(Span::styled(
-            gutter.clone(),
-            Style::default().fg(FAINT).bg(bg),
-        ));
-        used += gutter.width();
-        let subtle: Vec<Span> = spans.iter().map(|s| subtle_span(theme, s, bg)).collect();
-        let body = clip_spans(
-            &subtle,
-            cw.saturating_sub(used + 1),
-            Style::default().fg(FAINT).bg(bg),
-        );
-        used += spans_width(&body);
-        out.extend(body);
-    }
-    out.push(Span::styled(
-        " ".repeat(cw.saturating_sub(used)),
-        Style::default().bg(bg),
-    ));
-    debug_assert_eq!(spans_width(&out), cw);
-    out
-}
-
-/// Unified-view change line: "  − " sign + subdued text, full-width tint.
-fn unified_change_line(
-    sign: char,
-    spans: &[Span<'static>],
-    tint: Color,
-    width: usize,
-    theme: Theme,
-) -> Line<'static> {
-    let gutter = format!("  {sign} ");
-    let mut out = vec![Span::styled(
-        gutter.clone(),
-        Style::default()
-            .fg(if sign == '+' { GREEN } else { RED })
-            .bg(tint),
-    )];
-    let subtle: Vec<Span> = spans.iter().map(|s| subtle_span(theme, s, tint)).collect();
-    let body = clip_spans(
-        &subtle,
-        width.saturating_sub(gutter.width() + 1),
-        Style::default().fg(FAINT).bg(tint),
-    );
-    let used = gutter.width() + spans_width(&body);
-    out.extend(body);
-    out.push(Span::styled(
-        " ".repeat(width.saturating_sub(used)),
-        Style::default().bg(tint),
-    ));
-    Line::from(out)
-}
-
-/// Context/plain row: straight syntax colors, ellipsized to `width`.
-fn clipped_plain_line(ctx: &[Span<'static>], width: usize, prefix: &'static str) -> Line<'static> {
-    let mut out = vec![Span::raw(prefix)];
-    let body = clip_spans(
-        ctx,
-        width.saturating_sub(prefix.width()),
-        Style::default().fg(FAINT),
-    );
-    out.extend(body);
-    Line::from(out)
-}
-
-/// Syntax color softened toward TEXT so it sits calmly on a diff tint —
-/// opencode's `generateSubtleSyntax` trick. Mixed from *themed* colors, so
-/// the result is intentionally a non-slot color that Theme::apply skips.
-fn subtle_span(theme: Theme, span: &Span<'static>, bg: Color) -> Span<'static> {
-    let fg = mix(
-        theme.color(span.style.fg.unwrap_or(TEXT)),
-        theme.color(TEXT),
-        0.45,
-    );
-    Span::styled(span.content.clone(), Style::default().fg(fg).bg(bg))
-}
-
-fn spans_width(spans: &[Span<'static>]) -> usize {
-    spans.iter().map(|s| s.content.width()).sum()
-}
-
-/// Clip spans to ≤`budget` columns (grapheme-safe, adjacent same-style
-/// graphemes merged); on truncation the tail carries `ellipsis_style` "…".
-fn clip_spans(spans: &[Span<'static>], budget: usize, ellipsis_style: Style) -> Vec<Span<'static>> {
-    let (kept, cut) = truncate_spans(spans, budget);
-    if !cut {
-        return kept;
-    }
-    let (mut kept, _) = truncate_spans(spans, budget.saturating_sub(1));
-    kept.push(Span::styled("…", ellipsis_style));
-    kept
-}
-
-/// Grapheme-safe span truncation; second return = something was dropped.
-fn truncate_spans(spans: &[Span<'static>], budget: usize) -> (Vec<Span<'static>>, bool) {
-    let mut out: Vec<Span<'static>> = Vec::new();
-    let mut used = 0;
-    for span in spans {
-        for g in span.content.graphemes(true) {
-            if used + g.width() > budget {
-                return (out, true);
-            }
-            if let Some(last) = out
-                .last_mut()
-                .filter(|s: &&mut Span<'static>| s.style == span.style)
-            {
-                last.content.to_mut().push_str(g);
-            } else {
-                out.push(Span::styled(g.to_owned(), span.style));
-            }
-            used += g.width();
-        }
-    }
-    (out, false)
-}
-
-/// Expanded card body (^O): input block, then the tool-specific full result.
-fn tool_expanded(
-    t: &super::state::ToolView,
-    lines: &mut Vec<Line<'static>>,
-    width: usize,
-    theme: Theme,
-) {
-    let prefix = "  ";
-    // edit/write/webfetch already have fully structured bodies; repeating their
-    // often-large JSON arguments before the useful content only adds noise.
-    if !matches!(t.name.as_str(), "edit" | "write" | "webfetch") {
-        for line in t.input.lines() {
-            lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
-        }
-    }
-    if t.status == ToolStatus::Running {
-        for line in t.progress.lines() {
-            lines.extend(wrap(
-                line,
-                Style::default().fg(MUTED).italic(),
-                width,
-                prefix,
-            ));
-        }
-        if t.name != "write" {
-            return;
-        }
-    }
-    match t.name.as_str() {
-        "read" | "write" if t.content_hl.is_some() => {
-            for line in t.content_hl.as_ref().unwrap() {
-                lines.extend(super::markdown::wrap_spans(
-                    line.spans.clone(),
-                    width,
-                    prefix,
-                ));
-            }
-        }
-        "edit" => match &t.diff_rows {
-            Some(rows) => {
-                let (rendered, _) = diff_render(rows, width, theme, usize::MAX, true);
-                lines.extend(rendered);
-            }
-            None => {
-                for line in t.output.lines() {
-                    lines.extend(diff_line(line, width, prefix));
-                }
-            }
-        },
-        "webfetch" => {
-            // Highlighted structured content (json/xml/html) renders like code;
-            // markdown/text pages stream as wrapped body lines.
-            if let Some(hl) = &t.content_hl {
-                for line in hl {
-                    lines.extend(super::markdown::wrap_spans(
-                        line.spans.clone(),
-                        width,
-                        prefix,
-                    ));
-                }
-            } else {
-                for line in t.output.lines() {
-                    lines.extend(wrap(line, Style::default().fg(TEXT), width, prefix));
-                }
-            }
-        }
-        "shell" => {
-            for line in t.output.lines() {
-                lines.extend(wrap(line, Style::default().fg(TEXT), width, prefix));
-            }
-            if !t.stderr.trim().is_empty() {
-                lines.extend(wrap(
-                    "── stderr ──",
-                    Style::default().fg(FAINT),
-                    width,
-                    prefix,
-                ));
-                for line in t.stderr.lines() {
-                    lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
-                }
-            }
-        }
-        _ => {
-            for line in t.output.lines() {
-                lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
-            }
-        }
-    }
-}
-
-/// Type-aware card preview with per-tool line quotas: read renders nothing,
-/// shell keeps one tail line, edit/write keep the first change rows,
-/// websearch lists sources. Everything else is at most one summary line.
-fn tool_preview(
-    t: &super::state::ToolView,
-    lines: &mut Vec<Line<'static>>,
-    width: usize,
-    theme: Theme,
-    edit_preview_rows: usize,
-) {
-    let prefix = "  ";
-    match t.name.as_str() {
-        "shell" if t.status == ToolStatus::Running => {
-            // Last 3 progress lines, following scroll.
-            let prog: Vec<&str> = t.progress.lines().collect();
-            if prog.is_empty() {
-                lines.extend(wrap(
-                    "waiting for output…",
-                    Style::default().fg(MUTED),
-                    width,
-                    prefix,
-                ));
-            } else {
-                for line in &prog[prog.len().saturating_sub(3)..] {
-                    lines.extend(wrap(line, Style::default().fg(CYAN), width, prefix));
-                }
-            }
-        }
-        "shell" => {
-            // Preview source: stdout, falling back to stderr (many CLIs print
-            // their headline to stderr).
-            let out: Vec<&str> = if t.output.trim().is_empty() {
-                t.stderr.lines().collect()
-            } else {
-                t.output.lines().collect()
-            };
-            if t.status == ToolStatus::Failed {
-                for line in out.iter().take(5) {
-                    lines.extend(wrap(line, Style::default().fg(RED), width, prefix));
-                }
-                more_hint(lines, out.len().saturating_sub(5), width);
-            } else {
-                let start = out.len().saturating_sub(1);
-                for line in &out[start..] {
-                    lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
-                }
-                if out.is_empty() {
-                    lines.extend(wrap("no output", Style::default().fg(MUTED), width, prefix));
-                }
-            }
-        }
-        "edit" if t.status != ToolStatus::Running => match &t.diff_rows {
-            Some(rows) if !rows.is_empty() => {
-                let (rendered, shown) =
-                    diff_render(rows, width, theme, edit_preview_rows.max(1), false);
-                lines.extend(rendered);
-                let total = t.adds.unwrap_or(0) + t.dels.unwrap_or(0);
-                more_hint(lines, total.saturating_sub(shown), width);
-            }
-            Some(_) => {
-                lines.extend(wrap(
-                    "no changes",
-                    Style::default().fg(MUTED),
-                    width,
-                    prefix,
-                ));
-            }
-            // Fallback for cards without a parsed diff (orphaned events).
-            None => {
-                let rows: Vec<&str> = t
-                    .output
-                    .lines()
-                    .filter(|l| {
-                        (l.starts_with('+') && !l.starts_with("+++"))
-                            || (l.starts_with('-') && !l.starts_with("---"))
-                            || l.starts_with(' ')
-                    })
-                    .take(4)
-                    .collect();
-                if rows.is_empty() {
-                    lines.extend(wrap(
-                        "no changes",
-                        Style::default().fg(MUTED),
-                        width,
-                        prefix,
-                    ));
-                } else {
-                    for line in &rows {
-                        lines.extend(diff_line(line, width, prefix));
-                    }
-                }
-            }
-        },
-        "write" => {
-            // Ghost-diff of what is (about to be) written; highlighted at
-            // ToolStarted, so this also streams while running.
-            if let Some(hl) = &t.content_hl {
-                for line in hl.iter().take(2) {
-                    lines.extend(super::markdown::wrap_spans(
-                        line.spans.clone(),
-                        width,
-                        prefix,
-                    ));
-                }
-                more_hint(lines, hl.len().saturating_sub(2), width);
-            }
-        }
-        // read: the title already says what was read; a content teaser is noise.
-        "read" => {}
-        "websearch" if !t.brief.is_empty() => {
-            for row in t.brief.iter().take(3) {
-                lines.extend(wrap(row, Style::default().fg(MUTED), width, "  ⏤ "));
-            }
-            more_hint(lines, t.brief.len().saturating_sub(3), width);
-        }
-        "webfetch" if !t.brief.is_empty() => {
-            for row in t.brief.iter().take(3) {
-                lines.extend(wrap(row, Style::default().fg(MUTED), width, "  "));
-            }
-            more_hint(lines, t.brief.len().saturating_sub(3), width);
-        }
-        _ => {
-            if let Some(line) = t.output.lines().find(|l| !l.trim().is_empty()) {
-                lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
-            }
-        }
-    }
-}
-
-/// Like wrap() but applies bg color to the full line width (for diff backgrounds).
-fn wrap_bg(text: &str, style: Style, width: usize, prefix: &str) -> Vec<Line<'static>> {
-    let available = width.saturating_sub(prefix.width()).max(2);
-    let mut result = Vec::new();
-    let mut line = String::new();
-    let mut used = 0;
-    for g in text.graphemes(true) {
-        if used + g.width() > available && !line.is_empty() {
-            let pad = available.saturating_sub(used);
-            result.push(Line::from(Span::styled(
-                format!("{prefix}{line}{}", " ".repeat(pad)),
-                style,
-            )));
-            line.clear();
-            used = 0;
-        }
-        line.push_str(g);
-        used += g.width();
-    }
-    let pad = available.saturating_sub(used);
-    result.push(Line::from(Span::styled(
-        format!("{prefix}{line}{}", " ".repeat(pad)),
-        style,
-    )));
-    result
-}
-fn wrap(text: &str, style: Style, width: usize, prefix: &str) -> Vec<Line<'static>> {
-    let available = width.saturating_sub(prefix.width()).max(2);
-    let mut result = Vec::new();
-    let mut line = String::new();
-    let mut used = 0;
-    for g in text.graphemes(true) {
-        if used + g.width() > available && !line.is_empty() {
-            result.push(Line::from(Span::styled(format!("{prefix}{line}"), style)));
-            line.clear();
-            used = 0;
-        }
-        line.push_str(g);
-        used += g.width();
-    }
-    result.push(Line::from(Span::styled(format!("{prefix}{line}"), style)));
-    result
-}
 #[cfg(test)]
 mod tests {
     #[test]
@@ -2288,9 +963,8 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
         let mut v = View::default();
         v.model_choices = (0..100).map(|i| format!("model-{i:03}")).collect();
-        v.model_picker = Some(99);
-        v.theme_picker = Some(super::super::theme::Theme::ALL.len() - 1);
-        v.session_picker = Some(super::super::state::SessionPickerState {
+        v.overlay = Overlay::Sessions(super::super::state::SessionPickerState {
+            pending_delete: None,
             rows: (0..100)
                 .map(|i| crate::sessions::SessionRow {
                     id: yourai_core::prelude::SessionId(format!("session-{i:03}")),
@@ -2314,11 +988,15 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
         for (draw, expected) in [
             (
-                model_picker_overlay as fn(&mut ratatui::Frame<'_>, Rect, &View),
-                "model-099",
+                sessions_overlay as fn(&mut ratatui::Frame<'_>, Rect, &View),
+                "row-099",
             ),
-            (sessions_overlay, "row-099"),
+            (model_picker_overlay, "model-099"),
         ] {
+            let previous = std::mem::replace(&mut v.overlay, Overlay::Models(99));
+            if expected == "row-099" {
+                v.overlay = previous;
+            }
             t.draw(|f| draw(f, f.area(), &v)).unwrap();
             let text: String = t
                 .backend()
@@ -2559,7 +1237,7 @@ mod tests {
         };
         for theme in [Theme::Dark, Theme::Light, Theme::Nord, Theme::Dracula] {
             v.theme = theme;
-            v.stats = true;
+            v.overlay = Overlay::Stats { scroll: 0 };
             terminal
                 .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
                 .unwrap();
@@ -2576,7 +1254,7 @@ mod tests {
             assert!(text.contains("3 failed"));
             assert!(text.contains("47.5 tok/s"));
             assert!(text.contains("cache hit"));
-            v.stats = false;
+            v.overlay = Overlay::None;
             // Theme cycling via ^Y still works (footer button removed).
             v.theme = v.theme.next();
             assert_ne!(v.theme, theme);
@@ -2614,7 +1292,7 @@ mod tests {
         v.editor.take();
         v.toast = None;
         v.context_usage.as_mut().unwrap().context_window = None;
-        v.stats = true;
+        v.overlay = Overlay::Stats { scroll: 0 };
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
@@ -2656,7 +1334,7 @@ mod tests {
         assert!(screen.iter().any(|r| r.contains("yourai")));
         assert!(screen[31].contains("test-model"));
 
-        assert!(!v.stats);
+        assert!(!v.overlay.is_open());
         if let Ok(path) = std::env::var("YOURAI_WELCOME_SNAPSHOT") {
             let cells = terminal.backend().buffer().content().iter().map(|c| json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg)})).collect::<Vec<_>>();
             std::fs::write(
@@ -2694,7 +1372,6 @@ mod tests {
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
-        assert!(renderer.animation_start.is_none());
         renderer.anchor = Some((0, 0));
         renderer.reveal(Some(0));
         renderer.follow(&mut v);
@@ -2940,7 +1617,7 @@ mod tests {
                 .iter()
                 .map(|c| c.symbol())
                 .collect::<String>();
-            assert!(content.contains(if w < 30 { "YourAI" } else { "ready" }));
+            assert!(content.contains(if w < 30 { "YourAI" } else { "ask" }));
             if w == 120 {
                 // Card preview shows output by design (§4.3); full input only when expanded.
                 assert!(!content.contains("YOURAI"));
@@ -2979,7 +1656,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        v.session_picker = Some(SessionPickerState {
+        v.overlay = Overlay::Sessions(SessionPickerState {
+            pending_delete: None,
             rows: vec![
                 SessionRow {
                     id: SessionId("d3f40178deadbeef".into()),
@@ -3016,7 +1694,7 @@ mod tests {
         // Current session marker visible.
         assert!(text.contains("●"));
         // Filter: type "parser".
-        v.session_picker.as_mut().unwrap().query = "parser".into();
+        v.overlay.sessions_mut().unwrap().query = "parser".into();
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
@@ -3038,7 +1716,7 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut v = View::default();
         v.theme = Theme::Nord;
-        v.theme_picker = Some(0);
+        v.overlay = Overlay::Themes(0);
         let m = Metadata {
             session: "id".into(),
             cwd: "/tmp".into(),
@@ -3169,10 +1847,55 @@ mod tests {
         v.dismiss_asks();
         frame!("approval overlay closes", SessionStatus::Idle);
         // Help overlay.
-        v.help = true;
+        v.overlay = Overlay::Help { scroll: 0 };
         frame!("help overlay opens", SessionStatus::Idle);
-        v.help = false;
+        v.overlay = Overlay::None;
         frame!("help overlay closes", SessionStatus::Idle);
         assert_eq!(prev.unwrap().area, Rect::new(0, 0, w, h));
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    #[test]
+    fn narrow_footer_preserves_permissions_and_all_dashboard_sizes_fit() {
+        let mut v = View::default();
+        v.model_label = "provider/model".into();
+        v.context_usage = Some(yourai_harness::runtime::ContextUsage {
+            estimated_tokens: 90000,
+            context_window: Some(100000),
+            input_budget: Some(90000),
+            output_reserve: 8000,
+        });
+        let m = Metadata {
+            session: "test".into(),
+            cwd: "/workspace".into(),
+            trusted_shell: false,
+            yolo: true,
+        };
+        for width in [30, 35, 39, 40, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            let mut renderer = Renderer::default();
+            terminal
+                .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let footer = (0..width)
+                .map(|x| buffer[(x, 19)].symbol())
+                .collect::<String>();
+            assert!(footer.contains("YOLO"), "{footer}");
+            assert!(footer.contains("provider/model"), "{footer}");
+            assert!(
+                renderer.panel.is_none(),
+                "no tasks means full-width conversation"
+            );
+            v.overlay = Overlay::Stats { scroll: 0 };
+            terminal
+                .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
+                .unwrap();
+            v.overlay = Overlay::None;
+        }
     }
 }

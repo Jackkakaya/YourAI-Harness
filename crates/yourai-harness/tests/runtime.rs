@@ -1201,7 +1201,18 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
         output_reserve: 2048,
         ..ContextPolicy::default()
     };
-    h.switch_model(new.clone(), policy).await.unwrap();
+    h.switch_model_with_settings(
+        new.clone(),
+        policy,
+        yourai_harness::assembly::ModelSettings {
+            provider: "other".into(),
+            requests: Default::default(),
+            header_timeout: Some(Duration::from_secs(1)),
+            chunk_timeout: Some(Duration::from_secs(1)),
+        },
+    )
+    .await
+    .unwrap();
     let usage = h.host.context_usage().unwrap();
     assert_eq!(usage.context_window, Some(32_000));
     assert_eq!(usage.output_reserve, 2048);
@@ -1295,5 +1306,43 @@ async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
         .unwrap()
         .unwrap()
         .unwrap();
+    h.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn model_switch_publishes_chunk_timeout_with_model() {
+    let dir = TempDir::new().unwrap();
+    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+    config.system_prompt = Some("test".into());
+    let h = Harness::open(config, Arc::new(Model::new(vec![answer("old")])))
+        .await
+        .unwrap();
+    let next = Arc::new(Model::new(vec![hangs_after("partial")]));
+    h.switch_model_with_settings(
+        next,
+        ContextPolicy::default(),
+        yourai_harness::assembly::ModelSettings {
+            provider: "new".into(),
+            requests: Default::default(),
+            header_timeout: Some(Duration::from_millis(20)),
+            chunk_timeout: Some(Duration::from_millis(20)),
+        },
+    )
+    .await
+    .unwrap();
+    h.host.submit(In::user_text("hello")).unwrap();
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        h.host.run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("new timeout must replace the old 300-second default")
+    .unwrap()
+    .unwrap();
+    assert!(report.result.is_err());
     h.close().await.unwrap();
 }

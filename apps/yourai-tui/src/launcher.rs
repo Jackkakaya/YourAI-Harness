@@ -27,10 +27,13 @@ use std::{
 use yourai_core::prelude::{SessionId, SessionManager};
 use yourai_harness::SessionCatalog;
 
-/// Run the launcher. Returns:
-/// - `Ok(Some(id))` — user picked a session to resume.
-/// - `Ok(None)` — user pressed Esc to start a fresh session.
-pub async fn pick(catalog: &SessionCatalog) -> Result<Option<SessionId>, Error> {
+pub enum Choice {
+    Resume(SessionId),
+    New,
+    Quit,
+}
+
+pub async fn pick(catalog: &SessionCatalog) -> Result<Choice, Error> {
     let metas = catalog.list_sessions().await?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -40,7 +43,7 @@ pub async fn pick(catalog: &SessionCatalog) -> Result<Option<SessionId>, Error> 
     // Stable secondary sort by title for ties on updated_at.
     rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.title.cmp(&b.title)));
     if rows.is_empty() {
-        return Ok(None);
+        return Ok(Choice::New);
     }
     let _screen = Screen::open()?;
     let mut query = String::new();
@@ -58,11 +61,11 @@ pub async fn pick(catalog: &SessionCatalog) -> Result<Option<SessionId>, Error> 
             Event::Key(k) if k.kind != KeyEventKind::Release => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                 match k.code {
-                    KeyCode::Char('q') if ctrl => return Ok(None),
-                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Char('q') if ctrl => return Ok(Choice::Quit),
+                    KeyCode::Esc => return Ok(Choice::New),
                     KeyCode::Enter => {
                         if let Some(idx) = picked {
-                            return Ok(Some(rows[idx].id.clone()));
+                            return Ok(Choice::Resume(rows[idx].id.clone()));
                         }
                     }
                     KeyCode::Up => {

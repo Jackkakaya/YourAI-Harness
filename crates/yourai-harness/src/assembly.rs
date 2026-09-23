@@ -7,8 +7,9 @@ use crate::{
 };
 use model_hooks::DefaultHookModelExecutor;
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -35,6 +36,8 @@ pub struct HarnessConfig {
     pub max_shared_model_calls: Option<u64>,
     pub max_known_tokens: Option<u64>,
     pub request_policy: crate::model::RequestPolicy,
+    /// Stable provider key used to retain admission state across model switches.
+    pub model_provider: String,
     pub model_header_timeout: Option<Duration>,
     pub model_chunk_timeout: Option<Duration>,
 }
@@ -58,12 +61,24 @@ impl HarnessConfig {
             max_shared_model_calls: Some(256),
             max_known_tokens: None,
             request_policy: Default::default(),
+            model_provider: String::new(),
             model_header_timeout: None,
             model_chunk_timeout: None,
         }
     }
 }
+/// Runtime settings published with the main model at the same idle boundary.
+#[derive(Clone)]
+pub struct ModelSettings {
+    pub provider: String,
+    pub requests: crate::model::RequestPolicy,
+    pub header_timeout: Option<Duration>,
+    pub chunk_timeout: Option<Duration>,
+}
 pub struct Harness {
+    provider_budgets: Mutex<HashMap<(String, crate::model::RequestPolicy), Arc<ModelBudget>>>,
+    current_budget: Mutex<Arc<ModelBudget>>,
+    main_loop_config: crate::default_loop::LoopConfig,
     /// Shared persistence interface for frontends reading clean session history.
     pub sessions: Arc<dyn SessionManager>,
     pub host: Arc<SessionHost>,
@@ -133,7 +148,7 @@ impl Harness {
         let budget = ModelBudget::configured(
             config.max_shared_model_calls,
             config.max_known_tokens,
-            config.request_policy,
+            config.request_policy.clone(),
             (*catalog.store).clone(),
         )?;
         let model: Arc<dyn ModelProvider> = Arc::new(MeteredModel {
@@ -192,19 +207,20 @@ impl Harness {
             crate::memory::register(hooks.as_ref(), provider, catalog.clone(), id.clone()).await?;
         }
         let loop_defaults = crate::default_loop::LoopConfig::default();
+        let main_loop_config = crate::default_loop::LoopConfig {
+            memory_search_limit: config.memory_search_limit,
+            model_header_timeout: config
+                .model_header_timeout
+                .unwrap_or(loop_defaults.model_header_timeout),
+            model_chunk_timeout: config
+                .model_chunk_timeout
+                .unwrap_or(loop_defaults.model_chunk_timeout),
+            ..loop_defaults
+        };
         agent
             .ctx()
             .set_agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
-                crate::default_loop::LoopConfig {
-                    memory_search_limit: config.memory_search_limit,
-                    model_header_timeout: config
-                        .model_header_timeout
-                        .unwrap_or(loop_defaults.model_header_timeout),
-                    model_chunk_timeout: config
-                        .model_chunk_timeout
-                        .unwrap_or(loop_defaults.model_chunk_timeout),
-                    ..loop_defaults
-                },
+                main_loop_config.clone(),
             )));
         if let Some(provider) = config.skill_provider {
             agent.ctx().set_skills(provider);
@@ -258,6 +274,12 @@ impl Harness {
             tools.register(subagents.clone());
         }
         Ok(Self {
+            provider_budgets: Mutex::new(HashMap::from([(
+                (config.model_provider, config.request_policy),
+                budget.clone(),
+            )])),
+            current_budget: Mutex::new(budget.clone()),
+            main_loop_config,
             sessions: catalog,
             host,
             tools,
@@ -280,8 +302,58 @@ impl Harness {
         model: Arc<dyn ModelProvider>,
         policy: ContextPolicy,
     ) -> Result<(), YourAiError> {
+        self.switch_model_inner(model, policy, None).await
+    }
+    /// Shared usage counters with the current main provider's cooldown.
+    pub fn model_snapshot(&self) -> crate::model::BudgetSnapshot {
+        self.current_budget.lock().unwrap().snapshot()
+    }
+    /// Atomically publish main-model context, timeouts and provider admission at idle.
+    pub async fn switch_model_with_settings(
+        &self,
+        model: Arc<dyn ModelProvider>,
+        policy: ContextPolicy,
+        settings: ModelSettings,
+    ) -> Result<(), YourAiError> {
+        settings.requests.validate()?;
+        if [settings.header_timeout, settings.chunk_timeout]
+            .into_iter()
+            .flatten()
+            .any(|d| d.is_zero())
+        {
+            return Err(ErrorKind::Config("model timeouts must be positive".into()).into());
+        }
+        self.switch_model_inner(model, policy, Some(settings)).await
+    }
+    async fn switch_model_inner(
+        &self,
+        model: Arc<dyn ModelProvider>,
+        policy: ContextPolicy,
+        settings: Option<ModelSettings>,
+    ) -> Result<(), YourAiError> {
         policy.validate()?;
         let _gate = self.host.try_operation()?;
+        let selected_budget =
+            if let Some(settings) = &settings {
+                if let Some(budget) = self
+                    .provider_budgets
+                    .lock()
+                    .unwrap()
+                    .get(&(settings.provider.clone(), settings.requests.clone()))
+                    .cloned()
+                {
+                    budget
+                } else {
+                    self.budget.for_provider(
+                        settings.requests.clone(),
+                        SqliteStore::open(&self.host.context().transcript_path.ok_or_else(
+                            || ErrorKind::Config("session database missing".into()),
+                        )?)?,
+                    )?
+                }
+            } else {
+                self.current_budget.lock().unwrap().clone()
+            };
         let id = self.host.context().id;
         let history = MemoryContext::new(
             id.clone(),
@@ -298,8 +370,27 @@ impl Harness {
         self.sessions.save_session(&meta).await?;
         let model = Arc::new(MeteredModel {
             inner: model,
-            budget: self.budget.clone(),
+            budget: selected_budget.clone(),
         });
+        if let Some(settings) = settings {
+            let defaults = crate::default_loop::LoopConfig::default();
+            let mut config = self.main_loop_config.clone();
+            config.model_header_timeout = settings
+                .header_timeout
+                .unwrap_or(defaults.model_header_timeout);
+            config.model_chunk_timeout = settings
+                .chunk_timeout
+                .unwrap_or(defaults.model_chunk_timeout);
+            self.host
+                .agent
+                .ctx()
+                .set_agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(config)));
+            self.provider_budgets.lock().unwrap().insert(
+                (settings.provider, settings.requests),
+                selected_budget.clone(),
+            );
+        }
+        *self.current_budget.lock().unwrap() = selected_budget;
         self.host.agent.ctx().set_context_manager(history);
         self.host.agent.ctx().set_model(model);
         Ok(())

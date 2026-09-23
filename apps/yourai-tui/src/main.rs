@@ -102,11 +102,18 @@ async fn run() -> Result<(), Error> {
     if resume.as_ref().is_some_and(|SessionId(id)| id.is_empty()) {
         let catalog = SessionCatalog::new(&config.session_dir)?;
         match launcher::pick(&catalog).await? {
-            Some(picked) => resume = Some(picked),
-            None => resume = None,
+            launcher::Choice::Resume(picked) => resume = Some(picked),
+            launcher::Choice::New => resume = None,
+            launcher::Choice::Quit => return Ok(()),
         }
     }
     let mut hc = HarnessConfig::new(config.session_dir.clone(), std::env::current_dir()?);
+    hc.model_provider = config
+        .model
+        .split_once('/')
+        .map(|(p, _)| p)
+        .unwrap_or_default()
+        .into();
     hc.request_policy = request_policy.clone();
     hc.model_header_timeout = model_header_timeout;
     hc.model_chunk_timeout = model_chunk_timeout;

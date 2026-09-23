@@ -1,3 +1,4 @@
+mod tool_output;
 use super::editor::Editor;
 use ratatui::text::{Line, Span};
 use serde_json::{json, Value};
@@ -5,6 +6,7 @@ use std::{
     collections::{HashSet, VecDeque},
     time::{Duration, Instant},
 };
+use tool_output::*;
 use yourai_core::prelude::*;
 const MAX_TEXT: usize = 32_000;
 const MAX_ITEMS: usize = 1000;
@@ -164,7 +166,9 @@ pub struct RetryState {
 
 /// `/sessions` overlay state. Rows are loaded once on open; the filter query
 /// and selected index mutate freely while the overlay is open.
+#[derive(Clone, Debug)]
 pub struct SessionPickerState {
+    pub pending_delete: Option<crate::sessions::SessionRow>,
     pub rows: Vec<crate::sessions::SessionRow>,
     pub query: String,
     pub selected: usize,
@@ -181,6 +185,7 @@ pub struct View {
     // Timeline state: mutate only through methods so item identities, folds and
     // the render revision (touch) cannot drift apart.
     items: VecDeque<Item>,
+    item_versions: VecDeque<u64>,
     pub editor: Editor,
     asks: VecDeque<Ask>,
     assistant: Option<usize>,
@@ -192,21 +197,14 @@ pub struct View {
     /// Session title shown in the conversation header; derived from the first prompt.
     pub title: Option<String>,
     pub todos: Vec<Todo>,
-    /// Right sidebar (Todo list + telemetry). Default on; toggled by ^T.
+    /// Optional Todo panel. Default on; toggled by ^T.
     pub todo_panel: bool,
     pub todo_scroll: usize,
-    pub stats: bool,
-    pub help: bool,
-    /// `/models` picker: Some(index) when open.
-    pub model_picker: Option<usize>,
+    pub overlay: super::overlay::Overlay,
     /// Candidate labels for the model picker.
     pub model_choices: Vec<String>,
     /// Current model display label (updated by /models switch).
     pub model_label: String,
-    /// `/sessions` picker state: Some when the overlay is open.
-    pub session_picker: Option<SessionPickerState>,
-    /// `/theme` picker: Some(selected index) when open.
-    pub theme_picker: Option<usize>,
     /// Optional per-model pricing for cost display (input $/M, output $/M).
     pub pricing: Option<(f64, f64)>,
     pub usage: Usage,
@@ -226,6 +224,7 @@ impl Default for View {
             theme: Default::default(),
             context_usage: None,
             items: VecDeque::new(),
+            item_versions: VecDeque::new(),
             editor: Editor::default(),
             asks: VecDeque::new(),
             assistant: None,
@@ -238,13 +237,9 @@ impl Default for View {
             todos: vec![],
             todo_panel: true,
             todo_scroll: 0,
-            stats: false,
-            help: false,
-            model_picker: None,
+            overlay: Default::default(),
             model_choices: vec![],
             model_label: String::new(),
-            session_picker: None,
-            theme_picker: None,
             pricing: None,
             usage: Usage::default(),
             unseen: 0,
@@ -270,16 +265,7 @@ impl View {
         self.thinking == Some(index)
     }
 
-    /// True if the model is currently producing reasoning (thinking phase).
-    pub fn is_thinking(&self) -> bool {
-        self.thinking.is_some() && self.assistant.is_none()
-    }
-
-    /// True if the model is currently streaming an assistant response.
-    pub fn is_responding(&self) -> bool {
-        self.assistant.is_some()
-    }
-
+    /// Stable identity independent of front-of-history eviction.
     pub fn item_id(&self, index: usize) -> u64 {
         self.first_item_id + index as u64
     }
@@ -287,6 +273,15 @@ impl View {
     /// through the methods below (they maintain ids, folds and `revision`).
     pub fn items(&self) -> &VecDeque<Item> {
         &self.items
+    }
+    pub fn item_version(&self, index: usize) -> u64 {
+        self.item_versions[index]
+    }
+    fn item_mut(&mut self, index: usize) -> Option<&mut Item> {
+        if let Some(version) = self.item_versions.get_mut(index) {
+            *version = version.wrapping_add(1);
+        }
+        self.items.get_mut(index)
     }
     pub fn expanded(&self, id: u64) -> bool {
         self.expanded.contains(&id)
@@ -382,6 +377,7 @@ impl View {
     pub fn clear_timeline(&mut self) {
         self.first_item_id += self.items.len() as u64;
         self.items.clear();
+        self.item_versions.clear();
         self.expanded.clear();
         self.selected = None;
         self.settle();
@@ -392,7 +388,6 @@ impl View {
     pub fn set_todos(&mut self, todos: Vec<Todo>) {
         if self.todos != todos {
             self.todos = todos;
-            self.todo_scroll = self.todo_scroll.min(self.todos.len().saturating_sub(1));
         }
     }
     /// Derive a display title from a prompt; the first non-empty derivation wins.
@@ -413,8 +408,10 @@ impl View {
     }
     fn push(&mut self, item: Item) {
         self.items.push_back(item);
+        self.item_versions.push_back(0);
         if self.items.len() > MAX_ITEMS {
             self.items.pop_front();
+            self.item_versions.pop_front();
             self.expanded.remove(&self.first_item_id);
             if self.selected == Some(self.first_item_id) {
                 self.selected = None;
@@ -448,7 +445,7 @@ impl View {
             self.thinking
         };
         if let Some(i) = index {
-            if let Some(Item::Text { text: body, .. }) = self.items.get_mut(i) {
+            if let Some(Item::Text { text: body, .. }) = self.item_mut(i) {
                 append(body, text);
                 self.touch();
                 return;
@@ -480,9 +477,10 @@ impl View {
         self.asks.clear();
         self.active = false;
         self.since = None;
-        for item in &mut self.items {
+        for (i, item) in self.items.iter_mut().enumerate() {
             if let Item::Tool(t) = item {
                 if t.status == ToolStatus::Running {
+                    self.item_versions[i] = self.item_versions[i].wrapping_add(1);
                     t.status = ToolStatus::Interrupted;
                     t.seconds = t.started.map(|s| s.elapsed().as_secs());
                 }
@@ -507,7 +505,7 @@ impl View {
             Out::Message { text } => {
                 self.retry = None;
                 if let Some(i) = self.assistant.take() {
-                    if let Some(Item::Text { text: body, .. }) = self.items.get_mut(i) {
+                    if let Some(Item::Text { text: body, .. }) = self.item_mut(i) {
                         *body = bounded(&text);
                     }
                 } else {
@@ -604,9 +602,8 @@ impl View {
                 is_error,
             } => {
                 let failed = is_error || (name == "shell" && output["ok"] == false);
-                // Successful results are shaped per tool so the UI never
-                // renders machine blobs; failures are flattened into readable
-                // diagnostic lines instead of pretty-printed JSON.
+                // Known results have typed previews. Unknown results retain bounded
+                // structured values so expanded cards remain inspectable.
                 let mut body = String::new();
                 let mut stderr = String::new();
                 let mut brief = Vec::new();
@@ -675,7 +672,20 @@ impl View {
                             brief = page_brief(content, format);
                             body = bounded(content);
                         }
-                        _ => body = summarize_output(&output),
+                        _ => {
+                            body = summarize_output(&output);
+                            let summary =
+                                ["content", "result", "message", "text", "summary", "output"]
+                                    .iter()
+                                    .find_map(|key| output.get(*key).and_then(Value::as_str));
+                            brief.push(summary.map(bounded).unwrap_or_else(|| {
+                                if output.is_object() || output.is_array() {
+                                    "Structured result · ^O to inspect".into()
+                                } else {
+                                    body.clone()
+                                }
+                            }));
+                        }
                     }
                 }
                 let status = if failed {
@@ -761,10 +771,14 @@ impl View {
         }
     }
     fn tool_mut(&mut self, id: &str) -> Option<&mut ToolView> {
-        self.items.iter_mut().rev().find_map(|i| match i {
-            Item::Tool(t) if t.id == id => Some(t.as_mut()),
+        let index = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, Item::Tool(t) if t.id == id))?;
+        match self.item_mut(index)? {
+            Item::Tool(t) => Some(t.as_mut()),
             _ => None,
-        })
+        }
     }
     pub fn restore(&mut self, rows: Vec<StoredMessage>) {
         for row in rows {
@@ -907,399 +921,6 @@ fn append_progress(body: &mut String, text: &str) {
 }
 pub fn pretty(v: &Value) -> String {
     bounded(&serde_json::to_string_pretty(v).unwrap_or_default())
-}
-/// Count +/- lines in a unified diff; ---/+++ file headers excluded.
-fn diff_stats(diff: &str) -> (usize, usize) {
-    let (mut adds, mut dels) = (0, 0);
-    for line in diff.lines() {
-        if line.starts_with('+') && !line.starts_with("+++") {
-            adds += 1;
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            dels += 1;
-        }
-    }
-    (adds, dels)
-}
-
-/// Parse a unified diff into width-agnostic display rows. Each hunk's old
-/// side (context+deletions) and new side (context+additions) are highlighted
-/// as continuous text, so multiline scopes within a hunk resolve correctly.
-/// `"-a,b"`/`"+c,d"` hunk offsets drive per-cell line numbers.
-fn build_diff_rows(diff: &str, path: &str) -> Vec<DiffRow> {
-    let mut rows = Vec::new();
-    let mut lines = diff.lines().peekable();
-    // Skip the ---/+++ file header block.
-    while lines.peek().is_some_and(|l| !l.starts_with("@@")) {
-        lines.next();
-    }
-    while let Some(header) = lines.next() {
-        let Some((mut old_no, mut new_no)) = hunk_offsets(header) else {
-            continue; // stray line before/between hunks (\ No newline…, etc.)
-        };
-        rows.push(DiffRow::hunk(header));
-        let mut body: Vec<&str> = Vec::new();
-        while let Some(l) = lines.peek() {
-            if l.starts_with("@@") {
-                break;
-            }
-            body.push(lines.next().unwrap());
-        }
-        let plain = |s: &str| vec![Span::styled(s.to_owned(), ratatui::style::Style::default())];
-        let side = |keep: fn(char) -> bool| -> Vec<Vec<Span<'static>>> {
-            let text = body
-                .iter()
-                .filter(|l| keep(l.chars().next().unwrap_or(' ')))
-                .map(|l| l.get(1..).unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n");
-            match super::syntax::highlight(&text, path) {
-                Some(hl) => hl.into_iter().map(|l| l.spans).collect(),
-                None => text.lines().map(plain).collect(),
-            }
-        };
-        let old_hl = side(|c| c != '+');
-        let new_hl = side(|c| c != '-');
-        let (mut oi, mut ni) = (0usize, 0usize);
-        let mut pend_old: Vec<(usize, Vec<Span<'static>>)> = Vec::new();
-        let mut pend_new: Vec<(usize, Vec<Span<'static>>)> = Vec::new();
-        let flush = |rows: &mut Vec<DiffRow>, pend_old: &mut Vec<_>, pend_new: &mut Vec<_>| {
-            let n = pend_old.len().max(pend_new.len());
-            for i in 0..n {
-                rows.push(DiffRow::change(
-                    pend_old.get(i).cloned(),
-                    pend_new.get(i).cloned(),
-                ));
-            }
-            pend_old.clear();
-            pend_new.clear();
-        };
-        for line in body {
-            let (kind, _) = line.split_at(1.min(line.len()));
-            match kind {
-                " " => {
-                    flush(&mut rows, &mut pend_old, &mut pend_new);
-                    let spans = old_hl.get(oi).cloned().unwrap_or_default();
-                    rows.push(DiffRow::ctx(spans));
-                    oi += 1;
-                    ni += 1;
-                    old_no += 1;
-                    new_no += 1;
-                }
-                "-" => {
-                    pend_old.push((old_no, old_hl.get(oi).cloned().unwrap_or_default()));
-                    old_no += 1;
-                    oi += 1;
-                }
-                "+" => {
-                    pend_new.push((new_no, new_hl.get(ni).cloned().unwrap_or_default()));
-                    new_no += 1;
-                    ni += 1;
-                }
-                _ => {} // "\ No newline at end of file" and friends
-            }
-        }
-        flush(&mut rows, &mut pend_old, &mut pend_new);
-    }
-    rows
-}
-/// "@@ -40,6 +41,7 @@" → (40, 41).
-fn hunk_offsets(header: &str) -> Option<(usize, usize)> {
-    let inner = header.strip_prefix("@@")?.split("@@").next()?;
-    let mut old = None;
-    let mut new = None;
-    for part in inner.split_whitespace() {
-        if let Some(rest) = part.strip_prefix('-') {
-            old = rest.split(',').next()?.parse().ok();
-        } else if let Some(rest) = part.strip_prefix('+') {
-            new = rest.split(',').next()?.parse().ok();
-        }
-    }
-    Some((old?, new?))
-}
-/// read output lines look like "12|code"; split the numeric gutter.
-fn split_gutter(line: &str) -> (&str, &str) {
-    let Some((num, rest)) = line.split_once('|') else {
-        return ("", line);
-    };
-    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
-        return ("", line);
-    }
-    (num, rest)
-}
-/// Keep highlighting work bounded: write/read inputs are not size-capped
-/// upstream the way card bodies are (MAX_TEXT).
-fn capped(code: &str) -> &str {
-    let mut end = code.len().min(MAX_TEXT);
-    while !code.is_char_boundary(end) {
-        end -= 1;
-    }
-    &code[..end]
-}
-/// Highlight read output, preserving source line numbers as a gutter span.
-fn hl_read(content: &str, path: &str) -> Vec<Line<'static>> {
-    use super::theme::FAINT;
-    use ratatui::{style::Style, text::Span};
-    let content = capped(content);
-    let mut nums = Vec::new();
-    let mut src = String::new();
-    for line in content.lines() {
-        let (num, code) = split_gutter(line);
-        nums.push(num);
-        src.push_str(code);
-        src.push('\n');
-    }
-    let plain: Vec<Line<'static>> = src.lines().map(|l| Line::from(l.to_owned())).collect();
-    let highlighted = super::syntax::highlight(&src, path).unwrap_or(plain);
-    highlighted
-        .into_iter()
-        .zip(nums)
-        .map(|(mut line, num)| {
-            let mut spans = vec![Span::styled(
-                format!("{num:>4} "),
-                Style::default().fg(FAINT),
-            )];
-            spans.append(&mut line.spans);
-            Line::from(spans)
-        })
-        .collect()
-}
-/// Highlight file content with a fixed gutter (write renders "+ " ghost-diff).
-fn hl_lines(code: &str, hint: &str, gutter: &'static str) -> Vec<Line<'static>> {
-    use super::theme::GREEN;
-    use ratatui::{style::Style, text::Span};
-    let code = capped(code);
-    let plain: Vec<Line<'static>> = code.lines().map(|l| Line::from(l.to_owned())).collect();
-    let highlighted = super::syntax::highlight(code, hint).unwrap_or(plain);
-    highlighted
-        .into_iter()
-        .map(|mut line| {
-            let mut spans = vec![Span::styled(gutter.to_owned(), Style::default().fg(GREEN))];
-            spans.append(&mut line.spans);
-            Line::from(spans)
-        })
-        .collect()
-}
-/// websearch content → "title — host" rows. Exa has returned several
-/// equivalent shapes over time (Title/URL blocks, markdown links, JSON result
-/// arrays and bare URLs), so accept all of them and deduplicate by URL.
-fn search_brief(content: &str) -> Vec<String> {
-    fn push(rows: &mut Vec<String>, seen: &mut HashSet<String>, title: Option<&str>, url: &str) {
-        let url = url
-            .trim()
-            .trim_matches(|c: char| matches!(c, '<' | '>' | ')' | ']' | ','));
-        if rows.len() >= 24 || !seen.insert(url.to_owned()) {
-            return;
-        }
-        let host = url_host(url);
-        let title = title.map(str::trim).filter(|s| !s.is_empty());
-        let row = match (title, host) {
-            (Some(t), Some(h)) => format!("{t} — {h}"),
-            (Some(t), None) => t.to_owned(),
-            (None, Some(h)) => format!("{h} · {url}"),
-            (None, None) => url.to_owned(),
-        };
-        rows.push(bounded(&row));
-    }
-    fn json_results(value: &Value, rows: &mut Vec<String>, seen: &mut HashSet<String>) {
-        match value {
-            Value::Array(values) => {
-                for value in values {
-                    json_results(value, rows, seen);
-                }
-            }
-            Value::Object(map) => {
-                if let Some(url) = map
-                    .get("url")
-                    .or_else(|| map.get("link"))
-                    .and_then(Value::as_str)
-                {
-                    let title = map
-                        .get("title")
-                        .or_else(|| map.get("name"))
-                        .and_then(Value::as_str);
-                    push(rows, seen, title, url);
-                }
-                for key in ["results", "items", "data", "content"] {
-                    if let Some(child) = map.get(key) {
-                        json_results(child, rows, seen);
-                    }
-                }
-            }
-            Value::String(text) => parse_text(text, rows, seen),
-            _ => {}
-        }
-    }
-    fn markdown_link(line: &str) -> Option<(&str, &str)> {
-        let open = line.find('[')?;
-        let middle = line[open + 1..].find("](")? + open + 1;
-        let close = line[middle + 2..].find(')')? + middle + 2;
-        Some((&line[open + 1..middle], &line[middle + 2..close]))
-    }
-    fn bare_url(line: &str) -> Option<&str> {
-        let start = line.find("https://").or_else(|| line.find("http://"))?;
-        line[start..].split_whitespace().next()
-    }
-    fn parse_text(text: &str, rows: &mut Vec<String>, seen: &mut HashSet<String>) {
-        let mut title: Option<String> = None;
-        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            let lower = line.to_ascii_lowercase();
-            if let Some((_, rest)) = line.split_once(':') {
-                if lower.starts_with("title:") || lower.starts_with("name:") {
-                    title = Some(rest.trim().to_owned());
-                    continue;
-                }
-                if lower.starts_with("url:") || lower.starts_with("link:") {
-                    push(rows, seen, title.take().as_deref(), rest);
-                    continue;
-                }
-            }
-            if let Some((label, url)) = markdown_link(line) {
-                push(rows, seen, Some(label), url);
-                title = None;
-            } else if let Some(url) = bare_url(line) {
-                push(rows, seen, title.take().as_deref(), url);
-            } else if line.starts_with('#') {
-                title = Some(line.trim_start_matches('#').trim().to_owned());
-            }
-        }
-    }
-
-    let mut rows = Vec::new();
-    let mut seen = HashSet::new();
-    if let Ok(value) = serde_json::from_str::<Value>(content) {
-        json_results(&value, &mut rows, &mut seen);
-    } else {
-        parse_text(content, &mut rows, &mut seen);
-    }
-    rows
-}
-
-fn url_host(url: &str) -> Option<String> {
-    url::Url::parse(url)
-        .ok()?
-        .host_str()
-        .filter(|host| !host.is_empty())
-        .map(str::to_owned)
-}
-
-/// A quiet two-line page teaser for webfetch previews. Markdown headings and
-/// common HTML tags are stripped enough to avoid showing markup as the summary.
-fn page_brief(content: &str, format: &str) -> Vec<String> {
-    content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| {
-            let cleaned = if format == "markdown" {
-                line.trim_start_matches('#').trim()
-            } else if format == "html" {
-                line.trim_matches(|c| c == '<' || c == '>').trim()
-            } else {
-                line
-            };
-            (!cleaned.is_empty()).then(|| bounded(cleaned))
-        })
-        .take(3)
-        .collect()
-}
-
-/// Flatten structured tool errors into stable human-readable diagnostics.
-fn format_error(error: &Value, envelope: &Value) -> String {
-    fn scalar(value: &Value) -> Option<String> {
-        match value {
-            Value::String(s) => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
-            Value::Bool(b) => Some(b.to_string()),
-            _ => None,
-        }
-    }
-    fn fields(value: &Value, lines: &mut Vec<String>) {
-        match value {
-            Value::Object(map) => {
-                for key in ["message", "reason", "detail", "details", "code", "status"] {
-                    if let Some(text) = map.get(key).and_then(scalar) {
-                        let label = if key == "message" { "Error" } else { key };
-                        lines.push(format!("{}: {text}", capitalize(label)));
-                    }
-                }
-                if lines.is_empty() {
-                    for (key, value) in map.iter().take(8) {
-                        if let Some(text) = scalar(value) {
-                            lines.push(format!("{}: {text}", capitalize(key)));
-                        }
-                    }
-                }
-            }
-            Value::Array(values) => {
-                for value in values.iter().take(8) {
-                    if let Some(text) = scalar(value) {
-                        lines.push(format!("Error: {text}"));
-                    } else {
-                        fields(value, lines);
-                    }
-                }
-            }
-            _ => {
-                if let Some(text) = scalar(value) {
-                    lines.push(format!("Error: {text}"));
-                }
-            }
-        }
-    }
-    fn capitalize(text: &str) -> String {
-        let mut chars = text.chars();
-        match chars.next() {
-            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-            None => String::new(),
-        }
-    }
-
-    let mut lines = Vec::new();
-    fields(error, &mut lines);
-    if lines.is_empty() {
-        lines.push("Tool failed".into());
-    }
-    if let Some(tool) = envelope.get("tool").and_then(Value::as_str) {
-        lines.push(format!("Tool: {tool}"));
-    }
-    bounded(&lines.join("\n"))
-}
-
-/// Human-readable body for tools with no dedicated shape: first meaningful
-/// string field, array items, or a key listing. Never raw pretty-printed JSON.
-fn summarize_output(v: &Value) -> String {
-    for key in [
-        "content", "result", "message", "text", "stdout", "output", "summary", "response",
-    ] {
-        if let Some(s) = v.get(key).and_then(Value::as_str) {
-            let s = s.trim();
-            if !s.is_empty() {
-                return bounded(s);
-            }
-        }
-    }
-    match v {
-        Value::Array(items) => {
-            let strings: Vec<&str> = items.iter().filter_map(Value::as_str).take(8).collect();
-            if strings.is_empty() {
-                format!("{} items", items.len())
-            } else {
-                let suffix = if items.len() > 8 {
-                    format!("\n… +{} more", items.len() - 8)
-                } else {
-                    String::new()
-                };
-                bounded(&format!("{}{suffix}", strings.join("\n")))
-            }
-        }
-        Value::Object(map) => {
-            let keys: Vec<&str> = map.keys().map(String::as_str).take(8).collect();
-            let suffix = if map.len() > 8 { ", …" } else { "" };
-            format!("{}{}", keys.join(", "), suffix)
-        }
-        Value::String(s) => bounded(s),
-        other => other.to_string(),
-    }
 }
 #[cfg(test)]
 mod tests {
@@ -1538,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tool_output_never_renders_raw_json() {
+    fn unknown_tool_output_preserves_structured_values() {
         let mut v = View::default();
         v.event(Out::ToolDone {
             id: "x".into(),
@@ -1547,8 +1168,8 @@ mod tests {
             is_error: false,
         });
         let t = only_tool(&v);
-        assert_eq!(t.output, "Issue YOUR-47 created");
-        assert!(!t.output.contains('{'), "no json braces: {}", t.output);
+        assert!(t.output.contains("Issue YOUR-47 created"));
+
         // Opaque object without a text field degrades to a key listing.
         let mut v = View::default();
         v.event(Out::ToolDone {
@@ -1558,7 +1179,8 @@ mod tests {
             is_error: false,
         });
         let t = only_tool(&v);
-        assert!(!t.output.contains('{'));
+        assert!(t.output.contains("https://x"));
+        assert!(t.output.contains("7"));
         assert!(t.output.contains("ok"));
     }
 
