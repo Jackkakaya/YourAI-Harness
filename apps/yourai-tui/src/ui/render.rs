@@ -48,7 +48,6 @@ pub struct Renderer {
     anchor: Option<(u64, usize)>,
     reveal: Option<u64>,
     turn_target: Option<u64>,
-    question_hit: Option<(Rect, u64)>,
     /// 40ms tick frame index shared by the breathing bar and card spinners.
     tick: u64,
 }
@@ -68,12 +67,6 @@ impl Renderer {
 
     pub fn click(&mut self, view: &mut View, x: u16, y: u16) {
         let point = Position::new(x, y);
-        if let Some((area, id)) = self.question_hit {
-            if area.contains(point) {
-                self.turn_target = Some(id);
-                return;
-            }
-        }
         if self.command_area.is_some_and(|r| r.contains(point)) {
             if let Some((_, command)) = self.command_hits.iter().find(|(r, _)| r.contains(point)) {
                 view.editor.take();
@@ -202,7 +195,8 @@ impl Renderer {
             )
             .min(area.height.saturating_sub(6));
         let input_height = if v.asks_empty() { input_height } else { 0 };
-        let footer_height = if cols[0].width < 64 { 4 } else { 3 };
+        let footer_lines = footer_lines(cols[0].width as usize, v, m, queued);
+        let footer_height = footer_lines.len() as u16;
         let busy = v.active || compact || !v.asks_empty();
         let activity_height = if busy { 1 } else { 0 };
         let narrow_dock = if !sidebar_visible && !v.todos.is_empty() && v.todo_panel {
@@ -228,29 +222,7 @@ impl Renderer {
             Constraint::Length(footer_height),
         ])
         .split(cols[0]);
-        let transcript = rows[0];
-        let title = v.title.as_deref().unwrap_or("Untitled session");
-        let block = Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(BORDER))
-            .title(Line::from(vec![
-                Span::styled(" ✦ ", Style::default().fg(ACCENT)),
-                Span::styled(title.to_owned(), Style::default().fg(TEXT).bold()),
-                Span::raw(" "),
-            ]))
-            .title(
-                Line::from(Span::styled(
-                    if v.scroll > 0 {
-                        format!(" {} new · Ctrl-End follows ", v.unseen)
-                    } else {
-                        String::new()
-                    },
-                    Style::default().fg(MUTED),
-                ))
-                .alignment(Alignment::Right),
-            );
-        let inner = block.inner(transcript);
-        f.render_widget(block, transcript);
+        let inner = rows[0];
         self.transcript = inner;
         let preview_rows = edit_preview_quota(inner.height);
         let key = (v.revision, inner.width, inner.height, v.theme);
@@ -308,45 +280,6 @@ impl Renderer {
         v.scroll = v.scroll.min(self.lines.len().saturating_sub(height));
         let end = self.lines.len().saturating_sub(v.scroll);
         let start = end.saturating_sub(height);
-        self.question_hit = None;
-        let question = if v.scroll == 0 {
-            self.timeline.turns.last()
-        } else {
-            self.timeline
-                .turns
-                .iter()
-                .rev()
-                .find(|(line, _)| *line <= start)
-                .or_else(|| self.timeline.turns.first())
-        };
-        if let Some((_, id)) = question {
-            let index = id.saturating_sub(v.item_id(0)) as usize;
-            if let Some(Item::Text {
-                role: Role::User,
-                text,
-            }) = v.items().get(index)
-            {
-                let hint = if transcript.width >= 75 {
-                    " · Ctrl-Home latest · Ctrl-↑/↓ browse "
-                } else {
-                    " · Ctrl-Home "
-                };
-                let label = format!(
-                    " YOU · {}{}",
-                    elide(
-                        &text.replace('\n', " "),
-                        (transcript.width as usize).saturating_sub(hint.width() + 7)
-                    ),
-                    hint
-                );
-                let area = Rect::new(transcript.x, transcript.y, transcript.width, 1);
-                f.render_widget(
-                    Paragraph::new(label).style(Style::default().fg(ACCENT).bg(PANEL)),
-                    area,
-                );
-                self.question_hit = Some((area, *id));
-            }
-        }
         f.render_widget(Paragraph::new(self.lines[start..end].to_vec()), inner);
         for (line, id) in &self.headers {
             if *line >= start && *line < end {
@@ -383,7 +316,13 @@ impl Renderer {
         } else {
             " Message "
         };
-        let input_title_right = if cols[0].width >= 70 {
+        let input_title_right = if v.scroll > 0 {
+            if cols[0].width >= 70 {
+                " Ctrl-Home question · Ctrl-End latest "
+            } else {
+                " ^End latest "
+            }
+        } else if cols[0].width >= 70 {
             " Enter send · Alt-Enter newline · / commands "
         } else {
             " F1 help "
@@ -480,7 +419,7 @@ impl Renderer {
             self.todo_hit = Some(rows[3]);
         }
         let footer = rows[5];
-        draw_footer(f, footer, v, m, queued);
+        f.render_widget(Paragraph::new(footer_lines), footer);
         v.commands
             .sync(&v.editor.text, v.asks_empty() && !v.overlay.is_open());
         let commands = v.commands.items();
@@ -954,77 +893,130 @@ fn draw_activity_bar(f: &mut Frame<'_>, area: Rect, v: &View, compact: bool, tic
     );
 }
 
-/// Essential model/permission information survives narrow terminals.
-fn draw_footer(f: &mut Frame<'_>, area: Rect, v: &View, m: &Metadata, queued: usize) {
-    let width = area.width as usize;
+/// Measure semantic fields before allocating rows; never rely on Paragraph clipping.
+fn footer_lines(width: usize, v: &View, m: &Metadata, queued: usize) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(MUTED);
     let permission = permission_label(m.yolo, m.trusted_shell);
-    let status_style = Style::default().fg(if m.yolo { YELLOW } else { MUTED });
+    let permission_style = Style::default()
+        .fg(if m.yolo { YELLOW } else { MUTED })
+        .bold();
     let title = v.title.as_deref().unwrap_or("New session");
-    let cwd_budget = width.saturating_sub(3) / 2;
-    let cwd = if m.cwd.width() > cwd_budget {
-        let name = std::path::Path::new(&m.cwd)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&m.cwd);
-        elide(&format!("…/{name}"), cwd_budget)
+    // Both labels get their full text when it fits. Otherwise preserve the path's
+    // meaningful tail and explicitly elide both labels within measured budgets.
+    let cwd_budget = if title.width() + m.cwd.width() + 3 <= width {
+        m.cwd.width()
     } else {
-        m.cwd.clone()
+        width.saturating_sub(3) / 2
     };
+    let cwd = elide_tail(&m.cwd, cwd_budget);
+    let title = elide(title, width.saturating_sub(cwd.width() + 3));
+    let mut lines = vec![Line::from(vec![
+        Span::styled(title, Style::default().fg(TEXT)),
+        Span::styled(format!(" · {cwd}"), muted),
+    ])];
     let context = ctx_pressure(v)
-        .map(|n| format!("{:.0}%", n * 100.0))
+        .map(|n| {
+            if n * 100.0 > 999.0 {
+                ">999%".into()
+            } else {
+                format!("{:.0}%", n * 100.0)
+            }
+        })
         .unwrap_or_else(|| "—".into());
     let rate = v
         .model_metrics
         .requests
         .last_output_tokens_per_second
-        .map(|n| format!("{n:.1}"))
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(compact_number)
         .unwrap_or_else(|| "—".into());
-    let metrics = format!(
-        "tok {} · ctx {context} · {rate} tok/s",
-        tokens(v.usage.total_tokens)
-    );
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            elide(title, width.saturating_sub(cwd.width() + 3)),
-            Style::default().fg(TEXT),
-        ),
-        Span::styled(format!(" · {cwd}"), Style::default().fg(MUTED)),
-    ])];
-    if width < 64 {
-        lines.push(
-            Line::from(format!(
-                "tok {} · ctx {context}",
-                tokens(v.usage.total_tokens)
-            ))
-            .style(Style::default().fg(MUTED)),
-        );
-        let queue = if queued > 0 {
-            format!(" · {queued} queued")
-        } else {
-            String::new()
-        };
-        lines.push(Line::from(format!("{rate} tok/s{queue}")).style(Style::default().fg(MUTED)));
-    } else {
-        let queue = if queued > 0 {
-            format!(" · {queued} queued")
-        } else {
-            String::new()
-        };
-        lines.push(Line::from(format!("{metrics}{queue}")).style(Style::default().fg(MUTED)));
+    let mut fields = vec![
+        format!("tok {}", tokens(v.usage.total_tokens)),
+        format!("ctx {context}"),
+        format!("{rate} tok/s"),
+    ];
+    if queued > 0 {
+        fields.push(format!(
+            "{} queued",
+            if queued < 1000 {
+                queued.to_string()
+            } else {
+                compact_number(queued as f64)
+            }
+        ));
     }
-    let model = elide(&v.model_label, width.saturating_sub(permission.width() + 3));
-    let gap = width.saturating_sub(model.width() + permission.width());
-    lines.push(Line::from(vec![
-        Span::styled(model, Style::default().fg(MUTED)),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(permission, status_style.bold()),
-    ]));
-    f.render_widget(Paragraph::new(lines), area);
+    // Keep a field's value and unit together; wrap only between fields.
+    let mut row = Line::default();
+    for field in fields {
+        if !row.spans.is_empty() && row.width() + 3 + field.width() > width {
+            lines.push(row);
+            row = Line::default();
+        }
+        if !row.spans.is_empty() {
+            row.spans.push(Span::styled(" · ", muted));
+        }
+        row.spans.push(Span::styled(field, muted));
+    }
+    let model_budget = width.saturating_sub(permission.width() + 3);
+    let model = elide(&v.model_label, model_budget);
+    if row.width() + model.width() + permission.width() + 6 > width {
+        lines.push(row);
+        row = Line::default();
+    } else if !model.is_empty() {
+        row.spans.push(Span::styled(" · ", muted));
+    }
+    row.spans.push(Span::styled(model, muted));
+    let gap = width.saturating_sub(row.width() + permission.width());
+    row.spans.push(Span::raw(" ".repeat(gap)));
+    row.spans.push(Span::styled(permission, permission_style));
+    lines.push(row);
+    lines
 }
 
-fn tokens(value: u64) -> String {
-    format!("{:.1}K", value as f64 / 1000.0)
+fn compact_number(value: f64) -> String {
+    if value >= 1e21 {
+        return format!("{value:.1e}");
+    }
+    for (scale, suffix) in [
+        (1e18, "E"),
+        (1e15, "P"),
+        (1e12, "T"),
+        (1e9, "B"),
+        (1e6, "M"),
+        (1e3, "K"),
+    ] {
+        if value >= scale {
+            return format!("{:.1}{suffix}", value / scale);
+        }
+    }
+    format!("{value:.1}")
 }
+fn tokens(value: u64) -> String {
+    if value < 1_000_000 {
+        format!("{:.1}K", value as f64 / 1000.0)
+    } else {
+        compact_number(value as f64)
+    }
+}
+fn elide_tail(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.into();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut tail = Vec::new();
+    let mut used = 1;
+    for g in text.graphemes(true).rev() {
+        if used + g.width() > width {
+            break;
+        }
+        used += g.width();
+        tail.push(g);
+    }
+    format!("…{}", tail.into_iter().rev().collect::<String>())
+}
+
 fn elide(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -1377,7 +1369,7 @@ mod tests {
             terminal
                 .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
                 .unwrap();
-            assert_eq!(terminal.backend().buffer()[(0, 0)].bg, theme.color(PANEL));
+            assert_eq!(terminal.backend().buffer()[(0, 0)].bg, theme.color(BG));
             let text = terminal
                 .backend()
                 .buffer()
@@ -1634,7 +1626,9 @@ mod tests {
         };
         let screen = draw(&mut terminal, &mut renderer, &mut v);
         let text = screen.join("\n");
-        assert!(text.contains("✦ Fix parser crash"));
+        assert!(text.contains("Fix parser crash"));
+        assert!(!screen[0].contains("Fix parser crash"), "no top title");
+        assert_eq!(text.matches("Fix parser crash").count(), 1);
         // Panel title is "Todo · 1/9" (not "TODO 1/9").
         assert!(text.contains("Todo · 1/9"));
         // Completed items use [✓] marker.
@@ -2020,8 +2014,7 @@ mod regression_tests {
                     .unwrap();
             };
         draw(&mut terminal, &mut renderer, &mut view);
-        let latest = renderer.timeline.turns.last().unwrap().1;
-        assert_eq!(renderer.question_hit.unwrap().1, latest);
+
         renderer.latest_turn();
         draw(&mut terminal, &mut renderer, &mut view);
         let start = renderer.lines.len() - view.scroll - renderer.transcript.height as usize;
@@ -2032,7 +2025,10 @@ mod regression_tests {
         assert_eq!(start, renderer.timeline.turns[0].0);
         renderer.jump_turn(&mut view, false);
         draw(&mut terminal, &mut renderer, &mut view);
-        assert_eq!(renderer.question_hit.unwrap().1, latest);
+        assert_eq!(
+            renderer.lines.len() - view.scroll - renderer.transcript.height as usize,
+            renderer.timeline.turns[1].0
+        );
         terminal.backend_mut().resize(40, 20);
         terminal.autoresize().unwrap();
         draw(&mut terminal, &mut renderer, &mut view);
@@ -2043,6 +2039,45 @@ mod regression_tests {
         renderer.follow(&mut view);
         draw(&mut terminal, &mut renderer, &mut view);
         assert_eq!(view.scroll, 0);
+    }
+    #[test]
+    fn footer_measures_unicode_long_labels_and_large_metrics() {
+        let mut v = View::default();
+        v.title = Some("这是一个很长的会话标题 🔎 review ".repeat(6));
+        v.model_label = "provider/very-long-model-name-with-reasoning-variant".repeat(3);
+        v.usage.total_tokens = u64::MAX;
+        v.model_metrics.requests.last_output_tokens_per_second = Some(f64::MAX);
+        let m = Metadata {
+            session: "test".into(),
+            cwd: "/Users/开发者/workspaces/很长的目录名字/YourAI-Harness".into(),
+            trusted_shell: false,
+            yolo: true,
+        };
+        for width in 30..=160 {
+            let lines = footer_lines(width, &v, &m, usize::MAX);
+            assert!(lines.len() <= 4);
+            for line in &lines {
+                assert!(line.width() <= width, "width {width}: {line}");
+            }
+            let text = lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for field in ["tok ", "ctx ", "tok/s", "YOLO", "queued"] {
+                assert!(text.contains(field));
+            }
+        }
+        v.title = Some("Review".into());
+        v.model_label = "mock/model".into();
+        v.usage.total_tokens = 1200;
+        v.model_metrics.requests.last_output_tokens_per_second = Some(47.5);
+        let lines = footer_lines(120, &v, &m, 0);
+        assert_eq!(lines.len(), 2, "wide terminals should not spend extra rows");
+        assert!(
+            lines[0].to_string().contains(&m.cwd),
+            "a fitting path stays complete"
+        );
     }
     #[test]
     fn tiny_approval_keeps_error_and_reply_visible() {
@@ -2105,7 +2140,7 @@ mod regression_tests {
                 .collect::<String>();
             assert!(footer.contains("YOLO"), "{footer}");
             assert!(footer.contains("provider/model"), "{footer}");
-            let footer_rows = if width < 64 { 4 } else { 3 };
+            let footer_rows = footer_lines(width as usize, &v, &m, 0).len() as u16;
             let details = (20 - footer_rows..20)
                 .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
                 .collect::<String>();

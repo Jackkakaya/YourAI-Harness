@@ -85,7 +85,7 @@ with tempfile.TemporaryDirectory() as tmp:
                     os.write(master, b'\x1b[1;1R')
 
     try:
-        wait_for(b'Untitled session')
+        wait_for(b'New session')
         os.write(master, b'/models\r')
         wait_for(b'Models')
         os.write(master, b'\r')
@@ -125,7 +125,7 @@ with tempfile.TemporaryDirectory() as tmp:
         time.sleep(0.2)
         captured.clear()
         os.write(master, b'/clear\r')
-        wait_for(b'Untitled session')
+        wait_for(b'New session')
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before_new + 2
         captured.clear()
         os.write(master, b'after reset\r')

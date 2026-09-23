@@ -119,7 +119,7 @@ with tempfile.TemporaryDirectory() as tmp:
                     os.write(master, b'\x1b[1;1R')
 
     try:
-        wait_for(b'Untitled session')
+        wait_for(b'New session')
         if rate_limit or quota_limit or single_request or retry_once:
             os.write(master,b'hello\r')
             if single_request or retry_once:
@@ -156,9 +156,9 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'16.0K')
         os.write(master, b'\x02')  # Close the dashboard.
         time.sleep(0.3)
-        os.write(master, b'\x1b[<0;4;1M\x1b[<32;11;1M\x1b[<0;11;1m')
+        os.write(master, b'\x1b[<0;1;34M\x1b[<32;11;34M\x1b[<0;11;34m')
         wait_for(b'Copied')
-        assert clipboard_file.read_text() == 'Untitled', repr(clipboard_file.read_text())
+        assert clipboard_file.read_text() == 'New session', repr(clipboard_file.read_text())
         os.write(master, b'/')
         wait_for(b'/continue')
         os.write(master, b'\x1b\x7f/theme nord\r')

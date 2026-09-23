@@ -78,7 +78,7 @@ with tempfile.TemporaryDirectory() as tmp:
                     os.write(master, b'\x1b[1;1R')
 
     try:
-        wait_for(b'Untitled session')
+        wait_for(b'New session')
         os.write(master, b'seed message\r')
         wait_for(b'LAUNCHER_OK')
         os.write(master, b'\x11')  # Ctrl-Q

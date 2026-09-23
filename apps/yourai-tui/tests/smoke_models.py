@@ -84,7 +84,7 @@ with tempfile.TemporaryDirectory() as tmp:
                     os.write(master, b'\x1b[1;1R')
 
     try:
-        wait_for(b'Untitled session')
+        wait_for(b'New session')
         # Send first message with default model (smoke-model).
         os.write(master, b'first message\r')
         wait_for(b'MODELS_OK')
