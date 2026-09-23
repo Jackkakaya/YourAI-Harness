@@ -57,6 +57,11 @@ const COMMANDS: &[Command] = &[
         argument: false,
     },
     Command {
+        text: "/results",
+        description: "Inspect recorded file and command actions",
+        argument: false,
+    },
+    Command {
         text: "/status",
         description: "Toggle stats dashboard",
         argument: false,
@@ -185,7 +190,7 @@ mod tests {
     fn filter_navigation_dismissal_and_arguments() {
         let mut menu = Menu::default();
         menu.sync("/", true);
-        assert_eq!(menu.items().len(), 12);
+        assert_eq!(menu.items().len(), 13);
         menu.step(true);
         assert_eq!(menu.items()[menu.selected].text, "/quit");
         menu.sync("/co", true);

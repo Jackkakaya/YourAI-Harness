@@ -238,6 +238,13 @@ pub(super) fn model_picker_overlay(f: &mut Frame<'_>, area: Rect, v: &View) {
                 Span::styled(prefix.to_owned(), Style::default().fg(ACCENT)),
                 Span::styled(format!("{mark} {label}"), Style::default().fg(color)),
             ])
+            .style(if i == selected {
+                Style::default()
+                    .bg(FOCUS_SURFACE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
         })
         .collect();
     f.render_widget(
@@ -338,10 +345,17 @@ pub(super) fn sessions_overlay(f: &mut Frame<'_>, area: Rect, v: &View) {
             } else {
                 Style::default().fg(color)
             };
-            lines.push(Line::from(vec![
-                Span::styled(prefix, Style::default().fg(ACCENT)),
-                Span::styled(body, style),
-            ]));
+            lines.push(
+                Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(ACCENT)),
+                    Span::styled(body, style),
+                ])
+                .style(if is_selected {
+                    Style::default().bg(FOCUS_SURFACE)
+                } else {
+                    Style::default()
+                }),
+            );
         }
     }
     f.render_widget(
@@ -395,6 +409,11 @@ pub(super) fn theme_picker_overlay(f: &mut Frame<'_>, area: Rect, v: &View) {
                 Span::styled(prefix.to_owned(), Style::default().fg(ACCENT)),
                 Span::styled(format!("{mark} {label}"), style),
             ])
+            .style(if is_selected {
+                Style::default().bg(FOCUS_SURFACE)
+            } else {
+                Style::default()
+            })
         })
         .collect();
     f.render_widget(

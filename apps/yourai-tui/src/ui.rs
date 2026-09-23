@@ -372,9 +372,13 @@ pub async fn run(
     let mut compact: Option<JoinHandle<()>> = None;
     let mut clipboard_task: Option<JoinHandle<std::io::Result<()>>> = None;
     let mut context_refreshed = Instant::now() - Duration::from_secs(2);
+    let mut stats_task: Option<
+        JoinHandle<(Option<yourai_harness::runtime::ContextUsage>, Option<u64>)>,
+    > = None;
     let mut pending_switch: Option<SessionTarget> = None;
     let ui_future = async {
-        let mut tick = tokio::time::interval(Duration::from_millis(40));
+        // Service input at ~60 Hz; unchanged frames still do not redraw.
+        let mut tick = tokio::time::interval(Duration::from_millis(16));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_snap: Option<FrameSnap> = None;
         loop {
@@ -439,6 +443,9 @@ pub async fn run(
                         ),
                         _ => {}
                     }
+                }
+                if let Some(task) = stats_task.take() {
+                    task.abort();
                 }
                 view = fresh;
                 let ctx = new_h.host.context();
@@ -780,6 +787,11 @@ pub async fn run(
                                 }
                                 match text.trim() {
                                     "/quit" => return Ok(()),
+                                    "/results" => {
+                                        view.editor.take();
+                                        renderer.latest_results(&mut view);
+                                        continue;
+                                    }
                                     "/help" => {
                                         view.overlay = Overlay::Help { scroll: 0 };
                                         view.editor.take();
@@ -1037,10 +1049,29 @@ pub async fn run(
             }
             view.model_metrics = h.model_snapshot();
             let mut context_tick = false;
-            if context_refreshed.elapsed() >= Duration::from_secs(1) {
-                let context_next = h.host.context_usage().ok();
-                let usage_next = h.usage.session_usage(&h.host.context().id).await.ok();
+            if stats_task.is_none() && context_refreshed.elapsed() >= Duration::from_secs(1) {
+                let host = h.host.clone();
+                let usage = h.usage.clone();
+                let session = host.context().id;
+                // Building a token estimate reads history and tool schemas. It must
+                // never hold up input or terminal painting; keep one request in flight.
+                stats_task = Some(tokio::spawn(async move {
+                    let context = tokio::task::spawn_blocking(move || host.context_usage().ok())
+                        .await
+                        .ok()
+                        .flatten();
+                    let count = usage
+                        .session_usage(&session)
+                        .await
+                        .ok()
+                        .map(|u| u.request_count);
+                    (context, count)
+                }));
                 context_refreshed = Instant::now();
+            }
+            if stats_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let (context_next, usage_next) =
+                    stats_task.take().unwrap().await.unwrap_or_default();
                 // Redraw only when the sidebar data actually moved.
                 let context_changed = match (&context_next, &view.context_usage) {
                     (None, None) => false,
@@ -1054,13 +1085,13 @@ pub async fn run(
                 };
                 let responses_changed = usage_next
                     .as_ref()
-                    .is_some_and(|u| u.request_count != view.recorded_responses);
+                    .is_some_and(|count| *count != view.recorded_responses);
                 if context_changed || responses_changed {
                     context_tick = true;
                 }
                 view.context_usage = context_next;
                 if let Some(usage) = usage_next {
-                    view.recorded_responses = usage.request_count;
+                    view.recorded_responses = usage;
                 }
             }
             let status = h.host.status();
@@ -1076,6 +1107,9 @@ pub async fn run(
         }
     };
     let result = ui_future.await;
+    if let Some(task) = stats_task {
+        task.abort();
+    }
     if let Some(task) = clipboard_task {
         task.abort();
     }

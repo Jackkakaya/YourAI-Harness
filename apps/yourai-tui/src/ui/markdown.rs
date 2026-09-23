@@ -1,7 +1,7 @@
 //! Markdown is presentation only: no HTML execution, links or task-state mutations.
 use super::{
     state::clean,
-    theme::{ACCENT, BLUE, GREEN, MUTED, PANEL, TEXT},
+    theme::{BLUE, CODE_SURFACE, GREEN, MUTED, TEXT},
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::prelude::*;
@@ -21,6 +21,8 @@ struct Writer {
     width: usize,
     styles: Vec<Style>,
     lists: Vec<Option<u64>>,
+    item_indents: Vec<usize>,
+    item_start: bool,
     quote: usize,
     code: bool,
     code_lang: String,
@@ -56,11 +58,19 @@ impl Writer {
                 "  ".repeat(self.lists.len().saturating_sub(1))
             )
         };
-        self.lines.extend(wrap_spans(
+        let indent = self.item_indents.last().copied().unwrap_or(0);
+        let continuation = format!("{prefix}{}", " ".repeat(indent));
+        self.lines.extend(wrap_spans_with_prefixes(
             std::mem::take(&mut self.spans),
             self.width,
-            &prefix,
+            if self.item_start {
+                &prefix
+            } else {
+                &continuation
+            },
+            &continuation,
         ));
+        self.item_start = false;
     }
     fn blank(&mut self) {
         self.flush();
@@ -104,7 +114,7 @@ impl Writer {
                     let mut spans = row.get(i).cloned().unwrap_or_default();
                     if row_index == 0 {
                         for span in &mut spans {
-                            span.style = span.style.fg(ACCENT).bold();
+                            span.style = span.style.fg(TEXT).bold();
                         }
                     }
                     wrap_spans(spans, sizes[i], "")
@@ -147,6 +157,8 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
         width,
         styles: vec![],
         lists: vec![],
+        item_indents: vec![],
+        item_start: false,
         quote: 0,
         code: false,
         code_lang: String::new(),
@@ -161,8 +173,8 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {}
                 Tag::Heading { .. } => {
-                    w.flush();
-                    w.styles.push(w.style().fg(ACCENT).bold());
+                    w.blank();
+                    w.styles.push(w.style().fg(TEXT).bold());
                 }
                 Tag::Strong => w.styles.push(w.style().bold()),
                 Tag::Emphasis => w.styles.push(w.style().italic()),
@@ -189,6 +201,8 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
                         }
                         _ => "• ".into(),
                     };
+                    w.item_indents.push(marker.width());
+                    w.item_start = true;
                     w.text(&marker, Style::default().fg(MUTED));
                 }
                 Tag::CodeBlock(kind) => {
@@ -197,10 +211,16 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
                         CodeBlockKind::Fenced(lang) => clean(&lang),
                         _ => String::new(),
                     };
-                    w.lines.push(Line::from(Span::styled(
-                        format!("  ┌ {}", w.code_lang),
-                        Style::default().fg(MUTED),
-                    )));
+                    let label = if w.code_lang.is_empty() {
+                        "code"
+                    } else {
+                        &w.code_lang
+                    };
+                    w.lines.extend(wrap_spans(
+                        vec![Span::styled(label.to_owned(), Style::default().fg(MUTED))],
+                        w.width,
+                        "  ",
+                    ));
                     w.code = true;
                 }
                 Tag::Table(_) => {
@@ -236,7 +256,10 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
                     w.flush();
                     w.quote = w.quote.saturating_sub(1);
                 }
-                TagEnd::Item => w.flush(),
+                TagEnd::Item => {
+                    w.flush();
+                    w.item_indents.pop();
+                }
                 TagEnd::List(_) => {
                     w.flush();
                     w.lists.pop();
@@ -251,27 +274,22 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
                                 let spans = line
                                     .spans
                                     .into_iter()
-                                    .map(|s| Span::styled(s.content, s.style.bg(PANEL)))
+                                    .map(|s| Span::styled(s.content, s.style.bg(CODE_SURFACE)))
                                     .collect();
-                                w.lines.extend(wrap_spans(spans, w.width, "  │ "));
+                                w.lines.extend(code_rows(spans, w.width));
                             }
                         }
                         // Unknown/unspecified language: keep the single-color look.
                         None => {
                             for line in src.lines() {
-                                w.lines.extend(wrap_spans(
-                                    vec![Span::styled(
-                                        line.to_owned(),
-                                        Style::default().fg(BLUE).bg(PANEL),
-                                    )],
+                                w.lines.extend(code_rows(
+                                    vec![Span::styled(line.to_owned(), Style::default().fg(TEXT))],
                                     w.width,
-                                    "  │ ",
                                 ));
                             }
                         }
                     }
-                    w.lines
-                        .push(Line::from(Span::styled("  └", Style::default().fg(MUTED))));
+                    w.blank();
                 }
                 TagEnd::TableCell => {
                     if let Some(table) = &mut w.table {
@@ -297,7 +315,7 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
                 w.text(&text, w.style())
             }
-            Event::Code(text) => w.text(&text, w.style().fg(BLUE).bg(PANEL)),
+            Event::Code(text) => w.text(&text, w.style().fg(BLUE).bg(CODE_SURFACE)),
             Event::SoftBreak => w.text(" ", w.style()),
             Event::HardBreak => {
                 w.flush();
@@ -328,7 +346,27 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
     w.lines
 }
 pub(crate) fn wrap_spans(spans: Styled, width: usize, prefix: &str) -> Vec<Line<'static>> {
-    let available = width.saturating_sub(prefix.width()).max(1);
+    wrap_spans_with_prefixes(spans, width, prefix, prefix)
+}
+
+fn code_rows(spans: Styled, width: usize) -> Vec<Line<'static>> {
+    wrap_spans(spans, width, "    ")
+        .into_iter()
+        .map(|mut line| {
+            line.spans
+                .push(Span::raw(" ".repeat(width.saturating_sub(line.width()))));
+            line.style(Style::default().bg(CODE_SURFACE))
+        })
+        .collect()
+}
+
+fn wrap_spans_with_prefixes(
+    spans: Styled,
+    width: usize,
+    prefix: &str,
+    continuation: &str,
+) -> Vec<Line<'static>> {
+    let mut available = width.saturating_sub(prefix.width()).max(1);
     let mut lines = vec![];
     let mut current = vec![Span::styled(prefix.to_owned(), Style::default().fg(MUTED))];
     let mut used = 0;
@@ -336,7 +374,11 @@ pub(crate) fn wrap_spans(spans: Styled, width: usize, prefix: &str) -> Vec<Line<
         for g in span.content.graphemes(true) {
             if used + g.width() > available && used > 0 {
                 lines.push(Line::from(std::mem::take(&mut current)));
-                current.push(Span::styled(prefix.to_owned(), Style::default().fg(MUTED)));
+                current.push(Span::styled(
+                    continuation.to_owned(),
+                    Style::default().fg(MUTED),
+                ));
+                available = width.saturating_sub(continuation.width()).max(1);
                 used = 0;
             }
             if let Some(last) = current.last_mut().filter(|s| s.style == span.style) {
@@ -366,6 +408,43 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
     }
+    #[test]
+    fn wrapped_list_items_keep_hanging_indent() {
+        for (source, indent) in [
+            ("- abcdefghijklmnopqrst", 4),
+            ("12. abcdefghijklmnopqrst", 6),
+        ] {
+            let lines = render(source, 14);
+            assert!(lines.len() > 1);
+            for line in &lines[1..] {
+                assert!(plain(std::slice::from_ref(line)).starts_with(&" ".repeat(indent)));
+            }
+            assert!(lines.iter().all(|line| line.width() <= 14));
+        }
+        let lines = render(
+            "- first  \n  second\n  - nested text wraps across the screen\n- last",
+            18,
+        );
+        let text = plain(&lines);
+        assert!(text.contains("    second"), "{text}");
+        assert!(text.contains("  • last"), "{text}");
+        assert!(lines.iter().all(|line| line.width() <= 18));
+    }
+
+    #[test]
+    fn code_blocks_have_full_surfaces_without_decorative_frames() {
+        let lines = render("```rust\nlet value = 1;\n```\n\nDone.", 30);
+        let text = plain(&lines);
+        assert!(!text.contains(['┌', '│', '└']));
+        let code = lines
+            .iter()
+            .find(|line| plain(std::slice::from_ref(line)).contains("let value"))
+            .unwrap();
+        assert_eq!(code.width(), 30);
+        assert_eq!(code.style.bg, Some(CODE_SURFACE));
+        assert!(text.contains("Done."));
+    }
+
     #[test]
     fn renders_markdown_styles_tasks_code_and_tables() {
         let lines = render("# Heading\n\n**bold** *italic* ~~removed~~ `inline`\n\n- [x] done\n- [ ] pending\n\n> quote\n\n```rust\nlet x = 1;\n```\n\n| Key | Value |\n| --- | --- |\n| 中文 | **yes** |\n\n[docs](https://example.com)", 60);
@@ -404,7 +483,7 @@ mod tests {
         assert!(
             spans
                 .iter()
-                .any(|s| s.content.contains("x = 1") && s.style.fg == Some(BLUE)),
+                .any(|s| s.content.contains("x = 1") && s.style.fg == Some(TEXT)),
             "unknown fence keeps the legacy single color"
         );
         assert!(lines.iter().all(|l| l.width() <= 60));

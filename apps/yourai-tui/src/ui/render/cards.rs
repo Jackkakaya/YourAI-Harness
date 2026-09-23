@@ -329,7 +329,7 @@ pub(super) fn tool_expanded(
     width: usize,
     theme: Theme,
 ) {
-    let prefix = "  ";
+    let prefix = "    ";
     // edit/write/webfetch already have fully structured bodies; repeating their
     // often-large JSON arguments before the useful content only adds noise.
     if !matches!(t.name.as_str(), "edit" | "write" | "webfetch") {
@@ -422,7 +422,7 @@ pub(super) fn tool_preview(
     theme: Theme,
     edit_preview_rows: usize,
 ) {
-    let prefix = "  ";
+    let prefix = "    ";
     match t.name.as_str() {
         "shell" if t.status == ToolStatus::Running => {
             // Last 3 progress lines, following scroll.
@@ -436,23 +436,42 @@ pub(super) fn tool_preview(
                 ));
             } else {
                 for line in &prog[prog.len().saturating_sub(3)..] {
-                    lines.extend(wrap(line, Style::default().fg(CYAN), width, prefix));
+                    lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
                 }
             }
         }
         "shell" => {
-            // Preview source: stdout, falling back to stderr (many CLIs print
-            // their headline to stderr).
-            let out: Vec<&str> = if t.output.trim().is_empty() {
+            let failed = t.status == ToolStatus::Failed || t.exit_code.is_some_and(|c| c != 0);
+            // Diagnostics commonly go to stderr while stdout contains build progress.
+            let use_stderr = !t.stderr.trim().is_empty() && (failed || t.output.trim().is_empty());
+            let out: Vec<&str> = if use_stderr {
                 t.stderr.lines().collect()
             } else {
                 t.output.lines().collect()
             };
-            if t.status == ToolStatus::Failed {
-                for line in out.iter().take(5) {
+            if failed {
+                let start = out.len().saturating_sub(5);
+                let source = if use_stderr { "stderr" } else { "stdout" };
+                lines.extend(wrap(
+                    &format!(
+                        "{source} · last {} lines · ^O full output",
+                        out.len().min(5)
+                    ),
+                    Style::default().fg(MUTED),
+                    width,
+                    prefix,
+                ));
+                for line in &out[start..] {
                     lines.extend(wrap(line, Style::default().fg(RED), width, prefix));
                 }
-                more_hint(lines, out.len().saturating_sub(5), width);
+                if out.is_empty() {
+                    lines.extend(wrap(
+                        "No diagnostic output",
+                        Style::default().fg(RED),
+                        width,
+                        prefix,
+                    ));
+                }
             } else {
                 let start = out.len().saturating_sub(1);
                 for line in &out[start..] {
