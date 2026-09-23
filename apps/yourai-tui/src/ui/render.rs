@@ -780,7 +780,7 @@ fn sidebar(f: &mut Frame<'_>, area: Rect, v: &View) -> (Option<Rect>, Option<Rec
     let done = v.todos.iter().filter(|t| t.completed).count();
     f.render_widget(
         Paragraph::new(format!(" Todo · {done}/{} · ^T", v.todos.len()))
-            .style(Style::default().fg(ACCENT)),
+            .style(Style::default().fg(ACCENT).bold()),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
     let body = Rect::new(
@@ -817,7 +817,11 @@ fn sidebar(f: &mut Frame<'_>, area: Rect, v: &View) -> (Option<Rect>, Option<Rec
                 ),
                 Span::styled(
                     text,
-                    Style::default().fg(if todo.completed { MUTED } else { TEXT }),
+                    if current == Some(i) {
+                        Style::default().fg(TEXT).bold()
+                    } else {
+                        Style::default().fg(if todo.completed { MUTED } else { TEXT })
+                    },
                 ),
             ]));
         }
@@ -966,14 +970,25 @@ fn footer_lines(width: usize, v: &View, m: &Metadata, queued: usize) -> Vec<Line
     );
     let gap = width.saturating_sub(left.width() + right_width);
     vec![Line::from(vec![
-        Span::styled(left, muted),
+        Span::styled(elide(title, title_budget), Style::default().fg(TEXT).bold()),
+        Span::styled(
+            format!(
+                " · {}",
+                elide_tail(&m.cwd, left_width.saturating_sub(title_budget + 3))
+            ),
+            muted,
+        ),
         Span::raw(" ".repeat(gap)),
-        Span::styled(metrics, muted),
+        Span::styled(metrics, Style::default().fg(TEXT)),
         Span::styled(overflow, muted),
         Span::styled(" · ", Style::default().fg(BORDER)),
         Span::styled(
             permission,
-            Style::default().fg(if m.yolo { YELLOW } else { MUTED }),
+            if m.yolo {
+                Style::default().fg(YELLOW).bold()
+            } else {
+                muted
+            },
         ),
     ])]
 }
@@ -1392,7 +1407,7 @@ mod tests {
             v.theme = v.theme.next();
             assert_ne!(v.theme, theme);
             if let Ok(path) = std::env::var("YOURAI_THEME_SNAPSHOT") {
-                let cells = terminal.backend().buffer().content().iter().map(|c|json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg)})).collect::<Vec<_>>();
+                let cells = terminal.backend().buffer().content().iter().map(|c|json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD)})).collect::<Vec<_>>();
                 std::fs::write(
                     format!("{path}-{}.json", theme.name()),
                     serde_json::to_vec(&json!({"width":120,"height":36,"cells":cells})).unwrap(),
@@ -1469,7 +1484,7 @@ mod tests {
 
         assert!(!v.overlay.is_open());
         if let Ok(path) = std::env::var("YOURAI_WELCOME_SNAPSHOT") {
-            let cells = terminal.backend().buffer().content().iter().map(|c| json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg)})).collect::<Vec<_>>();
+            let cells = terminal.backend().buffer().content().iter().map(|c| json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD)})).collect::<Vec<_>>();
             std::fs::write(
                 path,
                 serde_json::to_vec(&json!({"width":120,"height":32,"cells":cells})).unwrap(),
@@ -1758,7 +1773,7 @@ mod tests {
                 assert!(!content.contains("YOURAI"));
                 assert!(!content.contains("YOU  "));
                 if let Ok(path) = std::env::var("YOURAI_TUI_SNAPSHOT") {
-                    let cells=terminal.backend().buffer().content().iter().map(|c|json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg)})).collect::<Vec<_>>();
+                    let cells=terminal.backend().buffer().content().iter().map(|c|json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD)})).collect::<Vec<_>>();
                     std::fs::write(
                         path,
                         serde_json::to_vec(&json!({"width":w,"height":h,"cells":cells})).unwrap(),

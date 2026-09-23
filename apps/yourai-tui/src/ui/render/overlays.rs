@@ -18,7 +18,7 @@ pub(super) fn stats_overlay(f: &mut Frame<'_>, area: Rect, v: &View, m: &Metadat
     ));
     lines.push(Line::default());
     // Context section.
-    lines.push(label("Context", MUTED));
+    lines.push(label("Context", TEXT).style(Style::default().bold()));
     if let Some(usage) = &v.context_usage {
         let used = usage.estimated_tokens;
         if let Some(window) = usage.context_window.filter(|w| *w > 0) {
@@ -62,7 +62,7 @@ pub(super) fn stats_overlay(f: &mut Frame<'_>, area: Rect, v: &View, m: &Metadat
     }
     lines.push(Line::default());
     // Requests section.
-    lines.push(label("Requests · this run", MUTED));
+    lines.push(label("Requests · this run", TEXT).style(Style::default().bold()));
     lines.push(label(
         &format!(
             "{} calls · {} in last 60s",
@@ -114,7 +114,7 @@ pub(super) fn stats_overlay(f: &mut Frame<'_>, area: Rect, v: &View, m: &Metadat
     ));
     lines.push(Line::default());
     // Tokens section.
-    lines.push(label("Tokens · session", MUTED));
+    lines.push(label("Tokens · session", TEXT).style(Style::default().bold()));
     lines.push(label(
         &format!(
             "{} in · {} out · {} total",
@@ -133,7 +133,7 @@ pub(super) fn stats_overlay(f: &mut Frame<'_>, area: Rect, v: &View, m: &Metadat
     lines.push(label(&format!("{} responses", v.recorded_responses), MUTED));
     lines.push(Line::default());
     // Permissions.
-    lines.push(label("Permissions", MUTED));
+    lines.push(label("Permissions", TEXT).style(Style::default().bold()));
     lines.push(label(
         if m.yolo {
             "YOLO · approvals skipped"
@@ -149,7 +149,15 @@ pub(super) fn stats_overlay(f: &mut Frame<'_>, area: Rect, v: &View, m: &Metadat
     let lines: Vec<_> = lines
         .into_iter()
         .flat_map(|line| {
-            crate::ui::markdown::wrap_spans(line.spans, width.saturating_sub(2) as usize, "")
+            let spans = line
+                .spans
+                .into_iter()
+                .map(|mut span| {
+                    span.style = line.style.patch(span.style);
+                    span
+                })
+                .collect();
+            crate::ui::markdown::wrap_spans(spans, width.saturating_sub(2) as usize, "")
         })
         .collect();
     let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));

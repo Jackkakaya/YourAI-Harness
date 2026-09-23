@@ -16,31 +16,31 @@ const fn rgb(value: u32) -> Color {
 
 // Baseline slot constants = the Dark palette. Renderers build every span from
 // these (and only these) colors.
-pub(crate) const BG: Color = rgb(0x18191B);
-pub(crate) const PANEL: Color = rgb(0x292C30);
-pub(crate) const TEXT: Color = rgb(0xF1F0EA);
-pub(crate) const MUTED: Color = rgb(0xB0B1AA);
-pub(crate) const FAINT: Color = rgb(0x6C6D6A);
-pub(crate) const YELLOW: Color = rgb(0xD6B583);
-pub(crate) const ACCENT: Color = rgb(0xB7C9AD);
-pub(crate) const GREEN: Color = rgb(0x9DBD9E);
-pub(crate) const RED: Color = rgb(0xD8948F);
-pub(crate) const BLUE: Color = rgb(0xA6B9D0);
-pub(crate) const CYAN: Color = rgb(0x9DBFC0);
-pub(crate) const BORDER: Color = rgb(0x555A60);
-pub(crate) const DIFF_ADD_BG: Color = rgb(0x2C322F);
-pub(crate) const DIFF_DEL_BG: Color = rgb(0x352B2C);
+pub(crate) const BG: Color = rgb(0x101214);
+pub(crate) const PANEL: Color = rgb(0x2C3035);
+pub(crate) const TEXT: Color = rgb(0xFFFFFF);
+pub(crate) const MUTED: Color = rgb(0xC3C7C0);
+pub(crate) const FAINT: Color = rgb(0x727673);
+pub(crate) const YELLOW: Color = rgb(0xE7C797);
+pub(crate) const ACCENT: Color = rgb(0xC7DEB9);
+pub(crate) const GREEN: Color = rgb(0xAED0AD);
+pub(crate) const RED: Color = rgb(0xE5A19A);
+pub(crate) const BLUE: Color = rgb(0xBACDE4);
+pub(crate) const CYAN: Color = rgb(0xAED5D5);
+pub(crate) const BORDER: Color = rgb(0x7E898A);
+pub(crate) const DIFF_ADD_BG: Color = rgb(0x282F2B);
+pub(crate) const DIFF_DEL_BG: Color = rgb(0x302728);
 // Syntax highlight slots (Dark baseline values, derived in `Palette::derive`
 // with fixed mixes; keep in sync: test `dark_baseline_slots_match_palette`).
-pub(crate) const SY_KEYWORD: Color = rgb(0xC9AC9D);
-pub(crate) const SY_STRING: Color = rgb(0xD7A589);
-pub(crate) const SY_FUNCTION: Color = rgb(0xE2D0B1);
-pub(crate) const SY_TYPE: Color = rgb(0xA7C3B8);
-pub(crate) const SY_NUMBER: Color = rgb(0xA4C0A2);
-pub(crate) const SY_COMMENT: Color = rgb(0xA7B6A5);
-pub(crate) const SY_OPERATOR: Color = rgb(0xE8DBC6);
-pub(crate) const SY_PUNCT: Color = rgb(0xD1D1CA);
-pub(crate) const SY_VARIABLE: Color = rgb(0xCFD7DE);
+pub(crate) const SY_KEYWORD: Color = rgb(0xD8BCA8);
+pub(crate) const SY_STRING: Color = rgb(0xE6B499);
+pub(crate) const SY_FUNCTION: Color = rgb(0xF2E0C6);
+pub(crate) const SY_TYPE: Color = rgb(0xB8D9CA);
+pub(crate) const SY_NUMBER: Color = rgb(0xB5D4B0);
+pub(crate) const SY_COMMENT: Color = rgb(0xBACBB7);
+pub(crate) const SY_OPERATOR: Color = rgb(0xF7EBDB);
+pub(crate) const SY_PUNCT: Color = rgb(0xE1E3E0);
+pub(crate) const SY_VARIABLE: Color = rgb(0xE0E9F3);
 
 /// Lookup ordering must match `Palette::slots()` exactly.
 pub(crate) const SLOTS: [Color; 23] = [
@@ -261,12 +261,12 @@ impl Theme {
     pub fn palette(self) -> Palette {
         match self.effective() {
             Self::Dark | Self::System => Palette::derive(
-                0x18191B, 0x292C30, 0xF1F0EA, 0xB0B1AA, 0xB7C9AD, 0x9DBD9E, 0xD8948F, 0xD6B583,
-                0xA6B9D0, 0x9DBFC0, 0x555A60,
+                0x101214, 0x2C3035, 0xFFFFFF, 0xC3C7C0, 0xC7DEB9, 0xAED0AD, 0xE5A19A, 0xE7C797,
+                0xBACDE4, 0xAED5D5, 0x7E898A,
             ),
             Self::Light => Palette::derive(
-                0xF7F6F2, 0xEAE8E1, 0x252823, 0x60665B, 0x4F684D, 0x3F704C, 0xA8433C, 0x876622,
-                0x4A6787, 0x3C7175, 0xB3B7AD,
+                0xFAFAF7, 0xE3E5DF, 0x161B16, 0x414A3E, 0x35522C, 0x2F633B, 0x98352E, 0x76520D,
+                0x365575, 0x265E60, 0x798374,
             ),
             Self::OneDark => Palette::derive(
                 0x282C34, 0x21252B, 0xABB2BF, 0x5C6370, 0xC678DD, 0x98C379, 0xE06C75, 0xE5C07B,
@@ -523,6 +523,18 @@ mod tests {
         let (la, lb) = (luminance(a), luminance(b));
         let (hi, lo) = (la.max(lb), la.min(lb));
         (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn primary_themes_keep_text_and_boundaries_distinct() {
+        for theme in [Theme::Dark, Theme::Light] {
+            let p = theme.palette();
+            for surface in [p.bg, p.panel] {
+                assert!(contrast(p.text, surface) >= 12.0);
+                assert!(contrast(p.muted, surface) >= 7.0);
+                assert!(contrast(p.border, surface) >= 3.0);
+            }
+        }
     }
 
     #[test]

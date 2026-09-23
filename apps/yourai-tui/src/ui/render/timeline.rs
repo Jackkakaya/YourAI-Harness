@@ -149,10 +149,13 @@ fn item_lines(
             role: Role::User,
             text,
         } => {
-            lines.push(Line::from(Span::styled(
-                format!("  YOU {}", "─".repeat(width.saturating_sub(7))),
-                Style::default().fg(ACCENT).bold(),
-            )));
+            lines.push(Line::from(vec![
+                Span::styled("  YOU ", Style::default().fg(ACCENT).bold()),
+                Span::styled(
+                    "─".repeat(width.saturating_sub(7)),
+                    Style::default().fg(BORDER),
+                ),
+            ]));
             lines.push(Line::from(" ".repeat(width)).style(Style::default().bg(PANEL)));
             for line in text.lines() {
                 for row in wrap(

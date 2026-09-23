@@ -42,9 +42,16 @@ pub(super) fn tool_title(
             Style::default().fg(ACCENT),
         ),
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
-        Span::styled(subject, Style::default().fg(TEXT)),
+        Span::styled(subject, Style::default().fg(TEXT).bold()),
         Span::raw(" ".repeat(pad)),
-        Span::styled(meta, Style::default().fg(FAINT)),
+        Span::styled(
+            meta,
+            if t.status == ToolStatus::Failed || t.exit_code.is_some_and(|code| code != 0) {
+                Style::default().fg(RED).bold()
+            } else {
+                Style::default().fg(MUTED)
+            },
+        ),
     ])
 }
 
