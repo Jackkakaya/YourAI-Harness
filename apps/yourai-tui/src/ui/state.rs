@@ -1,4 +1,5 @@
 use super::editor::Editor;
+use super::mention;
 use ratatui::text::{Line, Span};
 use serde_json::{json, Value};
 use std::{
@@ -170,6 +171,58 @@ pub struct SessionPickerState {
     pub selected: usize,
 }
 
+/// An attachment staged for the next submit (OpenCode FilePart semantics:
+/// the frontend references files, the harness reads them).
+///
+/// - Clipboard images have an empty `marker` and are always sent.
+/// - File references carry a `marker` (`@relative/path`); they are only sent
+///   while the marker text is still present in the editor, so deleting the
+///   mention also drops the attachment — content and intent cannot drift
+///   apart.
+pub struct PendingAttachment {
+    /// `@relative/path` text that must remain in the editor for the
+    /// attachment to be sent; empty for clipboard images.
+    pub marker: String,
+    pub attachment: UserAttachment,
+}
+
+impl View {
+    /// Attachments that should accompany `text`: clipboard images (empty
+    /// marker) plus file references whose marker is still present.
+    pub fn attachments_for(&self, text: &str) -> Vec<UserAttachment> {
+        self.pending_attachments
+            .iter()
+            .filter(|a| a.marker.is_empty() || marker_present(text, &a.marker))
+            .map(|a| a.attachment.clone())
+            .collect()
+    }
+}
+
+/// Word-boundary-aware marker search: `@src` must not match inside
+/// `@src/main.rs`, and the match must start at a word boundary like the
+/// mention trigger itself.
+fn marker_present(text: &str, marker: &str) -> bool {
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(marker) {
+        let start = from + offset;
+        let end = start + marker.len();
+        let start_ok = start == 0
+            || text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| c.is_whitespace());
+        let end_ok = text[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && !matches!(c, '/' | '_' | '-' | '.'));
+        if start_ok && end_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 pub struct View {
     pub model_metrics: yourai_harness::model::BudgetSnapshot,
     pub retry: Option<RetryState>,
@@ -183,6 +236,10 @@ pub struct View {
     items: VecDeque<Item>,
     pub editor: Editor,
     asks: VecDeque<Ask>,
+    /// Staged clipboard images, sent with the next submitted message.
+    pub pending_attachments: Vec<PendingAttachment>,
+    /// `@` file-mention autocomplete state.
+    pub mention: mention::MentionState,
     assistant: Option<usize>,
     thinking: Option<usize>,
     pub scroll: usize,
@@ -228,6 +285,8 @@ impl Default for View {
             items: VecDeque::new(),
             editor: Editor::default(),
             asks: VecDeque::new(),
+            pending_attachments: vec![],
+            mention: mention::MentionState::default(),
             assistant: None,
             thinking: None,
             scroll: 0,
@@ -1679,5 +1738,54 @@ mod tests {
         assert_eq!(t.adds, Some(2));
         assert!(t.created);
         assert!(t.content_hl.is_some());
+    }
+
+    // ── attachments ────────────────────────────────────────────────────
+
+    fn staged(marker: &str, attachment: UserAttachment) -> PendingAttachment {
+        PendingAttachment {
+            marker: marker.to_owned(),
+            attachment,
+        }
+    }
+
+    #[test]
+    fn clipboard_images_are_always_sent_and_refs_need_their_marker() {
+        let v = View {
+            pending_attachments: vec![
+                staged("", UserAttachment::base64("image/png", "aGVsbG8=", Some("c.png".into()))),
+                staged(
+                    "@src/main.rs",
+                    UserAttachment::file("/abs/src/main.rs", None),
+                ),
+            ],
+            ..Default::default()
+        };
+        // Marker present → both sent.
+        let atts = v.attachments_for("look at @src/main.rs please");
+        assert_eq!(atts.len(), 2);
+        // Marker deleted → only the clipboard image remains.
+        let atts = v.attachments_for("look at this please");
+        assert_eq!(atts.len(), 1);
+        assert!(matches!(atts[0].data, AttachmentData::Base64(_)));
+    }
+
+    #[test]
+    fn marker_matching_respects_word_boundaries() {
+        let v = View {
+            pending_attachments: vec![staged(
+                "@src",
+                UserAttachment::file("/abs/src", None),
+            )],
+            ..Default::default()
+        };
+        // `@src` inside `@src/main.rs` is NOT the dir marker.
+        assert!(v.attachments_for("see @src/main.rs").is_empty());
+        // Exact marker (followed by whitespace) matches.
+        assert_eq!(v.attachments_for("see @src now").len(), 1);
+        // Marker at end of text matches.
+        assert_eq!(v.attachments_for("see @src").len(), 1);
+        // Embedded in a word (`foo@src`) does not — mentions need a boundary.
+        assert!(v.attachments_for("see foo@src").is_empty());
     }
 }

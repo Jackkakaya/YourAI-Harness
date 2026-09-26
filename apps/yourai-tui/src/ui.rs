@@ -2,6 +2,7 @@ mod clipboard;
 mod commands;
 mod editor;
 mod markdown;
+mod mention;
 mod render;
 mod selection;
 mod state;
@@ -19,7 +20,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, prelude::*};
 use render::{Metadata, Renderer};
-use state::{derive_title, Item, Role, View};
+use state::{derive_title, Item, PendingAttachment, Role, View};
 use std::{
     io::{self, Stdout, Write},
     sync::Arc,
@@ -249,6 +250,20 @@ fn copy_selection(renderer: &Renderer, task: &mut Option<JoinHandle<std::io::Res
     }
 }
 
+/// Stage a clipboard image: empty marker → always sent with the next submit.
+fn stage_clipboard_image(view: &mut View, img: clipboard::ClipboardImage) {
+    let n = view.pending_attachments.len() + 1;
+    let mime = img.mime.clone();
+    view.pending_attachments.push(PendingAttachment {
+        marker: String::new(),
+        attachment: UserAttachment::base64(img.mime, img.data, Some(format!("clipboard-{n}.png"))),
+    });
+    view.notice(
+        Level::Info,
+        format!("Image attached ({mime}). Enter to send, Esc to clear."),
+    );
+}
+
 /// Everything a frame depends on. Redrawing only when this changes keeps the
 /// physical cursor untouched while idle: ratatui re-emits show/move-cursor on
 /// every `draw`, and terminals restart the cursor blink on each one, so a
@@ -363,6 +378,7 @@ pub async fn run(
     let mut screen = Screen::open()?;
     let mut renderer = Renderer::default();
     let context = harness.host.context();
+    let cwd = context.cwd.clone();
     let mut meta = Metadata {
         session: context.id.0,
         cwd: context.cwd.to_string_lossy().into(),
@@ -547,7 +563,17 @@ pub async fn run(
                     },
                     Event::Mouse(_) => {}
                     Event::Paste(text) => {
-                        if let Some(a) = view.ask_mut() {
+                        if text.is_empty() {
+                            // Bracketed paste with empty text often means the
+                            // clipboard holds an image (most terminals can't
+                            // paste images as text). Best-effort: try reading
+                            // an image so Ctrl+V works even when the terminal
+                            // intercepts it as a bracketed paste rather than a
+                            // KeyEvent.
+                            if let Ok(Some(img)) = clipboard::read_image().await {
+                                stage_clipboard_image(&mut view, img);
+                            }
+                        } else if let Some(a) = view.ask_mut() {
                             a.editor.insert(&text);
                         } else {
                             view.editor.insert(&text);
@@ -565,9 +591,18 @@ pub async fn run(
                             copy_selection(&renderer, &mut clipboard_task);
                             continue;
                         }
-                        if key.code == KeyCode::Esc && renderer.selection.active() {
-                            renderer.selection.clear();
-                            continue;
+                        if key.code == KeyCode::Esc {
+                            if renderer.selection.active() {
+                                renderer.selection.clear();
+                                continue;
+                            }
+                            // No selection: Esc drops staged attachments before
+                            // falling through to the interrupt handler below.
+                            if !view.pending_attachments.is_empty() {
+                                view.pending_attachments.clear();
+                                view.notice(Level::Info, "Attachments cleared.");
+                                continue;
+                            }
                         }
                         renderer.selection.clear();
                         if view.help {
@@ -768,6 +803,92 @@ pub async fn run(
                                 _ => continue,
                             }
                         }
+                        // ── @ mention autocomplete ───────────────────────
+                        // When active, intercept navigation keys before the
+                        // command menu or editor sees them.
+                        if view.mention.active && view.asks_empty() && !ctrl && !alt {
+                            match key.code {
+                                KeyCode::Up => {
+                                    view.mention.step(true);
+                                    continue;
+                                }
+                                KeyCode::Down => {
+                                    view.mention.step(false);
+                                    continue;
+                                }
+                                KeyCode::Esc => {
+                                    view.mention.deactivate();
+                                    continue;
+                                }
+                                KeyCode::Tab => {
+                                    if let Some(entry) = view.mention.current().cloned() {
+                                        if entry.is_dir {
+                                            // Tab on directory: expand (down-drill).
+                                            let replace = format!("@{}", entry.display);
+                                            let anchor = view.mention.anchor;
+                                            let end = anchor + 1 + view.mention.query.len();
+                                            view.editor.cursor = anchor;
+                                            for _ in 0..(end - anchor) {
+                                                view.editor.delete();
+                                            }
+                                            view.editor.insert(&format!("{replace}/"));
+                                            if let Some((a, q)) = mention::MentionState::detect(
+                                                &view.editor.text,
+                                                view.editor.cursor,
+                                            ) {
+                                                view.mention.entries = mention::scan(&cwd, &q);
+                                                view.mention.activate(a, &q);
+                                            } else {
+                                                view.mention.deactivate();
+                                            }
+                                            continue;
+                                        }
+                                        // Tab on file: same as Enter (select).
+                                    } else {
+                                        continue;
+                                    }
+                                    // Fall through to Enter logic below.
+                                }
+                                KeyCode::Enter => {
+                                    // Entered when Tab also falls through for files.
+                                }
+                                _ => continue,
+                            }
+                            // ── File/directory selection (Tab or Enter) ──
+                            // Both stage a file reference: the editor keeps a
+                            // short `@path` marker, the harness reads the file
+                            // (text window, image normalization, directory
+                            // listing) at submit time. No content is inlined
+                            // here.
+                            if let Some(entry) = view.mention.current().cloned() {
+                                let display = entry.display.clone();
+                                let anchor = view.mention.anchor;
+                                let end = anchor + 1 + view.mention.query.len();
+                                view.mention.deactivate();
+                                view.editor.cursor = anchor;
+                                for _ in 0..(end - anchor) {
+                                    view.editor.delete();
+                                }
+                                view.editor.insert(&format!("@{display} "));
+                                let marker = format!("@{display}");
+                                // Re-attaching replaces the previous staging
+                                // for the same marker instead of duplicating.
+                                view.pending_attachments
+                                    .retain(|a| a.marker != marker);
+                                view.pending_attachments.push(PendingAttachment {
+                                    marker,
+                                    attachment: UserAttachment::file(
+                                        entry.path.to_string_lossy().into_owned(),
+                                        None,
+                                    ),
+                                });
+                                view.notice(
+                                    Level::Info,
+                                    format!("Attached {display}. Esc to clear."),
+                                );
+                                continue;
+                            }
+                        }
                         view.commands.sync(&view.editor.text, view.asks_empty());
                         let commands = view.commands.items();
                         if !commands.is_empty() && !ctrl && !alt {
@@ -821,6 +942,23 @@ pub async fn run(
                             }
                             KeyCode::Char('b') if ctrl => view.stats = !view.stats,
                             KeyCode::Char('y') if ctrl => view.theme = view.theme.next(),
+                            // Ctrl+V: paste an image from the clipboard. Text
+                            // paste still arrives via bracketed-paste Event::Paste;
+                            // this reads image data that bracketed paste cannot carry.
+                            KeyCode::Char('v') if ctrl => {
+                                match clipboard::read_image().await {
+                                    Ok(Some(img)) => stage_clipboard_image(&mut view, img),
+                                    Ok(None) => {
+                                        view.notice(Level::Info, "No image in clipboard.");
+                                    }
+                                    Err(e) => {
+                                        view.notice(
+                                            Level::Error,
+                                            format!("Clipboard read failed: {e}"),
+                                        );
+                                    }
+                                }
+                            }
                             KeyCode::End if ctrl => renderer.follow(&mut view),
                             KeyCode::PageUp if alt && !view.asks_empty() => {
                                 if let Some(ask) = view.ask_mut() {
@@ -1052,19 +1190,48 @@ pub async fn run(
                                 }
                                 let queued = text.starts_with("/queue ");
                                 let body = text.strip_prefix("/queue ").unwrap_or(&text);
-                                if body.trim().is_empty() {
+                                let atts = view.attachments_for(&text);
+                                let n_images = atts
+                                    .iter()
+                                    .filter(|a| matches!(a.data, AttachmentData::Base64(_)))
+                                    .count();
+                                let n_refs = atts.len() - n_images;
+                                // /queue is a mid-turn steer; it cannot carry
+                                // attachments (images or file references).
+                                if queued && !atts.is_empty() {
+                                    view.notice(
+                                        Level::Warning,
+                                        "Attachments cannot be queued. Send without /queue, or press Esc to clear them.",
+                                    );
+                                    continue;
+                                }
+                                // Allow image-only messages (no text body).
+                                if body.trim().is_empty() && atts.is_empty() {
                                     continue;
                                 }
                                 let input = if queued {
                                     In::follow_up(body)
-                                } else {
+                                } else if atts.is_empty() {
                                     In::user_text(body)
+                                } else {
+                                    In::user_text_with_attachments(body, atts)
                                 };
                                 match h.host.submit(input) {
                                     Ok(()) => {
+                                        // Clear attachments only after a successful submit,
+                                        // so a failure (e.g. turn-in-flight rejection)
+                                        // preserves them for retry.
+                                        view.pending_attachments.clear();
                                         view.editor.remember(&text);
                                         view.editor.take();
-                                        view.user(body, queued);
+                                        let mut display = body.to_string();
+                                        if n_images > 0 {
+                                            display.push_str(&format!(" [img×{n_images}]"));
+                                        }
+                                        if n_refs > 0 {
+                                            display.push_str(&format!(" [ref×{n_refs}]"));
+                                        }
+                                        view.user(&display, queued);
                                         renderer.follow(&mut view);
                                         if driver.is_none() {
                                             driver = Some(drive(
@@ -1108,6 +1275,26 @@ pub async fn run(
                                     edit(&mut ask.editor, key);
                                 } else {
                                     edit(&mut view.editor, key);
+                                    // After each keystroke, check for @ mention
+                                    // trigger. Rescan only when the query
+                                    // changed — cursor moves within the same
+                                    // query must not hit the disk again.
+                                    if let Some((anchor, query)) = mention::MentionState::detect(
+                                        &view.editor.text,
+                                        view.editor.cursor,
+                                    ) {
+                                        if !view.mention.active
+                                            || view.mention.query != query
+                                            || view.mention.entries.is_empty()
+                                        {
+                                            view.mention.entries = mention::scan(&cwd, &query);
+                                            view.mention.activate(anchor, &query);
+                                        } else {
+                                            view.mention.anchor = anchor;
+                                        }
+                                    } else if view.mention.active {
+                                        view.mention.deactivate();
+                                    }
                                 }
                             }
                         }
