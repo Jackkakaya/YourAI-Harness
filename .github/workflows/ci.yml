@@ -86,13 +86,8 @@ jobs:
         working-directory: apps/yourai-tui/tests
         run: |
           set -e
-          # Only run smoke tests that exist — some are added by later PRs.
-          for f in smoke.py smoke_launcher.py smoke_models.py; do
-            if [ -f "$f" ]; then
-              echo "::group::Running $f"
-              python3 "$f"
-              echo "::endgroup::"
-            else
-              echo "::notice::$f not found, skipping"
-            fi
+          for f in smoke.py smoke_launcher.py smoke_models.py smoke_ui.py smoke_frames.py; do
+            echo "::group::Running $f"
+            python3 "$f"
+            echo "::endgroup::"
           done

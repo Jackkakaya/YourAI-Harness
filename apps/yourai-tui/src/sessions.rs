@@ -61,6 +61,29 @@ pub fn filter_sessions(rows: &[SessionRow], query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// One display row for the sessions list: title elided to `title_w` display
+/// columns (width-padded so CJK titles align), short id, model and relative
+/// time. Shared by the launcher and the `/sessions` overlay so both render
+/// identical bodies.
+pub fn row_body(row: &SessionRow, title_w: usize, now: i64) -> String {
+    let title = crate::text::elide(&row.title, title_w);
+    let pad = title_w.saturating_sub(unicode_width::UnicodeWidthStr::width(title.as_str()));
+    let id8: String = row.id.0.chars().take(8).collect();
+    let model = if row.model.is_empty() {
+        "—".to_string()
+    } else {
+        crate::text::elide(&row.model, 16)
+    };
+    format!(
+        "{}{} {} · {:<16} · {}",
+        title,
+        " ".repeat(pad),
+        id8,
+        model,
+        relative_time(row.updated_at, now)
+    )
+}
+
 /// Relative time label: `2h ago`, `3d ago`, or `YYYY-MM-DD` beyond 30 days.
 /// `now` is unix seconds; pass `SystemTime::now()` from the caller.
 pub fn relative_time(updated_at: i64, now: i64) -> String {
@@ -108,6 +131,7 @@ fn utc_ymd(secs: u64) -> (i32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
 
     fn meta(id: &str, title: Option<&str>, model: Option<&str>, updated: i64) -> SessionMeta {
@@ -165,6 +189,31 @@ mod tests {
         assert_eq!(filter_sessions(&rows, "kimi").len(), 2);
         // "glm" matches the glm session only.
         assert_eq!(filter_sessions(&rows, "glm").len(), 1);
+    }
+
+    #[test]
+    fn row_body_elides_cjk_titles_by_display_width_and_aligns_columns() {
+        let row = SessionRow {
+            id: SessionId("d3f40178abcdef".into()),
+            title: "修复中文解析器的边界问题".into(),
+            model: "kimi-k3".into(),
+            updated_at: 0,
+            is_current: false,
+        };
+        // title_w = 10 columns: four CJK glyphs (8 cols) + ellipsis, padded
+        // one column so the id column starts exactly at title_w.
+        let body = row_body(&row, 10, 100);
+        assert!(body.contains("修复中文…"), "got: {body}");
+        let title_end = body.find(" d3f40178").unwrap();
+        let title_cols = unicode_width::UnicodeWidthStr::width(&body[..title_end]);
+        assert_eq!(title_cols, 10, "title column is display-width aligned");
+        assert!(body.contains("kimi-k3"));
+        // An empty model renders the placeholder, not an empty column.
+        let bare = SessionRow {
+            model: String::new(),
+            ..row
+        };
+        assert!(row_body(&bare, 10, 100).contains("—"));
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub enum Overlay {
         scroll: u16,
     },
     Models(usize),
+    LoadingSessions,
     Sessions(SessionPickerState),
     Themes(usize),
 }
@@ -25,39 +26,9 @@ pub enum Action {
     Session(SessionId),
     Delete(SessionId),
 }
-#[derive(PartialEq, Eq)]
-pub enum Snapshot {
-    None,
-    Help(u16),
-    Stats(u16),
-    Models(usize),
-    Themes(usize),
-    Sessions {
-        query: String,
-        selected: usize,
-        rows: usize,
-        pending_delete: Option<SessionId>,
-    },
-}
 impl Overlay {
     pub fn is_open(&self) -> bool {
         !matches!(self, Self::None)
-    }
-    /// Frame invalidation excludes immutable session rows.
-    pub fn snapshot(&self) -> Snapshot {
-        match self {
-            Self::None => Snapshot::None,
-            Self::Help { scroll } => Snapshot::Help(*scroll),
-            Self::Stats { scroll } => Snapshot::Stats(*scroll),
-            Self::Models(i) => Snapshot::Models(*i),
-            Self::Themes(i) => Snapshot::Themes(*i),
-            Self::Sessions(s) => Snapshot::Sessions {
-                query: s.query.clone(),
-                selected: s.selected,
-                rows: s.rows.len(),
-                pending_delete: s.pending_delete.as_ref().map(|r| r.id.clone()),
-            },
-        }
     }
     #[cfg(test)]
     pub fn sessions_mut(&mut self) -> Option<&mut SessionPickerState> {
@@ -70,7 +41,7 @@ impl Overlay {
         if let Self::Sessions(s) = self {
             if s.pending_delete.is_none() {
                 s.query
-                    .push_str(&super::state::clean(text).replace(['\n', '\r'], " "));
+                    .push_str(&crate::text::clean(text).replace(['\n', '\r'], " "));
                 s.selected = 0;
             }
         }
@@ -130,14 +101,11 @@ impl Overlay {
                 *self = Self::None;
             }
             Self::Sessions(s) => {
-                let filtered = crate::sessions::filter_sessions(&s.rows, &s.query);
-                if up {
-                    s.selected = s.selected.saturating_sub(1);
-                } else if down {
-                    s.selected = (s.selected + 1).min(filtered.len().saturating_sub(1));
-                } else {
+                let filtered_len = crate::sessions::filter_sessions(&s.rows, &s.query).len();
+                if !crate::picker::filter_input(key, &mut s.query, &mut s.selected, filtered_len) {
                     match key.code {
                         KeyCode::Char('d') if ctrl => {
+                            let filtered = crate::sessions::filter_sessions(&s.rows, &s.query);
                             if let Some(row) = filtered.get(s.selected).map(|i| &s.rows[*i]) {
                                 if !row.is_current {
                                     s.pending_delete = Some(row.clone());
@@ -145,22 +113,11 @@ impl Overlay {
                             }
                         }
                         KeyCode::Enter => {
+                            let filtered = crate::sessions::filter_sessions(&s.rows, &s.query);
                             if let Some(row) = filtered.get(s.selected).map(|i| &s.rows[*i]) {
                                 action = Action::Session(row.id.clone());
                                 *self = Self::None;
                             }
-                        }
-                        KeyCode::Backspace => {
-                            s.query.pop();
-                            s.selected = 0;
-                        }
-                        KeyCode::Char(c)
-                            if !key
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                        {
-                            s.query.push(c);
-                            s.selected = 0;
                         }
                         _ => {}
                     }
@@ -174,6 +131,7 @@ impl Overlay {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

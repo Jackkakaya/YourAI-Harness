@@ -17,33 +17,39 @@ const fn rgb(value: u32) -> Color {
 // Baseline slot constants = the Dark palette. Renderers build every span from
 // these (and only these) colors.
 pub(crate) const BG: Color = rgb(0x000000);
-pub(crate) const PANEL: Color = rgb(0x2C3035);
-pub(crate) const TEXT: Color = rgb(0xFFFFFF);
-pub(crate) const MUTED: Color = rgb(0xC3C7C0);
-pub(crate) const FAINT: Color = rgb(0x6B6D6A);
+pub(crate) const PANEL: Color = rgb(0x181818);
+pub(crate) const TEXT: Color = rgb(0xE8E6E3);
+pub(crate) const MUTED: Color = rgb(0xB4B1AC);
+pub(crate) const FAINT: Color = rgb(0x63615F);
 pub(crate) const YELLOW: Color = rgb(0xE7C797);
-pub(crate) const ACCENT: Color = rgb(0xC7DEB9);
+pub(crate) const ACCENT: Color = rgb(0xA8B8D0);
 pub(crate) const GREEN: Color = rgb(0xAED0AD);
 pub(crate) const RED: Color = rgb(0xE5A19A);
 pub(crate) const BLUE: Color = rgb(0xBACDE4);
 pub(crate) const CYAN: Color = rgb(0xAED5D5);
-pub(crate) const BORDER: Color = rgb(0x7E898A);
+pub(crate) const BORDER: Color = rgb(0x858580);
 pub(crate) const DIFF_ADD_BG: Color = rgb(0x1A1F1A);
 pub(crate) const DIFF_DEL_BG: Color = rgb(0x221817);
 // Syntax highlight slots (Dark baseline values, derived in `Palette::derive`
 // with fixed mixes; keep in sync: test `dark_baseline_slots_match_palette`).
-pub(crate) const SY_KEYWORD: Color = rgb(0xD8BCA8);
+pub(crate) const SY_KEYWORD: Color = rgb(0xCAABB2);
 pub(crate) const SY_STRING: Color = rgb(0xE6B499);
-pub(crate) const SY_FUNCTION: Color = rgb(0xF2E0C6);
-pub(crate) const SY_TYPE: Color = rgb(0xB8D9CA);
-pub(crate) const SY_NUMBER: Color = rgb(0xB5D4B0);
-pub(crate) const SY_COMMENT: Color = rgb(0xBACBB7);
-pub(crate) const SY_OPERATOR: Color = rgb(0xF7EBDB);
-pub(crate) const SY_PUNCT: Color = rgb(0xE1E3E0);
-pub(crate) const SY_VARIABLE: Color = rgb(0xE0E9F3);
+pub(crate) const SY_FUNCTION: Color = rgb(0xE7D5B9);
+pub(crate) const SY_TYPE: Color = rgb(0xACC9D3);
+pub(crate) const SY_NUMBER: Color = rgb(0xACC9B7);
+pub(crate) const SY_COMMENT: Color = rgb(0xB8B5B0);
+pub(crate) const SY_OPERATOR: Color = rgb(0xE0DEDB);
+pub(crate) const SY_PUNCT: Color = rgb(0xCECCC8);
+pub(crate) const SY_VARIABLE: Color = rgb(0xD3DBE3);
+
+pub(crate) const USER_SURFACE: Color = rgb(0x101010);
+
+pub(crate) const CODE_SURFACE: Color = rgb(0x0B0B0B);
+
+pub(crate) const FOCUS_SURFACE: Color = rgb(0x292828);
 
 /// Lookup ordering must match `Palette::slots()` exactly.
-pub(crate) const SLOTS: [Color; 23] = [
+pub(crate) const SLOTS: [Color; 26] = [
     BG,
     PANEL,
     TEXT,
@@ -67,6 +73,9 @@ pub(crate) const SLOTS: [Color; 23] = [
     SY_OPERATOR,
     SY_PUNCT,
     SY_VARIABLE,
+    USER_SURFACE,
+    CODE_SURFACE,
+    FOCUS_SURFACE,
 ];
 
 /// Linear interpolation between two RGB colors; `t = 0` keeps `a`, `t = 1` is `b`.
@@ -89,6 +98,9 @@ pub(crate) fn mix(from: Color, toward: Color, t: f32) -> Color {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
+    pub focus_surface: Color,
+    pub code_surface: Color,
+    pub user_surface: Color,
     pub bg: Color,
     pub panel: Color,
     pub text: Color,
@@ -115,7 +127,7 @@ pub struct Palette {
 }
 impl Palette {
     /// Same slot order as `SLOTS`.
-    fn slots(self) -> [Color; 23] {
+    fn slots(self) -> [Color; 26] {
         [
             self.bg,
             self.panel,
@@ -140,6 +152,9 @@ impl Palette {
             self.sy_operator,
             self.sy_punct,
             self.sy_variable,
+            self.user_surface,
+            self.code_surface,
+            self.focus_surface,
         ]
     }
     /// Build from the 11 base IDE colors; faint, diff surfaces and the nine
@@ -186,9 +201,12 @@ impl Palette {
             sy_function: mix(yellow_c, text_c, 0.45),
             sy_type: mix(cyan_c, accent_c, 0.4),
             sy_number: mix(green_c, accent_c, 0.28),
-            sy_comment: mix(muted_c, green_c, 0.45),
-            sy_operator: mix(text_c, yellow_c, 0.35),
+            sy_comment: mix(muted_c, text_c, 0.08),
+            sy_operator: mix(text_c, muted_c, 0.15),
             sy_punct: mix(muted_c, text_c, 0.5),
+            user_surface: mix(bg_c, rgb(panel), 2.0 / 3.0),
+            code_surface: mix(bg_c, rgb(panel), 0.47),
+            focus_surface: mix(rgb(panel), text_c, 0.08),
             sy_variable: mix(blue_c, text_c, 0.55),
         }
     }
@@ -261,8 +279,8 @@ impl Theme {
     pub fn palette(self) -> Palette {
         match self.effective() {
             Self::Dark | Self::System => Palette::derive(
-                0x000000, 0x2C3035, 0xFFFFFF, 0xC3C7C0, 0xC7DEB9, 0xAED0AD, 0xE5A19A, 0xE7C797,
-                0xBACDE4, 0xAED5D5, 0x7E898A,
+                0x000000, 0x181818, 0xE8E6E3, 0xB4B1AC, 0xA8B8D0, 0xAED0AD, 0xE5A19A, 0xE7C797,
+                0xBACDE4, 0xAED5D5, 0x858580,
             ),
             Self::Light => Palette::derive(
                 0xFAFAF7, 0xE3E5DF, 0x161B16, 0x414A3E, 0x35522C, 0x2F633B, 0x98352E, 0x76520D,
@@ -409,6 +427,7 @@ pub(crate) fn resolve_system_from_os() {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
 
     #[test]
@@ -431,8 +450,8 @@ mod tests {
                 ("sy_function", p.sy_function, mix(p.yellow, p.text, 0.45)),
                 ("sy_type", p.sy_type, mix(p.cyan, p.accent, 0.4)),
                 ("sy_number", p.sy_number, mix(p.green, p.accent, 0.28)),
-                ("sy_comment", p.sy_comment, mix(p.muted, p.green, 0.45)),
-                ("sy_operator", p.sy_operator, mix(p.text, p.yellow, 0.35)),
+                ("sy_comment", p.sy_comment, mix(p.muted, p.text, 0.08)),
+                ("sy_operator", p.sy_operator, mix(p.text, p.muted, 0.15)),
                 ("sy_punct", p.sy_punct, mix(p.muted, p.text, 0.5)),
                 ("sy_variable", p.sy_variable, mix(p.blue, p.text, 0.55)),
             ];
@@ -529,7 +548,10 @@ mod tests {
     fn primary_themes_keep_text_and_boundaries_distinct() {
         for theme in [Theme::Dark, Theme::Light] {
             let p = theme.palette();
-            for surface in [p.bg, p.panel] {
+            assert!(contrast(p.text, p.focus_surface) >= 7.0);
+            assert!(contrast(p.muted, p.focus_surface) >= 4.5);
+            assert!(contrast(p.accent, p.focus_surface) >= 4.5);
+            for surface in [p.bg, p.panel, p.user_surface, p.code_surface] {
                 assert!(contrast(p.text, surface) >= 12.0);
                 assert!(contrast(p.muted, surface) >= 7.0);
                 assert!(contrast(p.border, surface) >= 3.0);

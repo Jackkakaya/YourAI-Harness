@@ -86,7 +86,10 @@ impl Selection {
         if self.screen.as_ref().is_some_and(|s| s.area != buffer.area) {
             self.clear();
         }
-        self.screen = Some(buffer.clone());
+        match &mut self.screen {
+            Some(screen) => screen.clone_from(buffer),
+            None => self.screen = Some(buffer.clone()),
+        }
         if !self.active() {
             return;
         }
@@ -112,6 +115,7 @@ impl Selection {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
     use ratatui::style::Style;
     #[test]

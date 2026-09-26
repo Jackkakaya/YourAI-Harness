@@ -17,3 +17,17 @@ genai = "0.6.5"
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Keep local `cargo run` responsive without optimizing the entire application.
+# Debug symbols and assertions remain enabled; target the frame and text hot paths.
+[profile.dev.package.yourai-tui]
+opt-level = 1
+
+[profile.dev.package.ratatui]
+opt-level = 2
+
+[profile.dev.package.unicode-width]
+opt-level = 2
+
+[profile.dev.package.unicode-segmentation]
+opt-level = 2

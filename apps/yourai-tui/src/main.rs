@@ -4,6 +4,7 @@ mod models;
 mod picker;
 mod sessions;
 mod terminal;
+mod text;
 mod ui;
 use config::{Config, Error};
 use std::{io::IsTerminal, path::PathBuf, sync::Arc};
@@ -80,7 +81,8 @@ async fn run() -> Result<(), Error> {
         );
         return Ok(());
     }
-    let model = config.resolve(variant.as_deref())?;
+    let (model, context) = config.resolve(variant.as_deref())?;
+    config.context = context;
     config.selected_variant = variant;
     if config.context.input_budget().is_none() {
         eprintln!("Context window unknown: configure provider.<id>.models.<id>.limit.context to enable automatic/manual summarization.");
@@ -109,12 +111,7 @@ async fn run() -> Result<(), Error> {
         }
     }
     let mut hc = HarnessConfig::new(config.session_dir.clone(), std::env::current_dir()?);
-    hc.model_provider = config
-        .model
-        .split_once('/')
-        .map(|(p, _)| p)
-        .unwrap_or_default()
-        .into();
+    hc.model_provider = config.provider_id().into();
     hc.request_policy = request_policy.clone();
     hc.model_header_timeout = model_header_timeout;
     hc.model_chunk_timeout = model_chunk_timeout;
