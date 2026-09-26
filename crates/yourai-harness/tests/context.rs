@@ -746,3 +746,50 @@ async fn compact_uses_message_content_without_opening_media_locations() {
         .iter()
         .any(|p| matches!(p, ContentPart::Binary(_))));
 }
+
+/// Regression for the attachment feature: `GenaiModel` must implement
+/// `media_tokens`. Before it did, the fail-closed trait default made
+/// `MemoryContext::build_request` reject every request whose history
+/// contained a Binary part ("media budgeting/capability is not configured").
+#[tokio::test]
+async fn binary_attachment_builds_request_with_genai_model() {
+    use base64::Engine as _;
+    let model = yourai_harness::GenaiModel::new(
+        genai::Client::builder().build(),
+        "test-model",
+    );
+    let (_dir, _store, c) = setup(policy(), Arc::new(model), None).await;
+    // Blank 2000x2000 PNG — compresses to a tiny payload but keeps full
+    // dimensions for the estimator.
+    let img = image::DynamicImage::new_rgb8(2000, 2000);
+    let mut buf = Vec::new();
+    img.to_rgb8()
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .unwrap();
+    let data = base64::engine::general_purpose::STANDARD.encode(&buf);
+    append(
+        &c,
+        vec![ChatMessage::user(MessageContent::from_parts(vec![
+            ContentPart::from_text("describe this"),
+            ContentPart::from_binary_base64("image/png", data.as_str(), None),
+        ]))],
+    )
+    .await;
+    let request = c.build_request(&[]).unwrap();
+    // 2000x2000 -> max(anthropic 1568^2/750 = 3279, openai 4 tiles = 765).
+    assert!(
+        request.estimated_tokens >= 3279,
+        "image tokens must be counted: {}",
+        request.estimated_tokens
+    );
+    // ... and the Binary part survives into the outgoing request.
+    assert!(request
+        .request
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .parts()
+        .iter()
+        .any(|p| matches!(p, ContentPart::Binary(_))));
+}

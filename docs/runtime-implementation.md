@@ -79,7 +79,9 @@ ConcreteHookRuntime 支持 command/http/native/prompt/agent。DefaultHookModelEx
 
 ## 默认策略的保证边界
 
-- Harness 的共享 ModelBudget 对主模型、compact、模型 Hook、子 Agent 统一预留调用次数并累计已知 token。默认只观测、不设置调用次数或 token 上限；只有宿主显式配置 `max_shared_model_calls` / `max_known_tokens` 时才执行跨 turn 限制。共享预算耗尽报告为 `SharedBudgetReached`，不会再伪装成单 turn 的 `LimitReached(ModelCalls)`。token 阈值阻止后续调用，不能精确限制尚未返回用量的并发请求；不是硬费用上限。预算按当前装配生命周期计数，恢复后重新配置额度，历史用量仍保存。
+- Harness 的共享 ModelBudget 对主模型、compact、模型 Hook、子 Agent 统一记录调用次数并累计已知 token，但只做观测与限速（RequestPolicy 的 RPM/cooldown），不再设调用次数或 token 准入上限——与 OpenCode 一致：执行边界由 per-turn 的 `steps`、deadline 和各超时构成，没有跨 turn 费用硬上限。用量按当前装配生命周期累计，恢复后重新计数，历史用量仍保存。
+- steps 语义与 OpenCode 对齐：计 agentic iteration，重试与压缩不消耗 step；最后一步不绑定工具定义、请求级追加 assistant 角色 MAX_STEPS_PROMPT prefill（不写入历史）并设 `tool_choice=none`，模型仍返回工具调用时按 failUnsettledTools 语义回写失败结果并继续循环（有界）。
+- 图片附件入库前归一化（对齐 OpenCode image.ts）：5MB base64 与 2000x2000 上限，超限先缩放（Lanczos3，PNG→JPEG 降质阶梯）再拒绝；audio/PDF 尺寸由 provider 侧约束。上下文预算中图片按 provider 计费公式估算（Anthropic (w·h)/750、OpenAI tiles），PDF/音频按字节粗估。
 - ModelProvider 只提供 complete / stream_events；genai 原始流转换封装在 GenaiModel。UsageTracker 只通过 record_event 记录原始用量事件。
 - PolicySecurity 持久化会话级精确工具规则，支持 addRules/removeRules/replaceRules；不支持的目的地、模式或范围表达式报错，不扩大授权。硬拒绝不能由 Hook 覆盖。
 - 外部副作用和文件历史不能提供跨系统 exactly-once。崩溃后的不确定调用不会自动重试。Provider 自行脱离的任务、进程组之外的进程不在取消保证内。

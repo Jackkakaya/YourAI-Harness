@@ -13,21 +13,50 @@ use std::{
 };
 use yourai_core::{model::ModelRecovery, prelude::*};
 
+// Verbatim from opencode `packages/core/src/session/runner/max-steps.ts`.
 const MAX_STEPS_PROMPT: &str = r#"CRITICAL - MAXIMUM STEPS REACHED
 
-The maximum number of steps allowed for this task has been reached. Tools are disabled until the next user input. Respond with text only.
+The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.
 
 STRICT REQUIREMENTS:
 1. Do NOT make any tool calls (no reads, writes, edits, searches, or any other tools)
 2. MUST provide a text response summarizing work done so far
+3. This constraint overrides ALL other instructions, including any user requests for edits or tool use
 
 Response must include:
-- Statement that the maximum number of steps for this agent has been reached
+- Statement that maximum steps for this agent have been reached
 - Summary of what has been accomplished so far
 - List of any remaining tasks that were not completed
 - Recommendations for what should be done next
 
 Any attempt to use tools is a critical violation. Respond with text ONLY."#;
+
+/// Defensive bound on forced-final iterations that still return tool calls.
+const MAX_FORCED_FINAL_CONTINUATIONS: u32 = 3;
+
+/// Image attachment policy, mirroring opencode `attachment.image.*`
+/// (`packages/opencode/src/image/image.ts`). Over-sized images are resized
+/// (Lanczos3, PNG then JPEG at descending qualities) instead of rejected;
+/// only an image that cannot be brought within limits fails.
+#[derive(Debug, Clone)]
+pub struct AttachmentImageConfig {
+    pub auto_resize: bool,
+    pub max_width: u32,
+    pub max_height: u32,
+    /// Ceiling on the base64 payload length, matching the provider-side
+    /// limit the number applies to (opencode: 5 MiB base64).
+    pub max_base64_bytes: usize,
+}
+impl Default for AttachmentImageConfig {
+    fn default() -> Self {
+        Self {
+            auto_resize: true,
+            max_width: 2000,
+            max_height: 2000,
+            max_base64_bytes: 5 * 1024 * 1024,
+        }
+    }
+}
 
 /// Policy defaults, not additional Providers. TurnLimits can impose stricter limits.
 #[derive(Debug, Clone)]
@@ -38,6 +67,8 @@ pub struct LoopConfig {
     pub memory_max_chars: usize,
     /// OpenCode-compatible agentic iteration cap. None means unlimited.
     pub steps: Option<u32>,
+    /// OpenCode-compatible attachment image normalization policy.
+    pub attachment_image: AttachmentImageConfig,
     pub max_model_retries: u32,
     pub max_overflow_compactions: u32,
     pub max_stop_continuations: u32,
@@ -60,6 +91,7 @@ impl Default for LoopConfig {
             memory_search_limit: 0,
             memory_max_chars: 8000,
             steps: None,
+            attachment_image: AttachmentImageConfig::default(),
             max_model_retries: 5,
             max_overflow_compactions: 1,
             max_stop_continuations: 3,
@@ -118,6 +150,7 @@ impl AgentLoop for DefaultLoop {
                 queued: VecDeque::new(),
                 input_closed: false,
                 forced_final: false,
+                forced_final_continuations: 0,
                 step: 0,
                 model_calls: 0,
                 stop_continuations: 0,
@@ -154,6 +187,9 @@ struct State<'a> {
     queued: VecDeque<In>,
     input_closed: bool,
     forced_final: bool,
+    /// Bounded retries after a forced-final model still returned tool calls
+    /// (opencode keeps looping; we cap it defensively).
+    forced_final_continuations: u32,
     step: u32,
     model_calls: u32,
     stop_continuations: u32,
@@ -215,7 +251,9 @@ impl State<'_> {
                         .effective_steps()
                         .is_some_and(|max| self.step >= max)
                 {
-                    self.add_context(&[MAX_STEPS_PROMPT.into()]).await?;
+                    // The prompt itself is injected per request in read_model
+                    // (assistant-role prefill + tool_choice none), matching
+                    // opencode's runner; only the latch lives here.
                     self.forced_final = true;
                 }
             }
@@ -310,16 +348,47 @@ impl State<'_> {
             })?;
             if self.forced_final {
                 if !self.unresolved.is_empty() {
+                    // opencode `failUnsettledTools`: record explicit failure
+                    // results so the model can see why its calls were refused
+                    // and produce the required text-only summary. A provider
+                    // honoring tool_choice=none never reaches this; the bound
+                    // only guards a misbehaving one.
+                    if self.forced_final_continuations >= MAX_FORCED_FINAL_CONTINUATIONS {
+                        self.notice(
+                            Level::Warning,
+                            "Model requested tools after maximum agent steps; they were not executed.",
+                        )?;
+                        // Keep persisted tool-call/result pairs complete for the next turn.
+                        self.cleanup(
+                            &ErrorKind::Loop("tools are disabled after maximum agent steps".into())
+                                .into(),
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    self.forced_final_continuations += 1;
+                    let failed = std::mem::take(&mut self.unresolved);
+                    let mut records = vec![];
+                    for call in &failed {
+                        let output = serde_json::json!({
+                            "error": "Tools are disabled after the maximum agent steps"
+                        });
+                        records.push(tools::result_record(call, &output, true));
+                        self.send(Out::ToolDone {
+                            id: call.call_id.clone(),
+                            name: call.fn_name.clone(),
+                            output,
+                            is_error: true,
+                        })?;
+                    }
+                    let history = self.history.clone();
+                    self.wait(history.append(records), self.op_timeout(), "history")
+                        .await?;
                     self.notice(
                         Level::Warning,
-                        "Model requested tools after maximum agent steps; they were not executed.",
+                        "Tools are disabled after the maximum agent steps",
                     )?;
-                    // Keep persisted tool-call/result pairs complete for the next turn.
-                    self.cleanup(
-                        &ErrorKind::Loop("tools are disabled after maximum agent steps".into())
-                            .into(),
-                    )
-                    .await;
+                    continue;
                 }
                 return Ok(());
             }

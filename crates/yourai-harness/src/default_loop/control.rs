@@ -193,7 +193,7 @@ impl State<'_> {
         } else {
             let mut parts = vec![ContentPart::from_text(text.clone())];
             for att in &attachments {
-                parts.push(attachment_to_part(att)?);
+                parts.push(attachment_to_part(att, &self.config.attachment_image)?);
             }
             ChatMessage::user(MessageContent::from_parts(parts))
         };
@@ -342,21 +342,35 @@ impl State<'_> {
     }
 }
 
-// ── attachment validation & genai Binary conversion ──────────────────
+// ── attachment normalization & genai Binary conversion ────────────────
+//
+// Mirrors opencode `packages/opencode/src/image/image.ts`:
+// - images are normalized before entering history: within-limit images pass
+//   through untouched, over-limit images are resized (Lanczos3; PNG first,
+//   then JPEG at qualities 80/85/70/55/40; dimensions shrink ×0.75 per
+//   ladder step, at most 32 candidates) and only an image that cannot be
+//   brought within limits fails;
+// - audio and PDF sizes are provider-side concerns and pass through.
 
-/// Maximum decoded payload for a single attachment (20 MiB).
-///
-/// This is the most restrictive ceiling across the providers genai targets:
-/// - OpenAI accepts images up to ~20 MB.
-/// - Anthropic accepts base64 image data up to ~32 MB (~24 MB decoded).
-///
-/// 20 MiB decoded is safe for both.
-const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+use base64::{
+    engine::{
+        general_purpose::{GeneralPurpose, GeneralPurposeConfig},
+        DecodePaddingMode,
+    },
+    Engine as _,
+};
 
-/// Validate a [`UserAttachment`] and convert it to a genai
-/// [`ContentPart::Binary`].
-///
-/// ## How genai handles Binary per provider
+/// Standard alphabet, tolerant of missing padding on decode (frontends may
+/// emit unpadded base64); always encodes with padding.
+static BASE64: GeneralPurpose = GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+
+/// opencode JPEG quality ladder (80 deliberately before 85).
+const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
+
+/// How genai handles Binary per provider
 ///
 /// Binary parts are **only** processed in **User-role** messages; genai's
 /// adapter code for assistant/tool roles silently ignores them. Since we
@@ -373,15 +387,10 @@ const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 /// URL-sourced binaries have provider gaps (Anthropic can't do image URLs;
 /// OpenAI can't do file URLs) — genai warns and skips those. We only emit
 /// `BinarySource::Base64`, so both providers are covered.
-///
-/// ## Validation
-///
-/// 1. `content_type` must be `image/*`, `audio/*`, or `application/pdf` —
-///    anything else is rejected with a clear error rather than silently
-///    dropped by an adapter.
-/// 2. The decoded payload (estimated from base64 length) must not exceed
-///    [`MAX_ATTACHMENT_BYTES`].
-fn attachment_to_part(att: &UserAttachment) -> Result<ContentPart, YourAiError> {
+fn attachment_to_part(
+    att: &UserAttachment,
+    cfg: &super::AttachmentImageConfig,
+) -> Result<ContentPart, YourAiError> {
     let ct = att.content_type.trim().to_ascii_lowercase();
     if !(ct.starts_with("image/") || ct.starts_with("audio/") || ct == "application/pdf") {
         return Err(ErrorKind::Config(format!(
@@ -389,23 +398,116 @@ fn attachment_to_part(att: &UserAttachment) -> Result<ContentPart, YourAiError> 
         ))
         .into());
     }
-    // Estimate decoded size from base64 length: 4 base64 chars ≈ 3 bytes.
-    // This is a slight over-estimate when padding is present, which is fine
-    // for a ceiling check.
-    let estimated_bytes = att.data.len().saturating_mul(3) / 4;
-    if estimated_bytes > MAX_ATTACHMENT_BYTES {
-        return Err(ErrorKind::Config(format!(
-            "attachment too large: ~{} MiB exceeds the {} MiB limit",
-            estimated_bytes / (1024 * 1024),
-            MAX_ATTACHMENT_BYTES / (1024 * 1024),
-        ))
-        .into());
-    }
+    let (mime, data) = if ct.starts_with("image/") {
+        normalize_image(att, &ct, cfg)?
+    } else {
+        (ct, att.data.clone())
+    };
     Ok(ContentPart::from_binary_base64(
-        ct,
-        att.data.as_str(),
+        mime,
+        data.as_str(),
         att.name.clone(),
     ))
+}
+
+fn size_error(
+    width: u32,
+    height: u32,
+    bytes: usize,
+    cfg: &super::AttachmentImageConfig,
+) -> YourAiError {
+    ErrorKind::Config(format!(
+        "Image {width}x{height} with base64 size {bytes} exceeds configured limits and could not be resized below {}x{}/{} bytes",
+        cfg.max_width, cfg.max_height, cfg.max_base64_bytes
+    ))
+    .into()
+}
+
+/// Decode, size-check and (if needed) resize one image attachment.
+/// Returns the effective MIME type and base64 payload.
+fn normalize_image(
+    att: &UserAttachment,
+    ct: &str,
+    cfg: &super::AttachmentImageConfig,
+) -> Result<(String, String), YourAiError> {
+    let bytes = BASE64
+        .decode(att.data.as_bytes())
+        .map_err(|_| ErrorKind::Config("attachment image is not valid base64".into()))?;
+    let image = image::load_from_memory(&bytes)
+        .map_err(|_| ErrorKind::Config("attachment image could not be decoded".into()))?;
+    let (width, height) = (image.width(), image.height());
+    if width <= cfg.max_width
+        && height <= cfg.max_height
+        && att.data.len() <= cfg.max_base64_bytes
+    {
+        // Fast path: within limits, pass the original payload through
+        // untouched (no re-encode, no quality loss).
+        return Ok((ct.to_owned(), att.data.clone()));
+    }
+    if !cfg.auto_resize {
+        return Err(size_error(width, height, att.data.len(), cfg));
+    }
+    let scale = 1f64
+        .min(cfg.max_width as f64 / width as f64)
+        .min(cfg.max_height as f64 / height as f64);
+    let mut size = (
+        ((width as f64 * scale).round() as u32).max(1),
+        ((height as f64 * scale).round() as u32).max(1),
+    );
+    // At most 32 candidate sizes, shrinking ×0.75 each step (opencode ladder).
+    for _ in 0..32 {
+        let resized = image.resize_exact(size.0, size.1, image::imageops::FilterType::Lanczos3);
+        let mut candidates = vec![("image/png", encode_png(&resized))];
+        for quality in JPEG_QUALITIES {
+            candidates.push(("image/jpeg", encode_jpeg(&resized, quality)));
+        }
+        let encoded = candidates
+            .into_iter()
+            .map(|(mime, result)| result.map(|data| (mime, data)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some((mime, data)) = encoded
+            .into_iter()
+            .find(|(_, data)| data.len() <= cfg.max_base64_bytes)
+        {
+            return Ok((mime.into(), data));
+        }
+        let next = (
+            shrink_step(size.0),
+            shrink_step(size.1),
+        );
+        if next == size {
+            break;
+        }
+        size = next;
+    }
+    Err(size_error(width, height, att.data.len(), cfg))
+}
+
+fn shrink_step(dim: u32) -> u32 {
+    if dim == 1 {
+        1
+    } else {
+        ((dim as f64 * 0.75).floor() as u32).max(1)
+    }
+}
+
+fn encode_png(image: &image::DynamicImage) -> Result<String, YourAiError> {
+    let mut buf = Vec::new();
+    image
+        .to_rgb8()
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e| ErrorKind::Config(format!("png re-encode failed: {e}")))?;
+    Ok(BASE64.encode(&buf))
+}
+
+fn encode_jpeg(image: &image::DynamicImage, quality: u8) -> Result<String, YourAiError> {
+    let mut buf = Vec::new();
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+    image
+        .to_rgb8()
+        .write_with_encoder(encoder)
+        .map_err(|e| ErrorKind::Config(format!("jpeg re-encode failed: {e}")))?;
+    Ok(BASE64.encode(&buf))
 }
 
 #[cfg(test)]
@@ -420,45 +522,114 @@ mod tests {
         }
     }
 
+    /// Blank in-memory image, base64-encoded.
+    fn blank_png_base64(width: u32, height: u32) -> String {
+        let img = image::DynamicImage::new_rgb8(width, height);
+        encode_png(&img).unwrap()
+    }
+
+    /// Deterministic high-entropy image that resists PNG/JPEG compression.
+    fn noisy_png_base64(width: u32, height: u32) -> String {
+        let mut buf = image::RgbImage::new(width, height);
+        for (x, y, pixel) in buf.enumerate_pixels_mut() {
+            let v = ((x.wrapping_mul(31) as u64 + y.wrapping_mul(17) as u64
+                + (x as u64) * (y as u64))
+                % 256) as u8;
+            *pixel = image::Rgb([v, v.wrapping_mul(3), v.wrapping_mul(7)]);
+        }
+        encode_png(&image::DynamicImage::from(buf)).unwrap()
+    }
+
+    fn limits() -> super::super::AttachmentImageConfig {
+        super::super::AttachmentImageConfig {
+            auto_resize: true,
+            max_width: 64,
+            max_height: 64,
+            max_base64_bytes: 5 * 1024 * 1024,
+        }
+    }
+
+    fn part_dims(part: &ContentPart) -> (u32, u32) {
+        let binary = part.as_binary().unwrap();
+        let BinarySource::Base64(data) = &binary.source else {
+            panic!("expected base64 source");
+        };
+        let bytes = BASE64.decode(data.as_bytes()).unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        (img.width(), img.height())
+    }
+
     #[test]
-    fn image_attachment_converts_to_binary_image() {
-        let part = attachment_to_part(&att("image/png", "iVBORw0KGgo=")).unwrap();
+    fn image_attachment_within_limits_passes_through_unchanged() {
+        let data = blank_png_base64(8, 8);
+        let part = attachment_to_part(&att("image/png", &data), &limits()).unwrap();
         let binary = part.as_binary().unwrap();
         assert!(binary.is_image());
         assert_eq!(binary.content_type, "image/png");
         assert_eq!(binary.name.as_deref(), Some("test.bin"));
-        // Base64 source is preserved verbatim.
-        assert!(matches!(&binary.source, BinarySource::Base64(b) if b.as_ref() == "iVBORw0KGgo="));
+        // Fast path: base64 source is preserved verbatim, no re-encode.
+        assert!(
+            matches!(&binary.source, BinarySource::Base64(b) if b.as_ref() == data),
+            "within-limit image must not be re-encoded"
+        );
     }
 
     #[test]
-    fn pdf_and_audio_are_accepted() {
-        let pdf = attachment_to_part(&att("application/pdf", "JVBERi0=")).unwrap();
+    fn oversized_image_is_resized_by_default() {
+        let part = attachment_to_part(&att("image/png", &noisy_png_base64(100, 100)), &limits())
+            .unwrap();
+        let (w, h) = part_dims(&part);
+        assert!(w <= 64 && h <= 64, "resized to {w}x{h}");
+        assert!(part.as_binary().unwrap().is_image());
+    }
+
+    #[test]
+    fn byte_limit_drives_further_shrinking() {
+        let mut cfg = limits();
+        cfg.max_base64_bytes = 200; // forces the ladder well below 64x64
+        let part = attachment_to_part(&att("image/png", &noisy_png_base64(200, 200)), &cfg).unwrap();
+        let (w, h) = part_dims(&part);
+        assert!(w <= 64 && h <= 64);
+        let BinarySource::Base64(data) = &part.as_binary().unwrap().source else {
+            panic!()
+        };
+        assert!(data.len() <= 200, "base64 len {} exceeds limit", data.len());
+    }
+
+    #[test]
+    fn oversized_image_without_auto_resize_is_rejected() {
+        let mut cfg = limits();
+        cfg.auto_resize = false;
+        let err =
+            attachment_to_part(&att("image/png", &noisy_png_base64(100, 100)), &cfg).unwrap_err();
+        assert!(err.to_string().contains("exceeds configured limits"));
+    }
+
+    #[test]
+    fn invalid_image_data_is_rejected() {
+        let err = attachment_to_part(&att("image/png", "aGVsbG8="), &limits()).unwrap_err();
+        assert!(err.to_string().contains("could not be decoded"));
+    }
+
+    #[test]
+    fn pdf_and_audio_pass_through_without_size_checks() {
+        let pdf = attachment_to_part(&att("application/pdf", "JVBERi0="), &limits()).unwrap();
         assert!(pdf.as_binary().unwrap().is_pdf());
 
-        let audio = attachment_to_part(&att("audio/wav", "UklGRiQ=")).unwrap();
+        let audio = attachment_to_part(&att("audio/wav", "UklGRiQ="), &limits()).unwrap();
         assert!(audio.as_binary().unwrap().is_audio());
     }
 
     #[test]
     fn unsupported_content_type_is_rejected() {
-        let err = attachment_to_part(&att("text/plain", "aGVsbG8=")).unwrap_err();
+        let err = attachment_to_part(&att("text/plain", "aGVsbG8="), &limits()).unwrap_err();
         assert!(err.to_string().contains("unsupported attachment type"));
     }
 
     #[test]
-    fn oversized_attachment_is_rejected() {
-        // base64 length L → decoded ≈ L*3/4 (integer division).  We need
-        // estimated_bytes > MAX_ATTACHMENT_BYTES, so add enough margin to
-        // clear the integer-division boundary.
-        let big = "A".repeat(MAX_ATTACHMENT_BYTES * 4 / 3 + 100);
-        let err = attachment_to_part(&att("image/png", &big)).unwrap_err();
-        assert!(err.to_string().contains("too large"));
-    }
-
-    #[test]
     fn content_type_is_case_insensitive_and_trimmed() {
-        let part = attachment_to_part(&att("  IMAGE/PNG  ", "iVBORw0KGgo=")).unwrap();
+        let data = blank_png_base64(8, 8);
+        let part = attachment_to_part(&att("  IMAGE/PNG  ", &data), &limits()).unwrap();
         assert_eq!(part.as_binary().unwrap().content_type, "image/png");
     }
 }

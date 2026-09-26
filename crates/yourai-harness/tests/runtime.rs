@@ -13,9 +13,13 @@ use yourai_harness::{collaboration::*, *};
 
 #[test]
 fn default_agent_budgets_are_unlimited() {
-    HarnessConfig::new("sessions".into(), ".".into());
     let loop_config = default_loop::LoopConfig::default();
     assert_eq!(loop_config.steps, None);
+    // OpenCode attachment.image defaults: 5 MiB base64 / 2000x2000 / resize.
+    assert!(loop_config.attachment_image.auto_resize);
+    assert_eq!(loop_config.attachment_image.max_width, 2000);
+    assert_eq!(loop_config.attachment_image.max_height, 2000);
+    assert_eq!(loop_config.attachment_image.max_base64_bytes, 5 * 1024 * 1024);
 }
 
 fn context(

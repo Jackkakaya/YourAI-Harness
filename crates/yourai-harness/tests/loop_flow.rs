@@ -46,13 +46,16 @@ async fn image_attachment_is_committed_as_binary_and_reaches_the_model() {
     let history = Arc::new(History::default());
     let model = Arc::new(Model::new(vec![answer("ok")]));
     let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
+    // attachment_to_part decodes and normalizes image attachments, so the
+    // payload must be a real image.
+    let data = tiny_png_base64();
     let (_events, result) = collect(
         agent
             .start(In::user_text_with_attachments(
                 "describe this",
                 vec![UserAttachment {
                     content_type: "image/png".into(),
-                    data: "iVBORw0KGgo=".into(),
+                    data,
                     name: Some("clip.png".into()),
                 }],
             ))
@@ -81,6 +84,18 @@ async fn image_attachment_is_committed_as_binary_and_reaches_the_model() {
         .find(|m| m.role == ChatRole::User)
         .unwrap();
     assert_eq!(req_user.content.binaries().len(), 1);
+}
+
+/// Real 8x8 PNG, base64-encoded — the loop decodes image attachments for
+/// normalization, so fabricated payloads are rejected.
+fn tiny_png_base64() -> String {
+    let img = image::DynamicImage::new_rgb8(8, 8);
+    let mut buf = Vec::new();
+    img.to_rgb8()
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .unwrap();
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(&buf)
 }
 #[tokio::test]
 async fn tools_record_success_and_failure_then_model_continues() {
@@ -459,33 +474,65 @@ async fn model_call_limit_forces_final_text_only_summary() {
         .unwrap_or(&[])
         .is_empty());
     assert_eq!(h.inputs.lock().unwrap().len(), 1);
+    // OpenCode runner alignment: the final request carries an assistant-role
+    // MAX_STEPS_PROMPT prefill (request-only, never persisted) and forbids
+    // tool calls at the API level.
+    let last = requests[1].request.messages.last().unwrap();
+    assert_eq!(last.role, ChatRole::Assistant);
+    assert!(last
+        .content
+        .first_text()
+        .is_some_and(|t| t.contains("MAXIMUM STEPS REACHED")));
+    assert_eq!(requests[1].options.tool_choice, Some(ToolChoice::None));
 }
 #[tokio::test]
 async fn model_call_limit_never_executes_calls_from_the_final_step() {
     let h = Arc::new(Handler::new("tool", Mode::Return));
     let registry = Arc::new(Registry::default());
     registry.register(h.clone());
-    let model = Arc::new(Model::new(vec![calls(&["tool"])]));
-    let agent = builder(
-        model.clone(),
-        Arc::new(History::default()),
-        LoopConfig::default(),
-    )
-    .tools(registry)
-    .build();
+    // The final step still returns a tool call; opencode failUnsettledTools
+    // semantics feed an explicit failure result back so the model can produce
+    // the required text-only summary on the next iteration.
+    let model = Arc::new(Model::new(vec![calls(&["tool"]), answer("wrapped up")]));
+    let history = Arc::new(History::default());
+    let agent = builder(model.clone(), history.clone(), LoopConfig::default())
+        .tools(registry)
+        .build();
     let mut options = TurnOptions::default();
     options.limits.steps = Some(1);
     let result = agent.run_with(In::user_text("go"), options).await.unwrap();
     assert!(h.inputs.lock().unwrap().is_empty());
-    assert_eq!(result.text, "");
+    assert_eq!(result.text, "wrapped up");
     let requests = model.requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0]
-        .request
-        .tools
-        .as_deref()
-        .unwrap_or(&[])
-        .is_empty());
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(request
+            .request
+            .tools
+            .as_deref()
+            .unwrap_or(&[])
+            .is_empty());
+        assert_eq!(request.options.tool_choice, Some(ToolChoice::None));
+    }
+    // The refused call is persisted as an error tool result so history stays
+    // complete for the next turn.
+    let tool_message = history
+        .messages()
+        .into_iter()
+        .find(|m| m.role == ChatRole::Tool)
+        .expect("refused tool call must leave a tool-result record");
+    let response = tool_message
+        .content
+        .parts()
+        .iter()
+        .find_map(|part| match part {
+            ContentPart::ToolResponse(response) => Some(response),
+            _ => None,
+        })
+        .unwrap();
+    assert!(response
+        .content
+        .contains("Tools are disabled after the maximum agent steps"));
 }
 #[tokio::test]
 async fn invisible_failure_announces_structured_retry_status() {

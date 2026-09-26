@@ -78,7 +78,7 @@ pub mod chat {
     pub use genai::chat::{
         Binary, BinarySource, ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatRole,
         ChatStreamEvent, ChatStreamResponse, ContentPart, MessageContent, StopReason, StreamChunk,
-        StreamEnd, Tool, ToolCall, ToolResponse, Usage as GenaiUsage,
+        StreamEnd, Tool, ToolCall, ToolChoice, ToolResponse, Usage as GenaiUsage,
     };
 }
 
