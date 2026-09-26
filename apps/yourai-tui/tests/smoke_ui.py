@@ -1,4 +1,4 @@
-from smoke_support import wait_exit
+from smoke_support import wait_completed, wait_exit
 """UI regression flows: modal isolation, model defaults, deletion, narrow stats and launcher quit."""
 import fcntl
 import http.server
@@ -101,6 +101,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert 'after stats' in json.dumps(requests[0][1])
         assert 'LEAK' not in json.dumps(requests[0][1])
         db = sqlite3.connect(Path(tmp) / '.yourai/sessions/sessions.sqlite3')
+        db_path = Path(tmp) / '.yourai/sessions/sessions.sqlite3'
         # Local commands must reset the actual model context, retain old sessions,
         # and preserve the process permission selection across a session switch.
         time.sleep(0.2)
@@ -109,6 +110,8 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'YOLO enabled')
         before_new = db.execute('SELECT count(*) FROM sessions').fetchone()[0]
         captured.clear()
+        # /new is idle-guarded; the 'after stats' turn must be fully settled.
+        wait_completed(db_path, 'main', 1)
         os.write(master, b'/new\r')
         wait_for(b'Session ready')
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before_new + 1
@@ -122,8 +125,8 @@ with tempfile.TemporaryDirectory() as tmp:
         assert 'after stats' not in json.dumps(requests[-1][1])
         assert 'fresh context' in json.dumps(requests[-1][1])
         assert '/new' not in json.dumps(requests[-1][1])
-        time.sleep(0.2)
         captured.clear()
+        wait_completed(db_path, 'main', 2)
         os.write(master, b'/clear\r')
         wait_for(b'New session')
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before_new + 2
@@ -133,7 +136,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert len(requests) == 3
         assert 'fresh context' not in json.dumps(requests[-1][1])
         assert 'after reset' in json.dumps(requests[-1][1])
-        time.sleep(0.2)
+        wait_completed(db_path, 'main', 3)
         old_id = str(uuid.uuid4())
         db.execute("INSERT INTO sessions(session_id,title,created_at,updated_at) VALUES (?, 'Old review', 1, 1)", (old_id,))
         db.commit()

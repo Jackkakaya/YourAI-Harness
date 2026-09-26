@@ -1,4 +1,4 @@
-from smoke_support import wait_exit
+from smoke_support import wait_completed, wait_exit
 """Smoke test for /models switching: verify the second request hits the switched model."""
 import fcntl
 import http.server
@@ -90,7 +90,9 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'MODELS_OK')
         assert len(requests) >= 1, 'first request missing'
         assert requests[0][1]['model'] == 'smoke-model', f'expected smoke-model, got {requests[0][1]["model"]}'
-        # Switch to alt model via direct command.
+        # Switch to alt model via direct command; it is idle-guarded, so the
+        # first turn must be fully settled first.
+        wait_completed(Path(tmp) / '.yourai/sessions/sessions.sqlite3', 'main', 1)
         os.write(master, b'/models mock/alt\r')
         time.sleep(0.5)
         # Verify the footer shows the new model label.

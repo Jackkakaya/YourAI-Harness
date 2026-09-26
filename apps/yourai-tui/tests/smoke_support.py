@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import sqlite3
 import struct
 import subprocess
 import tempfile
@@ -26,6 +27,36 @@ DEFAULT_BIN = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
 
 WHEEL_UP = b'\x1b[<64;10;10M'
 WHEEL_DOWN = b'\x1b[<65;10;10M'
+
+
+def wait_completed(db_path, source, count, timeout=15):
+    """Wait until `count` model requests of `source` reached outcome='completed'.
+
+    A response's completion row is written when it ends, before the turn
+    settles (message persistence, host-idle transition). Tests about to send
+    a guarded session command (/compact, /new, /clear, /models, /sessions)
+    must not race that finalization: the app's input path is fast enough to
+    deliver the command while the turn is still closing, and the idle guard
+    rejects it. Poll the storage, then allow a settle margin.
+    """
+    end = time.monotonic() + timeout
+    while True:
+        db = sqlite3.connect(db_path)
+        try:
+            done = db.execute(
+                "SELECT COUNT(*) FROM model_requests WHERE source=? AND outcome='completed'",
+                (source,),
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            done = 0  # database or table not created yet
+        finally:
+            db.close()
+        if done >= count:
+            time.sleep(0.5)  # turn-finalization margin: message persist + host idle
+            return
+        if time.monotonic() > end:
+            raise AssertionError(f'{done}/{count} {source} requests completed after {timeout}s')
+        time.sleep(0.1)
 
 
 def long_text(sections=500):

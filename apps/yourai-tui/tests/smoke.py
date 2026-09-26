@@ -1,4 +1,4 @@
-from smoke_support import wait_exit
+from smoke_support import wait_completed, wait_exit
 """Offline POSIX TUI smoke test. Run cargo build -p yourai-tui first."""
 import fcntl
 import http.server
@@ -196,6 +196,9 @@ with tempfile.TemporaryDirectory() as tmp:
         os.write(master, b'\x0f\x1b[1;5F')  # fold again and follow the latest output
         os.write(master, b'next question\r')
         wait_for(b'SMOKE_SECOND_OK')
+        # /compact is guarded by the idle check; the streamed marker appears
+        # before the turn's finalization completes, so wait for it.
+        wait_completed(Path(tmp) / '.yourai/sessions/sessions.sqlite3', 'main', 3)
         os.write(master, b'/compact\r')
         wait_for(b'Summarized')
         os.write(master, b'\x11')
