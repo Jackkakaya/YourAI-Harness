@@ -3,12 +3,15 @@
 //! Two source forms (see [`yourai_core::protocol::AttachmentData`]):
 //! - **Base64** media: images are normalized first (opencode `image.ts`:
 //!   5 MB base64 / 2000×2000 ceilings, auto-resize before rejection), audio
-//!   and PDF pass through — their sizes are provider-side concerns.
+//!   and PDF pass through. Every base64 payload is bounded by the
+//!   protocol-level [`MAX_USER_ATTACHMENT_BYTES`] ceiling (20 MiB decoded)
+//!   before any decode, because protocol inputs are untrusted.
 //! - **File** references (opencode FilePart semantics): the harness reads the
 //!   file so frontends never inline content. Text files become bounded text
 //!   parts (optional 1-based line window, char cap), images go through the
 //!   same normalization ladder, directories expand to a first-level listing,
-//!   audio/PDF become Binary parts.
+//!   audio/PDF become Binary parts (also capped at
+//!   [`MAX_USER_ATTACHMENT_BYTES`]).
 
 use std::path::{Path, PathBuf};
 use yourai_core::prelude::*;
@@ -45,9 +48,31 @@ pub(super) fn resolve_attachment(
                 ))
                 .into());
             }
+            if data.is_empty() {
+                return Err(ErrorKind::Config("attachment payload is empty".into()).into());
+            }
+            // Protocol ceiling before any decode: base64 length L → decoded
+            // ≈ L*3/4 (integer division over-estimates nothing here).
+            let estimated_bytes = data.len().saturating_mul(3) / 4;
+            if estimated_bytes > MAX_USER_ATTACHMENT_BYTES {
+                return Err(ErrorKind::Config(format!(
+                    "attachment too large: ~{} MiB exceeds the {} MiB limit",
+                    estimated_bytes / (1024 * 1024),
+                    MAX_USER_ATTACHMENT_BYTES / (1024 * 1024),
+                ))
+                .into());
+            }
             let (mime, payload) = if ct.starts_with("image/") {
                 normalize_image(data, &ct, &config.attachment_image)?
             } else {
+                // Images are decoded (and validated) inside the normalization
+                // ladder; other media only need a base64 sanity check.
+                if BASE64.decode(data.as_bytes()).is_err() {
+                    return Err(ErrorKind::Config(
+                        "attachment payload is not valid base64".into(),
+                    )
+                    .into());
+                }
                 (ct, data.clone())
             };
             binary_part(mime, payload, att.name.clone())
@@ -270,6 +295,16 @@ fn resolve_file(file: &FileRef, config: &super::LoopConfig) -> Result<ContentPar
 }
 
 fn read_file_base64(path: &Path, display: &str) -> Result<String, YourAiError> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_USER_ATTACHMENT_BYTES as u64 {
+            return Err(ErrorKind::Config(format!(
+                "attachment too large: {} MiB exceeds the {} MiB limit",
+                meta.len() / (1024 * 1024),
+                MAX_USER_ATTACHMENT_BYTES / (1024 * 1024),
+            ))
+            .into());
+        }
+    }
     let bytes = std::fs::read(path)
         .map_err(|e| ErrorKind::Config(format!("attachment file read failed ({display}): {e}")))?;
     Ok(BASE64.encode(&bytes))
@@ -496,6 +531,26 @@ mod tests {
     fn unsupported_content_type_is_rejected() {
         let err = resolve_attachment(&att("text/plain", "aGVsbG8="), &config()).unwrap_err();
         assert!(err.to_string().contains("unsupported attachment type"));
+    }
+
+    #[test]
+    fn protocol_attachment_cap_rejects_oversized_base64() {
+        // base64 length L → decoded ≈ L*3/4 (integer division). Enough margin
+        // to clear the boundary above the 20 MiB protocol ceiling.
+        let big = "A".repeat(MAX_USER_ATTACHMENT_BYTES * 4 / 3 + 100);
+        let err = resolve_attachment(&att("audio/wav", &big), &config()).unwrap_err();
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn empty_or_invalid_base64_is_rejected() {
+        let err = resolve_attachment(&att("audio/wav", ""), &config()).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+        let err = resolve_attachment(&att("audio/wav", "not base64!"), &config()).unwrap_err();
+        assert!(err.to_string().contains("valid base64"));
+        // Images surface the same problem through the decode in the ladder.
+        let err = resolve_attachment(&att("image/png", "not base64!"), &config()).unwrap_err();
+        assert!(err.to_string().contains("valid base64"));
     }
 
     #[test]

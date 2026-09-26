@@ -7,6 +7,13 @@ use serde_json::Value;
 
 // region:    --- In ---
 
+/// Maximum decoded size accepted for one user attachment (20 MiB) — the most
+/// restrictive ceiling across the providers genai targets (OpenAI ~20 MB,
+/// Anthropic ~32 MB base64). Frontends should enforce this before
+/// reading/encoding files; loops must enforce it again because protocol
+/// inputs are untrusted.
+pub const MAX_USER_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
 /// 用户消息附带的附件：内联 base64 媒体，或本地文件引用。
 ///
 /// 两种形态由 harness 在消息入口（`accept_input`）统一解析为模型可见的

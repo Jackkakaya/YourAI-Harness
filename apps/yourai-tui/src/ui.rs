@@ -241,6 +241,27 @@ fn edit(e: &mut editor::Editor, key: KeyEvent) {
         _ => {}
     }
 }
+/// A mention filesystem scan running off the UI thread. Delivers
+/// `(anchor, query, entries)`; stale results are discarded by comparing
+/// against the live mention state.
+type MentionScan = JoinHandle<(usize, String, Vec<mention::MentionEntry>)>;
+
+fn start_mention_scan(
+    task: &mut Option<MentionScan>,
+    cwd: &std::path::Path,
+    anchor: usize,
+    query: String,
+) {
+    if let Some(previous) = task.take() {
+        previous.abort();
+    }
+    let cwd = cwd.to_path_buf();
+    *task = Some(tokio::task::spawn_blocking(move || {
+        let entries = mention::scan(&cwd, &query);
+        (anchor, query, entries)
+    }));
+}
+
 fn copy_selection(renderer: &Renderer, task: &mut Option<JoinHandle<std::io::Result<()>>>) {
     if let Some(text) = renderer.selection.text().filter(|text| !text.is_empty()) {
         if let Some(previous) = task.take() {
@@ -394,6 +415,7 @@ pub async fn run(
     });
     let mut compact: Option<JoinHandle<()>> = None;
     let mut clipboard_task: Option<JoinHandle<std::io::Result<()>>> = None;
+    let mut mention_scan: Option<MentionScan> = None;
     let mut context_refreshed = Instant::now() - Duration::from_secs(2);
     let mut pending_switch: Option<SessionId> = None;
     let ui_future = async {
@@ -402,6 +424,17 @@ pub async fn run(
         let mut last_snap: Option<FrameSnap> = None;
         loop {
             tick.tick().await;
+            if mention_scan.as_ref().is_some_and(|task| task.is_finished()) {
+                if let Ok((anchor, query, entries)) = mention_scan.take().unwrap().await {
+                    if view.mention.active
+                        && view.mention.anchor == anchor
+                        && view.mention.query == query
+                    {
+                        view.mention.entries = entries;
+                        view.mention.selected = 0;
+                    }
+                }
+            }
             // Prepare and restore the target before shutting down the current
             // session, so failure leaves the current driver and view usable.
             if let Some(new_id) = pending_switch.take() {
@@ -827,17 +860,22 @@ pub async fn run(
                                             let replace = format!("@{}", entry.display);
                                             let anchor = view.mention.anchor;
                                             let end = anchor + 1 + view.mention.query.len();
-                                            view.editor.cursor = anchor;
-                                            for _ in 0..(end - anchor) {
-                                                view.editor.delete();
-                                            }
-                                            view.editor.insert(&format!("{replace}/"));
+                                            view.editor.replace_range(
+                                                anchor..end,
+                                                &format!("{replace}/"),
+                                            );
                                             if let Some((a, q)) = mention::MentionState::detect(
                                                 &view.editor.text,
                                                 view.editor.cursor,
                                             ) {
-                                                view.mention.entries = mention::scan(&cwd, &q);
                                                 view.mention.activate(a, &q);
+                                                view.mention.entries.clear();
+                                                start_mention_scan(
+                                                    &mut mention_scan,
+                                                    &cwd,
+                                                    a,
+                                                    q,
+                                                );
                                             } else {
                                                 view.mention.deactivate();
                                             }
@@ -865,11 +903,8 @@ pub async fn run(
                                 let anchor = view.mention.anchor;
                                 let end = anchor + 1 + view.mention.query.len();
                                 view.mention.deactivate();
-                                view.editor.cursor = anchor;
-                                for _ in 0..(end - anchor) {
-                                    view.editor.delete();
-                                }
-                                view.editor.insert(&format!("@{display} "));
+                                view.editor
+                                    .replace_range(anchor..end, &format!("@{display} "));
                                 let marker = format!("@{display}");
                                 // Re-attaching replaces the previous staging
                                 // for the same marker instead of duplicating.
@@ -1283,14 +1318,23 @@ pub async fn run(
                                         &view.editor.text,
                                         view.editor.cursor,
                                     ) {
+                                        // Scan off the UI thread, and only when
+                                        // the mention actually moved or changed —
+                                        // cursor moves within the same query
+                                        // must not hit the disk or reset the
+                                        // selection.
                                         if !view.mention.active
+                                            || view.mention.anchor != anchor
                                             || view.mention.query != query
-                                            || view.mention.entries.is_empty()
                                         {
-                                            view.mention.entries = mention::scan(&cwd, &query);
                                             view.mention.activate(anchor, &query);
-                                        } else {
-                                            view.mention.anchor = anchor;
+                                            view.mention.entries.clear();
+                                            start_mention_scan(
+                                                &mut mention_scan,
+                                                &cwd,
+                                                anchor,
+                                                query,
+                                            );
                                         }
                                     } else if view.mention.active {
                                         view.mention.deactivate();
@@ -1367,6 +1411,9 @@ pub async fn run(
     if let Some(task) = clipboard_task {
         task.abort();
     }
+    if let Some(task) = mention_scan {
+        task.abort();
+    }
     cancel.cancel();
     if let Some(h) = harness_opt.take() {
         h.host.interrupt();
@@ -1401,8 +1448,14 @@ async fn switch_model(
         .resolve(variant.as_deref())
         .map_err(|e| e.to_string())?;
     candidate.selected_variant = variant.clone();
+    let (header_timeout, chunk_timeout) = candidate.model_timeouts().map_err(|e| e.to_string())?;
     harness
-        .switch_model(model, candidate.context.clone())
+        .switch_model(
+            model,
+            candidate.context.clone(),
+            header_timeout,
+            chunk_timeout,
+        )
         .await
         .map_err(|e| e.to_string())?;
     let p = candidate.pricing();

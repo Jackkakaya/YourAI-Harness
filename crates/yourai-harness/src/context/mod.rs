@@ -349,14 +349,17 @@ impl ContextManager for MemoryContext {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>> {
         Box::pin(async move {
-            let deadline = options
-                .deadline
-                .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(120));
+            // OpenCode has no compaction deadline: None means unlimited. Each
+            // summarization call is still bounded by model header/chunk timeouts.
+            let deadline = options.deadline;
             let committed = AtomicBool::new(false);
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => if committed.load(Ordering::Acquire) { Err(error("compact", "summary committed; cancelled during PostCompact")) } else { Err(AbortReason::Cancelled.into()) },
-                _ = tokio::time::sleep_until(deadline.into()) => if committed.load(Ordering::Acquire) { Err(error("compact", "summary committed; deadline exceeded during PostCompact")) } else { Err(AbortReason::DeadlineExceeded.into()) },
+                _ = async { match deadline {
+                    Some(d) => tokio::time::sleep_until(d.into()).await,
+                    None => std::future::pending().await,
+                }} => if committed.load(Ordering::Acquire) { Err(error("compact", "summary committed; deadline exceeded during PostCompact")) } else { Err(AbortReason::DeadlineExceeded.into()) },
                 result = self.maintain(options, execution, cancel, &committed) => result
             }
         })

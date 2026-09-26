@@ -1,3 +1,4 @@
+use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -33,6 +34,25 @@ impl Editor {
         self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
         // Insertion may merge graphemes (combining marks / ZWJ sequences).
+        while self.cursor < self.text.len()
+            && !self
+                .text
+                .grapheme_indices(true)
+                .any(|(i, _)| i == self.cursor)
+        {
+            self.cursor += self.text[self.cursor..].chars().next().unwrap().len_utf8();
+        }
+    }
+    /// Replace an exact UTF-8 byte range and leave the cursor after the replacement.
+    /// Callers use byte offsets from this editor, so both ends must be char boundaries.
+    pub fn replace_range(&mut self, range: Range<usize>, replacement: &str) {
+        assert!(range.start <= range.end && range.end <= self.text.len());
+        assert!(self.text.is_char_boundary(range.start));
+        assert!(self.text.is_char_boundary(range.end));
+        let replacement = super::state::clean(replacement);
+        let start = range.start;
+        self.text.replace_range(range, &replacement);
+        self.cursor = start + replacement.len();
         while self.cursor < self.text.len()
             && !self
                 .text
@@ -306,6 +326,17 @@ mod tests {
         e.delete();
         assert_eq!(e.text, "你next");
     }
+    #[test]
+    fn byte_range_replacement_preserves_text_after_unicode_mention() {
+        let mut e = Editor::default();
+        e.insert("before @你好 after");
+        let start = e.text.find('@').unwrap();
+        let end = start + "@你好".len();
+        e.replace_range(start..end, "@文件 ");
+        assert_eq!(e.text, "before @文件  after");
+        assert_eq!(e.cursor, "before @文件 ".len());
+    }
+
     #[test]
     fn history_restores_draft() {
         let mut e = Editor::default();

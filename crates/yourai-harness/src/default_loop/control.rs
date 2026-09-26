@@ -7,16 +7,16 @@ use yourai_core::prelude::*;
 
 impl State<'_> {
     pub(crate) fn op_timeout(&self) -> Option<Duration> {
-        Some(self.config.operation_timeout)
+        self.config.operation_timeout
     }
-    pub(crate) fn deadline(&self, timeout: Option<Duration>) -> Instant {
-        let local = Instant::now() + timeout.unwrap_or(self.config.operation_timeout);
-        self.tc
-            .info
-            .options
-            .limits
-            .deadline
-            .map_or(local, |total| local.min(total))
+    pub(crate) fn deadline(&self, timeout: Option<Duration>) -> Option<Instant> {
+        let local = timeout.or(self.config.operation_timeout).map(|d| Instant::now() + d);
+        match (local, self.tc.info.options.limits.deadline) {
+            (Some(l), Some(total)) => Some(l.min(total)),
+            (Some(l), None) => Some(l),
+            (None, Some(total)) => Some(total),
+            (None, None) => None,
+        }
     }
     pub(crate) fn timeout_error(&self, phase: &'static str) -> YourAiError {
         if self
@@ -93,7 +93,10 @@ impl State<'_> {
                 biased;
                 _ = self.tc.cancel.cancelled() => return Err(AbortReason::Cancelled.into()),
                 _ = self.tc.outbox.closed() => return Err(AbortReason::Disconnected.into()),
-                _ = tokio::time::sleep_until(deadline.into()) => return Err(self.timeout_error(phase)),
+                _ = async { match deadline {
+                    Some(d) => tokio::time::sleep_until(d.into()).await,
+                    None => std::future::pending().await,
+                }} => return Err(self.timeout_error(phase)),
                 result = &mut future => return result,
                 input = self.tc.inbox.recv(), if !self.input_closed => match input {
                     Some(input) => self.route(input), None => self.input_closed = true,
@@ -323,10 +326,16 @@ impl State<'_> {
             }
             Ok::<_, YourAiError>(())
         };
-        let failure = match tokio::time::timeout(self.config.cleanup_timeout, cleanup).await {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e.to_string()),
-            Err(_) => Some("cleanup timed out".into()),
+        let failure = match self.config.cleanup_timeout {
+            Some(t) => match tokio::time::timeout(t, cleanup).await {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(_) => Some("cleanup timed out".into()),
+            },
+            None => match cleanup.await {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            },
         };
         if let Some(message) = failure {
             outbox.send(Out::Notice {

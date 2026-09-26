@@ -60,6 +60,11 @@ impl Default for AttachmentImageConfig {
 }
 
 /// Policy defaults, not additional Providers. TurnLimits can impose stricter limits.
+///
+/// Timeouts follow OpenCode's model: only `model_header_timeout`,
+/// `model_chunk_timeout` and `tool_timeout` have finite defaults. All other
+/// timeouts default to `None` (unlimited), matching OpenCode which has no
+/// operation/approval/hook/cleanup deadline.
 #[derive(Debug, Clone)]
 pub struct LoopConfig {
     /// Explicitly selected skills; listing a skill does not activate it.
@@ -78,16 +83,29 @@ pub struct LoopConfig {
     pub max_overflow_compactions: u32,
     pub max_stop_continuations: u32,
     pub max_permission_rechecks: u32,
+    /// Initial retry delay (opencode `session/retry.ts`:
+    /// `RETRY_INITIAL_DELAY = 2000`), doubled per attempt with 25% jitter.
     pub retry_delay: Duration,
+    /// Retry delay ceiling when the response carries no `retry-after` header
+    /// (opencode `RETRY_MAX_DELAY_NO_HEADERS = 30_000`). Explicit
+    /// `retry-after` values are honored on top of this.
     pub retry_max_delay: Duration,
-    pub operation_timeout: Duration,
+    /// OpenCode has no operation timeout; `None` = unlimited.
+    pub operation_timeout: Option<Duration>,
+    /// OpenCode `headerTimeout` equivalent (default 300s).
     pub model_header_timeout: Duration,
+    /// OpenCode `chunkTimeout` equivalent (default 300s).
     pub model_chunk_timeout: Duration,
-    /// Tool execution deadline, separate from model/storage operation timeouts.
+    /// Local tool-execution safety bound (default 600s). OpenCode itself has
+    /// no global tool timeout — individual tools self-limit — but our loop
+    /// runs tools under a shared deadline, so a finite default is required.
     pub tool_timeout: Duration,
-    pub approval_timeout: Duration,
-    pub hook_timeout: Duration,
-    pub cleanup_timeout: Duration,
+    /// OpenCode has no approval timeout; `None` = unlimited.
+    pub approval_timeout: Option<Duration>,
+    /// OpenCode has no hook timeout; `None` = unlimited.
+    pub hook_timeout: Option<Duration>,
+    /// OpenCode has no cleanup timeout; `None` = unlimited.
+    pub cleanup_timeout: Option<Duration>,
 }
 impl Default for LoopConfig {
     fn default() -> Self {
@@ -102,15 +120,17 @@ impl Default for LoopConfig {
             max_overflow_compactions: 1,
             max_stop_continuations: 3,
             max_permission_rechecks: 1,
+            // opencode session/retry.ts: 2s initial, ×2 exponential backoff,
+            // 25% jitter, 30s ceiling without retry-after headers, 5 retries.
             retry_delay: Duration::from_secs(2),
             retry_max_delay: Duration::from_secs(30),
-            operation_timeout: Duration::from_secs(120),
+            operation_timeout: None,
             model_header_timeout: Duration::from_secs(300),
             model_chunk_timeout: Duration::from_secs(300),
-            tool_timeout: Duration::from_secs(610),
-            approval_timeout: Duration::from_secs(300),
-            hook_timeout: Duration::from_secs(30),
-            cleanup_timeout: Duration::from_secs(5),
+            tool_timeout: Duration::from_secs(600),
+            approval_timeout: None,
+            hook_timeout: None,
+            cleanup_timeout: None,
         }
     }
 }
@@ -313,12 +333,15 @@ impl State<'_> {
                                     wait_ms: delay.as_millis().min(u64::MAX as u128) as u64,
                                 })?;
                                 // checked_add: an absurd server retry-after must not panic here.
+                                // No operation timeout (OpenCode default) means the sleep bounds itself.
                                 self.wait(
                                     async {
                                         tokio::time::sleep(delay).await;
                                         Ok(())
                                     },
-                                    delay.checked_add(self.config.operation_timeout),
+                                    self.config
+                                        .operation_timeout
+                                        .and_then(|op| delay.checked_add(op)),
                                     "retry",
                                 )
                                 .await?;
@@ -444,7 +467,7 @@ impl State<'_> {
     }
     async fn compact(&mut self, trigger: CompactionTrigger) -> Result<(), YourAiError> {
         let mut request = CompactionRequest::new(trigger);
-        request.deadline = Some(self.deadline(self.op_timeout()));
+        request.deadline = self.deadline(self.op_timeout());
         request.tools = self
             .tc
             .snap

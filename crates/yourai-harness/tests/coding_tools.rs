@@ -281,7 +281,7 @@ async fn child_restore_rebinds_builtin_working_directory() {
     .unwrap();
     assert!(child.path().join("child.txt").exists());
     assert!(!d.path().join("child.txt").exists());
-    host.close(std::time::Duration::from_secs(1)).await.unwrap();
+    host.close(Some(std::time::Duration::from_secs(1))).await.unwrap();
     h.close().await.unwrap();
 }
 
