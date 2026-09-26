@@ -837,7 +837,10 @@ impl SessionRuntime for SessionHost {
             }}=>Err(AbortReason::DeadlineExceeded.into()) }
         })
     }
-    fn close<'a>(&'a self, timeout: Option<Duration>) -> BoxFuture<'a, Result<Vec<In>, YourAiError>> {
+    fn close<'a>(
+        &'a self,
+        timeout: Option<Duration>,
+    ) -> BoxFuture<'a, Result<Vec<In>, YourAiError>> {
         Box::pin(async move {
             if self.status() == SessionStatus::Closed {
                 return Ok(vec![]);

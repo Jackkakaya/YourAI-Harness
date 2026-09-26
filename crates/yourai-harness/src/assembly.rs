@@ -237,6 +237,13 @@ impl Harness {
         } else {
             None
         };
+        // Initialize opencode-aligned tool-output truncation with a spill
+        // directory under the session data root (opencode: data/tool-output).
+        // Spill files let the model re-read truncated shell/web output via read.
+        crate::tools::init_truncation(
+            config.root.join("tool-output"),
+            crate::tools::TruncateLimits::default(),
+        );
         // Task progress is a basic coding capability, independent of workspace/subagents.
         let tasks = Some(TaskBoard::new(&host, "default")?);
         let subagents = if config.extensions {

@@ -134,15 +134,7 @@ pub fn scan(cwd: &Path, query: &str) -> Vec<MentionEntry> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     let mut scanned = 0;
-    scan_dir(
-        cwd,
-        cwd,
-        query,
-        0,
-        &mut scanned,
-        &mut dirs,
-        &mut files,
-    );
+    scan_dir(cwd, cwd, query, 0, &mut scanned, &mut dirs, &mut files);
     dirs.sort_by(|a, b| a.display.cmp(&b.display));
     files.sort_by(|a, b| a.display.cmp(&b.display));
     dirs.extend(files);
@@ -189,10 +181,7 @@ fn scan_dir(
         if SKIP_DIRS.contains(&name.as_str()) {
             continue;
         }
-        let is_dir = entry
-            .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or(false);
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let display = path
             .strip_prefix(cwd)
             .ok()
@@ -231,10 +220,7 @@ mod tests {
 
     #[test]
     fn detect_at_at_line_start() {
-        assert_eq!(
-            MentionState::detect("@foo", 4),
-            Some((0, "foo".to_owned()))
-        );
+        assert_eq!(MentionState::detect("@foo", 4), Some((0, "foo".to_owned())));
     }
 
     #[test]

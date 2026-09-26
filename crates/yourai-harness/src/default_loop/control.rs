@@ -10,7 +10,9 @@ impl State<'_> {
         self.config.operation_timeout
     }
     pub(crate) fn deadline(&self, timeout: Option<Duration>) -> Option<Instant> {
-        let local = timeout.or(self.config.operation_timeout).map(|d| Instant::now() + d);
+        let local = timeout
+            .or(self.config.operation_timeout)
+            .map(|d| Instant::now() + d);
         match (local, self.tc.info.options.limits.deadline) {
             (Some(l), Some(total)) => Some(l.min(total)),
             (Some(l), None) => Some(l),

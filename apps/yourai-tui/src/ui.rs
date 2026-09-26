@@ -860,22 +860,15 @@ pub async fn run(
                                             let replace = format!("@{}", entry.display);
                                             let anchor = view.mention.anchor;
                                             let end = anchor + 1 + view.mention.query.len();
-                                            view.editor.replace_range(
-                                                anchor..end,
-                                                &format!("{replace}/"),
-                                            );
+                                            view.editor
+                                                .replace_range(anchor..end, &format!("{replace}/"));
                                             if let Some((a, q)) = mention::MentionState::detect(
                                                 &view.editor.text,
                                                 view.editor.cursor,
                                             ) {
                                                 view.mention.activate(a, &q);
                                                 view.mention.entries.clear();
-                                                start_mention_scan(
-                                                    &mut mention_scan,
-                                                    &cwd,
-                                                    a,
-                                                    q,
-                                                );
+                                                start_mention_scan(&mut mention_scan, &cwd, a, q);
                                             } else {
                                                 view.mention.deactivate();
                                             }

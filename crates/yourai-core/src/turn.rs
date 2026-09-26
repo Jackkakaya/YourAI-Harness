@@ -35,6 +35,9 @@ impl std::fmt::Display for TurnId {
 ///
 /// `steps` 与 OpenCode 的 agent `steps` 一致：它计算 agentic iteration，
 /// 重试和压缩内部模型调用不额外消耗 step；达到最后一步时应禁用工具并强制文本收尾。
+/// 未指定时 Loop 仍会施加 `MAX_AGENT_STEPS`（1000）硬上限作为本地安全网
+/// （现行 OpenCode 对未配置 steps 的 agent 不设上限；其 v1 runner 曾以
+/// `stopWhen` 封顶 1000 步）。显式 `steps` 按原值生效。
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct TurnLimits {

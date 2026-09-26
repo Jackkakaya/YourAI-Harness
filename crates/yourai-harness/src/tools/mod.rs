@@ -1,6 +1,7 @@
 //! Built-in tools implement Core's existing ToolHandler; no loop or storage dependency.
 mod files;
 mod shell;
+mod truncate;
 mod web;
 pub use web::{WebFetch, WebSearch};
 
@@ -8,6 +9,11 @@ pub use files::{Edit, Read, Write};
 mod registry;
 pub mod result;
 pub use registry::ToolSet;
+pub use truncate::{
+    cleanup as truncate_cleanup, clip_line, footnote, init as init_truncation,
+    output as truncate_output, set_limits as set_truncate_limits, Limits as TruncateLimits,
+    MAX_BYTES, MAX_LINES, MAX_LINE_LENGTH,
+};
 
 use serde_json::{json, Value};
 pub use shell::Shell;

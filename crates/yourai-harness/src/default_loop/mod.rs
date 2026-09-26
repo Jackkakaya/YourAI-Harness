@@ -59,6 +59,18 @@ impl Default for AttachmentImageConfig {
     }
 }
 
+/// Local safety net for unconfigured `steps`: current opencode leaves an
+/// agent without `steps` unbounded (`isLastStep` requires a defined cap),
+/// but its v1 runner capped `streamText` at 1000 steps. A finite ceiling
+/// prevents unbounded tool loops; an explicit `steps` is honoured as-is.
+const MAX_AGENT_STEPS: u32 = 1000;
+
+/// OpenCode `session/processor.ts` `DOOM_LOOP_THRESHOLD = 3`: when the same
+/// tool is invoked with identical input three times in a row, it routes
+/// through `permission.ask` so a runaway loop can be broken.
+/// `doom_loop_check` mirrors that gate.
+const DOOM_LOOP_THRESHOLD: u32 = 3;
+
 /// Policy defaults, not additional Providers. TurnLimits can impose stricter limits.
 ///
 /// Timeouts follow OpenCode's model: only `model_header_timeout`,
@@ -71,7 +83,8 @@ pub struct LoopConfig {
     pub skill_ids: Vec<String>,
     pub memory_search_limit: usize,
     pub memory_max_chars: usize,
-    /// OpenCode-compatible agentic iteration cap. None means unlimited.
+    /// OpenCode-compatible agentic iteration cap. None means unlimited up to the
+    /// `MAX_AGENT_STEPS` (1000) hard ceiling imposed by `effective_steps`.
     pub steps: Option<u32>,
     /// OpenCode-compatible attachment image normalization policy.
     pub attachment_image: AttachmentImageConfig,
@@ -79,6 +92,9 @@ pub struct LoopConfig {
     /// selection the cap applies to the selected window). Directories and
     /// binary media are unaffected.
     pub attachment_text_max_chars: usize,
+    /// Model-call retry cap (opencode `session/retry.ts`
+    /// `RETRY_MAX_RETRIES = 5`; the AI SDK layer itself retries zero times,
+    /// `llm.ts` `maxRetries: input.retries ?? 0`).
     pub max_model_retries: u32,
     pub max_overflow_compactions: u32,
     pub max_stop_continuations: u32,
@@ -180,6 +196,8 @@ impl AgentLoop for DefaultLoop {
                 step: 0,
                 model_calls: 0,
                 stop_continuations: 0,
+                doom_streak: 0,
+                last_tool: None,
                 bound_tools: HashMap::new(),
                 call_ids: HashSet::new(),
                 unresolved: VecDeque::new(),
@@ -219,6 +237,10 @@ struct State<'a> {
     step: u32,
     model_calls: u32,
     stop_continuations: u32,
+    /// Consecutive identical tool executions (name + arguments); drives
+    /// `doom_loop_check` at `DOOM_LOOP_THRESHOLD`, mirroring OpenCode.
+    doom_streak: u32,
+    last_tool: Option<(String, String)>,
     unresolved: VecDeque<ToolCall>,
     bound_tools: HashMap<String, Arc<dyn ToolHandler>>,
     call_ids: HashSet<String>,
@@ -272,10 +294,7 @@ impl State<'_> {
             }
             if new_step {
                 self.step += 1;
-                if !self.forced_final
-                    && self
-                        .effective_steps()
-                        .is_some_and(|max| self.step >= max)
+                if !self.forced_final && self.effective_steps().is_some_and(|max| self.step >= max)
                 {
                     // The prompt itself is injected per request in read_model
                     // (assistant-role prefill + tool_choice none), matching
@@ -458,11 +477,17 @@ impl State<'_> {
     }
 
     /// Per-turn options may only tighten the configured agent step cap.
+    ///
+    /// OpenCode leaves an agent without `steps` unbounded at the outer loop but
+    /// still caps each `streamText` run at 1000 (`stopWhen`). YourAI has a single
+    /// step counter, so an unconfigured cap gets the `MAX_AGENT_STEPS` (1000)
+    /// safety net; an explicit `steps` (tightened by per-turn `TurnLimits`) is
+    /// honoured as-is, matching OpenCode's `agent.steps ?? Infinity` semantics.
     fn effective_steps(&self) -> Option<u32> {
-        let config = self.config.steps;
-        match self.tc.info.options.limits.steps {
-            Some(limit) => Some(config.map_or(limit, |configured| configured.min(limit))),
-            None => config,
+        match (self.config.steps, self.tc.info.options.limits.steps) {
+            (Some(configured), Some(limit)) => Some(configured.min(limit)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => Some(MAX_AGENT_STEPS),
         }
     }
     async fn compact(&mut self, trigger: CompactionTrigger) -> Result<(), YourAiError> {
