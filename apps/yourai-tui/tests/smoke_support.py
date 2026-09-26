@@ -248,9 +248,16 @@ def wait_exit(child, master, timeout=10):
         if time.monotonic() >= deadline:
             raise AssertionError('TUI did not exit after Ctrl-Q')
         if select.select([master], [], [], 0.05)[0]:
-            data = os.read(master, 65536)
+            try:
+                data = os.read(master, 65536)
+            except OSError:
+                # Linux raises EIO on the master once the child exits and
+                # the last slave closes (Probe closes its own copy); macOS
+                # reports EOF instead. Either way, draining is done.
+                break
             if b'\x1b[6n' in data:
                 os.write(master, b'\x1b[1;1R')
+    child.wait()
     return child.returncode
 
 
