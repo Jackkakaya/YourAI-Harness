@@ -30,6 +30,9 @@ pub struct TaskBoard {
     tasks: Mutex<HashMap<String, Task>>,
     gate: tokio::sync::Mutex<()>,
     seq: AtomicU64,
+    /// Bumped on every committed mutation so pollers can skip unchanged
+    /// copies of the whole board.
+    version: AtomicU64,
     pub team: String,
 }
 impl TaskBoard {
@@ -48,8 +51,12 @@ impl TaskBoard {
             tasks: Mutex::new(tasks),
             gate: tokio::sync::Mutex::new(()),
             seq: AtomicU64::new(seq),
+            version: AtomicU64::new(0),
             team: team.into(),
         }))
+    }
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
     }
     pub fn list(&self) -> Vec<Task> {
         let mut v: Vec<_> = self.tasks.lock().unwrap().values().cloned().collect();
@@ -96,6 +103,7 @@ impl TaskBoard {
         next.insert(task.id.clone(), task.clone());
         atomic_write(&host.dir.join("tasks.json"), &next)?;
         *tasks = next;
+        self.version.fetch_add(1, Ordering::Relaxed);
         Ok(task)
     }
     pub async fn complete(&self, id: &str) -> Result<(), YourAiError> {
@@ -129,6 +137,7 @@ impl TaskBoard {
         next.get_mut(id).unwrap().completed = true;
         atomic_write(&host.dir.join("tasks.json"), &next)?;
         *tasks = next;
+        self.version.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
     pub async fn idle(&self, teammate: &str) -> Result<(), YourAiError> {

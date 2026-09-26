@@ -1,18 +1,21 @@
-mod overlays;
-use overlays::*;
+use super::{frame_time::FrameTime, presentation::Canvas};
 mod cards;
-mod results;
+mod overlays;
 mod timeline;
 use super::overlay::Overlay;
 use super::{
     editor::Editor,
-    state::{DiffRow, Item, Role, ToolStatus, View},
+    state::{Item, ToolStatus, View},
     theme::{
-        lerp_color, mix, Theme, ACCENT, BG, BLUE, BORDER, DIFF_ADD_BG, DIFF_DEL_BG, FAINT,
-        FOCUS_SURFACE, GREEN, MUTED, PANEL, RED, TEXT, USER_SURFACE, YELLOW,
+        lerp_color, Theme, ACCENT, BG, BLUE, BORDER, CODE_SURFACE, FOCUS_SURFACE, GREEN, MUTED,
+        PANEL, RED, TEXT, YELLOW,
     },
 };
-use cards::*;
+use crate::text::{elide, elide_tail};
+use cards::tool_title_row;
+use overlays::{
+    ask_overlay, model_picker_overlay, sessions_overlay, stats_overlay, theme_picker_overlay,
+};
 use ratatui::{
     prelude::*,
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
@@ -21,7 +24,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 #[cfg(test)]
 use yourai_core::prelude::Out;
-use yourai_core::prelude::{Level, SessionStatus};
+#[cfg(test)]
+use yourai_core::prelude::SessionStatus;
 
 pub struct Metadata {
     pub session: String,
@@ -34,32 +38,55 @@ pub struct Renderer {
     pub selection: super::selection::Selection,
     key: Option<(u64, u16, u16, Theme, bool)>,
     timeline: timeline::TimelineCache,
+    /// One frame's resolved layout: the rects, the laid-out lines and the hit
+    /// regions of the last prepared frame. Input-time queries (hit tests,
+    /// selection anchors, scroll clamps, turn jumps) read this snapshot; the
+    /// cache and the animation clock stay on the renderer.
+    layout: Layout,
+    /// Animation is clock-driven, independent of input/preparation frequency.
+    animation_start: Option<std::time::Instant>,
+    tick: u64,
+}
+#[derive(Default)]
+struct Layout {
+    /// Transcript viewport: the reading column, the native-scroll window and
+    /// the anchor row base.
+    transcript: Rect,
+    /// The stacked rows: [transcript, ask, activity, todo dock, input].
+    rows: Vec<Rect>,
+    /// Todo sidebar rect when the wide layout shows it.
+    panel: Option<Rect>,
     lines: timeline::LayoutLines,
     headers: Vec<(usize, u64)>,
+    turns: Vec<(usize, u64)>,
     hits: Vec<(Rect, u64)>,
-    result_hits: Vec<(Rect, u64)>,
     command_hits: Vec<(Rect, super::commands::Command)>,
     command_area: Option<Rect>,
     follow_hit: Option<Rect>,
-    question_hit: Option<(Rect, u64)>,
     todo_hit: Option<Rect>,
     todo_area: Option<Rect>,
-    transcript: Rect,
-    panel: Option<Rect>,
-    anchor: Option<(u64, usize)>,
-    reveal: Option<u64>,
-    turn_target: Option<u64>,
-    result_target: Option<u64>,
-    /// 40ms tick frame index shared by the breathing bar and card spinners.
-    tick: u64,
 }
+/// What a click on the last painted frame hit. The renderer answers queries
+/// about its own layout; the resulting View mutations live in the action
+/// layer (`app::click_dispatch`), keeping input state out of the render path.
+pub(crate) enum Hit<'a> {
+    /// The "↓ Latest" pill shown above the composer while scrolled up.
+    FollowLatest,
+    /// A row of the slash-command menu.
+    Command(&'a super::commands::Command),
+    /// The Todo panel title (same as ^T).
+    TodoToggle,
+    /// The header line of a foldable block (tool card or thinking).
+    Block(u64),
+}
+
 impl Renderer {
     pub fn begin_selection(&mut self, x: u16, y: u16) {
         let point = Position::new(x, y);
-        let region = if self.transcript.contains(point) {
-            Some(self.transcript)
-        } else if self.panel.is_some_and(|r| r.contains(point)) {
-            self.panel
+        let region = if self.layout.transcript.contains(point) {
+            Some(self.layout.transcript)
+        } else if self.layout.panel.is_some_and(|r| r.contains(point)) {
+            self.layout.panel
         } else {
             // Title/border rows and the footer: select from the whole screen.
             self.selection.screen.as_ref().map(|b| b.area)
@@ -67,130 +94,129 @@ impl Renderer {
         self.selection.begin(point, region.unwrap_or_default());
     }
 
-    pub fn click(&mut self, view: &mut View, x: u16, y: u16) {
+    /// Resolve a click against the last painted frame's hit regions.
+    pub fn hit_test(&self, x: u16, y: u16) -> Option<Hit<'_>> {
         let point = Position::new(x, y);
-        if let Some((rect, id)) = self.question_hit {
-            if rect.contains(point) {
-                self.turn_target = Some(id);
-                return;
-            }
-        }
-        if self.follow_hit.is_some_and(|rect| rect.contains(point)) {
-            self.follow(view);
-            return;
-        }
-        if self.command_area.is_some_and(|r| r.contains(point)) {
-            if let Some((_, command)) = self.command_hits.iter().find(|(r, _)| r.contains(point)) {
-                view.editor.take();
-                view.editor.insert(command.text);
-                if command.argument {
-                    view.editor.insert(" ");
-                }
-            }
-            return;
-        }
-        if self.todo_hit.is_some_and(|r| r.contains(point)) {
-            view.todo_panel = !view.todo_panel;
-            return;
-        }
-        if let Some((_, id)) = self.result_hits.iter().find(|(r, _)| r.contains(point)) {
-            if !view.expanded(*id) {
-                view.toggle(*id);
-            }
-            self.reveal = Some(*id);
-            return;
-        }
-        if let Some((_, id)) = self.hits.iter().find(|(r, _)| r.contains(point)) {
-            self.anchor = Some((*id, y.saturating_sub(self.transcript.y) as usize));
-            view.toggle(*id);
-        }
-    }
-    pub fn scroll(&self, view: &mut View, x: u16, y: u16, up: bool) {
         if self
-            .todo_area
-            .is_some_and(|r| r.contains(Position::new(x, y)))
-            && view.todo_panel
+            .layout
+            .follow_hit
+            .is_some_and(|rect| rect.contains(point))
         {
-            view.todo_scroll = if up {
-                view.todo_scroll.saturating_sub(3)
-            } else {
-                view.todo_scroll.saturating_add(3)
-            };
-        } else {
-            view.scroll = if up {
-                view.scroll.saturating_add(3)
-            } else {
-                view.scroll.saturating_sub(3)
-            };
-            if view.scroll == 0 {
-                view.follow();
-            }
+            return Some(Hit::FollowLatest);
         }
-    }
-    pub fn latest_results(&mut self, view: &mut View) {
-        if let Some(&(_, id)) = self.timeline.result_starts.last() {
-            self.result_target = Some(id);
-        } else {
-            view.toast = Some(("No recorded actions yet".into(), std::time::Instant::now()));
-        }
-    }
-    pub fn latest_turn(&mut self) {
-        self.turn_target = self.timeline.turns.last().map(|(_, id)| *id);
-    }
-    pub fn jump_turn(&mut self, view: &mut View, previous: bool) {
-        let start = self
-            .lines
-            .len()
-            .saturating_sub(view.scroll + self.transcript.height as usize);
-        self.turn_target = if previous {
-            self.timeline
-                .turns
+        if self.layout.command_area.is_some_and(|r| r.contains(point)) {
+            // Rows only; the menu chrome swallows clicks so they do not fall
+            // through to the transcript underneath.
+            return self
+                .layout
+                .command_hits
                 .iter()
-                .rev()
-                .find(|(line, _)| *line < start)
-                .or_else(|| self.timeline.turns.first())
-                .map(|(_, id)| *id)
-        } else {
-            self.timeline
-                .turns
-                .iter()
-                .find(|(line, _)| *line > start)
-                .map(|(_, id)| *id)
-        };
-        if !previous && self.turn_target.is_none() {
-            self.follow(view);
+                .find(|(r, _)| r.contains(point))
+                .map(|(_, c)| Hit::Command(c));
         }
-    }
-    pub fn follow(&mut self, view: &mut View) {
-        self.result_target = None;
-        self.turn_target = None;
-        self.anchor = None;
-        self.reveal = None;
-        view.follow();
-    }
-    pub fn reveal(&mut self, id: Option<u64>) {
-        self.reveal = id;
+        if self.layout.todo_hit.is_some_and(|r| r.contains(point)) {
+            return Some(Hit::TodoToggle);
+        }
+        self.layout
+            .hits
+            .iter()
+            .find(|(r, _)| r.contains(point))
+            .map(|(_, id)| Hit::Block(*id))
     }
 
+    /// Remember the screen row a block header was clicked at, so the next
+    /// frame pins that line back where the user grabbed it.
+    pub fn anchor(&self, v: &mut View, id: u64, y: u16) {
+        v.navigation
+            .anchor(id, y.saturating_sub(self.layout.transcript.y) as usize);
+    }
+
+    /// Whether a wheel event at (x, y) belongs to the Todo panel.
+    pub fn wheel_on_todo(&self, x: u16, y: u16, panel_visible: bool) -> bool {
+        panel_visible
+            && self
+                .layout
+                .todo_area
+                .is_some_and(|r| r.contains(Position::new(x, y)))
+    }
+
+    /// Transcript wheel: three rows per tick, matching codex and opencode —
+    /// one row per event reads as laggy crawling on remote links even when
+    /// every frame lands on time. Clamped to the current layout.
+    pub fn scroll(&self, v: &mut View, rows: usize, up: bool) {
+        v.navigation.scroll(
+            rows,
+            up,
+            self.layout
+                .lines
+                .len()
+                .saturating_sub(self.layout.transcript.height as usize),
+        );
+    }
+
+    pub fn latest_turn(&self, v: &mut View) {
+        v.navigation
+            .turn(self.layout.turns.last().map(|(_, id)| *id));
+    }
+    pub fn jump_turn(&self, v: &mut View, previous: bool) {
+        v.navigation.jump(
+            &self.layout.turns,
+            self.layout.lines.len(),
+            self.layout.transcript.height as usize,
+            previous,
+        );
+    }
+
+    /// Resolve layout-dependent interaction state in memory, then return the
+    /// complete screen. Presentation decides whether any terminal I/O is owed.
+    pub fn prepare(
+        &mut self,
+        area: Rect,
+        v: &mut View,
+        m: &Metadata,
+        time: FrameTime,
+        queued: usize,
+        compact: bool,
+    ) -> Canvas {
+        let mut canvas = Canvas::new(area);
+        self.compose(&mut canvas, v, m, time, queued, compact);
+        canvas
+    }
+
+    #[cfg(test)]
     pub fn draw(
         &mut self,
-        f: &mut Frame<'_>,
+        f: &mut ratatui::Frame<'_>,
         v: &mut View,
         m: &Metadata,
         _status: &SessionStatus,
         queued: usize,
         compact: bool,
     ) {
+        self.prepare(f.area(), v, m, FrameTime::now(), queued, compact)
+            .paint(f);
+    }
+
+    /// Prepare one frame in three stages: relayout (rects + cache + reading
+    /// anchor), navigation resolution against the new layout, then paint.
+    fn compose(
+        &mut self,
+        f: &mut Canvas,
+        v: &mut View,
+        m: &Metadata,
+        time: FrameTime,
+        queued: usize,
+        compact: bool,
+    ) {
         let area = f.area();
-        self.hits.clear();
-        self.result_hits.clear();
-        self.command_hits.clear();
-        self.command_area = None;
-        self.follow_hit = None;
-        self.question_hit = None;
-        self.todo_hit = None;
-        self.todo_area = None;
-        self.tick = self.tick.wrapping_add(1);
+        self.layout.hits.clear();
+        self.layout.command_hits.clear();
+        self.layout.command_area = None;
+        self.layout.follow_hit = None;
+        self.layout.todo_hit = None;
+        self.layout.todo_area = None;
+        let start = *self.animation_start.get_or_insert(time.monotonic);
+        self.tick = time.monotonic.saturating_duration_since(start).as_millis() as u64 / 100;
         f.render_widget(
             Block::default().style(Style::default().bg(BG).fg(TEXT)),
             area,
@@ -206,26 +232,48 @@ impl Renderer {
             v.theme.apply(f.buffer_mut());
             return;
         }
+        // Stage 1: resolve the layout. The only View write is preserving the
+        // reading anchor across a relayout, which needs the old and new
+        // layout at once.
+        self.relayout(area, v, compact);
+        // The native-scroll window rides on the canvas; Presentation hands it
+        // to the terminal backend. The renderer never touches terminal state.
+        f.set_scroll_region(self.layout.transcript);
+        // Stage 2: navigation — pending intents resolve against the new
+        // layout. This and the anchor above are the only View writes in the
+        // prepare path.
+        v.navigation.resolve(
+            self.layout.lines.len(),
+            self.layout.transcript.height as usize,
+            &self.layout.headers,
+            &self.layout.turns,
+        );
+        // Stage 3: paint. Rendering records hit regions into the layout.
+        self.paint(f, v, m, time, queued, compact);
+    }
+
+    /// Compute the frame's rects and, on a cache miss, relayout the timeline.
+    fn relayout(&mut self, area: Rect, v: &mut View, compact: bool) {
+        let layout = &mut self.layout;
         let content_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
         // Todo panel appears only when there are tasks to inspect.
-        // Below 80 columns use a one-line dock above the input.
-        let sidebar_visible = v.todo_panel && !v.todos.is_empty() && area.width >= 80;
+        // Preserve a readable conversation column; compact windows use the task dock.
+        let sidebar_visible = v.todos.panel_open() && area.width >= 100;
         let panel_w = (area.width / 3).clamp(28, 40);
         // The composer owns the whole window width, independently of Todo.
         let width = content_area.width.saturating_sub(4).max(2) as usize;
         let (editor_lines, _, _) = v.editor.layout(width);
-        // Leave three editable rows at rest; shrink gracefully on short terminals.
+        // One editable row plus breathing room; grow only as the draft wraps.
         let input_height = editor_lines
             .len()
             .saturating_add(2)
-            .max(5)
-            .min(usize::from((area.height / 3).clamp(3, 10)))
+            .max(3)
+            .min(usize::from((area.height / 3).clamp(3, 8)))
             .min(usize::from(area.height.saturating_sub(6))) as u16;
         let input_height = if v.asks_empty() { input_height } else { 0 };
-        let footer_lines = footer_lines(area.width as usize, v, m, queued);
         let busy = v.active || compact || !v.asks_empty();
         let activity_height = if busy { 1 } else { 0 };
-        let narrow_dock = if !sidebar_visible && !v.todos.is_empty() && v.todo_panel {
+        let narrow_dock = if !sidebar_visible && v.todos.panel_open() {
             1
         } else {
             0
@@ -240,7 +288,7 @@ impl Renderer {
                 .height
                 .saturating_sub(input_height + activity_height + narrow_dock + 1),
         );
-        let rows = Layout::vertical([
+        let rows = ratatui::layout::Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(ask_height),
             Constraint::Length(activity_height),
@@ -249,98 +297,87 @@ impl Renderer {
         ])
         .split(content_area);
         let cols = if sidebar_visible {
-            Layout::horizontal([Constraint::Min(50), Constraint::Length(panel_w)]).split(rows[0])
+            ratatui::layout::Layout::horizontal([Constraint::Min(50), Constraint::Length(panel_w)])
+                .split(rows[0])
         } else {
-            Layout::horizontal([Constraint::Percentage(100)]).split(rows[0])
+            ratatui::layout::Layout::horizontal([Constraint::Percentage(100)]).split(rows[0])
         };
         let inner = cols[0];
-        self.transcript = inner;
+        // The reading anchor is extracted from the OLD layout before the
+        // transcript rect is replaced.
+        let reading_anchor = (v.navigation.offset() > 0)
+            .then(|| {
+                layout.lines.anchor_at(
+                    layout
+                        .lines
+                        .len()
+                        .saturating_sub(v.navigation.offset() + layout.transcript.height as usize),
+                )
+            })
+            .flatten();
+        layout.transcript = inner;
+        layout.panel = cols.get(1).copied();
+        layout.rows = rows.to_vec();
         let preview_rows = edit_preview_quota(inner.height);
         let key = (v.revision, inner.width, inner.height, v.theme, v.active);
         if self.key != Some(key) {
-            let old = self.lines.len();
-            (self.lines, self.headers) = self.timeline.layout(
+            (layout.lines, layout.headers) = self.timeline.layout(
                 v,
                 inner.width.saturating_sub(2) as usize,
                 preview_rows,
                 self.tick,
             );
-            if self.key.is_some_and(|k| k.1 == key.1) && v.scroll > 0 {
-                v.scroll = if self.lines.len() >= old {
-                    v.scroll.saturating_add(self.lines.len() - old)
-                } else {
-                    v.scroll.saturating_sub(old - self.lines.len())
-                };
+            if let Some(line) = reading_anchor.and_then(|anchor| layout.lines.locate(anchor)) {
+                v.navigation
+                    .preserve_line(line, layout.lines.len(), inner.height as usize);
             }
             self.key = Some(key);
         }
+        layout.turns = self.timeline.turns.clone();
+    }
+
+    /// Render the resolved layout; hit regions are recorded into it so the
+    /// next input event resolves against this frame.
+    fn paint(
+        &mut self,
+        f: &mut Canvas,
+        v: &mut View,
+        m: &Metadata,
+        time: FrameTime,
+        queued: usize,
+        compact: bool,
+    ) {
+        let area = f.area();
+        let layout = &mut self.layout;
+        let inner = layout.transcript;
+        let rows = layout.rows.clone();
+        let footer_lines = footer_lines(area.width as usize, v, m, queued);
         let height = inner.height as usize;
-        if let Some((id, offset)) = self.anchor.take() {
-            if let Some((line, _)) = self.headers.iter().find(|(_, key)| *key == id) {
-                v.scroll = self
-                    .lines
-                    .len()
-                    .saturating_sub(line.saturating_sub(offset) + height);
-            }
-        }
-        if let Some(id) = self.reveal.take() {
-            if let Some((line, _)) = self.headers.iter().find(|(_, key)| *key == id) {
-                let end = self.lines.len().saturating_sub(v.scroll);
-                if *line < end.saturating_sub(height) || *line >= end {
-                    v.scroll = self.lines.len().saturating_sub(*line + height);
-                }
-            }
-        }
-        if let Some(id) = self.turn_target.take() {
-            if let Some((line, _)) = self.timeline.turns.iter().find(|(_, key)| *key == id) {
-                v.scroll = self.lines.len().saturating_sub(*line + height);
-            }
-        }
-        if let Some(id) = self.result_target.take() {
-            if let Some((line, _)) = self
-                .timeline
-                .result_starts
-                .iter()
-                .find(|(_, key)| *key == id)
-            {
-                v.scroll = self.lines.len().saturating_sub(*line + height);
-            }
-        }
-        v.scroll = v.scroll.min(self.lines.len().saturating_sub(height));
-        let end = self.lines.len().saturating_sub(v.scroll);
+        let end = layout.lines.len().saturating_sub(v.navigation.offset());
         let start = end.saturating_sub(height);
-        let mut visible = self.lines.viewport(start..end);
+        let mut visible = layout.lines.viewport(start..end);
         // Only visible tool headers need animation or mouse hit regions.
-        let first_header = self.headers.partition_point(|(line, _)| *line < start);
-        for &(line, id) in &self.headers[first_header..] {
+        let first_header = layout.headers.partition_point(|(line, _)| *line < start);
+        for &(line, id) in &layout.headers[first_header..] {
             if line >= end {
                 break;
             }
             if let Some(Item::Tool(tool)) = v.items().get(id.saturating_sub(v.item_id(0)) as usize)
             {
                 if tool.status == ToolStatus::Running {
-                    visible[line - start] = tool_title(
+                    // Animated titles bypass the cache: the tick changes the
+                    // spinner but not the content version. Same title builder
+                    // as the layout path (cards::tool_title_row).
+                    visible[line - start] = tool_title_row(
                         tool,
                         v.selected() == Some(id),
+                        v.expanded(id),
                         inner.width.saturating_sub(2) as usize,
                         self.tick,
                     );
                 }
             }
-            self.hits.push((
-                Rect::new(inner.x, inner.y + (line - start) as u16, inner.width, 1),
-                id,
-            ));
-        }
-        let first_result = self
-            .timeline
-            .result_links
-            .partition_point(|(line, _)| *line < start);
-        for &(line, id) in &self.timeline.result_links[first_result..] {
-            if line >= end {
-                break;
-            }
-            self.result_hits.push((
+            layout.hits.push((
                 Rect::new(inner.x, inner.y + (line - start) as u16, inner.width, 1),
                 id,
             ));
@@ -355,141 +392,43 @@ impl Renderer {
             rows[4],
             v.asks_empty() && !v.overlay.is_open(),
             if v.active {
-                "Add guidance · Enter to steer · /queue for next"
+                "Add guidance…"
             } else {
-                "Ask anything · / commands"
+                "Ask anything…"
             },
         );
-        // Contextual navigation lives in composer padding, not a second status bar.
-        if rows[4].height >= 3 && !v.overlay.is_open() {
-            let question = if v.scroll == 0 {
-                self.timeline.turns.last()
-            } else {
-                self.timeline
-                    .turns
-                    .iter()
-                    .rev()
-                    .find(|(line, _)| *line <= start)
-                    .or_else(|| self.timeline.turns.first())
-            };
-            let mut x = rows[4].x + 2;
-            let y = rows[4].bottom() - 1;
-            if let Some(&(_, id)) = question {
-                let label = if rows[4].width >= 70 && v.scroll == 0 {
-                    "↑ Question · Ctrl-Home"
-                } else {
-                    "↑ Question"
-                };
-                let rect = Rect::new(x, y, label.width() as u16, 1);
+        // Show one recovery action only while reading history; keep idle input quiet.
+        if v.navigation.offset() > 0 && rows[4].height >= 3 && !v.overlay.is_open() {
+            let label = "↓ Latest";
+            if rows[4].width >= label.width() as u16 + 4 {
+                let rect = Rect::new(
+                    rows[4].right() - label.width() as u16 - 2,
+                    rows[4].bottom() - 1,
+                    label.width() as u16,
+                    1,
+                );
                 f.render_widget(
                     Paragraph::new(label).style(Style::default().fg(MUTED).bg(PANEL)),
                     rect,
                 );
-                self.question_hit = Some((rect, id));
-                x += rect.width + 3;
-            }
-            if v.scroll > 0 {
-                let label = if rows[4].right().saturating_sub(x) >= 38 {
-                    "↓ Latest · Ctrl-End · reading history"
-                } else {
-                    "↓ Latest"
-                };
-                let label = elide(label, rows[4].right().saturating_sub(x + 1) as usize);
-                let rect = Rect::new(x, y, label.width() as u16, 1);
-                f.render_widget(
-                    Paragraph::new(label).style(Style::default().fg(ACCENT).bg(PANEL)),
-                    rect,
-                );
-                self.follow_hit = Some(rect);
+                layout.follow_hit = Some(rect);
             }
         }
-        if let Some(ask) = v.ask() {
-            let title = if ask.permission() {
-                " permission · y allow once / n deny · Enter confirms "
-            } else {
-                " Reply · plain text; /json for structured replies "
-            };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT))
-                .style(Style::default().bg(PANEL))
-                .title(title);
-            let inner = block.inner(rows[1]);
-            f.render_widget(block, rows[1]);
-            let parts = Layout::vertical([
-                Constraint::Min(0),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .split(inner);
-            let mut lines = Vec::new();
-            if ask.permission() {
-                let name = ask.payload["tool_name"].as_str().unwrap_or("tool");
-                lines.push(Line::from(Span::styled(
-                    format!("  Allow {name}?"),
-                    Style::default().fg(ACCENT).bold(),
-                )));
-            }
-            for line in ask.details.lines() {
-                lines.extend(wrap(
-                    line,
-                    Style::default().fg(TEXT),
-                    parts[0].width as usize,
-                    " ",
-                ));
-            }
-            let offset = ask
-                .scroll
-                .min(lines.len().saturating_sub(parts[0].height as usize));
-            f.render_widget(
-                Paragraph::new(
-                    lines
-                        .into_iter()
-                        .skip(offset)
-                        .take(parts[0].height as usize)
-                        .collect::<Vec<_>>(),
-                ),
-                parts[0],
-            );
-            if let Some(error) = &ask.error {
-                f.render_widget(
-                    Paragraph::new(error.as_str()).style(Style::default().fg(RED)),
-                    parts[1],
-                );
-            } else {
-                f.render_widget(
-                    Paragraph::new("Alt-PgUp/PgDn details · Esc cancels turn")
-                        .style(Style::default().fg(MUTED)),
-                    parts[1],
-                );
-            }
-            let (reply, row, col) = ask.editor.layout(parts[2].width as usize);
-            let line = reply.get(row).cloned().unwrap_or_default();
-            f.render_widget(
-                Paragraph::new(line).style(Style::default().fg(TEXT)),
-                parts[2],
-            );
-            if parts[2].width > 0 && parts[2].height > 0 && !v.overlay.is_open() {
-                f.set_cursor_position((
-                    parts[2].x + col.min(parts[2].width.saturating_sub(1) as usize) as u16,
-                    parts[2].y,
-                ));
-            }
-        }
+        ask_overlay(f, rows[1], v);
         // Breathing bar: one line above the input, visible only while busy.
-        if activity_height > 0 {
-            draw_activity_bar(f, rows[2], v, compact, self.tick);
+        if rows[2].height > 0 {
+            draw_activity_bar(f, rows[2], v, compact, self.tick, time.monotonic);
         }
         // Narrow-screen TODO dock (single line, only when panel won't fit).
-        if narrow_dock > 0 {
+        if rows[3].height > 0 {
             draw_narrow_todo_dock(f, rows[3], v);
-            self.todo_hit = Some(rows[3]);
+            layout.todo_hit = Some(rows[3]);
         }
         let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
         f.render_widget(Paragraph::new(footer_lines), footer);
-        v.commands
-            .sync(&v.editor.text, v.asks_empty() && !v.overlay.is_open());
-        let commands = v.commands.items();
+        let menu = v.menu();
+        let commands = menu.items();
+        let selected_command = menu.selected;
         if !commands.is_empty() {
             let height = (commands.len() as u16 + 2).min(rows[4].y.saturating_sub(area.y));
             let rect = Rect::new(
@@ -498,14 +437,11 @@ impl Renderer {
                 rows[4].width.min(62),
                 height,
             );
-            self.command_area = Some(rect);
+            layout.command_area = Some(rect);
             let visible = height.saturating_sub(2) as usize;
-            let start = v
-                .commands
-                .selected
-                .saturating_sub(visible.saturating_sub(1));
+            let start = selected_command.saturating_sub(visible.saturating_sub(1));
             for (row, command) in commands.iter().skip(start).take(visible).enumerate() {
-                self.command_hits.push((
+                layout.command_hits.push((
                     Rect::new(
                         rect.x + 1,
                         rect.y + 1 + row as u16,
@@ -524,23 +460,19 @@ impl Renderer {
                     Line::from(Span::styled(
                         format!(
                             " {} {:<17} {}",
-                            if i == v.commands.selected { "›" } else { " " },
+                            if i == selected_command { "›" } else { " " },
                             c.text,
                             c.description
                         ),
                         Style::default()
-                            .fg(if i == v.commands.selected {
-                                ACCENT
-                            } else {
-                                TEXT
-                            })
-                            .add_modifier(if i == v.commands.selected {
+                            .fg(if i == selected_command { ACCENT } else { TEXT })
+                            .add_modifier(if i == selected_command {
                                 Modifier::BOLD
                             } else {
                                 Modifier::empty()
                             }),
                     ))
-                    .style(Style::default().bg(if i == v.commands.selected {
+                    .style(Style::default().bg(if i == selected_command {
                         FOCUS_SURFACE
                     } else {
                         PANEL
@@ -560,19 +492,25 @@ impl Renderer {
                 rect,
             );
         }
-        if let Some(side) = cols.get(1) {
-            let hits = sidebar(f, *side, v);
-            self.panel = Some(*side);
-            self.todo_hit = hits.0;
-            self.todo_area = hits.1;
-        } else {
-            self.panel = None;
+        if let Some(side) = layout.panel {
+            let hits = sidebar(f, side, v);
+            layout.todo_hit = hits.0;
+            layout.todo_area = hits.1;
         }
         match &v.overlay {
             Overlay::None => {}
             Overlay::Stats { .. } => stats_overlay(f, area, v, m, queued),
             Overlay::Models(_) => model_picker_overlay(f, area, v),
-            Overlay::Sessions(_) => sessions_overlay(f, area, v),
+            Overlay::LoadingSessions => {
+                let rect = crate::picker::centered(area, 40, 3);
+                f.render_widget(Clear, rect);
+                f.render_widget(
+                    Paragraph::new("Loading sessions… · Esc close")
+                        .style(Style::default().fg(TEXT).bg(PANEL)),
+                    rect,
+                );
+            }
+            Overlay::Sessions(_) => sessions_overlay(f, area, v, time.unix_seconds),
             Overlay::Themes(_) => theme_picker_overlay(f, area, v),
             Overlay::Help { scroll } => help(f, area, *scroll),
         }
@@ -580,7 +518,7 @@ impl Renderer {
         self.selection
             .render(f.buffer_mut(), v.theme.color(BG), v.theme.color(BLUE));
         if let Some((message, since)) = &v.toast {
-            if since.elapsed().as_secs() < 3 {
+            if time.monotonic.saturating_duration_since(*since).as_secs() < 3 {
                 let width = (message.width() as u16 + 6).min(area.width.saturating_sub(4));
                 let rect = Rect::new(
                     area.x + (area.width - width) / 2,
@@ -614,10 +552,10 @@ fn pulse_color(seconds: f32, theme: super::theme::Theme) -> Color {
     lerp_color(theme.color(MUTED), theme.color(ACCENT), intensity)
 }
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-fn spinner_frame(tick: u64) -> char {
+pub(super) fn spinner_frame(tick: u64) -> char {
     SPINNER[(tick as usize) % SPINNER.len()]
 }
-fn activity(v: &View, compact: bool) -> String {
+fn activity(v: &View, compact: bool, now: std::time::Instant) -> String {
     if let Some(ask) = v.ask() {
         return if ask.permission() {
             "Waiting for approval"
@@ -632,7 +570,7 @@ fn activity(v: &View, compact: bool) -> String {
     if let Some(retry) = &v.retry {
         let seconds = retry
             .until
-            .saturating_duration_since(std::time::Instant::now())
+            .saturating_duration_since(now)
             .as_secs_f64()
             .ceil() as u64;
         return format!(
@@ -655,10 +593,10 @@ fn activity(v: &View, compact: bool) -> String {
     }
     v.model_activity().into()
 }
-fn elapsed_str(v: &View) -> String {
+fn elapsed_str(v: &View, now: std::time::Instant) -> String {
     v.since
         .map(|t| {
-            let s = t.elapsed().as_secs();
+            let s = now.saturating_duration_since(t).as_secs();
             if s >= 60 {
                 format!("{}m {}s", s / 60, s % 60)
             } else {
@@ -698,7 +636,7 @@ fn permission_label(yolo: bool, trusted: bool) -> &'static str {
         "ask"
     }
 }
-fn welcome(f: &mut Frame<'_>, area: Rect) {
+fn welcome(f: &mut Canvas, area: Rect) {
     // A task-oriented empty state; no terminal banner or persistent title bar.
     let wide = area.width >= 60 && area.height >= 10;
     let content = if wide {
@@ -741,7 +679,7 @@ fn welcome(f: &mut Frame<'_>, area: Rect) {
     f.render_widget(Paragraph::new(lines), rect);
 }
 
-fn draw_editor(f: &mut Frame<'_>, e: &Editor, area: Rect, focus: bool, placeholder: &str) {
+fn draw_editor(f: &mut Canvas, e: &Editor, area: Rect, focus: bool, placeholder: &str) {
     if area.is_empty() {
         return;
     }
@@ -790,27 +728,27 @@ fn draw_editor(f: &mut Frame<'_>, e: &Editor, area: Rect, focus: bool, placehold
     }
 }
 /// Todo-only panel; diagnostics are available in the dashboard.
-fn sidebar(f: &mut Frame<'_>, area: Rect, v: &View) -> (Option<Rect>, Option<Rect>) {
+fn sidebar(f: &mut Canvas, area: Rect, v: &View) -> (Option<Rect>, Option<Rect>) {
     let block = Block::default()
-        .padding(ratatui::widgets::Padding::new(2, 0, 0, 0))
-        .style(Style::default().bg(BG));
+        .padding(ratatui::widgets::Padding::new(2, 2, 1, 1))
+        .style(Style::default().bg(CODE_SURFACE));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let done = v.todos.iter().filter(|t| t.completed).count();
+    let done = v.todos.items().iter().filter(|t| t.completed).count();
     f.render_widget(
-        Paragraph::new(format!(" Todo · {done}/{} · ^T", v.todos.len()))
+        Paragraph::new(format!(" Todo · {done}/{} · ^T", v.todos.items().len()))
             .style(Style::default().fg(TEXT).bold()),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
     let body = Rect::new(
         inner.x,
-        inner.y.saturating_add(1),
+        inner.y.saturating_add(2),
         inner.width,
-        inner.height.saturating_sub(1),
+        inner.height.saturating_sub(2),
     );
-    let current = v.todos.iter().position(|t| !t.completed);
+    let current = v.todos.items().iter().position(|t| !t.completed);
     let mut lines = Vec::new();
-    for (i, todo) in v.todos.iter().enumerate() {
+    for (i, todo) in v.todos.items().iter().enumerate() {
         let (mark, color) = if todo.completed {
             ("✓", GREEN)
         } else if current == Some(i) {
@@ -846,8 +784,8 @@ fn sidebar(f: &mut Frame<'_>, area: Rect, v: &View) -> (Option<Rect>, Option<Rec
         }
     }
     let scroll = v
-        .todo_scroll
-        .min(lines.len().saturating_sub(body.height as usize));
+        .todos
+        .scroll_within(lines.len().saturating_sub(body.height as usize));
     f.render_widget(
         Paragraph::new(
             lines
@@ -893,11 +831,12 @@ fn wrap_todo_text(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Narrow-screen single-line TODO dock (between ask and input).
-fn draw_narrow_todo_dock(f: &mut Frame<'_>, area: Rect, v: &View) {
-    let done = v.todos.iter().filter(|t| t.completed).count();
-    let total = v.todos.len();
+fn draw_narrow_todo_dock(f: &mut Canvas, area: Rect, v: &View) {
+    let done = v.todos.items().iter().filter(|t| t.completed).count();
+    let total = v.todos.items().len();
     let next = v
         .todos
+        .items()
         .iter()
         .find(|t| !t.completed)
         .map(|t| t.text.replace('\n', " "))
@@ -909,16 +848,23 @@ fn draw_narrow_todo_dock(f: &mut Frame<'_>, area: Rect, v: &View) {
     );
 }
 
-fn draw_activity_bar(f: &mut Frame<'_>, area: Rect, v: &View, compact: bool, tick: u64) {
+fn draw_activity_bar(
+    f: &mut Canvas,
+    area: Rect,
+    v: &View,
+    compact: bool,
+    tick: u64,
+    now: std::time::Instant,
+) {
     let spinner = spinner_frame(tick);
-    let act = activity(v, compact);
-    let elapsed = elapsed_str(v);
+    let act = activity(v, compact, now);
+    let elapsed = elapsed_str(v, now);
     let text = if elapsed.is_empty() {
         format!("{spinner} {act} · Esc 打断")
     } else {
         format!("{spinner} {act} · {elapsed} · Esc 打断")
     };
-    let color = pulse_color(tick as f32 * 0.04, v.theme);
+    let color = pulse_color(tick as f32 * 0.1, v.theme);
     f.render_widget(
         Paragraph::new(elide(&text, area.width as usize)).style(Style::default().fg(color)),
         area,
@@ -951,7 +897,7 @@ fn footer_lines(width: usize, v: &View, m: &Metadata, queued: usize) -> Vec<Line
     let metrics_budget = width.saturating_sub(label_reserve + permission.width() + 6);
     let mut omitted = false;
     let mut optional = vec![
-        (0, format!("tok {}", tokens(v.usage.total_tokens))),
+        (0, format!("tok {}", tokens(v.usage().total_tokens))),
         (2, format!("{rate} tok/s")),
     ];
     if queued > 0 {
@@ -985,26 +931,18 @@ fn footer_lines(width: usize, v: &View, m: &Metadata, queued: usize) -> Vec<Line
     let right_width = metrics.width() + overflow.width() + 3 + permission.width();
     let left_width = width.saturating_sub(right_width + 2);
     let title = v.title.as_deref().unwrap_or("New session");
-    let title_budget = if title.width() + 3 + m.cwd.width() <= left_width {
-        title.width()
+    // A partial title competes with the path and conveys little: show it whole or omit it.
+    let show_title = !omitted && title.width() + 3 + m.cwd.width() <= left_width;
+    let title_label = if show_title {
+        format!("{title} · ")
     } else {
-        title.width().min(left_width.saturating_sub(3) / 2)
+        String::new()
     };
-    let left = format!(
-        "{} · {}",
-        elide(title, title_budget),
-        elide_tail(&m.cwd, left_width.saturating_sub(title_budget + 3))
-    );
-    let gap = width.saturating_sub(left.width() + right_width);
+    let path = elide_tail(&m.cwd, left_width.saturating_sub(title_label.width()));
+    let gap = width.saturating_sub(title_label.width() + path.width() + right_width);
     vec![Line::from(vec![
-        Span::styled(elide(title, title_budget), Style::default().fg(TEXT).bold()),
-        Span::styled(
-            format!(
-                " · {}",
-                elide_tail(&m.cwd, left_width.saturating_sub(title_budget + 3))
-            ),
-            muted,
-        ),
+        Span::styled(title_label, Style::default().fg(TEXT).bold()),
+        Span::styled(path, muted),
         Span::raw(" ".repeat(gap)),
         Span::styled(metrics, Style::default().fg(TEXT)),
         Span::styled(overflow, muted),
@@ -1045,48 +983,13 @@ fn tokens(value: u64) -> String {
         compact_number(value as f64)
     }
 }
-fn elide_tail(text: &str, width: usize) -> String {
-    if text.width() <= width {
-        return text.into();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut tail = Vec::new();
-    let mut used = 1;
-    for g in text.graphemes(true).rev() {
-        if used + g.width() > width {
-            break;
-        }
-        used += g.width();
-        tail.push(g);
-    }
-    format!("…{}", tail.into_iter().rev().collect::<String>())
-}
 
-fn elide(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if text.width() <= width {
-        return text.into();
-    }
-    let mut result = String::new();
-    for g in text.graphemes(true) {
-        if result.width() + g.width() + 1 > width {
-            break;
-        }
-        result.push_str(g);
-    }
-    result.push('…');
-    result
-}
 fn label(s: &str, color: Color) -> Line<'static> {
     Line::from(Span::styled(format!("  {s}"), Style::default().fg(color)))
 }
-fn help(f: &mut Frame<'_>, area: Rect, scroll: u16) {
+fn help(f: &mut Canvas, area: Rect, scroll: u16) {
     let rect = crate::picker::centered(area, 78, area.height.saturating_sub(2) as usize);
-    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/results        Jump to latest recorded file/command actions\n/help           This help · Esc closes\n\nApprovals: y/n + Enter (YOLO skips approvals).";
+    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y/n + Enter (YOLO skips approvals).";
     let lines: Vec<_> = text
         .lines()
         .flat_map(|line| {
@@ -1127,12 +1030,6 @@ fn edit_preview_quota(height: u16) -> usize {
 }
 
 #[cfg(test)]
-fn timeline(v: &View, width: usize) -> (Vec<Line<'static>>, Vec<(usize, u64)>) {
-    let (lines, headers) = timeline::TimelineCache::default().layout(v, width, 3, 0);
-    (lines.viewport(0..lines.len()), headers)
-}
-
-#[cfg(test)]
 mod tests {
     /// Repeat with --release --ignored --nocapture for renderer-only timings.
     #[test]
@@ -1163,7 +1060,7 @@ mod tests {
         for stream in [false, true] {
             let mut samples = vec![];
             for i in 0..120 {
-                v.scroll = 100 + (i % 30) * 3;
+                v.navigation.set_offset(100 + (i % 30) * 3);
                 if stream {
                     v.event(Out::Chunk {
                         text: "More output. ".into(),
@@ -1178,298 +1075,57 @@ mod tests {
                 "render_bench stream={stream} p50={:.3}ms p95={:.3}ms rows={} items={}",
                 samples[60],
                 samples[114],
-                renderer.lines.len(),
+                renderer.layout.lines.len(),
                 v.items().len()
             );
         }
-    }
-
-    #[test]
-    fn pickers_fit_small_terminals_and_scroll_to_selected_rows() {
-        use ratatui::{backend::TestBackend, Terminal};
-        let mut v = View::default();
-        v.model_choices = (0..100).map(|i| format!("model-{i:03}")).collect();
-        v.overlay = Overlay::Sessions(super::super::state::SessionPickerState {
-            pending_delete: None,
-            rows: (0..100)
-                .map(|i| crate::sessions::SessionRow {
-                    id: yourai_core::prelude::SessionId(format!("session-{i:03}")),
-                    title: format!("row-{i:03}"),
-                    model: String::new(),
-                    updated_at: 0,
-                    is_current: false,
-                })
-                .collect(),
-            query: String::new(),
-            selected: 99,
-        });
-        for width in [1, 20, 30, 40, 48, 80] {
-            for height in [1, 2, 3, 8, 24] {
-                let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
-                for draw in [model_picker_overlay, sessions_overlay, theme_picker_overlay] {
-                    t.draw(|f| draw(f, f.area(), &v)).unwrap();
-                }
+        // Include cell diffing and actual ANSI encoding, not only TestBackend writes.
+        struct Output(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
             }
         }
-        let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        for (draw, expected) in [
-            (
-                sessions_overlay as fn(&mut ratatui::Frame<'_>, Rect, &View),
-                "row-099",
-            ),
-            (model_picker_overlay, "model-099"),
-        ] {
-            let previous = std::mem::replace(&mut v.overlay, Overlay::Models(99));
-            if expected == "row-099" {
-                v.overlay = previous;
+        let output = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(Output(output.clone())),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 160, 48)),
+            },
+        )
+        .unwrap();
+        let mut renderer = Renderer::default();
+        let mut samples = Vec::new();
+        let mut bytes = 0;
+        for i in 0..121 {
+            v.navigation.set_offset(100 + i * 3);
+            output.borrow_mut().clear();
+            let start = Instant::now();
+            terminal
+                .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
+                .unwrap();
+            if i > 0 {
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                bytes += output.borrow().len();
             }
-            t.draw(|f| draw(f, f.area(), &v)).unwrap();
-            let text: String = t
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|c| c.symbol())
-                .collect();
-            assert!(
-                text.contains(expected),
-                "selected row is not visible: {expected}"
-            );
         }
-    }
-
-    fn timeline_text(lines: &[Line<'static>]) -> String {
-        lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[test]
-    fn tool_title_right_aligns_meta_and_elides_long_subject() {
-        let mut v = View::default();
-        let long = "cargo test --workspace --all-targets ".repeat(8);
-        v.event(Out::ToolStarted {
-            id: "t".into(),
-            name: "shell".into(),
-            input: json!({ "command": long }),
-        });
-        v.event(Out::ToolDone {
-            id: "t".into(),
-            name: "shell".into(),
-            output: json!({"ok":true,"exit_code":0,"termination":"exit","output_complete":true,"stdout":"done\n","stderr":""}),
-            is_error: false,
-        });
-        let (lines, _) = timeline(&v, 80);
-        let title = lines
-            .iter()
-            .find(|l| l.spans.iter().any(|s| s.content.contains('✓')))
-            .expect("title line");
-        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains('…'), "long subject elided: {text}");
-        assert!(text.contains("exit 0"), "meta survives elision: {text}");
-        // Sub-second durations are silent; the meta ends with the exit code.
-        assert!(text.trim_end().ends_with("exit 0"), "meta last: {text}");
-        assert!(title.width() <= 80, "title fits width: {}", title.width());
-    }
-
-    #[test]
-    fn failed_shell_preview_prioritizes_stderr_tail_over_stdout_progress() {
-        let mut v = View::default();
-        v.event(Out::ToolStarted {
-            id: "build".into(),
-            name: "shell".into(),
-            input: json!({"command": "cargo build"}),
-        });
-        v.event(Out::ToolDone {
-            id: "build".into(), name: "shell".into(),
-            output: json!({"ok":false,"exit_code":1,"stdout":"Compiling dependencies", "stderr":"warning 1\nwarning 2\nwarning 3\nwarning 4\nwarning 5\nerror: unresolved import"}),
-            is_error: true,
-        });
-        let tool = v
-            .items()
-            .iter()
-            .find_map(|item| {
-                if let Item::Tool(t) = item {
-                    Some(t)
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        let mut lines = vec![];
-        tool_preview(tool, &mut lines, 80, Theme::Dark, 3);
-        let text = lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert!(text.contains("error: unresolved import"));
-        assert!(text.contains("stderr") && text.contains("^O full output"));
-        assert!(!text.contains("Compiling dependencies") && !text.contains("warning 1"));
-        lines.clear();
-        tool_expanded(tool, &mut lines, 80, Theme::Dark);
-        let full = lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert!(full.contains("Compiling dependencies") && full.contains("warning 1"));
-    }
-
-    #[test]
-    fn card_previews_follow_per_tool_quotas() {
-        let mut v = View::default();
-        // read: no code teaser at all.
-        v.event(Out::ToolStarted {
-            id: "r".into(),
-            name: "read".into(),
-            input: json!({"path":"src/main.rs"}),
-        });
-        v.event(Out::ToolDone {
-            id: "r".into(),
-            name: "read".into(),
-            output: json!({"ok":true,"path":"src/main.rs","offset":1,"content":"1|fn main() {}\n"}),
-            is_error: false,
-        });
-        // shell done: exactly one tail line of stdout.
-        v.event(Out::ToolStarted {
-            id: "s".into(),
-            name: "shell".into(),
-            input: json!({"command":"seq"}),
-        });
-        v.event(Out::ToolDone {
-            id: "s".into(),
-            name: "shell".into(),
-            output: json!({"ok":true,"exit_code":0,"termination":"exit","output_complete":true,"stdout":"alpha\nbeta\ngamma\n","stderr":""}),
-            is_error: false,
-        });
-        // write: line count + confirmed "new" marker in the title.
-        v.event(Out::ToolStarted {
-            id: "w".into(),
-            name: "write".into(),
-            input: json!({"path":"docs/design.md","content":"# T\n\nbody\n"}),
-        });
-        v.event(Out::ToolDone {
-            id: "w".into(),
-            name: "write".into(),
-            output: json!({"ok":true,"path":"docs/design.md","created":true,"bytes_written":8}),
-            is_error: false,
-        });
-        // unknown tool: a single summarized line, never raw JSON.
-        v.event(Out::ToolDone {
-            id: "x".into(),
-            name: "mcp__jira".into(),
-            output: json!({"result":"Created YOUR-9","ok":true}),
-            is_error: false,
-        });
-        let (lines, _) = timeline(&v, 80);
-        let text = timeline_text(&lines);
-        assert!(text.contains("1 lines"), "read meta: {text}");
-        assert!(text.contains("+3 · new"), "write meta: {text}");
-        assert!(text.contains("# T"), "write ghost-diff preview: {text}");
-        assert!(!text.contains("fn main"), "read teaser hidden: {text}");
-        assert!(text.contains("gamma"), "shell tail line: {text}");
-        assert!(!text.contains("alpha"), "shell older lines hidden: {text}");
-        assert!(text.contains("Created YOUR-9"), "summarized body: {text}");
-        assert!(!text.contains('{'), "no raw json: {text}");
-    }
-
-    fn edit_view() -> View {
-        let mut v = View::default();
-        v.event(Out::ToolStarted {
-            id: "e".into(),
-            name: "edit".into(),
-            input: json!({"path":"src/main.rs","old_text":"    old();","new_text":"    new();\n    more();"}),
-        });
-        v.event(Out::ToolDone {
-            id: "e".into(),
-            name: "edit".into(),
-            output: json!({"ok":true,"path":"src/main.rs","changed":true,"diff":"--- src/main.rs\n+++ src/main.rs\n@@ -40,3 +40,4 @@\n fn main() {\n-    old();\n+    new();\n+    more();\n }\n"}),
-            is_error: false,
-        });
-        v
-    }
-
-    fn line_text(line: &Line<'static>) -> String {
-        line.spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
-    #[test]
-    fn edit_card_splits_side_by_side_when_wide() {
-        let (lines, _) = timeline(&edit_view(), 140);
-        let text = timeline_text(&lines);
-        assert!(text.contains(" │ "), "split separator: {text}");
-        // Old and new versions of the changed line sit on the same row.
-        let pair = lines
-            .iter()
-            .map(line_text)
-            .find(|t| t.contains("old();") && t.contains("new();"))
-            .expect("paired row: {text}");
-        assert!(
-            pair.contains("41"),
-            "cell gutter carries line numbers: {pair}"
-        );
-        // Right-aligned meta and full-width, padded cells.
-        assert!(text.contains("+2 −1"), "title meta: {text}");
-        let row = lines
-            .iter()
-            .find(|l| line_text(l).contains("old();") && line_text(l).contains("new();"))
-            .unwrap();
-        assert_eq!(row.width(), 139, "cells pad the full row");
-    }
-
-    #[test]
-    fn edit_card_unifies_below_split_threshold() {
-        let (lines, _) = timeline(&edit_view(), 100);
-        let text = timeline_text(&lines);
-        assert!(
-            !text.contains(" │ "),
-            "no split separator when narrow: {text}"
-        );
-        let texts: Vec<String> = lines.iter().map(line_text).collect();
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.starts_with("  - ") && t.contains("old();")),
-            "old line carries the '-' gutter: {texts:?}"
-        );
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.starts_with("  + ") && t.contains("new();")),
-            "new line carries the '+' gutter: {texts:?}"
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "ansi_scroll p50={:.3}ms p95={:.3}ms bytes/frame={}",
+            samples[60],
+            samples[114],
+            bytes / 120
         );
     }
 
-    #[test]
-    fn websearch_preview_lists_sources_with_more_hint() {
-        let mut v = View::default();
-        let content = (1..=4)
-            .map(|i| format!("Title: Result {i}\nURL: https://host{i}.example/page"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        v.event(Out::ToolDone {
-            id: "w".into(),
-            name: "websearch".into(),
-            output: json!({"provider":"exa","query":"q","content":content}),
-            is_error: false,
-        });
-        let (lines, _) = timeline(&v, 80);
-        let text = timeline_text(&lines);
-        assert!(text.contains("Result 1 — host1.example"), "{text}");
-        assert!(text.contains("Result 3 — host3.example"), "{text}");
-        assert!(!text.contains("Result 4"), "fourth row hidden: {text}");
-        assert!(text.contains("⋯ 1 more · ^O"), "more hint: {text}");
-    }
-
+    #[allow(clippy::wildcard_imports)]
     use super::*;
+    use crate::ui::state::Role;
+    use crate::ui::theme::USER_SURFACE;
     use ratatui::backend::TestBackend;
     use serde_json::json;
     #[test]
@@ -1496,9 +1152,14 @@ mod tests {
         v.model_metrics.requests.cache_read_tokens = 80;
         v.model_metrics.requests.cache_known_input_tokens = 100;
         v.model_metrics.requests.cache_reported_responses = 1;
-        v.usage.input_tokens = 125_000;
-        v.usage.output_tokens = 6_000;
-        v.usage.total_tokens = 131_000;
+        v.restore_usage(
+            yourai_core::prelude::Usage {
+                input_tokens: 125_000,
+                output_tokens: 6_000,
+                total_tokens: 131_000,
+            },
+            0,
+        );
         let m = Metadata {
             session: "session-123".into(),
             cwd: "~/projects/yourai".into(),
@@ -1556,11 +1217,13 @@ mod tests {
         assert!(text.contains("/continue"));
         assert!(text.contains("Copied"));
         let (rect, _) = renderer
+            .layout
             .command_hits
             .iter()
             .find(|(_, c)| c.text == "/queue")
+            .copied()
             .unwrap();
-        renderer.click(&mut v, rect.x, rect.y);
+        super::super::app::click_dispatch(&mut renderer, &mut v, rect.x, rect.y);
         assert_eq!(v.editor.text, "/queue ");
         v.editor.take();
         v.toast = None;
@@ -1584,7 +1247,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
         let mut renderer = Renderer::default();
         let mut v = View::default();
-        v.model_label = "test-model".into();
+        v.model.label = "test-model".into();
         let m = Metadata {
             session: "session-123".into(),
             cwd: "/workspace".into(),
@@ -1622,36 +1285,43 @@ mod tests {
         v.event(Out::Reasoning {
             text: "checking".into(),
         });
-        assert_eq!(activity(&v, false), "Thinking");
+        assert_eq!(activity(&v, false, std::time::Instant::now()), "Thinking");
         v.event(Out::ToolStarted {
             id: "t".into(),
             name: "shell".into(),
             input: json!({"command":"cargo test"}),
         });
-        assert_eq!(activity(&v, false), "Running cargo test");
+        assert_eq!(
+            activity(&v, false, std::time::Instant::now()),
+            "Running cargo test"
+        );
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 2, false))
             .unwrap();
         let screen = rows(&terminal).join("\n");
         assert!(!screen.contains("yourai · your"));
         assert!(screen.contains("Running cargo"));
-        assert!(screen.contains("Enter to steer"));
+        assert!(screen.contains("Add guidance…"));
         // Queued count is now in the footer left slot.
         assert!(screen.contains("2 queued"));
         v.event(Out::Ask {
             id: "approval".into(),
             payload: json!({"kind":"permission"}),
         });
-        assert_eq!(activity(&v, false), "Waiting for approval");
+        assert_eq!(
+            activity(&v, false, std::time::Instant::now()),
+            "Waiting for approval"
+        );
         v.settle();
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
-        renderer.anchor = Some((0, 0));
-        renderer.reveal(Some(0));
-        renderer.follow(&mut v);
-        assert!(renderer.anchor.is_none() && renderer.reveal.is_none());
-        assert_eq!(v.scroll, 0);
+        v.navigation.anchor(0, 0);
+        v.navigation.reveal(Some(0));
+
+        v.follow();
+        v.navigation.resolve(100, 10, &[(0, 0)], &[]);
+        assert_eq!(v.navigation.offset(), 0);
         assert_ne!(
             pulse_color(0.0, super::super::theme::Theme::Dark),
             pulse_color(1.0, super::super::theme::Theme::Dark)
@@ -1694,24 +1364,27 @@ mod tests {
         terminal
             .draw(|f| renderer.draw(f, &mut view, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
-        assert_eq!(renderer.hits.len(), 2);
-        let (rect, id) = renderer.hits[1];
+        assert_eq!(renderer.layout.hits.len(), 2);
+        let (rect, id) = renderer.layout.hits[1];
         // Card preview shows output but NOT the input JSON (only expanded shows input).
         assert!(!renderer
+            .layout
             .lines
             .iter()
             .any(|l| l.to_string().contains("\"command\"")));
-        renderer.click(&mut view, rect.x + 2, rect.y);
+        super::super::app::click_dispatch(&mut renderer, &mut view, rect.x + 2, rect.y);
         terminal
             .draw(|f| renderer.draw(f, &mut view, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
         // Expanded shows the input JSON.
         assert!(renderer
+            .layout
             .lines
             .iter()
             .any(|l| l.to_string().contains("\"command\"")));
         // Expanded thinking shows full text (card title already has a summary).
         assert!(renderer
+            .layout
             .lines
             .iter()
             .any(|l| l.to_string().contains("private-thought")));
@@ -1720,8 +1393,13 @@ mod tests {
         terminal
             .draw(|f| renderer.draw(f, &mut view, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
-        let (rect, _) = *renderer.hits.iter().find(|(_, key)| *key == id).unwrap();
-        renderer.click(&mut view, rect.x + 2, rect.y);
+        let (rect, _) = *renderer
+            .layout
+            .hits
+            .iter()
+            .find(|(_, key)| *key == id)
+            .unwrap();
+        super::super::app::click_dispatch(&mut renderer, &mut view, rect.x + 2, rect.y);
         assert!(!view.expanded(id));
     }
 
@@ -1740,7 +1418,7 @@ mod tests {
                 completed: i == 0,
             })
             .collect();
-        v.set_todos(todos.clone());
+        v.todos.set(todos.clone());
         v.event(Out::Reasoning {
             text: "a thought".into(),
         });
@@ -1791,22 +1469,22 @@ mod tests {
         let last = *list.last().unwrap();
         assert!(first < last);
         // Clicking the Todo title toggles the panel off.
-        let hit = renderer.todo_hit.unwrap();
-        renderer.click(&mut v, hit.x, hit.y);
-        assert!(!v.todo_panel);
+        let hit = renderer.layout.todo_hit.unwrap();
+        super::super::app::click_dispatch(&mut renderer, &mut v, hit.x, hit.y);
+        assert!(!v.todos.panel);
         let text = draw(&mut terminal, &mut renderer, &mut v).join("\n");
         // With panel off, Todo items are not visible.
         assert!(!text.contains("Task number 0"));
         // Re-open via the field directly (wide screen has no dock to click).
-        v.todo_panel = true;
+        v.todos.panel = true;
         draw(&mut terminal, &mut renderer, &mut v);
         // Wheel over the TODO list scrolls it, not the transcript.
-        let area = renderer.todo_area.unwrap();
-        renderer.scroll(&mut v, area.x, area.y, false);
-        assert_eq!(v.todo_scroll, 3);
+        let area = renderer.layout.todo_area.unwrap();
+        super::super::app::wheel_dispatch(&mut renderer, &mut v, area.x, area.y, false);
+        assert_eq!(v.todos.scroll(), 1);
         todos.retain(|t| t.id != "t8");
-        v.set_todos(todos);
-        assert_eq!(v.todo_scroll, 3);
+        v.todos.set(todos);
+        assert_eq!(v.todos.scroll(), 1);
         // Reasoning renders italic + dim; tool output uses its own color.
         let thinking_id = (0..v.items().len())
             .map(|i| v.item_id(i))
@@ -1879,7 +1557,7 @@ mod tests {
             v.event(Out::Reasoning {
                 text: "Inspect the parser boundary and preserve existing behavior.".into(),
             });
-            v.set_todos(vec![
+            v.todos.set(vec![
                 super::super::state::Todo {
                     id: "a".into(),
                     text: "Inspect parser".into(),
@@ -1960,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_turn_shows_action_summary_only_after_live_work_finishes() {
+    fn completed_turn_keeps_original_evidence_without_duplicate_summary() {
         let mut v = View::default();
         v.theme = Theme::Dark;
         v.user("Fix the parser boundary and verify the change.", false);
@@ -2025,77 +1703,29 @@ mod tests {
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
-        assert!(renderer.timeline.result_starts.is_empty());
         v.event(Out::Message { text:"## Parser boundary updated\n\nThe empty-input case still needs a follow-up fix.\n\n- Build command exited successfully.\n- Parser test command failed; inspect the diagnostic below.".into() });
         v.settle();
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
-        assert_eq!(renderer.timeline.result_starts.len(), 1);
-        assert_eq!(renderer.result_hits.len(), 3);
-        if let Ok(path) = std::env::var("YOURAI_RESULTS_SNAPSHOT") {
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(!content.contains("Recorded actions"));
+        assert!(content.contains("parser_empty_input"));
+        assert!(content.contains("cargo check"));
+        assert_eq!(content.matches("Parser boundary updated").count(), 1);
+        if let Ok(path) = std::env::var("YOURAI_READING_SNAPSHOT") {
             let cells = terminal.backend().buffer().content().iter().map(|c|json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD)})).collect::<Vec<_>>();
             std::fs::write(
                 path,
                 serde_json::to_vec(&json!({"width":120,"height":48,"cells":cells})).unwrap(),
             )
             .unwrap();
-        }
-    }
-
-    #[test]
-    fn result_rows_open_their_original_tool_and_keep_footer_single_line() {
-        let mut v = View::default();
-        v.user("Fix parser", false);
-        v.event(Out::ToolStarted {
-            id: "edit".into(),
-            name: "edit".into(),
-            input: json!({"path":"src/parser.rs"}),
-        });
-        v.event(Out::ToolDone {
-            id: "edit".into(),
-            name: "edit".into(),
-            output: json!({"ok":true,"diff":"-old\n+new"}),
-            is_error: false,
-        });
-        let tool = v.item_id(1);
-        v.event(Out::Message {
-            text: "Explanation.\n\n".repeat(40),
-        });
-        v.settle();
-        let m = Metadata {
-            session: "result".into(),
-            cwd: "/workspace".into(),
-            trusted_shell: false,
-            yolo: false,
-        };
-        for width in [30, 80, 120] {
-            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
-            let mut renderer = Renderer::default();
-            renderer.follow(&mut v);
-            terminal
-                .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
-                .unwrap();
-            let &(rect, id) = renderer
-                .result_hits
-                .iter()
-                .find(|(_, id)| *id == tool)
-                .expect("result action visible");
-            renderer.click(&mut v, rect.x, rect.y);
-            assert!(v.expanded(id));
-            terminal
-                .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
-                .unwrap();
-            assert!(
-                renderer.hits.iter().any(|(_, id)| *id == tool),
-                "target tool revealed"
-            );
-            renderer.latest_results(&mut v);
-            terminal
-                .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
-                .unwrap();
-            assert!(renderer.result_hits.iter().any(|(_, id)| *id == tool));
-            assert_eq!(footer_lines(width as usize, &v, &m, 0).len(), 1);
         }
     }
 
@@ -2115,36 +1745,48 @@ mod tests {
             yolo: false,
         };
         for scroll in [0, 20, 100] {
-            v.scroll = scroll;
+            v.navigation.set_offset(scroll);
             terminal
                 .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
                 .unwrap();
-            assert!(renderer.lines.len() > renderer.transcript.height as usize);
+            assert!(renderer.layout.lines.len() > renderer.layout.transcript.height as usize);
             if scroll > 0 {
-                assert!(renderer.follow_hit.is_some(), "history has a return action");
+                assert!(
+                    renderer.layout.follow_hit.is_some(),
+                    "history has a return action"
+                );
             } else {
-                assert!(renderer.follow_hit.is_none(), "live view stays quiet");
+                assert!(
+                    renderer.layout.follow_hit.is_none(),
+                    "live view stays quiet"
+                );
             }
-            for y in 0..renderer.transcript.bottom() {
+            for y in 0..renderer.layout.transcript.bottom() {
                 assert_eq!(terminal.backend().buffer()[(79, y)].symbol(), " ");
             }
         }
-        let hit = renderer.follow_hit.unwrap();
-        renderer.click(&mut v, hit.x, hit.y);
-        assert_eq!(v.scroll, 0);
+        // Overscroll cannot accumulate invisible distance and delay direction reversal.
+        for _ in 0..1000 {
+            super::super::app::wheel_dispatch(&mut renderer, &mut v, 1, 1, true);
+        }
+        let top = renderer.layout.lines.len() - renderer.layout.transcript.height as usize;
+        assert_eq!(v.navigation.offset(), top);
+        super::super::app::wheel_dispatch(&mut renderer, &mut v, 1, 1, false);
+        assert_eq!(v.navigation.offset(), top - 3);
+        let hit = renderer.layout.follow_hit.unwrap();
+        super::super::app::click_dispatch(&mut renderer, &mut v, hit.x, hit.y);
+        assert_eq!(v.navigation.offset(), 0);
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
-        assert!(renderer.follow_hit.is_none());
-        let (question, id) = renderer
-            .question_hit
-            .expect("question navigation is discoverable");
-        renderer.click(&mut v, question.x, question.y);
-        assert_eq!(renderer.turn_target, Some(id));
+        assert!(renderer.layout.follow_hit.is_none());
+        renderer.latest_turn(&mut v);
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
-        let start = renderer.lines.len() - v.scroll - renderer.transcript.height as usize;
+        let start = renderer.layout.lines.len()
+            - v.navigation.offset()
+            - renderer.layout.transcript.height as usize;
         assert_eq!(start, renderer.timeline.turns[0].0);
     }
 
@@ -2152,7 +1794,7 @@ mod tests {
     fn composer_grows_across_full_width_and_keeps_cursor_above_single_footer() {
         let mut v = View::default();
         v.theme = Theme::Dark;
-        v.set_todos(vec![super::super::state::Todo {
+        v.todos.set(vec![super::super::state::Todo {
             id: "task".into(),
             text: "A task should never narrow the composer".into(),
             completed: false,
@@ -2184,7 +1826,7 @@ mod tests {
                 // Surface extends under the sidebar, including its right edge.
                 assert_eq!(buffer[(width - 1, prompt_y)].bg, PANEL);
                 assert_eq!(buffer[(width - 1, height - 2)].bg, PANEL);
-                if let Some(panel) = renderer.panel {
+                if let Some(panel) = renderer.layout.panel {
                     assert!(panel.bottom() < prompt_y);
                 }
                 assert!(cursor.x >= 3 && cursor.x < width - 1);
@@ -2194,120 +1836,15 @@ mod tests {
                     .collect::<String>();
                 assert!(footer.contains("YOLO"));
                 if text.is_empty() {
-                    let input_height = 5.min((height / 3).clamp(3, 10));
+                    let input_height = 3.min((height / 3).clamp(3, 8));
                     assert_eq!(
                         prompt_y,
                         height - input_height,
-                        "roomier input adapts to short windows"
+                        "compact input adapts to short windows"
                     );
                 }
             }
         }
-    }
-
-    #[test]
-    fn sessions_overlay_renders_rows_and_filters() {
-        use super::super::state::SessionPickerState;
-        use crate::sessions::SessionRow;
-        use yourai_core::prelude::SessionId;
-        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
-        let mut renderer = Renderer::default();
-        let mut v = View::default();
-        let m = Metadata {
-            session: "current-id".into(),
-            cwd: "/tmp".into(),
-            trusted_shell: false,
-            yolo: false,
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        v.overlay = Overlay::Sessions(SessionPickerState {
-            pending_delete: None,
-            rows: vec![
-                SessionRow {
-                    id: SessionId("d3f40178deadbeef".into()),
-                    title: "Fix parser off-by-one".into(),
-                    model: "kimi-k3".into(),
-                    updated_at: now - 2 * 3600,
-                    is_current: true,
-                },
-                SessionRow {
-                    id: SessionId("9a1b2c3ddeadd00d".into()),
-                    title: "Fix TUI sidebar".into(),
-                    model: "glm-4.6".into(),
-                    updated_at: now - 3 * 86_400,
-                    is_current: false,
-                },
-            ],
-            query: String::new(),
-            selected: 0,
-        });
-        terminal
-            .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
-            .unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
-        assert!(text.contains("Sessions"));
-        assert!(text.contains("Fix parser off-by-one"));
-        assert!(text.contains("d3f40178"));
-        assert!(text.contains("Fix TUI sidebar"));
-        // Current session marker visible.
-        assert!(text.contains("●"));
-        // Filter: type "parser".
-        v.overlay.sessions_mut().unwrap().query = "parser".into();
-        terminal
-            .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
-            .unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
-        assert!(text.contains("Fix parser off-by-one"));
-        assert!(!text.contains("Fix TUI sidebar"));
-    }
-
-    #[test]
-    fn theme_picker_lists_all_themes_and_marks_current() {
-        use super::super::theme::Theme;
-        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
-        let mut renderer = Renderer::default();
-        let mut v = View::default();
-        v.theme = Theme::Nord;
-        v.overlay = Overlay::Themes(0);
-        let m = Metadata {
-            session: "id".into(),
-            cwd: "/tmp".into(),
-            trusted_shell: false,
-            yolo: false,
-        };
-        terminal
-            .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
-            .unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
-        assert!(text.contains("Themes"));
-        // All theme names appear.
-        for t in Theme::ALL {
-            assert!(text.contains(t.name()), "missing theme {}", t.name());
-        }
-        // Current theme (Nord) is marked with ●.
-        let nord_line = text.lines().find(|l| l.contains("nord")).unwrap();
-        assert!(nord_line.contains("●"));
     }
 
     /// Diagnostic: report how many cells change per frame in common scenarios,
@@ -2401,10 +1938,11 @@ mod tests {
         // Scrollback: user scrolls up one wheel notch at a time.
         for i in 0..3 {
             renderer.selection.clear();
-            renderer.scroll(&mut v, 10, 10, true);
+            super::super::app::wheel_dispatch(&mut renderer, &mut v, 10, 10, true);
             frame!(format!("wheel scroll up #{i}"), SessionStatus::Idle);
         }
-        renderer.follow(&mut v);
+
+        v.follow();
         // Approval overlay appears: layout shifts, transcript shrinks.
         v.event(Out::Ask {
             id: "approval".into(),
@@ -2424,6 +1962,40 @@ mod tests {
 
 #[cfg(test)]
 mod regression_tests {
+    #[test]
+    fn reading_anchor_survives_head_eviction_and_tail_append() {
+        let mut view = View::default();
+        for i in 0..1000 {
+            view.notice(yourai_core::prelude::Level::Info, format!("message {i:04}"));
+        }
+        let meta = Metadata {
+            session: "test".into(),
+            cwd: "/tmp".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        let mut renderer = Renderer::default();
+        let area = Rect::new(0, 0, 80, 24);
+        renderer.prepare(area, &mut view, &meta, FrameTime::now(), 0, false);
+        view.navigation.set_offset(300);
+        renderer.prepare(area, &mut view, &meta, FrameTime::now(), 0, false);
+        let top = |r: &Renderer, v: &View| {
+            r.layout.lines.len() - v.navigation.offset() - r.layout.transcript.height as usize
+        };
+        let before = renderer
+            .layout
+            .lines
+            .viewport(top(&renderer, &view)..top(&renderer, &view) + 1);
+        view.notice(yourai_core::prelude::Level::Info, "appended after eviction");
+        renderer.prepare(area, &mut view, &meta, FrameTime::now(), 0, false);
+        let after = renderer
+            .layout
+            .lines
+            .viewport(top(&renderer, &view)..top(&renderer, &view) + 1);
+        assert_eq!(before, after);
+    }
+
+    #[allow(clippy::wildcard_imports)]
     use super::*;
     use ratatui::backend::TestBackend;
     #[test]
@@ -2452,37 +2024,52 @@ mod regression_tests {
             };
         draw(&mut terminal, &mut renderer, &mut view);
 
-        renderer.latest_turn();
+        renderer.latest_turn(&mut view);
         draw(&mut terminal, &mut renderer, &mut view);
-        let start = renderer.lines.len() - view.scroll - renderer.transcript.height as usize;
+        let start = renderer.layout.lines.len()
+            - view.navigation.offset()
+            - renderer.layout.transcript.height as usize;
         assert_eq!(start, renderer.timeline.turns[1].0);
         renderer.jump_turn(&mut view, true);
         draw(&mut terminal, &mut renderer, &mut view);
-        let start = renderer.lines.len() - view.scroll - renderer.transcript.height as usize;
+        let start = renderer.layout.lines.len()
+            - view.navigation.offset()
+            - renderer.layout.transcript.height as usize;
         assert_eq!(start, renderer.timeline.turns[0].0);
         renderer.jump_turn(&mut view, false);
         draw(&mut terminal, &mut renderer, &mut view);
         assert_eq!(
-            renderer.lines.len() - view.scroll - renderer.transcript.height as usize,
+            renderer.layout.lines.len()
+                - view.navigation.offset()
+                - renderer.layout.transcript.height as usize,
             renderer.timeline.turns[1].0
         );
         terminal.backend_mut().resize(40, 20);
         terminal.autoresize().unwrap();
         draw(&mut terminal, &mut renderer, &mut view);
-        renderer.latest_turn();
+        renderer.latest_turn(&mut view);
         draw(&mut terminal, &mut renderer, &mut view);
-        let start = renderer.lines.len() - view.scroll - renderer.transcript.height as usize;
+        let start = renderer.layout.lines.len()
+            - view.navigation.offset()
+            - renderer.layout.transcript.height as usize;
         assert_eq!(start, renderer.timeline.turns[1].0);
-        renderer.follow(&mut view);
+
+        view.follow();
         draw(&mut terminal, &mut renderer, &mut view);
-        assert_eq!(view.scroll, 0);
+        assert_eq!(view.navigation.offset(), 0);
     }
     #[test]
     fn footer_measures_unicode_long_labels_and_large_metrics() {
         let mut v = View::default();
         v.title = Some("这是一个很长的会话标题 🔎 review ".repeat(6));
-        v.model_label = "provider/very-long-model-name-with-reasoning-variant".repeat(3);
-        v.usage.total_tokens = u64::MAX;
+        v.model.label = "provider/very-long-model-name-with-reasoning-variant".repeat(3);
+        v.restore_usage(
+            yourai_core::prelude::Usage {
+                total_tokens: u64::MAX,
+                ..Default::default()
+            },
+            0,
+        );
         v.model_metrics.requests.last_output_tokens_per_second = Some(f64::MAX);
         let m = Metadata {
             session: "test".into(),
@@ -2501,13 +2088,23 @@ mod regression_tests {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join("\n");
+            assert!(
+                !text.contains("这是"),
+                "overflowing title must disappear entirely"
+            );
             for field in ["ctx ", "YOLO"] {
                 assert!(text.contains(field));
             }
         }
         v.title = Some("Review".into());
-        v.model_label = "mock/model".into();
-        v.usage.total_tokens = 1200;
+        v.model.label = "mock/model".into();
+        v.restore_usage(
+            yourai_core::prelude::Usage {
+                total_tokens: 1200,
+                ..Default::default()
+            },
+            0,
+        );
         v.model_metrics.requests.last_output_tokens_per_second = Some(47.5);
         let lines = footer_lines(120, &v, &m, 0);
         assert_eq!(lines.len(), 1, "footer must always use one row");
@@ -2552,7 +2149,7 @@ mod regression_tests {
     #[test]
     fn narrow_footer_preserves_permissions_and_all_dashboard_sizes_fit() {
         let mut v = View::default();
-        v.model_label = "provider/model".into();
+        v.model.label = "provider/model".into();
         v.context_usage = Some(yourai_harness::runtime::ContextUsage {
             estimated_tokens: 90000,
             context_window: Some(100000),
@@ -2589,7 +2186,7 @@ mod regression_tests {
                 assert!(details.contains(field), "missing {field}: {details}");
             }
             assert!(
-                renderer.panel.is_none(),
+                renderer.layout.panel.is_none(),
                 "no tasks means full-width conversation"
             );
             v.overlay = Overlay::Stats { scroll: 0 };
@@ -2598,5 +2195,60 @@ mod regression_tests {
                 .unwrap();
             v.overlay = Overlay::None;
         }
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::{activity, elapsed_str, FrameTime, Metadata, Renderer, View};
+    use crate::ui::state::RetryState;
+    use ratatui::layout::Rect;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn supplied_time_controls_animation_retry_elapsed_and_toast_expiry() {
+        let start = Instant::now();
+        let at = |seconds| FrameTime {
+            monotonic: start + Duration::from_secs(seconds),
+            unix_seconds: seconds as i64,
+        };
+        let mut view = View::default();
+        view.active = true;
+        view.since = Some(start);
+        view.toast = Some(("copied".into(), start));
+        view.retry = Some(RetryState {
+            attempt: 1,
+            max: 3,
+            reason: "retry".into(),
+            until: start + Duration::from_secs(5),
+        });
+        assert!(activity(&view, false, at(2).monotonic).contains("3s"));
+        assert_eq!(elapsed_str(&view, at(2).monotonic), "2s");
+        let meta = Metadata {
+            session: "test".into(),
+            cwd: "/tmp".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        let mut renderer = Renderer::default();
+        let area = Rect::new(0, 0, 80, 24);
+        let mut first = renderer.prepare(area, &mut view, &meta, at(0), 0, false);
+        let repeated = renderer.prepare(area, &mut view, &meta, at(0), 0, false);
+        assert!(first == repeated);
+        assert!(first
+            .buffer_mut()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+            .contains("copied"));
+        let mut expired = renderer.prepare(area, &mut view, &meta, at(4), 0, false);
+        assert!(first != expired);
+        assert!(!expired
+            .buffer_mut()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+            .contains("copied"));
     }
 }

@@ -1,3 +1,4 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -29,7 +30,7 @@ pub struct Editor {
 }
 impl Editor {
     pub fn insert(&mut self, text: &str) {
-        let text = super::state::clean(text);
+        let text = crate::text::clean(text);
         self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
         // Insertion may merge graphemes (combining marks / ZWJ sequences).
@@ -287,9 +288,87 @@ impl Editor {
         }
         (lines, cursor.0, cursor.1)
     }
+    /// The readline keymap: history on Ctrl-P/N and edge-of-buffer Up/Down,
+    /// word movement on Alt-B/F and Ctrl-Left/Right, unix kill commands, and
+    /// plain insertion. Input interpretation lives on the interpreted type,
+    /// mirroring `Overlay::key`.
+    pub fn key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            // Newline insertion.
+            KeyCode::Char('j') if ctrl => self.insert("\n"),
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                self.insert("\n")
+            }
+            // History navigation: Ctrl-P / Ctrl-N (readline) and Up / Down when
+            // the cursor sits on the first / last logical line (shell behaviour).
+            // In the middle of a multiline buffer, Up / Down move across rows.
+            KeyCode::Char('p') if ctrl => self.history(true),
+            KeyCode::Char('n') if ctrl => self.history(false),
+            KeyCode::Up => {
+                if self.on_first_line() {
+                    self.history(true);
+                } else {
+                    self.vertical(-1);
+                }
+            }
+            KeyCode::Down => {
+                if self.on_last_line() {
+                    self.history(false);
+                } else {
+                    self.vertical(1);
+                }
+            }
+            // Word-level movement (Alt-B/F, Ctrl-Left/Right).
+            KeyCode::Left if ctrl || alt => self.word_left(),
+            KeyCode::Right if ctrl || alt => self.word_right(),
+            KeyCode::Char('b') if alt => self.word_left(),
+            KeyCode::Char('f') if alt => self.word_right(),
+            // Character movement (readline Ctrl-B / Ctrl-F).
+            KeyCode::Char('b') if ctrl => self.left(),
+            KeyCode::Char('f') if ctrl => self.right(),
+            // Line movement (readline Ctrl-A / Ctrl-E).
+            KeyCode::Char('a') if ctrl => self.home(),
+            KeyCode::Char('e') if ctrl => self.end(),
+            // Deletion: Ctrl-H = backspace, Ctrl-D = forward delete, Ctrl-W =
+            // unix-word-rubout (whitespace-delimited), Ctrl-U / Ctrl-K kill to
+            // line start / end, Alt-D / Ctrl-Delete kill a word forward,
+            // Alt-Backspace / Ctrl-Backspace kill a word backward.
+            KeyCode::Char('h') if ctrl => self.backspace(),
+            KeyCode::Char('d') if ctrl => self.delete(),
+            KeyCode::Char('w') if ctrl => self.unix_word_rubout(),
+            KeyCode::Char('u') if ctrl => self.kill_to_start(),
+            KeyCode::Char('k') if ctrl => self.kill_to_end(),
+            KeyCode::Char('d') if alt => self.delete_word_fwd(),
+            KeyCode::Backspace if ctrl || alt => self.delete_word_back(),
+            KeyCode::Delete if ctrl => self.delete_word_fwd(),
+            // Plain movement / editing.
+            KeyCode::Left => self.left(),
+            KeyCode::Right => self.right(),
+            KeyCode::Home => self.home(),
+            KeyCode::End => self.end(),
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete(),
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.insert(&c.to_string())
+            }
+            KeyCode::Tab => self.insert("    "),
+            _ => {}
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
     #[test]
     fn unicode_editing_and_multiline_paste() {

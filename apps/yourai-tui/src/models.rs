@@ -57,6 +57,7 @@ pub fn model_choices(config: &Config) -> Vec<ModelChoice> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
     use crate::config::Config;
 

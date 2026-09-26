@@ -1,8 +1,6 @@
 //! Markdown is presentation only: no HTML execution, links or task-state mutations.
-use super::{
-    state::clean,
-    theme::{BLUE, CODE_SURFACE, GREEN, MUTED, TEXT},
-};
+use super::theme::{BLUE, CODE_SURFACE, GREEN, MUTED, TEXT};
+use crate::text::clean;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::prelude::*;
 use unicode_segmentation::UnicodeSegmentation;
@@ -69,6 +67,7 @@ impl Writer {
                 &continuation
             },
             &continuation,
+            Style::default().fg(MUTED),
         ));
         self.item_start = false;
     }
@@ -346,7 +345,24 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
     w.lines
 }
 pub(crate) fn wrap_spans(spans: Styled, width: usize, prefix: &str) -> Vec<Line<'static>> {
-    wrap_spans_with_prefixes(spans, width, prefix, prefix)
+    wrap_spans_with_prefixes(spans, width, prefix, prefix, Style::default().fg(MUTED))
+}
+
+/// Wrap one uniformly-styled text block; the prefix shares the text style
+/// (unlike `wrap_spans`, which keeps its continuation indents muted).
+pub(crate) fn wrap_text(
+    text: &str,
+    style: Style,
+    width: usize,
+    prefix: &str,
+) -> Vec<Line<'static>> {
+    wrap_spans_with_prefixes(
+        vec![Span::styled(text.to_owned(), style)],
+        width,
+        prefix,
+        prefix,
+        style,
+    )
 }
 
 fn code_rows(spans: Styled, width: usize) -> Vec<Line<'static>> {
@@ -365,19 +381,17 @@ fn wrap_spans_with_prefixes(
     width: usize,
     prefix: &str,
     continuation: &str,
+    prefix_style: Style,
 ) -> Vec<Line<'static>> {
     let mut available = width.saturating_sub(prefix.width()).max(1);
     let mut lines = vec![];
-    let mut current = vec![Span::styled(prefix.to_owned(), Style::default().fg(MUTED))];
+    let mut current = vec![Span::styled(prefix.to_owned(), prefix_style)];
     let mut used = 0;
     for span in spans {
         for g in span.content.graphemes(true) {
             if used + g.width() > available && used > 0 {
                 lines.push(Line::from(std::mem::take(&mut current)));
-                current.push(Span::styled(
-                    continuation.to_owned(),
-                    Style::default().fg(MUTED),
-                ));
+                current.push(Span::styled(continuation.to_owned(), prefix_style));
                 available = width.saturating_sub(continuation.width()).max(1);
                 used = 0;
             }
@@ -395,6 +409,7 @@ fn wrap_spans_with_prefixes(
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
     fn plain(lines: &[Line<'_>]) -> String {
         lines

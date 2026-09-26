@@ -115,6 +115,7 @@ impl Selection {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
     use ratatui::style::Style;
     #[test]

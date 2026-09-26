@@ -182,6 +182,7 @@ pub(crate) fn highlight(code: &str, hint: &str) -> Option<Vec<Line<'static>>> {
 #[cfg(test)]
 mod tests {
     use super::super::theme::SLOTS;
+    #[allow(clippy::wildcard_imports)]
     use super::*;
 
     fn fgs(lines: &[Line<'static>]) -> Vec<Color> {

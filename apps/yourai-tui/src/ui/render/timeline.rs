@@ -1,6 +1,12 @@
 //! Per-item layout cache. Content versions are owned by View, animation by Renderer.
-use super::*;
+use super::cards::{block_tool, surface_row, tool_expanded, tool_preview, tool_title_row};
+use crate::text::elide;
+use crate::ui::markdown::wrap_text;
+use crate::ui::state::{Item, Role, ToolStatus, View};
+use crate::ui::theme::{Theme, ACCENT, CODE_SURFACE, MUTED, RED, TEXT, USER_SURFACE, YELLOW};
+use ratatui::prelude::*;
 use std::{collections::HashMap, ops::Range, sync::Arc};
+use yourai_core::prelude::Level;
 #[derive(PartialEq, Eq)]
 struct Key {
     version: u64,
@@ -15,43 +21,71 @@ struct Entry {
     key: Key,
     lines: Arc<Vec<Line<'static>>>,
 }
-struct ResultEntry {
-    width: usize,
-    versions: Vec<(u64, u64)>,
-    lines: Arc<Vec<Line<'static>>>,
-    links: Vec<(usize, u64)>,
-}
 /// Indexed immutable blocks: revisions share history, scrolling clones only visible rows.
 #[derive(Default)]
 pub(super) struct LayoutLines {
-    blocks: Vec<(usize, Arc<Vec<Line<'static>>>)>,
+    blocks: Vec<LayoutBlock>,
     len: usize,
 }
+struct LayoutBlock {
+    id: u64,
+    start: usize,
+    lines: Arc<Vec<Line<'static>>>,
+}
 impl LayoutLines {
-    fn push(&mut self, lines: Arc<Vec<Line<'static>>>) {
+    fn push(&mut self, id: u64, lines: Arc<Vec<Line<'static>>>) {
         let start = self.len;
         self.len += lines.len();
-        self.blocks.push((start, lines));
+        self.blocks.push(LayoutBlock { id, start, lines });
     }
     #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = &Line<'static>> {
-        self.blocks.iter().flat_map(|(_, lines)| lines.iter())
+        self.blocks.iter().flat_map(|block| block.lines.iter())
     }
     pub fn len(&self) -> usize {
         self.len
+    }
+    /// Stable item identity plus a row within its rendered block. This works
+    /// for head eviction as well as tail growth; total row deltas do not.
+    pub fn anchor_at(&self, row: usize) -> Option<(u64, usize)> {
+        let index = self
+            .blocks
+            .partition_point(|b| b.start + b.lines.len() <= row);
+        self.blocks
+            .get(index)
+            .map(|b| (b.id, row.saturating_sub(b.start)))
+    }
+    pub fn locate(&self, (id, row): (u64, usize)) -> Option<usize> {
+        // If the item was evicted, use the first surviving block. If folded
+        // into a group, use that group's header. Never transfer to an unrelated
+        // item merely because it inherited an old numeric index.
+        let index = self
+            .blocks
+            .partition_point(|b| b.id <= id)
+            .saturating_sub(1);
+        self.blocks.get(index).map(|b| {
+            b.start
+                + if b.id == id {
+                    row.min(b.lines.len().saturating_sub(1))
+                } else {
+                    0
+                }
+        })
     }
     pub fn viewport(&self, range: Range<usize>) -> Vec<Line<'static>> {
         let mut visible = Vec::with_capacity(range.end.saturating_sub(range.start));
         let first = self
             .blocks
-            .partition_point(|(start, lines)| start + lines.len() <= range.start);
-        for (start, lines) in &self.blocks[first..] {
-            if *start >= range.end {
+            .partition_point(|block| block.start + block.lines.len() <= range.start);
+        for block in &self.blocks[first..] {
+            let start = block.start;
+            let lines = &block.lines;
+            if start >= range.end {
                 break;
             }
             visible.extend(
-                lines[range.start.saturating_sub(*start)
-                    ..range.end.saturating_sub(*start).min(lines.len())]
+                lines[range.start.saturating_sub(start)
+                    ..range.end.saturating_sub(start).min(lines.len())]
                     .iter()
                     .cloned(),
             );
@@ -64,9 +98,6 @@ impl LayoutLines {
 pub(super) struct TimelineCache {
     entries: HashMap<u64, Entry>,
     pub turns: Vec<(usize, u64)>,
-    pub result_links: Vec<(usize, u64)>,
-    pub result_starts: Vec<(usize, u64)>,
-    results: HashMap<u64, ResultEntry>,
     #[cfg(test)]
     pub builds: usize,
 }
@@ -79,30 +110,14 @@ impl TimelineCache {
         tick: u64,
     ) -> (LayoutLines, Vec<(usize, u64)>) {
         self.turns.clear();
-        self.result_links.clear();
-        self.result_starts.clear();
         let mut lines = LayoutLines::default();
         let mut headers = Vec::new();
         let first = v.item_id(0);
         self.entries
             .retain(|id, _| *id >= first && *id < first + v.items().len() as u64);
-        self.results
-            .retain(|id, _| *id >= first && *id < first + v.items().len() as u64);
-        let mut results = results::Results::default();
         let mut collapsed_until = 0;
         let mut expanded_until = 0;
         for (index, item) in v.items().iter().enumerate() {
-            if matches!(
-                item,
-                Item::Text {
-                    role: Role::User,
-                    ..
-                }
-            ) {
-                self.append_results(&results, &mut lines, width);
-                results = results::Results::default();
-            }
-            results.observe(v.item_id(index), v.item_version(index), item);
             if index < collapsed_until {
                 continue;
             }
@@ -122,19 +137,19 @@ impl TimelineCache {
                     })
                 {
                     headers.push((lines.len(), id));
-                    lines.push(Arc::new(vec![
-                        Line::from(Span::styled(
-                            elide(
-                                &format!(
-                                    "  ▸ Explored · {} read/search operations · click to expand",
-                                    end - index
+                    lines.push(
+                        id,
+                        Arc::new(vec![
+                            Line::from(Span::styled(
+                                elide(
+                                    &format!("  ▸ Read & search · {} operations", end - index),
+                                    width,
                                 ),
-                                width,
-                            ),
-                            Style::default().fg(MUTED),
-                        )),
-                        Line::default(),
-                    ]));
+                                Style::default().fg(MUTED),
+                            )),
+                            Line::default(),
+                        ]),
+                    );
                     collapsed_until = end;
                     continue;
                 }
@@ -175,47 +190,9 @@ impl TimelineCache {
             if View::foldable(item) {
                 headers.push((lines.len(), id));
             }
-            lines.push(self.entries[&id].lines.clone());
-        }
-        if !v.active && v.asks_empty() {
-            self.append_results(&results, &mut lines, width);
+            lines.push(id, self.entries[&id].lines.clone());
         }
         (lines, headers)
-    }
-    fn append_results(
-        &mut self,
-        results: &results::Results<'_>,
-        lines: &mut LayoutLines,
-        width: usize,
-    ) {
-        let Some(&(id, _)) = results.versions.first() else {
-            return;
-        };
-        if self
-            .results
-            .get(&id)
-            .is_none_or(|entry| entry.width != width || entry.versions != results.versions)
-        {
-            let (rows, links) = results.render(width);
-            self.results.insert(
-                id,
-                ResultEntry {
-                    width,
-                    versions: results.versions.clone(),
-                    lines: Arc::new(rows),
-                    links,
-                },
-            );
-        }
-        let entry = &self.results[&id];
-        self.result_starts.push((lines.len(), id));
-        self.result_links.extend(
-            entry
-                .links
-                .iter()
-                .map(|&(line, id)| (line + lines.len(), id)),
-        );
-        lines.push(entry.lines.clone());
     }
 }
 /// Group only successful, read-only exploration; edits, errors and live work stay visible.
@@ -292,7 +269,7 @@ fn item_lines(
         } => {
             lines.push(Line::from(" ".repeat(width)).style(Style::default().bg(USER_SURFACE)));
             for line in text.lines() {
-                for row in wrap(
+                for row in wrap_text(
                     line,
                     Style::default().fg(TEXT).bold(),
                     width.saturating_sub(2),
@@ -313,19 +290,33 @@ fn item_lines(
         Item::Notice { level, text } => {
             let color = match level {
                 Level::Error => RED,
-                Level::Warning => ACCENT,
+                Level::Warning => YELLOW,
                 _ => MUTED,
             };
             for line in text.lines() {
-                lines.extend(wrap(line, Style::default().fg(color), width, "  · "));
+                lines.extend(wrap_text(line, Style::default().fg(color), width, "  · "));
             }
         }
         Item::Tool(t) => {
-            lines.push(tool_title(t, selected, width, tick));
+            let mut body = Vec::new();
             if expanded {
-                tool_expanded(t, &mut lines, width, v.theme);
+                tool_expanded(t, &mut body, width, v.theme);
             } else {
-                tool_preview(t, &mut lines, width, v.theme, edit_preview_rows);
+                tool_preview(t, &mut body, width, v.theme, edit_preview_rows);
+            }
+            if block_tool(t, expanded) {
+                lines.push(tool_title_row(t, selected, expanded, width, tick));
+                if !body.is_empty() {
+                    lines.push(surface_row(Line::default(), width, CODE_SURFACE));
+                    lines.extend(
+                        body.into_iter()
+                            .map(|row| surface_row(row, width, CODE_SURFACE)),
+                    );
+                }
+                lines.push(surface_row(Line::default(), width, CODE_SURFACE));
+            } else {
+                lines.push(tool_title_row(t, selected, expanded, width, tick));
+                lines.extend(body);
             }
         }
     }
@@ -335,8 +326,64 @@ fn item_lines(
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
+    use crate::ui::theme::DIFF_ADD_BG;
     use serde_json::json;
+    use yourai_core::prelude::Out;
+    #[test]
+    fn substantial_tools_have_surfaces_while_reads_stay_inline() {
+        let mut view = View::default();
+        for (id, name, input, output) in [
+            (
+                "read",
+                "read",
+                json!({"path":"a.rs"}),
+                json!({"ok":true,"content":"source"}),
+            ),
+            (
+                "shell",
+                "shell",
+                json!({"command":"cargo check"}),
+                json!({"ok":true,"exit_code":0,"stdout":"Build complete"}),
+            ),
+        ] {
+            view.event(Out::ToolStarted {
+                id: id.into(),
+                name: name.into(),
+                input,
+            });
+            view.event(Out::ToolDone {
+                id: id.into(),
+                name: name.into(),
+                output,
+                is_error: false,
+            });
+        }
+        for width in [30, 80, 120] {
+            let read = item_lines(&view, 0, width, 3, 0);
+            assert_eq!(read[0].style.bg, None);
+            let shell = item_lines(&view, 1, width, 3, 0);
+            assert_eq!(shell[0].style.bg, Some(USER_SURFACE));
+            let output = shell
+                .iter()
+                .find(|row| row.to_string().contains("Build complete"))
+                .unwrap();
+            assert_eq!(output.style.bg, Some(CODE_SURFACE));
+            assert_eq!(output.width(), width);
+            assert_eq!(
+                shell.last().unwrap().style.bg,
+                None,
+                "blocks end with an unpainted gutter"
+            );
+        }
+        let diff = Line::from("+ change").style(Style::default().bg(DIFF_ADD_BG));
+        assert_eq!(
+            surface_row(diff, 30, CODE_SURFACE).style.bg,
+            Some(DIFF_ADD_BG)
+        );
+    }
+
     #[test]
     fn viewport_matches_full_layout_and_reuses_unchanged_blocks() {
         let mut view = View::default();
@@ -357,12 +404,18 @@ mod tests {
         });
         let (after, _) = cache.layout(&view, 40, 3, 0);
         assert!(
-            Arc::ptr_eq(&before.blocks[0].1, &after.blocks[0].1),
+            Arc::ptr_eq(&before.blocks[0].lines, &after.blocks[0].lines),
             "unchanged question is shared, not copied"
         );
-        assert!(!Arc::ptr_eq(&before.blocks[1].1, &after.blocks[1].1));
+        assert!(!Arc::ptr_eq(
+            &before.blocks[1].lines,
+            &after.blocks[1].lines
+        ));
         let (resized, _) = cache.layout(&view, 20, 3, 0);
-        assert!(!Arc::ptr_eq(&after.blocks[0].1, &resized.blocks[0].1));
+        assert!(!Arc::ptr_eq(
+            &after.blocks[0].lines,
+            &resized.blocks[0].lines
+        ));
     }
 
     #[test]
@@ -392,7 +445,7 @@ mod tests {
         let (folded, headers) = cache.layout(&view, 80, 3, 0);
         assert!(folded
             .iter()
-            .any(|line| line.to_string().contains("2 read/search")));
+            .any(|line| line.to_string().contains("Read & search · 2 operations")));
         assert_eq!(
             headers.len(),
             3,
@@ -402,14 +455,14 @@ mod tests {
         let (expanded, headers) = cache.layout(&view, 80, 3, 0);
         assert!(!expanded
             .iter()
-            .any(|line| line.to_string().contains("Explored")));
+            .any(|line| line.to_string().contains("Read & search")));
         assert_eq!(headers.len(), 4);
         view.toggle(first_tool);
         let (folded, _) = cache.layout(&view, 80, 3, 0);
         assert!(
             folded
                 .iter()
-                .any(|line| line.to_string().contains("Explored")),
+                .any(|line| line.to_string().contains("Read & search")),
             "click again collapses the group"
         );
         view.select_next(false);

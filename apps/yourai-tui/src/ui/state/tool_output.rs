@@ -1,5 +1,9 @@
 //! Typed tool-output projections and bounded syntax/diff previews.
-use super::*;
+use super::DiffRow;
+use crate::text::{bounded, clean, pretty, MAX_TEXT};
+use ratatui::text::{Line, Span};
+use serde_json::Value;
+use std::collections::HashSet;
 /// Count +/- lines in a unified diff; ---/+++ file headers excluded.
 pub(super) fn diff_stats(diff: &str) -> (usize, usize) {
     let (mut adds, mut dels) = (0, 0);
@@ -363,4 +367,108 @@ pub(super) fn summarize_output(v: &Value) -> String {
         Value::String(s) => bounded(s),
         _ => pretty(v),
     }
+}
+
+/// Presentation fields projected from a finished tool's result envelope.
+pub(super) struct ToolResult {
+    pub body: String,
+    pub stderr: String,
+    pub brief: Vec<String>,
+    pub content_hl: Option<Vec<Line<'static>>>,
+    pub content_format: Option<String>,
+    pub exit_code: Option<i64>,
+    pub adds: Option<usize>,
+    pub dels: Option<usize>,
+    pub diff_rows: Option<Vec<DiffRow>>,
+    /// write: whether the server confirmed creation (vs overwrite).
+    pub created: bool,
+}
+
+/// Typed projection of a finished tool's output: known tools get structured
+/// previews, unknown ones a bounded generic summary; error envelopes win.
+pub(super) fn tool_result(name: &str, output: &Value) -> ToolResult {
+    let mut r = ToolResult {
+        body: String::new(),
+        stderr: String::new(),
+        brief: Vec::new(),
+        content_hl: None,
+        content_format: None,
+        exit_code: None,
+        adds: None,
+        dels: None,
+        diff_rows: None,
+        created: false,
+    };
+    if let Some(error) = output.get("error") {
+        r.body = format_error(error, output);
+        return r;
+    }
+    match name {
+        "shell" => {
+            r.exit_code = output["exit_code"].as_i64();
+            let mut out = clean(output["stdout"].as_str().unwrap_or(""));
+            r.stderr = clean(output["stderr"].as_str().unwrap_or(""));
+            if output["output_complete"] == false {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str("[output incomplete]");
+            }
+            r.body = bounded(&out);
+        }
+        "read" if output.get("content").is_some() => {
+            let path = output["path"].as_str().unwrap_or("");
+            let content = output["content"].as_str().unwrap_or("");
+            r.content_hl = Some(hl_read(content, path));
+            r.body = bounded(content);
+        }
+        "edit" if output.get("diff").is_some() => {
+            let diff = bounded(output["diff"].as_str().unwrap_or(""));
+            let (a, d) = diff_stats(&diff);
+            r.adds = Some(a);
+            r.dels = Some(d);
+            r.diff_rows = Some(build_diff_rows(
+                &diff,
+                output["path"].as_str().unwrap_or(""),
+            ));
+            r.body = diff;
+        }
+        "write" => {
+            r.created = output["created"] == true;
+            // Content was highlighted at ToolStarted and survives the merge.
+        }
+        "websearch" => {
+            let content = output["content"].as_str().unwrap_or("");
+            r.brief = search_brief(content);
+            r.body = bounded(content);
+        }
+        "webfetch" => {
+            let content = output["content"].as_str().unwrap_or("");
+            let format = output["format"].as_str().unwrap_or("text");
+            r.content_format = Some(format.to_owned());
+            let hint = match format {
+                "html" | "json" | "xml" => Some(format),
+                _ => None,
+            };
+            if let Some(hint) = hint {
+                r.content_hl = super::super::syntax::highlight(capped(content), hint);
+            }
+            r.brief = page_brief(content, format);
+            r.body = bounded(content);
+        }
+        _ => {
+            r.body = summarize_output(output);
+            let summary = ["content", "result", "message", "text", "summary", "output"]
+                .iter()
+                .find_map(|key| output.get(*key).and_then(Value::as_str));
+            r.brief.push(summary.map(bounded).unwrap_or_else(|| {
+                if output.is_object() || output.is_array() {
+                    "Structured result · ^O to inspect".into()
+                } else {
+                    r.body.clone()
+                }
+            }));
+        }
+    }
+    r
 }

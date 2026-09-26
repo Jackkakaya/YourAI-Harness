@@ -1,15 +1,40 @@
 //! Tool cards, diff layout and bounded text wrapping.
-use super::*;
+use super::spinner_frame;
+use crate::text::elide;
+use crate::ui::markdown::wrap_text;
+use crate::ui::state::{DiffRow, ToolStatus, ToolView};
+use crate::ui::theme::{
+    mix, Theme, ACCENT, BG, DIFF_ADD_BG, DIFF_DEL_BG, FAINT, GREEN, MUTED, RED, TEXT, USER_SURFACE,
+};
+use ratatui::prelude::*;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+/// Substantial artifacts get a surface; small read/search events remain inline.
+pub(super) fn block_tool(t: &ToolView, expanded: bool) -> bool {
+    expanded
+        || matches!(t.name.as_str(), "shell" | "edit" | "write")
+        || t.status == ToolStatus::Failed
+        || t.exit_code.is_some_and(|code| code != 0)
+}
+
+/// Fill the complete row while preserving explicit diff/syntax backgrounds.
+pub(super) fn surface_row(
+    mut row: Line<'static>,
+    width: usize,
+    background: Color,
+) -> Line<'static> {
+    let background = row.style.bg.unwrap_or(background);
+    row.spans
+        .push(Span::raw(" ".repeat(width.saturating_sub(row.width()))));
+    row.style = row.style.bg(background);
+    row
+}
 
 /// Card title: "{▸ cursor} {status glyph} {subject}{pad}{meta}". The glyph
 /// carries the status color; the subject is bright and is the only elidable
 /// span; the right-hand meta always survives intact.
-pub(super) fn tool_title(
-    t: &crate::ui::state::ToolView,
-    selected: bool,
-    width: usize,
-    tick: u64,
-) -> Line<'static> {
+pub(super) fn tool_title(t: &ToolView, selected: bool, width: usize, tick: u64) -> Line<'static> {
     let (glyph, color) = match t.status {
         ToolStatus::Running => (spinner_frame(tick).to_string(), ACCENT),
         ToolStatus::Done => ("✓".into(), GREEN),
@@ -50,7 +75,14 @@ pub(super) fn tool_title(
                 } else {
                     MUTED
                 })
-                .bold(),
+                .add_modifier(
+                    if selected || t.status == ToolStatus::Running || t.status == ToolStatus::Failed
+                    {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    },
+                ),
         ),
         Span::raw(" ".repeat(pad)),
         Span::styled(
@@ -64,8 +96,27 @@ pub(super) fn tool_title(
     ])
 }
 
+/// Title row of a tool card, given a surface when the card renders as a
+/// block. The single implementation shared by the layout cache (static
+/// frames) and the per-frame animation bypass in `Renderer::draw` — the two
+/// must never drift apart.
+pub(super) fn tool_title_row(
+    t: &ToolView,
+    selected: bool,
+    expanded: bool,
+    width: usize,
+    tick: u64,
+) -> Line<'static> {
+    let title = tool_title(t, selected, width, tick);
+    if block_tool(t, expanded) {
+        surface_row(title, width, USER_SURFACE)
+    } else {
+        title
+    }
+}
+
 /// Right-hand title metadata, from structured state only (never parsed text).
-pub(super) fn tool_meta(t: &crate::ui::state::ToolView) -> String {
+pub(super) fn tool_meta(t: &ToolView) -> String {
     match t.name.as_str() {
         "shell" if t.status != ToolStatus::Running => {
             t.exit_code.map(|c| format!("exit {c}")).unwrap_or_default()
@@ -99,11 +150,11 @@ pub(super) fn tool_meta(t: &crate::ui::state::ToolView) -> String {
     }
 }
 
-/// "⋯ N more · ^O" footer shared by previews.
+/// Expand hint appears only when content is hidden.
 pub(super) fn more_hint(lines: &mut Vec<Line<'static>>, hidden: usize, width: usize) {
     if hidden > 0 {
-        lines.extend(wrap(
-            &format!("⋯ {hidden} more · ^O"),
+        lines.extend(wrap_text(
+            &format!("⋯ {hidden} more · Ctrl-O"),
             Style::default().fg(FAINT),
             width,
             "  ",
@@ -142,7 +193,7 @@ pub(super) fn diff_render(
     show_hunks: bool,
 ) -> (Vec<Line<'static>>, usize) {
     fn hunk_line(h: &str, width: usize) -> Vec<Line<'static>> {
-        wrap(h, Style::default().fg(FAINT), width, "  ")
+        wrap_text(h, Style::default().fg(FAINT), width, "  ")
     }
     let mut out = Vec::new();
     let (mut shown, mut changes) = (0usize, 0usize);
@@ -324,7 +375,7 @@ pub(super) fn truncate_spans(spans: &[Span<'static>], budget: usize) -> (Vec<Spa
 
 /// Expanded card body (^O): input block, then the tool-specific full result.
 pub(super) fn tool_expanded(
-    t: &crate::ui::state::ToolView,
+    t: &ToolView,
     lines: &mut Vec<Line<'static>>,
     width: usize,
     theme: Theme,
@@ -334,12 +385,12 @@ pub(super) fn tool_expanded(
     // often-large JSON arguments before the useful content only adds noise.
     if !matches!(t.name.as_str(), "edit" | "write" | "webfetch") {
         for line in t.input.lines() {
-            lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
+            lines.extend(wrap_text(line, Style::default().fg(MUTED), width, prefix));
         }
     }
     if t.status == ToolStatus::Running {
         for line in t.progress.lines() {
-            lines.extend(wrap(
+            lines.extend(wrap_text(
                 line,
                 Style::default().fg(MUTED).italic(),
                 width,
@@ -383,31 +434,47 @@ pub(super) fn tool_expanded(
                     ));
                 }
             } else {
-                for line in t.output.lines() {
-                    lines.extend(wrap(line, Style::default().fg(TEXT), width, prefix));
-                }
+                push_wrapped(
+                    lines,
+                    t.output.lines(),
+                    Style::default().fg(TEXT),
+                    width,
+                    prefix,
+                );
             }
         }
         "shell" => {
-            for line in t.output.lines() {
-                lines.extend(wrap(line, Style::default().fg(TEXT), width, prefix));
-            }
+            push_wrapped(
+                lines,
+                t.output.lines(),
+                Style::default().fg(TEXT),
+                width,
+                prefix,
+            );
             if !t.stderr.trim().is_empty() {
-                lines.extend(wrap(
+                lines.extend(wrap_text(
                     "── stderr ──",
                     Style::default().fg(FAINT),
                     width,
                     prefix,
                 ));
-                for line in t.stderr.lines() {
-                    lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
-                }
+                push_wrapped(
+                    lines,
+                    t.stderr.lines(),
+                    Style::default().fg(MUTED),
+                    width,
+                    prefix,
+                );
             }
         }
         _ => {
-            for line in t.output.lines() {
-                lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
-            }
+            push_wrapped(
+                lines,
+                t.output.lines(),
+                Style::default().fg(MUTED),
+                width,
+                prefix,
+            );
         }
     }
 }
@@ -416,7 +483,7 @@ pub(super) fn tool_expanded(
 /// shell keeps one tail line, edit/write keep the first change rows,
 /// websearch lists sources. Everything else is at most one summary line.
 pub(super) fn tool_preview(
-    t: &crate::ui::state::ToolView,
+    t: &ToolView,
     lines: &mut Vec<Line<'static>>,
     width: usize,
     theme: Theme,
@@ -428,16 +495,20 @@ pub(super) fn tool_preview(
             // Last 3 progress lines, following scroll.
             let prog: Vec<&str> = t.progress.lines().collect();
             if prog.is_empty() {
-                lines.extend(wrap(
+                lines.extend(wrap_text(
                     "waiting for output…",
                     Style::default().fg(MUTED),
                     width,
                     prefix,
                 ));
             } else {
-                for line in &prog[prog.len().saturating_sub(3)..] {
-                    lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
-                }
+                push_wrapped(
+                    lines,
+                    &prog[prog.len().saturating_sub(3)..],
+                    Style::default().fg(MUTED),
+                    width,
+                    prefix,
+                );
             }
         }
         "shell" => {
@@ -452,20 +523,25 @@ pub(super) fn tool_preview(
             if failed {
                 let start = out.len().saturating_sub(5);
                 let source = if use_stderr { "stderr" } else { "stdout" };
-                lines.extend(wrap(
-                    &format!(
-                        "{source} · last {} lines · ^O full output",
-                        out.len().min(5)
-                    ),
+                lines.extend(wrap_text(
+                    &if start > 0 {
+                        format!("{source} · last 5 lines · Ctrl-O to expand")
+                    } else {
+                        source.to_owned()
+                    },
                     Style::default().fg(MUTED),
                     width,
                     prefix,
                 ));
-                for line in &out[start..] {
-                    lines.extend(wrap(line, Style::default().fg(RED), width, prefix));
-                }
+                push_wrapped(
+                    lines,
+                    &out[start..],
+                    Style::default().fg(RED),
+                    width,
+                    prefix,
+                );
                 if out.is_empty() {
-                    lines.extend(wrap(
+                    lines.extend(wrap_text(
                         "No diagnostic output",
                         Style::default().fg(RED),
                         width,
@@ -474,11 +550,20 @@ pub(super) fn tool_preview(
                 }
             } else {
                 let start = out.len().saturating_sub(1);
-                for line in &out[start..] {
-                    lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
-                }
+                push_wrapped(
+                    lines,
+                    &out[start..],
+                    Style::default().fg(MUTED),
+                    width,
+                    prefix,
+                );
                 if out.is_empty() {
-                    lines.extend(wrap("no output", Style::default().fg(MUTED), width, prefix));
+                    lines.extend(wrap_text(
+                        "no output",
+                        Style::default().fg(MUTED),
+                        width,
+                        prefix,
+                    ));
                 }
             }
         }
@@ -491,7 +576,7 @@ pub(super) fn tool_preview(
                 more_hint(lines, total.saturating_sub(shown), width);
             }
             Some(_) => {
-                lines.extend(wrap(
+                lines.extend(wrap_text(
                     "no changes",
                     Style::default().fg(MUTED),
                     width,
@@ -511,7 +596,7 @@ pub(super) fn tool_preview(
                     .take(4)
                     .collect();
                 if rows.is_empty() {
-                    lines.extend(wrap(
+                    lines.extend(wrap_text(
                         "no changes",
                         Style::default().fg(MUTED),
                         width,
@@ -541,15 +626,23 @@ pub(super) fn tool_preview(
         // read: the title already says what was read; a content teaser is noise.
         "read" => {}
         "websearch" if !t.brief.is_empty() => {
-            for row in t.brief.iter().take(3) {
-                lines.extend(wrap(row, Style::default().fg(MUTED), width, "  ⏤ "));
-            }
+            push_wrapped(
+                lines,
+                t.brief.iter().take(3),
+                Style::default().fg(MUTED),
+                width,
+                "  ⏤ ",
+            );
             more_hint(lines, t.brief.len().saturating_sub(3), width);
         }
         "webfetch" if !t.brief.is_empty() => {
-            for row in t.brief.iter().take(3) {
-                lines.extend(wrap(row, Style::default().fg(MUTED), width, "  "));
-            }
+            push_wrapped(
+                lines,
+                t.brief.iter().take(3),
+                Style::default().fg(MUTED),
+                width,
+                "  ",
+            );
             more_hint(lines, t.brief.len().saturating_sub(3), width);
         }
         _ => {
@@ -559,52 +652,281 @@ pub(super) fn tool_preview(
                 .map(String::as_str)
                 .or_else(|| t.output.lines().find(|l| !l.trim().is_empty()))
             {
-                lines.extend(wrap(line, Style::default().fg(MUTED), width, prefix));
+                lines.extend(wrap_text(line, Style::default().fg(MUTED), width, prefix));
             }
         }
     }
 }
 
-/// Like wrap() but applies bg color to the full line width (for diff backgrounds).
-pub(super) fn wrap_bg(text: &str, style: Style, width: usize, prefix: &str) -> Vec<Line<'static>> {
-    let available = width.saturating_sub(prefix.width()).max(2);
-    let mut result = Vec::new();
-    let mut line = String::new();
-    let mut used = 0;
-    for g in text.graphemes(true) {
-        if used + g.width() > available && !line.is_empty() {
-            let pad = available.saturating_sub(used);
-            result.push(Line::from(Span::styled(
-                format!("{prefix}{line}{}", " ".repeat(pad)),
-                style,
-            )));
-            line.clear();
-            used = 0;
-        }
-        line.push_str(g);
-        used += g.width();
+/// Wrap each row of `rows` and append to `lines`.
+fn push_wrapped<S: AsRef<str>>(
+    lines: &mut Vec<Line<'static>>,
+    rows: impl IntoIterator<Item = S>,
+    style: Style,
+    width: usize,
+    prefix: &str,
+) {
+    for row in rows {
+        lines.extend(wrap_text(row.as_ref(), style, width, prefix));
     }
-    let pad = available.saturating_sub(used);
-    result.push(Line::from(Span::styled(
-        format!("{prefix}{line}{}", " ".repeat(pad)),
-        style,
-    )));
-    result
 }
-pub(super) fn wrap(text: &str, style: Style, width: usize, prefix: &str) -> Vec<Line<'static>> {
-    let available = width.saturating_sub(prefix.width()).max(2);
-    let mut result = Vec::new();
-    let mut line = String::new();
-    let mut used = 0;
-    for g in text.graphemes(true) {
-        if used + g.width() > available && !line.is_empty() {
-            result.push(Line::from(Span::styled(format!("{prefix}{line}"), style)));
-            line.clear();
-            used = 0;
-        }
-        line.push_str(g);
-        used += g.width();
+
+/// Like wrap_text() but applies bg color to the full line width (for diff backgrounds).
+pub(super) fn wrap_bg(text: &str, style: Style, width: usize, prefix: &str) -> Vec<Line<'static>> {
+    wrap_text(text, style, width, prefix)
+        .into_iter()
+        .map(|mut line| {
+            line.spans.push(Span::styled(
+                " ".repeat(width.saturating_sub(line.width())),
+                style,
+            ));
+            line
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::timeline::TimelineCache;
+    #[allow(clippy::wildcard_imports)]
+    use super::*;
+    use crate::ui::state::{Item, View};
+    use serde_json::json;
+    use yourai_core::prelude::Out;
+
+    fn timeline(v: &View, width: usize) -> (Vec<Line<'static>>, Vec<(usize, u64)>) {
+        let (lines, headers) = TimelineCache::default().layout(v, width, 3, 0);
+        (lines.viewport(0..lines.len()), headers)
     }
-    result.push(Line::from(Span::styled(format!("{prefix}{line}"), style)));
-    result
+
+    fn timeline_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tool_title_right_aligns_meta_and_elides_long_subject() {
+        let mut v = View::default();
+        let long = "cargo test --workspace --all-targets ".repeat(8);
+        v.event(Out::ToolStarted {
+            id: "t".into(),
+            name: "shell".into(),
+            input: json!({ "command": long }),
+        });
+        v.event(Out::ToolDone {
+            id: "t".into(),
+            name: "shell".into(),
+            output: json!({"ok":true,"exit_code":0,"termination":"exit","output_complete":true,"stdout":"done\n","stderr":""}),
+            is_error: false,
+        });
+        let (lines, _) = timeline(&v, 80);
+        let title = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains('✓')))
+            .expect("title line");
+        let text: String = title.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('…'), "long subject elided: {text}");
+        assert!(text.contains("exit 0"), "meta survives elision: {text}");
+        // Sub-second durations are silent; the meta ends with the exit code.
+        assert!(text.trim_end().ends_with("exit 0"), "meta last: {text}");
+        assert!(title.width() <= 80, "title fits width: {}", title.width());
+    }
+
+    #[test]
+    fn failed_shell_preview_prioritizes_stderr_tail_over_stdout_progress() {
+        let mut v = View::default();
+        v.event(Out::ToolStarted {
+            id: "build".into(),
+            name: "shell".into(),
+            input: json!({"command": "cargo build"}),
+        });
+        v.event(Out::ToolDone {
+            id: "build".into(), name: "shell".into(),
+            output: json!({"ok":false,"exit_code":1,"stdout":"Compiling dependencies", "stderr":"warning 1\nwarning 2\nwarning 3\nwarning 4\nwarning 5\nerror: unresolved import"}),
+            is_error: true,
+        });
+        let tool = v
+            .items()
+            .iter()
+            .find_map(|item| {
+                if let Item::Tool(t) = item {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let mut lines = vec![];
+        tool_preview(tool, &mut lines, 80, Theme::Dark, 3);
+        let text = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("error: unresolved import"));
+        assert!(text.contains("stderr") && text.contains("Ctrl-O to expand"));
+        assert!(!text.contains("Compiling dependencies") && !text.contains("warning 1"));
+        lines.clear();
+        tool_expanded(tool, &mut lines, 80, Theme::Dark);
+        let full = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(full.contains("Compiling dependencies") && full.contains("warning 1"));
+    }
+
+    #[test]
+    fn card_previews_follow_per_tool_quotas() {
+        let mut v = View::default();
+        // read: no code teaser at all.
+        v.event(Out::ToolStarted {
+            id: "r".into(),
+            name: "read".into(),
+            input: json!({"path":"src/main.rs"}),
+        });
+        v.event(Out::ToolDone {
+            id: "r".into(),
+            name: "read".into(),
+            output: json!({"ok":true,"path":"src/main.rs","offset":1,"content":"1|fn main() {}\n"}),
+            is_error: false,
+        });
+        // shell done: exactly one tail line of stdout.
+        v.event(Out::ToolStarted {
+            id: "s".into(),
+            name: "shell".into(),
+            input: json!({"command":"seq"}),
+        });
+        v.event(Out::ToolDone {
+            id: "s".into(),
+            name: "shell".into(),
+            output: json!({"ok":true,"exit_code":0,"termination":"exit","output_complete":true,"stdout":"alpha\nbeta\ngamma\n","stderr":""}),
+            is_error: false,
+        });
+        // write: line count + confirmed "new" marker in the title.
+        v.event(Out::ToolStarted {
+            id: "w".into(),
+            name: "write".into(),
+            input: json!({"path":"docs/design.md","content":"# T\n\nbody\n"}),
+        });
+        v.event(Out::ToolDone {
+            id: "w".into(),
+            name: "write".into(),
+            output: json!({"ok":true,"path":"docs/design.md","created":true,"bytes_written":8}),
+            is_error: false,
+        });
+        // unknown tool: a single summarized line, never raw JSON.
+        v.event(Out::ToolDone {
+            id: "x".into(),
+            name: "mcp__jira".into(),
+            output: json!({"result":"Created YOUR-9","ok":true}),
+            is_error: false,
+        });
+        let (lines, _) = timeline(&v, 80);
+        let text = timeline_text(&lines);
+        assert!(text.contains("1 lines"), "read meta: {text}");
+        assert!(text.contains("+3 · new"), "write meta: {text}");
+        assert!(text.contains("# T"), "write ghost-diff preview: {text}");
+        assert!(!text.contains("fn main"), "read teaser hidden: {text}");
+        assert!(text.contains("gamma"), "shell tail line: {text}");
+        assert!(!text.contains("alpha"), "shell older lines hidden: {text}");
+        assert!(text.contains("Created YOUR-9"), "summarized body: {text}");
+        assert!(!text.contains('{'), "no raw json: {text}");
+    }
+
+    fn edit_view() -> View {
+        let mut v = View::default();
+        v.event(Out::ToolStarted {
+            id: "e".into(),
+            name: "edit".into(),
+            input: json!({"path":"src/main.rs","old_text":"    old();","new_text":"    new();\n    more();"}),
+        });
+        v.event(Out::ToolDone {
+            id: "e".into(),
+            name: "edit".into(),
+            output: json!({"ok":true,"path":"src/main.rs","changed":true,"diff":"--- src/main.rs\n+++ src/main.rs\n@@ -40,3 +40,4 @@\n fn main() {\n-    old();\n+    new();\n+    more();\n }\n"}),
+            is_error: false,
+        });
+        v
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn edit_card_splits_side_by_side_when_wide() {
+        let (lines, _) = timeline(&edit_view(), 140);
+        let text = timeline_text(&lines);
+        assert!(text.contains(" │ "), "split separator: {text}");
+        // Old and new versions of the changed line sit on the same row.
+        let pair = lines
+            .iter()
+            .map(line_text)
+            .find(|t| t.contains("old();") && t.contains("new();"))
+            .expect("paired row: {text}");
+        assert!(
+            pair.contains("41"),
+            "cell gutter carries line numbers: {pair}"
+        );
+        // Right-aligned meta and full-width, padded cells.
+        assert!(text.contains("+2 −1"), "title meta: {text}");
+        let row = lines
+            .iter()
+            .find(|l| line_text(l).contains("old();") && line_text(l).contains("new();"))
+            .unwrap();
+        assert_eq!(row.width(), 140, "surface pads the complete block width");
+    }
+
+    #[test]
+    fn edit_card_unifies_below_split_threshold() {
+        let (lines, _) = timeline(&edit_view(), 100);
+        let text = timeline_text(&lines);
+        assert!(
+            !text.contains(" │ "),
+            "no split separator when narrow: {text}"
+        );
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("  - ") && t.contains("old();")),
+            "old line carries the '-' gutter: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("  + ") && t.contains("new();")),
+            "new line carries the '+' gutter: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn websearch_preview_lists_sources_with_more_hint() {
+        let mut v = View::default();
+        let content = (1..=4)
+            .map(|i| format!("Title: Result {i}\nURL: https://host{i}.example/page"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        v.event(Out::ToolDone {
+            id: "w".into(),
+            name: "websearch".into(),
+            output: json!({"provider":"exa","query":"q","content":content}),
+            is_error: false,
+        });
+        let (lines, _) = timeline(&v, 80);
+        let text = timeline_text(&lines);
+        assert!(text.contains("Result 1 — host1.example"), "{text}");
+        assert!(text.contains("Result 3 — host3.example"), "{text}");
+        assert!(!text.contains("Result 4"), "fourth row hidden: {text}");
+        assert!(text.contains("⋯ 1 more · Ctrl-O"), "more hint: {text}");
+    }
 }

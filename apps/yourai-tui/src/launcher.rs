@@ -2,26 +2,20 @@
 //! before `Harness::open`. Triggered by `--resume` with no value.
 //!
 //! The launcher deliberately avoids the main View/Renderer machinery so it
-//! can run before the harness exists and stay ~150 lines. It shares the
-//! pure filtering logic with the `/sessions` overlay via `crate::sessions`.
+//! can run before the harness exists. It shares the screen guard, picker
+//! geometry, list key handling, row formatting and truncation with the main
+//! UI via `crate::terminal`, `crate::picker` and `crate::sessions` — do not
+//! fork those pieces again here.
 use crate::config::Error;
-use crate::sessions::{filter_sessions, relative_time, rows_from, SessionRow};
-use crossterm::{
-    cursor::Show,
-    event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers,
-    },
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crate::sessions::{filter_sessions, rows_from, SessionRow};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     backend::CrosstermBackend,
     prelude::*,
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 use std::{
-    io::{self, Write},
+    io::{self},
     time::{SystemTime, UNIX_EPOCH},
 };
 use yourai_core::prelude::{SessionId, SessionManager};
@@ -45,7 +39,7 @@ pub async fn pick(catalog: &SessionCatalog) -> Result<Choice, Error> {
     if rows.is_empty() {
         return Ok(Choice::New);
     }
-    let _screen = Screen::open()?;
+    let _screen = crate::terminal::Screen::open()?;
     let mut query = String::new();
     let mut selected: usize = 0;
     let backend = crate::terminal::SizedBackend(CrosstermBackend::new(io::stdout()));
@@ -57,54 +51,23 @@ pub async fn pick(catalog: &SessionCatalog) -> Result<Choice, Error> {
         if !event::poll(std::time::Duration::from_millis(100))? {
             continue;
         }
-        match event::read()? {
-            Event::Key(k) if k.kind != KeyEventKind::Release => {
-                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                match k.code {
-                    KeyCode::Char('q') if ctrl => return Ok(Choice::Quit),
-                    KeyCode::Esc => return Ok(Choice::New),
-                    KeyCode::Enter => {
-                        if let Some(idx) = picked {
-                            return Ok(Choice::Resume(rows[idx].id.clone()));
-                        }
+        if let Event::Key(k) = event::read()? {
+            if k.kind == KeyEventKind::Release {
+                continue;
+            }
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            match k.code {
+                KeyCode::Char('q') if ctrl => return Ok(Choice::Quit),
+                KeyCode::Esc => return Ok(Choice::New),
+                KeyCode::Enter => {
+                    if let Some(idx) = picked {
+                        return Ok(Choice::Resume(rows[idx].id.clone()));
                     }
-                    KeyCode::Up => {
-                        if !filtered.is_empty() {
-                            selected = selected.saturating_sub(1);
-                        }
-                    }
-                    KeyCode::Down => {
-                        if !filtered.is_empty() {
-                            selected = (selected + 1).min(filtered.len() - 1);
-                        }
-                    }
-                    KeyCode::Char('p') if ctrl => {
-                        if !filtered.is_empty() {
-                            selected = selected.saturating_sub(1);
-                        }
-                    }
-                    KeyCode::Char('n') if ctrl => {
-                        if !filtered.is_empty() {
-                            selected = (selected + 1).min(filtered.len() - 1);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        query.pop();
-                        selected = 0;
-                    }
-                    KeyCode::Char(c)
-                        if !k
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        query.push(c);
-                        selected = 0;
-                    }
-                    _ => {}
+                }
+                _ => {
+                    crate::picker::filter_input(k, &mut query, &mut selected, filtered.len());
                 }
             }
-            Event::Resize(_, _) => {}
-            _ => {}
         }
     }
 }
@@ -146,6 +109,9 @@ fn render(
         )));
     } else {
         let inner_w = (width.saturating_sub(4)) as usize;
+        // Same column budget as the /sessions overlay: title shrinks, the
+        // id/model/time triple stays fixed.
+        let title_w = inner_w.saturating_sub(36).clamp(8, 32);
         for rank in
             crate::picker::visible_rows(filtered.len(), selected, rect.height.saturating_sub(4))
         {
@@ -153,26 +119,13 @@ fn render(
             let row = &rows[idx];
             let is_picked = picked == Some(idx);
             let marker = if is_picked { "►" } else { " " };
-            let title = truncate(&row.title, inner_w.saturating_sub(40));
-            let id8 = row.id.0.chars().take(8).collect::<String>();
-            let model = if row.model.is_empty() {
-                "—".into()
-            } else {
-                truncate(&row.model, 16)
-            };
-            let time = relative_time(row.updated_at, now);
-            let line = format!("{marker} {title:<28} {id8} · {model:<16} · {time}");
-            let color = if rank == selected {
-                Color::Cyan
-            } else if row.is_current {
-                Color::LightGreen
-            } else {
-                Color::White
-            };
+            let line = format!("{marker} {}", crate::sessions::row_body(row, title_w, now));
             let style = if rank == selected {
-                Style::default().fg(color).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(color)
+                Style::default().fg(Color::White)
             };
             lines.push(Line::from(Span::styled(line, style)));
         }
@@ -191,57 +144,9 @@ fn render(
     );
 }
 
-fn truncate(s: &str, width: usize) -> String {
-    let total = s.chars().count();
-    if total <= width {
-        return s.to_string();
-    }
-    let take = width.saturating_sub(1);
-    let mut out: String = s.chars().take(take).collect();
-    out.push('…');
-    out
-}
-
-struct Screen;
-impl Screen {
-    fn open() -> Result<Self, Error> {
-        enable_raw_mode()?;
-        let result = (|| {
-            execute!(
-                io::stdout(),
-                EnterAlternateScreen,
-                EnableBracketedPaste,
-                EnableMouseCapture
-            )?;
-            Ok::<(), io::Error>(())
-        })();
-        if let Err(e) = result {
-            restore();
-            return Err(e.into());
-        }
-        Ok(Self)
-    }
-}
-fn restore() {
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        io::stdout(),
-        LeaveAlternateScreen,
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        Show
-    );
-    let _ = io::stdout().write_all(b"\x1b[?2026l");
-    let _ = io::stdout().flush();
-}
-impl Drop for Screen {
-    fn drop(&mut self) {
-        restore();
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
 
     #[test]
@@ -274,5 +179,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cjk_titles_keep_column_alignment() {
+        // The old launcher-local `truncate` counted chars, so CJK titles
+        // (2 columns per glyph) overflowed their column. The shared row
+        // body must elide by display width and keep the id column stable.
+        let rows = vec![SessionRow {
+            id: SessionId("d3f40178deadbeef".into()),
+            title: "修复中文解析器的边界问题与回归测试".into(),
+            model: String::new(),
+            updated_at: 0,
+            is_current: false,
+        }];
+        let filtered: Vec<usize> = vec![0];
+        let mut t = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| render(f, &rows, &filtered, "", 0, Some(0), 0))
+            .unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // 17 CJK glyphs = 34 columns; title_w is 32, so 15 glyphs (30 cols)
+        // plus the ellipsis render, and the id follows in its own column.
+        // Wide glyphs pad the trailing cell, so compare space-stripped text.
+        let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("修复中文解析器的边界问题与回归…d3f40178"),
+            "got: {text}"
+        );
     }
 }

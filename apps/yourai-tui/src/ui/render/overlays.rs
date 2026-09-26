@@ -1,12 +1,21 @@
 //! Dashboard and pickers, constrained to the current terminal.
-use super::*;
+use super::Canvas;
+use super::{ctx_bar, ctx_color, label, tokens, Metadata};
+use crate::ui::markdown::wrap_text;
+use crate::ui::overlay::Overlay;
+use crate::ui::state::View;
+use crate::ui::theme::{Theme, ACCENT, FOCUS_SURFACE, GREEN, MUTED, PANEL, RED, TEXT, YELLOW};
+use ratatui::{
+    prelude::*,
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+};
 /// ^B dashboard overlay (replaces the old sidebar content).
-pub(super) fn stats_overlay(f: &mut Frame<'_>, area: Rect, v: &View, m: &Metadata, queued: usize) {
+pub(super) fn stats_overlay(f: &mut Canvas, area: Rect, v: &View, m: &Metadata, queued: usize) {
     let _ = queued;
     let width = area.width.min(64);
     let mut lines: Vec<Line<'static>> = vec![];
     // Session section.
-    lines.push(label(&v.model_label, TEXT));
+    lines.push(label(&v.model.label, TEXT));
     lines.push(label(&format!("cwd {}", abbreviate_home(&m.cwd)), MUTED));
     lines.push(label(
         &format!(
@@ -118,19 +127,22 @@ pub(super) fn stats_overlay(f: &mut Frame<'_>, area: Rect, v: &View, m: &Metadat
     lines.push(label(
         &format!(
             "{} in · {} out · {} total",
-            tokens(v.usage.input_tokens),
-            tokens(v.usage.output_tokens),
-            tokens(v.usage.total_tokens)
+            tokens(v.usage().input_tokens),
+            tokens(v.usage().output_tokens),
+            tokens(v.usage().total_tokens)
         ),
         TEXT,
     ));
-    if let Some((pin, pout)) = v.pricing {
+    if let Some((pin, pout)) = v.model.pricing {
         lines.push(label(
             &format!("Current model: ${pin}/{pout} per M in/out"),
             YELLOW,
         ));
     }
-    lines.push(label(&format!("{} responses", v.recorded_responses), MUTED));
+    lines.push(label(
+        &format!("{} responses", v.recorded_responses()),
+        MUTED,
+    ));
     lines.push(Line::default());
     // Permissions.
     lines.push(label("Permissions", TEXT).style(Style::default().bold()));
@@ -200,8 +212,86 @@ pub(super) fn abbreviate_home(path: &str) -> String {
     path.to_string()
 }
 
+/// One row of a picker list: rendered body plus whether it is the currently
+/// active item (drawn with the ● mark instead of ○).
+struct PickRow {
+    body: String,
+    current: bool,
+}
+
+/// Shared picker chrome: centered rounded box, ► selection cursor, ●/○
+/// current-item mark, focused-row surface and visible-row scrolling.
+/// `header` lines sit above the list (e.g. the sessions filter line);
+/// `current_color` tints the current item (GREEN for themes/sessions,
+/// TEXT when only the mark distinguishes it, as in models).
+#[allow(clippy::too_many_arguments)] // all params are distinct view concerns
+fn pick_list(
+    f: &mut Canvas,
+    area: Rect,
+    width: u16,
+    title: &str,
+    header: &[Line<'static>],
+    rows: &[PickRow],
+    selected: usize,
+    current_color: Color,
+) {
+    let rect = crate::picker::centered(area, width, rows.len() + header.len() + 2);
+    f.render_widget(Clear, rect);
+    let capacity = rect
+        .height
+        .saturating_sub(u16::try_from(header.len()).unwrap_or(u16::MAX) + 2);
+    let start = crate::picker::visible_rows(rows.len(), selected, capacity).start;
+    let mut lines: Vec<Line<'static>> = header.to_vec();
+    lines.extend(
+        rows.iter()
+            .enumerate()
+            .skip(start)
+            .take(usize::from(capacity))
+            .map(|(i, row)| {
+                let selected_row = i == selected;
+                let mark = if row.current { "●" } else { "○" };
+                let color = if selected_row {
+                    ACCENT
+                } else if row.current {
+                    current_color
+                } else {
+                    TEXT
+                };
+                let style = if selected_row {
+                    Style::default().fg(color).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(color)
+                };
+                Line::from(vec![
+                    Span::styled(
+                        if selected_row { "► " } else { "  " },
+                        Style::default().fg(ACCENT),
+                    ),
+                    Span::styled(format!("{mark} {}", row.body), style),
+                ])
+                .style(if selected_row {
+                    Style::default().bg(FOCUS_SURFACE)
+                } else {
+                    Style::default()
+                })
+            }),
+    );
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(PANEL).fg(TEXT))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(title),
+            ),
+        rect,
+    );
+}
+
 /// `/models` picker overlay.
-pub(super) fn model_picker_overlay(f: &mut Frame<'_>, area: Rect, v: &View) {
+pub(super) fn model_picker_overlay(f: &mut Canvas, area: Rect, v: &View) {
     let choices = &v.model_choices;
     if choices.is_empty() {
         let rect = crate::picker::centered(area, 54, 5);
@@ -218,52 +308,28 @@ pub(super) fn model_picker_overlay(f: &mut Frame<'_>, area: Rect, v: &View) {
         Overlay::Models(i) => i,
         _ => 0,
     };
-    let current_label = &v.model_label;
-    let rect = crate::picker::centered(area, 56, choices.len().saturating_add(2));
-    f.render_widget(Clear, rect);
-    let lines: Vec<Line<'static>> = choices
+    let rows: Vec<PickRow> = choices
         .iter()
-        .enumerate()
-        .skip(
-            crate::picker::visible_rows(choices.len(), selected, rect.height.saturating_sub(2))
-                .start,
-        )
-        .take(usize::from(rect.height.saturating_sub(2)))
-        .map(|(i, label)| {
-            let is_current = label == current_label;
-            let prefix = if i == selected { "► " } else { "  " };
-            let mark = if is_current { "●" } else { "○" };
-            let color = if i == selected { ACCENT } else { TEXT };
-            Line::from(vec![
-                Span::styled(prefix.to_owned(), Style::default().fg(ACCENT)),
-                Span::styled(format!("{mark} {label}"), Style::default().fg(color)),
-            ])
-            .style(if i == selected {
-                Style::default()
-                    .bg(FOCUS_SURFACE)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            })
+        .map(|label| PickRow {
+            body: label.clone(),
+            current: label == &v.model.label,
         })
         .collect();
-    f.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(PANEL).fg(TEXT))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(ACCENT))
-                    .title(" Models · ↑↓ · Enter · Esc "),
-            ),
-        rect,
+    pick_list(
+        f,
+        area,
+        56,
+        " Models · ↑↓ · Enter · Esc ",
+        &[],
+        &rows,
+        selected,
+        TEXT,
     );
 }
 
 /// `/sessions` picker overlay. Rows are pre-loaded into the picker state;
 /// filtering is computed per-frame via the shared `filter_sessions` helper.
-pub(super) fn sessions_overlay(f: &mut Frame<'_>, area: Rect, v: &View) {
+pub(super) fn sessions_overlay(f: &mut Canvas, area: Rect, v: &View, now: i64) {
     let Overlay::Sessions(picker) = &v.overlay else {
         return;
     };
@@ -285,147 +351,329 @@ pub(super) fn sessions_overlay(f: &mut Frame<'_>, area: Rect, v: &View) {
         );
         return;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     let filtered = crate::sessions::filter_sessions(&picker.rows, &picker.query);
-    let rect = crate::picker::centered(area, 80, filtered.len().saturating_add(6).min(24));
-    let width = rect.width;
-    f.render_widget(Clear, rect);
-    let mut lines: Vec<Line<'static>> = Vec::new();
     let hint = if picker.query.is_empty() {
         "type to filter · ↑↓ move · Enter switch · Esc close"
     } else {
         ""
     };
-    lines.push(Line::from(vec![
+    let filter_line = Line::from(vec![
         Span::styled("filter ", Style::default().fg(MUTED)),
         Span::styled(picker.query.clone(), Style::default().fg(TEXT)),
         Span::styled(hint.to_owned(), Style::default().fg(MUTED)),
-    ]));
-    lines.push(Line::default());
+    ]);
+    let mut header = vec![filter_line, Line::default()];
     if filtered.is_empty() {
-        lines.push(Line::from(Span::styled(
+        header.push(Line::from(Span::styled(
             "No sessions match.",
             Style::default().fg(YELLOW),
         )));
-    } else {
-        let inner_w = (width.saturating_sub(4)) as usize;
-        for rank in crate::picker::visible_rows(
-            filtered.len(),
-            picker.selected,
-            rect.height.saturating_sub(4),
-        ) {
-            let idx = filtered[rank];
-            let row = &picker.rows[idx];
-            let is_selected = rank == picker.selected;
-            let marker = if is_selected { "►" } else { " " };
-            let current = if row.is_current { "●" } else { "○" };
-            let title_w = inner_w.saturating_sub(36).clamp(8, 32);
-            let title = elide(&row.title, title_w);
-            let id8: String = row.id.0.chars().take(8).collect();
-            let model = if row.model.is_empty() {
-                "—".to_string()
-            } else {
-                elide(&row.model, 16)
-            };
-            let time = crate::sessions::relative_time(row.updated_at, now);
-            let prefix = format!("{marker} {current} ");
-            let body = format!("{title:<title_w$} {id8} · {model:<16} · {time}");
-            let color = if is_selected {
-                ACCENT
-            } else if row.is_current {
-                GREEN
-            } else {
-                TEXT
-            };
-            let style = if is_selected {
-                Style::default().fg(color).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(color)
-            };
-            lines.push(
-                Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(ACCENT)),
-                    Span::styled(body, style),
-                ])
-                .style(if is_selected {
-                    Style::default().bg(FOCUS_SURFACE)
-                } else {
-                    Style::default()
-                }),
-            );
-        }
     }
-    f.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(PANEL).fg(TEXT))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(ACCENT))
-                    .title(" Sessions · filter · ↑↓ · Enter · Ctrl-D del · Esc "),
-            ),
-        rect,
+    // Title column shrinks with the terminal; id/model/time are fixed.
+    let title_w = (usize::from(area.width.min(80).saturating_sub(4)))
+        .saturating_sub(36)
+        .clamp(8, 32);
+    let rows: Vec<PickRow> = filtered
+        .iter()
+        .map(|&idx| {
+            let row = &picker.rows[idx];
+            PickRow {
+                body: crate::sessions::row_body(row, title_w, now),
+                current: row.is_current,
+            }
+        })
+        .collect();
+    pick_list(
+        f,
+        area,
+        80,
+        " Sessions · filter · ↑↓ · Enter · Ctrl-D del · Esc ",
+        &header,
+        &rows,
+        picker.selected,
+        GREEN,
     );
 }
 
 /// `/theme` picker overlay: lists every theme in `Theme::ALL` with the
 /// currently active one marked. Enter applies immediately (live preview).
-pub(super) fn theme_picker_overlay(f: &mut Frame<'_>, area: Rect, v: &View) {
-    let all = crate::ui::theme::Theme::ALL;
+pub(super) fn theme_picker_overlay(f: &mut Canvas, area: Rect, v: &View) {
+    let all = Theme::ALL;
     let selected = match v.overlay {
         Overlay::Themes(i) => i,
         _ => 0,
     };
-    let rect = crate::picker::centered(area, 40, all.len().saturating_add(2));
-    f.render_widget(Clear, rect);
-    let lines: Vec<Line<'static>> = all
+    let rows: Vec<PickRow> = all
         .iter()
-        .enumerate()
-        .skip(crate::picker::visible_rows(all.len(), selected, rect.height.saturating_sub(2)).start)
-        .take(usize::from(rect.height.saturating_sub(2)))
-        .map(|(i, t)| {
-            let is_current = *t == v.theme;
-            let is_selected = i == selected;
-            let prefix = if is_selected { "► " } else { "  " };
-            let mark = if is_current { "●" } else { "○" };
-            let label = t.label();
-            let color = if is_selected {
-                ACCENT
-            } else if is_current {
-                GREEN
-            } else {
-                TEXT
-            };
-            let style = if is_selected {
-                Style::default().fg(color).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(color)
-            };
-            Line::from(vec![
-                Span::styled(prefix.to_owned(), Style::default().fg(ACCENT)),
-                Span::styled(format!("{mark} {label}"), style),
-            ])
-            .style(if is_selected {
-                Style::default().bg(FOCUS_SURFACE)
-            } else {
-                Style::default()
-            })
+        .map(|t| PickRow {
+            body: t.label().to_owned(),
+            current: *t == v.theme,
         })
         .collect();
-    f.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(PANEL).fg(TEXT))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(ACCENT))
-                    .title(" Themes · ↑↓ · Enter · Esc "),
-            ),
-        rect,
+    pick_list(
+        f,
+        area,
+        40,
+        " Themes · ↑↓ · Enter · Esc ",
+        &[],
+        &rows,
+        selected,
+        GREEN,
     );
+}
+
+/// Ask/reply panel: permission prompts and structured replies. Rendered
+/// above the input editor while the harness is waiting on the user.
+pub(super) fn ask_overlay(f: &mut Canvas, area: Rect, v: &View) {
+    let Some(ask) = v.ask() else { return };
+    let title = if ask.permission() {
+        " permission · y allow once / n deny · Enter confirms "
+    } else {
+        " Reply · plain text; /json for structured replies "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let parts = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    let mut lines = Vec::new();
+    if ask.permission() {
+        let name = ask.payload["tool_name"].as_str().unwrap_or("tool");
+        lines.push(Line::from(Span::styled(
+            format!("  Allow {name}?"),
+            Style::default().fg(ACCENT).bold(),
+        )));
+    }
+    for line in ask.details.lines() {
+        lines.extend(wrap_text(
+            line,
+            Style::default().fg(TEXT),
+            parts[0].width as usize,
+            " ",
+        ));
+    }
+    let offset = ask
+        .scroll
+        .min(lines.len().saturating_sub(parts[0].height as usize));
+    f.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(offset)
+                .take(parts[0].height as usize)
+                .collect::<Vec<_>>(),
+        ),
+        parts[0],
+    );
+    if let Some(error) = &ask.error {
+        f.render_widget(
+            Paragraph::new(error.as_str()).style(Style::default().fg(RED)),
+            parts[1],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new("Alt-PgUp/PgDn details · Esc cancels turn")
+                .style(Style::default().fg(MUTED)),
+            parts[1],
+        );
+    }
+    let (reply, row, col) = ask.editor.layout(parts[2].width as usize);
+    let line = reply.get(row).cloned().unwrap_or_default();
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().fg(TEXT)),
+        parts[2],
+    );
+    if parts[2].width > 0 && parts[2].height > 0 && !v.overlay.is_open() {
+        f.set_cursor_position((
+            parts[2].x + col.min(parts[2].width.saturating_sub(1) as usize) as u16,
+            parts[2].y,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Renderer;
+    #[allow(clippy::wildcard_imports)]
+    use super::*;
+    use crate::sessions::SessionRow;
+    use crate::ui::state::SessionPickerState;
+    use ratatui::backend::TestBackend;
+    use yourai_core::prelude::{SessionId, SessionStatus};
+
+    fn sessions_at_epoch(f: &mut Canvas, area: Rect, view: &View) {
+        sessions_overlay(f, area, view, 0);
+    }
+    #[test]
+    fn pickers_fit_small_terminals_and_scroll_to_selected_rows() {
+        let mut v = View::default();
+        v.model_choices = (0..100).map(|i| format!("model-{i:03}")).collect();
+        v.overlay = Overlay::Sessions(SessionPickerState {
+            pending_delete: None,
+            rows: (0..100)
+                .map(|i| crate::sessions::SessionRow {
+                    id: yourai_core::prelude::SessionId(format!("session-{i:03}")),
+                    title: format!("row-{i:03}"),
+                    model: String::new(),
+                    updated_at: 0,
+                    is_current: false,
+                })
+                .collect(),
+            query: String::new(),
+            selected: 99,
+        });
+        for width in [1, 20, 30, 40, 48, 80] {
+            for height in [1, 2, 3, 8, 24] {
+                let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
+                for draw in [
+                    model_picker_overlay,
+                    sessions_at_epoch,
+                    theme_picker_overlay,
+                ] {
+                    t.draw(|f| {
+                        let mut canvas = Canvas::new(f.area());
+                        draw(&mut canvas, f.area(), &v);
+                        canvas.paint(f);
+                    })
+                    .unwrap();
+                }
+            }
+        }
+        let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        for (draw, expected) in [
+            (sessions_at_epoch as fn(&mut Canvas, Rect, &View), "row-099"),
+            (model_picker_overlay, "model-099"),
+        ] {
+            let previous = std::mem::replace(&mut v.overlay, Overlay::Models(99));
+            if expected == "row-099" {
+                v.overlay = previous;
+            }
+            t.draw(|f| {
+                let mut canvas = Canvas::new(f.area());
+                draw(&mut canvas, f.area(), &v);
+                canvas.paint(f);
+            })
+            .unwrap();
+            let text: String = t
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(
+                text.contains(expected),
+                "selected row is not visible: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn sessions_overlay_renders_rows_and_filters() {
+        let mut terminal = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        let mut renderer = Renderer::default();
+        let mut v = View::default();
+        let m = Metadata {
+            session: "current-id".into(),
+            cwd: "/tmp".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        v.overlay = Overlay::Sessions(SessionPickerState {
+            pending_delete: None,
+            rows: vec![
+                SessionRow {
+                    id: SessionId("d3f40178deadbeef".into()),
+                    title: "Fix parser off-by-one".into(),
+                    model: "kimi-k3".into(),
+                    updated_at: now - 2 * 3600,
+                    is_current: true,
+                },
+                SessionRow {
+                    id: SessionId("9a1b2c3ddeadd00d".into()),
+                    title: "Fix TUI sidebar".into(),
+                    model: "glm-4.6".into(),
+                    updated_at: now - 3 * 86_400,
+                    is_current: false,
+                },
+            ],
+            query: String::new(),
+            selected: 0,
+        });
+        terminal
+            .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Sessions"));
+        assert!(text.contains("Fix parser off-by-one"));
+        assert!(text.contains("d3f40178"));
+        assert!(text.contains("Fix TUI sidebar"));
+        // Current session marker visible.
+        assert!(text.contains("●"));
+        // Filter: type "parser".
+        v.overlay.sessions_mut().unwrap().query = "parser".into();
+        terminal
+            .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Fix parser off-by-one"));
+        assert!(!text.contains("Fix TUI sidebar"));
+    }
+
+    #[test]
+    fn theme_picker_lists_all_themes_and_marks_current() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let mut renderer = Renderer::default();
+        let mut v = View::default();
+        v.theme = Theme::Nord;
+        v.overlay = Overlay::Themes(0);
+        let m = Metadata {
+            session: "id".into(),
+            cwd: "/tmp".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        terminal
+            .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Themes"));
+        // All theme names appear.
+        for t in Theme::ALL {
+            assert!(text.contains(t.name()), "missing theme {}", t.name());
+        }
+        // Current theme (Nord) is marked with ●.
+        let nord_line = text.lines().find(|l| l.contains("nord")).unwrap();
+        assert!(nord_line.contains("●"));
+    }
 }

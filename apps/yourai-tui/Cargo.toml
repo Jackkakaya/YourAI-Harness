@@ -28,3 +28,9 @@ syntect = { version = "5", default-features = false, features = [
 
 [dev-dependencies]
 tempfile = "3"
+
+# Keep module boundaries compiler-checked: no crate-internal glob imports
+# (`use super::*` etc.) in production code. Prelude globs are allowed via
+# clippy.toml; test modules opt out locally.
+[lints.clippy]
+wildcard_imports = "warn"

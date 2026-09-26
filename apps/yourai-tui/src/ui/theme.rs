@@ -37,8 +37,8 @@ pub(crate) const SY_STRING: Color = rgb(0xE6B499);
 pub(crate) const SY_FUNCTION: Color = rgb(0xE7D5B9);
 pub(crate) const SY_TYPE: Color = rgb(0xACC9D3);
 pub(crate) const SY_NUMBER: Color = rgb(0xACC9B7);
-pub(crate) const SY_COMMENT: Color = rgb(0xB1BFAC);
-pub(crate) const SY_OPERATOR: Color = rgb(0xE8DBC8);
+pub(crate) const SY_COMMENT: Color = rgb(0xB8B5B0);
+pub(crate) const SY_OPERATOR: Color = rgb(0xE0DEDB);
 pub(crate) const SY_PUNCT: Color = rgb(0xCECCC8);
 pub(crate) const SY_VARIABLE: Color = rgb(0xD3DBE3);
 
@@ -201,8 +201,8 @@ impl Palette {
             sy_function: mix(yellow_c, text_c, 0.45),
             sy_type: mix(cyan_c, accent_c, 0.4),
             sy_number: mix(green_c, accent_c, 0.28),
-            sy_comment: mix(muted_c, green_c, 0.45),
-            sy_operator: mix(text_c, yellow_c, 0.35),
+            sy_comment: mix(muted_c, text_c, 0.08),
+            sy_operator: mix(text_c, muted_c, 0.15),
             sy_punct: mix(muted_c, text_c, 0.5),
             user_surface: mix(bg_c, rgb(panel), 2.0 / 3.0),
             code_surface: mix(bg_c, rgb(panel), 0.47),
@@ -427,6 +427,7 @@ pub(crate) fn resolve_system_from_os() {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
 
     #[test]
@@ -449,8 +450,8 @@ mod tests {
                 ("sy_function", p.sy_function, mix(p.yellow, p.text, 0.45)),
                 ("sy_type", p.sy_type, mix(p.cyan, p.accent, 0.4)),
                 ("sy_number", p.sy_number, mix(p.green, p.accent, 0.28)),
-                ("sy_comment", p.sy_comment, mix(p.muted, p.green, 0.45)),
-                ("sy_operator", p.sy_operator, mix(p.text, p.yellow, 0.35)),
+                ("sy_comment", p.sy_comment, mix(p.muted, p.text, 0.08)),
+                ("sy_operator", p.sy_operator, mix(p.text, p.muted, 0.15)),
                 ("sy_punct", p.sy_punct, mix(p.muted, p.text, 0.5)),
                 ("sy_variable", p.sy_variable, mix(p.blue, p.text, 0.55)),
             ];

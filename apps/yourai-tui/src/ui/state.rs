@@ -1,14 +1,14 @@
 mod tool_output;
 use super::editor::Editor;
+use crate::text::{append, append_progress, bounded, pretty};
 use ratatui::text::{Line, Span};
 use serde_json::{json, Value};
 use std::{
     collections::{HashSet, VecDeque},
     time::{Duration, Instant},
 };
-use tool_output::*;
+use tool_output::{hl_lines, summarize_output, tool_result};
 use yourai_core::prelude::*;
-const MAX_TEXT: usize = 32_000;
 const MAX_ITEMS: usize = 1000;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -177,8 +177,7 @@ pub struct SessionPickerState {
 pub struct View {
     pub model_metrics: yourai_harness::model::BudgetSnapshot,
     pub retry: Option<RetryState>,
-    pub recorded_responses: u64,
-    pub commands: super::commands::Menu,
+    commands: super::commands::Menu,
     pub toast: Option<(String, Instant)>,
     pub theme: super::theme::Theme,
     pub context_usage: Option<yourai_harness::runtime::ContextUsage>,
@@ -190,28 +189,80 @@ pub struct View {
     asks: VecDeque<Ask>,
     assistant: Option<usize>,
     thinking: Option<usize>,
-    pub scroll: usize,
+    pub navigation: super::navigation::Navigation,
     first_item_id: u64,
     expanded: HashSet<u64>,
     selected: Option<u64>,
     /// Session title shown in the conversation header; derived from the first prompt.
     pub title: Option<String>,
-    pub todos: Vec<Todo>,
-    /// Optional Todo panel. Default on; toggled by ^T.
-    pub todo_panel: bool,
-    pub todo_scroll: usize,
+    pub todos: Todos,
     pub overlay: super::overlay::Overlay,
     /// Candidate labels for the model picker.
     pub model_choices: Vec<String>,
-    /// Current model display label (updated by /models switch).
-    pub model_label: String,
-    /// Optional per-model pricing for cost display (input $/M, output $/M).
-    pub pricing: Option<(f64, f64)>,
-    pub usage: Usage,
-    pub unseen: usize,
+    /// Current model display label and per-model pricing (input $/M, output
+    /// $/M); always set as a pair, never edited field by field.
+    pub model: ModelInfo,
+    usage: Usage,
+    recorded_responses: u64,
     pub revision: u64,
     pub active: bool,
     pub since: Option<Instant>,
+}
+/// The Todo list plus its panel and scroll position. Scroll is owned here:
+/// it saturates on nudge, deliberately outlives a shrinking list, and is
+/// clamped against the visible height when the panel is laid out.
+pub struct Todos {
+    /// Optional Todo panel. Default on; toggled by ^T.
+    pub panel: bool,
+    scroll: usize,
+    items: Vec<Todo>,
+}
+impl Default for Todos {
+    fn default() -> Self {
+        Self {
+            panel: true,
+            scroll: 0,
+            items: vec![],
+        }
+    }
+}
+impl Todos {
+    /// Replace the list; the scroll position deliberately survives a shrink.
+    pub fn set(&mut self, items: Vec<Todo>) {
+        self.items = items;
+    }
+    pub fn items(&self) -> &[Todo] {
+        &self.items
+    }
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+    /// Whether the panel has anything to show.
+    pub fn panel_open(&self) -> bool {
+        self.panel && !self.items.is_empty()
+    }
+    pub fn nudge(&mut self, rows: usize, up: bool) {
+        self.scroll = if up {
+            self.scroll.saturating_sub(rows)
+        } else {
+            self.scroll.saturating_add(rows)
+        };
+    }
+    #[cfg(test)]
+    pub fn scroll(&self) -> usize {
+        self.scroll
+    }
+    /// The effective scroll against the visible height; the stored position
+    /// deliberately survives (the test contract pins this).
+    pub fn scroll_within(&self, max: usize) -> usize {
+        self.scroll.min(max)
+    }
+}
+/// Model label and pricing travel as one pair through switches and restores.
+pub struct ModelInfo {
+    pub label: String,
+    pub pricing: Option<(f64, f64)>,
 }
 impl Default for View {
     fn default() -> Self {
@@ -229,20 +280,19 @@ impl Default for View {
             asks: VecDeque::new(),
             assistant: None,
             thinking: None,
-            scroll: 0,
+            navigation: Default::default(),
             first_item_id: 0,
             expanded: HashSet::new(),
             selected: None,
             title: None,
-            todos: vec![],
-            todo_panel: true,
-            todo_scroll: 0,
+            todos: Todos::default(),
             overlay: Default::default(),
             model_choices: vec![],
-            model_label: String::new(),
-            pricing: None,
+            model: ModelInfo {
+                label: String::new(),
+                pricing: None,
+            },
             usage: Usage::default(),
-            unseen: 0,
             revision: 0,
             active: false,
             since: None,
@@ -384,12 +434,40 @@ impl View {
         self.settle();
         self.follow();
     }
-    /// Todos render outside the cached timeline (sidebar repaints every frame),
-    /// so changes must not bump `revision`; `touch` would also inflate `unseen`.
-    pub fn set_todos(&mut self, todos: Vec<Todo>) {
-        if self.todos != todos {
-            self.todos = todos;
-        }
+    /// Session usage accounting. Three writers, three semantics; the named
+    /// methods are the only way in. Restore and the periodic storage poll
+    /// are authoritative (overwrite); streaming deltas accumulate on top; a
+    /// finished compaction reports replacement totals.
+    pub fn restore_usage(&mut self, usage: Usage, responses: u64) {
+        self.usage = usage;
+        self.recorded_responses = responses;
+    }
+    pub fn replace_usage(&mut self, usage: Usage) {
+        self.usage = usage;
+    }
+    pub fn accumulate_usage(&mut self, delta: &Usage) {
+        self.usage.input_tokens = self.usage.input_tokens.saturating_add(delta.input_tokens);
+        self.usage.output_tokens = self.usage.output_tokens.saturating_add(delta.output_tokens);
+        self.usage.total_tokens = self.usage.total_tokens.saturating_add(delta.total_tokens);
+    }
+    pub fn set_response_count(&mut self, count: u64) {
+        self.recorded_responses = count;
+    }
+    pub fn usage(&self) -> &Usage {
+        &self.usage
+    }
+    pub fn recorded_responses(&self) -> u64 {
+        self.recorded_responses
+    }
+
+    /// The menu is derived from the current draft and focus whenever accessed.
+    /// No caller can read stale items or forget a separate synchronization step.
+    pub fn menu(&mut self) -> &mut super::commands::Menu {
+        self.commands.sync(
+            &self.editor.text,
+            self.asks_empty() && !self.overlay.is_open(),
+        );
+        &mut self.commands
     }
     /// Derive a display title from a prompt; the first non-empty derivation wins.
     pub fn note_title(&mut self, text: &str) -> Option<String> {
@@ -403,9 +481,6 @@ impl View {
 
     pub fn touch(&mut self) {
         self.revision = self.revision.wrapping_add(1);
-        if self.scroll > 0 {
-            self.unseen = self.unseen.saturating_add(1);
-        }
     }
     fn push(&mut self, item: Item) {
         self.items.push_back(item);
@@ -490,8 +565,7 @@ impl View {
         self.touch();
     }
     pub fn follow(&mut self) {
-        self.scroll = 0;
-        self.unseen = 0;
+        self.navigation.follow();
     }
     pub fn event(&mut self, event: Out) {
         match event {
@@ -536,16 +610,18 @@ impl View {
                 self.retry = None;
                 self.assistant = None;
                 self.thinking = None;
-                // write: highlight the incoming content right away so the card
-                // previews the change while it runs.
-                let content_hl = (name == "write").then(|| {
-                    let path = input["path"].as_str().unwrap_or("");
-                    let content = input["content"].as_str().unwrap_or("");
-                    hl_lines(content, path, "+ ")
+                // write previews the incoming content right away so the card
+                // shows the change (with + gutters) while it runs.
+                let is_write = name == "write";
+                let content_hl = is_write.then(|| {
+                    hl_lines(
+                        input["content"].as_str().unwrap_or(""),
+                        input["path"].as_str().unwrap_or(""),
+                        "+ ",
+                    )
                 });
-                let adds = (name == "write")
-                    .then(|| input["content"].as_str().unwrap_or("").lines().count());
-                let created = name == "write";
+                let adds =
+                    is_write.then(|| input["content"].as_str().unwrap_or("").lines().count());
                 self.push(Item::Tool(Box::new(ToolView {
                     id,
                     name,
@@ -573,7 +649,7 @@ impl View {
                     exit_code: None,
                     adds,
                     dels: None,
-                    created,
+                    created: is_write,
                     diff_rows: None,
                 })));
             }
@@ -603,143 +679,49 @@ impl View {
                 is_error,
             } => {
                 let failed = is_error || (name == "shell" && output["ok"] == false);
-                // Known results have typed previews. Unknown results retain bounded
-                // structured values so expanded cards remain inspectable.
-                let mut body = String::new();
-                let mut stderr = String::new();
-                let mut brief = Vec::new();
-                let mut content_hl = None;
-                let mut content_format = None;
-                let mut exit_code = None;
-                let mut adds = None;
-                let mut dels = None;
-                let mut diff_rows = None;
-                let mut created = false;
-                if let Some(error) = output.get("error") {
-                    body = format_error(error, &output);
-                } else {
-                    match name.as_str() {
-                        "shell" => {
-                            exit_code = output["exit_code"].as_i64();
-                            let mut out = clean(output["stdout"].as_str().unwrap_or(""));
-                            stderr = clean(output["stderr"].as_str().unwrap_or(""));
-                            if output["output_complete"] == false {
-                                if !out.is_empty() {
-                                    out.push('\n');
-                                }
-                                out.push_str("[output incomplete]");
-                            }
-                            body = bounded(&out);
-                        }
-                        "read" if output.get("content").is_some() => {
-                            let path = output["path"].as_str().unwrap_or("");
-                            let content = output["content"].as_str().unwrap_or("");
-                            content_hl = Some(hl_read(content, path));
-                            body = bounded(content);
-                        }
-                        "edit" if output.get("diff").is_some() => {
-                            let diff = bounded(output["diff"].as_str().unwrap_or(""));
-                            let (a, d) = diff_stats(&diff);
-                            adds = Some(a);
-                            dels = Some(d);
-                            diff_rows = Some(build_diff_rows(
-                                &diff,
-                                output["path"].as_str().unwrap_or(""),
-                            ));
-                            body = diff;
-                        }
-                        "write" => {
-                            created = output["created"] == true;
-                            // Content was highlighted at ToolStarted.
-                        }
-                        "websearch" => {
-                            let content = output["content"].as_str().unwrap_or("");
-                            brief = search_brief(content);
-                            body = bounded(content);
-                        }
-                        "webfetch" => {
-                            let content = output["content"].as_str().unwrap_or("");
-                            let format = output["format"].as_str().unwrap_or("text");
-                            content_format = Some(format.to_owned());
-                            let hint = match format {
-                                "html" => Some("html"),
-                                "json" => Some("json"),
-                                "xml" => Some("xml"),
-                                _ => None,
-                            };
-                            if let Some(hint) = hint {
-                                content_hl = super::syntax::highlight(capped(content), hint);
-                            }
-                            brief = page_brief(content, format);
-                            body = bounded(content);
-                        }
-                        _ => {
-                            body = summarize_output(&output);
-                            let summary =
-                                ["content", "result", "message", "text", "summary", "output"]
-                                    .iter()
-                                    .find_map(|key| output.get(*key).and_then(Value::as_str));
-                            brief.push(summary.map(bounded).unwrap_or_else(|| {
-                                if output.is_object() || output.is_array() {
-                                    "Structured result · ^O to inspect".into()
-                                } else {
-                                    body.clone()
-                                }
-                            }));
-                        }
-                    }
-                }
+                let result = tool_result(&name, &output);
                 let status = if failed {
                     ToolStatus::Failed
                 } else {
                     ToolStatus::Done
                 };
                 if let Some(t) = self.tool_mut(&id) {
-                    t.output = body;
-                    t.stderr = stderr;
-                    t.brief = brief;
-                    t.exit_code = exit_code;
-                    if adds.is_some() {
-                        t.adds = adds;
-                    }
-                    if dels.is_some() {
-                        t.dels = dels;
-                    }
-                    if content_hl.is_some() {
-                        t.content_hl = content_hl;
-                    }
-                    if content_format.is_some() {
-                        t.content_format = content_format;
-                    }
-                    if diff_rows.is_some() {
-                        t.diff_rows = diff_rows;
-                    }
-                    if t.name == "write" {
-                        t.created = created;
-                    }
+                    t.output = result.body;
+                    t.stderr = result.stderr;
+                    t.brief = result.brief;
+                    t.exit_code = result.exit_code;
+                    // Result-side previews win; started-side ones (write
+                    // content, highlighted while running) survive a None.
+                    t.adds = result.adds.or(t.adds);
+                    t.dels = result.dels.or(t.dels);
+                    t.content_hl = result.content_hl.or_else(|| t.content_hl.take());
+                    t.content_format = result.content_format.or_else(|| t.content_format.take());
+                    t.diff_rows = result.diff_rows.or_else(|| t.diff_rows.take());
+                    t.created = result.created;
                     t.progress.clear();
                     t.status = status;
                     t.seconds = t.started.map(|s| s.elapsed().as_secs());
                 } else {
+                    // Orphan result (history replay): synthesize a finished card.
                     self.push(Item::Tool(Box::new(ToolView {
                         id: id.clone(),
                         name: name.clone(),
                         input: String::new(),
                         summary: bounded(output["path"].as_str().unwrap_or(&name)),
-                        output: body,
-                        stderr,
-                        brief,
-                        content_hl,
-                        content_format,
+                        output: result.body,
+                        stderr: result.stderr,
+                        brief: result.brief,
+                        content_hl: result.content_hl,
+                        content_format: result.content_format,
                         progress: String::new(),
                         status,
                         started: None,
                         seconds: None,
-                        exit_code,
-                        adds,
-                        dels,
-                        created,
-                        diff_rows,
+                        exit_code: result.exit_code,
+                        adds: result.adds,
+                        dels: result.dels,
+                        created: result.created,
+                        diff_rows: result.diff_rows,
                     })));
                 }
                 self.asks
@@ -759,14 +741,7 @@ impl View {
                 }
                 self.touch();
             }
-            Out::Usage { usage } => {
-                self.usage.input_tokens =
-                    self.usage.input_tokens.saturating_add(usage.input_tokens);
-                self.usage.output_tokens =
-                    self.usage.output_tokens.saturating_add(usage.output_tokens);
-                self.usage.total_tokens =
-                    self.usage.total_tokens.saturating_add(usage.total_tokens);
-            }
+            Out::Usage { usage } => self.accumulate_usage(&usage),
             Out::Notice { level, message } => self.notice(level, message),
             _ => {}
         }
@@ -859,73 +834,61 @@ pub fn derive_title(text: &str) -> Option<String> {
     }
     Some(title)
 }
-pub fn clean(text: &str) -> String {
-    // Strip terminal controls, including ANSI CSI/OSC sequences, from untrusted output.
-    let mut result = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => match chars.next() {
-                Some('[') => {
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    while let Some(c) = chars.next() {
-                        if c == '\u{7}' {
-                            break;
-                        }
-                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                result.push('\n');
-            }
-            '\t' => result.push_str("    "),
-            '\n' => result.push(c),
-            _ if !c.is_control() => result.push(c),
-            _ => {}
-        }
-    }
-    result
-}
-pub fn bounded(text: &str) -> String {
-    let mut out = clean(text);
-    if out.chars().count() > MAX_TEXT {
-        out = out.chars().take(MAX_TEXT).collect();
-        out.push_str("\n[Display shortened in TUI.]");
-    }
-    out
-}
-fn append(body: &mut String, text: &str) {
-    if body.chars().count() <= MAX_TEXT {
-        *body = bounded(&format!("{body}{text}"));
-    }
-}
-fn append_progress(body: &mut String, text: &str) {
-    body.push_str(&clean(text));
-    let count = body.chars().count();
-    if count > MAX_TEXT {
-        *body = body.chars().skip(count - MAX_TEXT).collect();
-    }
-}
-pub fn pretty(v: &Value) -> String {
-    bounded(&serde_json::to_string_pretty(v).unwrap_or_default())
-}
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
+    #[test]
+    fn usage_writers_use_three_named_semantics() {
+        let mut v = View::default();
+        v.restore_usage(
+            Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                total_tokens: 110,
+            },
+            5,
+        );
+        v.accumulate_usage(&Usage {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+        });
+        assert_eq!(v.usage().input_tokens, 101);
+        assert_eq!(v.usage().total_tokens, 113);
+        assert_eq!(v.recorded_responses(), 5);
+        // A finished compaction replaces the meter but keeps the count; the
+        // periodic storage poll stays authoritative for the count alone.
+        v.replace_usage(Usage::default());
+        assert_eq!(v.usage().total_tokens, 0);
+        assert_eq!(v.recorded_responses(), 5);
+        v.set_response_count(9);
+        assert_eq!(v.recorded_responses(), 9);
+    }
+    #[test]
+    fn todo_scroll_saturates_and_survives_a_shrinking_list() {
+        let mut todos = Todos::default();
+        assert!(!todos.panel_open());
+        todos.set(vec![Todo {
+            id: "1".into(),
+            text: "a".into(),
+            completed: false,
+        }]);
+        assert!(todos.panel_open());
+        todos.nudge(3, false);
+        assert_eq!(todos.scroll(), 3);
+        todos.nudge(10, true);
+        assert_eq!(todos.scroll(), 0, "upward nudge saturates at zero");
+        todos.nudge(5, false);
+        todos.set(vec![]);
+        assert_eq!(todos.scroll(), 5, "scroll deliberately outlives the list");
+        assert_eq!(todos.scroll_within(2), 2);
+        assert_eq!(
+            todos.scroll(),
+            5,
+            "display clamps without erasing the position"
+        );
+    }
     #[test]
     fn idle_status_before_final_message_does_not_duplicate_stream() {
         let mut view = View {
@@ -1109,17 +1072,6 @@ mod tests {
         v.settle();
         assert!(v.retry.is_none());
     }
-    #[test]
-    fn bounded_output_and_ansi() {
-        assert_eq!(clean("\x1b[31mred\x1b[0m\x1b]0;bad\x07"), "red");
-        let text = bounded(&"中".repeat(40000));
-        assert!(text.contains("Display shortened"));
-        assert!(text.chars().count() < 33000);
-        let mut progress = "old".repeat(20_000);
-        append_progress(&mut progress, "latest progress");
-        assert!(progress.ends_with("latest progress"));
-        assert_eq!(progress.chars().count(), MAX_TEXT);
-    }
 
     fn only_tool(v: &View) -> &ToolView {
         let tools: Vec<&ToolView> = v
@@ -1302,5 +1254,28 @@ mod tests {
         assert_eq!(t.adds, Some(2));
         assert!(t.created);
         assert!(t.content_hl.is_some());
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::View;
+    use crate::ui::overlay::Overlay;
+    #[test]
+    fn menu_tracks_draft_and_focus_without_a_sync_call() {
+        let mut view = View::default();
+        view.editor.insert("/");
+        view.menu().step(true);
+        assert_eq!(view.menu().items()[view.menu().selected].text, "/quit");
+        view.editor.take();
+        view.editor.insert("/co");
+        assert_eq!(view.menu().selected, 0);
+        assert_eq!(view.menu().items().len(), 2);
+        view.overlay = Overlay::Help { scroll: 0 };
+        assert!(view.menu().items().is_empty());
+        view.overlay = Overlay::None;
+        assert_eq!(view.menu().items().len(), 2);
+        view.menu().dismiss();
+        assert!(view.menu().items().is_empty());
     }
 }

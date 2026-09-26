@@ -1,0 +1,5 @@
+# Wildcard-import policy: prelude-style globs from external crates are
+# idiomatic and allowed. Crate-internal `use super::*` / `use submodule::*`
+# are what `clippy::wildcard_imports` (enabled in apps/yourai-tui) exists to
+# prevent — they flatten module boundaries into one shared namespace.
+allowed-prefixes = ["ratatui", "crossterm", "yourai_core", "yourai_harness"]

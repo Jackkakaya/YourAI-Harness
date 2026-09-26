@@ -63,7 +63,7 @@ Ghostty 将速度、功能和符合系统习惯的原生体验作为并列目标
 
 当前设计保留研究中的灰阶分层与一致的交互反馈，但撤下此前直接引用的 Warp 青蓝：用户反馈该方案不协调。默认主题改为纯黑、暖柔白、中性灰表面；标题与结果区靠字重组织，低饱和灰蓝仅用于交互焦点。具体色值与约束见 `tui-review-design.md` 的“当前颜色方案”。
 
-已实现：无角色标签、无应用滚动条、单行底栏、默认五行输入、Markdown 分层、代码底色、轮次快捷跳转、历史返回入口、失败 stderr 优先预览。
+已实现：无角色标签、无应用滚动条、单行底栏、默认三行输入、Markdown 分层、代码底色、轮次快捷跳转、历史返回入口、失败 stderr 优先预览。
 
 尚需设计与实现：按轮次汇总的过程组、文件变更/验证结果的汇总、内容块级操作、对话检索。以下为产品建议，不是已上线功能。
 
@@ -80,4 +80,14 @@ Ghostty 将速度、功能和符合系统习惯的原生体验作为并列目标
 
 ## 实施跟踪
 
-2026-09-24 后续实现了按请求段组织的 Recorded actions、失败优先、文件/命令分组、点击原始详情及 `/results` 导航。此处是工具证据的操作记录汇总；尚不等同于工作区净 diff 或语义化的测试报告，后两者仍需独立数据支持。
+2026-09-24 用户反馈后移除 Recorded actions 汇总和 /results；直接保留原始工具证据，减少与最终回答重复的界面内容。
+
+输入区精简：默认三行，仅随草稿换行增高；空态仅显示 Ask anything…，运行中为 Add guidance…。不再常驻问题跳转与快捷键说明，Ctrl-Home / Ctrl-↑↓ 保留；阅读历史时才显示简短的 ↓ Latest。底栏会话标题仅在完整标题、目录与指标都能容纳时显示，否则隐藏整个标题，目录优先保留。
+
+## OpenCode 分区与块级设计复核（2026-09-24）
+
+核对官方宣传截图与当前源码，截图只用于观察布局，不假定其代表所有当前默认设置：[官方截图](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/assets/lander/screenshot.png)、[会话组件](https://github.com/anomalyco/opencode/blob/dev/packages/tui/src/routes/session/index.tsx)、[侧栏组件](https://github.com/anomalyco/opencode/blob/dev/packages/tui/src/routes/session/sidebar.tsx)。
+
+源码区分 UserMessage、InlineToolRow 和 BlockTool：提问通过独立表面与留白建立边界，轻量工具减少纵向间隔，复杂工具使用完整内容块；侧栏有独立背景、内边距及内容滚动。这是按信息角色建立层级，而不是为每段文字添加一个框。
+
+此次适配：shell/edit/write、失败和展开详情使用浅标题条与深内容表面，保留 diff 自身红绿语义；成功读取/搜索维持轻量行。Todo 侧栏使用独立深灰表面、内边距、标题与列表间隔，100 列以下使用紧凑 dock。主回答保持纯黑画布，输入仍无框且默认三行，底栏仍只有一行；不恢复顶栏、角色标签、滚动条或重复操作汇总。块样式在条目缓存构建时处理，动画标题复用同一表面函数。

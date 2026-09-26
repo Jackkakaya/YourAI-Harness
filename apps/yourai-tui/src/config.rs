@@ -145,6 +145,13 @@ impl Config {
         }
         Ok(config)
     }
+    /// Provider id ("provider" of "provider/model"); empty when unprefixed.
+    pub fn provider_id(&self) -> &str {
+        self.model
+            .split_once('/')
+            .map(|(p, _)| p)
+            .unwrap_or_default()
+    }
     fn selected_provider(&self) -> Result<&ProviderConfig, Error> {
         let (provider, _) = self
             .model
@@ -184,7 +191,15 @@ impl Config {
             parse("chunkTimeout", options.chunk_timeout_ms)?,
         ))
     }
-    pub fn resolve(&mut self, variant: Option<&str>) -> Result<Arc<GenaiModel>, Error> {
+    /// Resolve the selected model (plus optional variant) into a live model
+    /// handle together with the context policy matching its limits. Pure:
+    /// callers explicitly adopt the policy (typically `self.context = …`),
+    /// keeping the model→context coupling visible at each call site instead
+    /// of hidden behind a mutation here.
+    pub fn resolve(
+        &self,
+        variant: Option<&str>,
+    ) -> Result<(Arc<GenaiModel>, yourai_core::prelude::ContextPolicy), Error> {
         self.request_policy()?;
         if self.max_model_calls == Some(0) {
             return Err("max_model_calls must be positive".into());
@@ -237,10 +252,11 @@ impl Config {
         {
             return Err("maxOutputTokens exceeds model limit.output".into());
         }
-        self.context.context_window = model.limit.context;
-        self.context.input_limit = model.limit.input;
-        self.context.output_reserve = output;
-        self.context.validate()?;
+        let mut context = self.context.clone();
+        context.context_window = model.limit.context;
+        context.input_limit = model.limit.input;
+        context.output_reserve = output;
+        context.validate()?;
         let mut chat = ChatOptions::default().with_max_tokens(output as u32);
         if let Some(v) = options.remove("temperature") {
             chat.temperature = Some(
@@ -298,9 +314,8 @@ impl Config {
             .map(|(k, v)| Ok((k, expand(&v)?)))
             .collect::<Result<_, Error>>()?;
         let client = provider.client(provider_id, chat)?;
-        Ok(Arc::new(
-            GenaiModel::new(client, name).with_headers(headers.into()),
-        ))
+        let model = Arc::new(GenaiModel::new(client, name).with_headers(headers.into()));
+        Ok((model, context))
     }
 }
 /// Resolves the XDG base directory for configuration.
@@ -431,6 +446,7 @@ impl ProviderConfig {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
     use serde_json::json;
     fn config() -> Config {
@@ -447,13 +463,13 @@ mod tests {
     #[tokio::test]
     async fn minimal_gateway_config_uses_model_name_and_default_prompt() {
         use yourai_core::model::ModelProvider;
-        let mut config: Config = serde_json::from_value(json!({
+        let config: Config = serde_json::from_value(json!({
             "model":"gateway/glm",
             "provider":{"gateway":{"options":{"baseURL":"http://localhost:8080/v1","apiKey":"test-only"}}}
         })).unwrap();
         assert!(config.system_prompt.is_none());
         assert_eq!(config.session_dir, PathBuf::from(".yourai/sessions"));
-        assert_eq!(config.resolve(None).unwrap().model_iden(), "glm");
+        assert_eq!(config.resolve(None).unwrap().0.model_iden(), "glm");
         let client = config.provider["gateway"]
             .client("gateway", ChatOptions::default())
             .unwrap();
@@ -475,15 +491,16 @@ mod tests {
     #[test]
     fn selects_model_and_variant_without_resolving_unused_credentials() {
         use yourai_core::model::ModelProvider;
-        let mut config = config();
-        assert_eq!(
-            config.resolve(Some("short")).unwrap().model_iden(),
-            "actual-api-model"
-        );
-        assert_eq!(config.context.context_window, Some(64000));
-        assert_eq!(config.context.output_reserve, 4000);
+        let config = config();
+        let (model, context) = config.resolve(Some("short")).unwrap();
+        assert_eq!(model.model_iden(), "actual-api-model");
+        // The returned policy carries the model's limits and the variant's
+        // output reserve; adopting it is the caller's explicit choice.
+        assert_eq!(context.context_window, Some(64000));
+        assert_eq!(context.output_reserve, 4000);
         assert!(config.resolve(Some("off")).is_err());
         assert!(config.resolve(Some("missing")).is_err());
+        let mut config = config;
         config.model = "absent/model".into();
         assert!(config.resolve(None).is_err());
     }
