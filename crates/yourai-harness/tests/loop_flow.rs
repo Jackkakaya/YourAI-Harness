@@ -46,18 +46,18 @@ async fn image_attachment_is_committed_as_binary_and_reaches_the_model() {
     let history = Arc::new(History::default());
     let model = Arc::new(Model::new(vec![answer("ok")]));
     let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
-    // attachment_to_part decodes and normalizes image attachments, so the
+    // attachment resolution decodes and normalizes image attachments, so the
     // payload must be a real image.
     let data = tiny_png_base64();
     let (_events, result) = collect(
         agent
             .start(In::user_text_with_attachments(
                 "describe this",
-                vec![UserAttachment {
-                    content_type: "image/png".into(),
+                vec![UserAttachment::base64(
+                    "image/png",
                     data,
-                    name: Some("clip.png".into()),
-                }],
+                    Some("clip.png".into()),
+                )],
             ))
             .unwrap(),
     )
@@ -84,6 +84,45 @@ async fn image_attachment_is_committed_as_binary_and_reaches_the_model() {
         .find(|m| m.role == ChatRole::User)
         .unwrap();
     assert_eq!(req_user.content.binaries().len(), 1);
+}
+
+#[tokio::test]
+async fn file_reference_attachment_becomes_bounded_text_in_history() {
+    let history = Arc::new(History::default());
+    let model = Arc::new(Model::new(vec![answer("reviewed")]));
+    let agent = builder(model, history.clone(), LoopConfig::default()).build();
+
+    // A real file on disk, referenced (not inlined) by the frontend.
+    let dir = std::env::temp_dir().join("yourai_loop_file_ref");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("notes.rs");
+    std::fs::write(&file, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
+
+    let (_events, result) = collect(
+        agent
+            .start(In::user_text_with_attachments(
+                "review this",
+                vec![UserAttachment::file(file.to_string_lossy().into_owned(), Some((2, 3)))],
+            ))
+            .unwrap(),
+    )
+    .await;
+    result.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The referenced file is read harness-side and committed as a text part
+    // (provenance note + line window + fence), never as a Binary part.
+    let user = &history.messages()[0];
+    assert_eq!(user.role, ChatRole::User);
+    assert!(user.content.binaries().is_empty());
+    let text = user.content.texts().join("\n");
+    assert!(text.contains("review this"), "{text}");
+    assert!(text.contains("[Attached file"), "{text}");
+    assert!(text.contains("lines 2-3"), "{text}");
+    assert!(text.contains("fn two() {}"), "{text}");
+    assert!(text.contains("fn three() {}"), "{text}");
+    assert!(!text.contains("fn one()"), "{text}");
 }
 
 /// Real 8x8 PNG, base64-encoded — the loop decodes image attachments for

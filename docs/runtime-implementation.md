@@ -81,7 +81,7 @@ ConcreteHookRuntime 支持 command/http/native/prompt/agent。DefaultHookModelEx
 
 - Harness 的共享 ModelBudget 对主模型、compact、模型 Hook、子 Agent 统一记录调用次数并累计已知 token，但只做观测与限速（RequestPolicy 的 RPM/cooldown），不再设调用次数或 token 准入上限——与 OpenCode 一致：执行边界由 per-turn 的 `steps`、deadline 和各超时构成，没有跨 turn 费用硬上限。用量按当前装配生命周期累计，恢复后重新计数，历史用量仍保存。
 - steps 语义与 OpenCode 对齐：计 agentic iteration，重试与压缩不消耗 step；最后一步不绑定工具定义、请求级追加 assistant 角色 MAX_STEPS_PROMPT prefill（不写入历史）并设 `tool_choice=none`，模型仍返回工具调用时按 failUnsettledTools 语义回写失败结果并继续循环（有界）。
-- 图片附件入库前归一化（对齐 OpenCode image.ts）：5MB base64 与 2000x2000 上限，超限先缩放（Lanczos3，PNG→JPEG 降质阶梯）再拒绝；audio/PDF 尺寸由 provider 侧约束。上下文预算中图片按 provider 计费公式估算（Anthropic (w·h)/750、OpenAI tiles），PDF/音频按字节粗估。
+- 附件协议双形态（`UserAttachment.data`，untagged 保证旧 base64 wire 兼容）：内联 base64 媒体（图片/PDF/音频），或文件引用 `{"path": "...", "lines": [10, 20]}`（OpenCode FilePart 语义，行窗口 1-based 闭区间）。引用形态由 harness 在 `accept_input` 统一解析：文本文件读出并截断为 text part（默认 50k 字符上限 + 行窗口），图片走归一化阶梯，目录展开为一级列表，audio/PDF 转 Binary；前端只传路径不做任何读取。图片附件入库前归一化（对齐 OpenCode image.ts）：5MB base64 与 2000x2000 上限，超限先缩放（Lanczos3，PNG→JPEG 降质阶梯）再拒绝；audio/PDF 尺寸由 provider 侧约束。上下文预算中图片按 provider 计费公式估算（Anthropic (w·h)/750、OpenAI tiles），PDF/音频按字节粗估。
 - ModelProvider 只提供 complete / stream_events；genai 原始流转换封装在 GenaiModel。UsageTracker 只通过 record_event 记录原始用量事件。
 - PolicySecurity 持久化会话级精确工具规则，支持 addRules/removeRules/replaceRules；不支持的目的地、模式或范围表达式报错，不扩大授权。硬拒绝不能由 Hook 覆盖。
 - 外部副作用和文件历史不能提供跨系统 exactly-once。崩溃后的不确定调用不会自动重试。Provider 自行脱离的任务、进程组之外的进程不在取消保证内。

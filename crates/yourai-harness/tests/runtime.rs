@@ -20,6 +20,8 @@ fn default_agent_budgets_are_unlimited() {
     assert_eq!(loop_config.attachment_image.max_width, 2000);
     assert_eq!(loop_config.attachment_image.max_height, 2000);
     assert_eq!(loop_config.attachment_image.max_base64_bytes, 5 * 1024 * 1024);
+    // Text files attached by reference are capped at 50k chars.
+    assert_eq!(loop_config.attachment_text_max_chars, 50_000);
 }
 
 fn context(

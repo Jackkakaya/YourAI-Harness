@@ -1,5 +1,6 @@
 //! DefaultLoop owns one Turn; session lifecycle and extensions remain outside it.
 //! All state is local to run_turn, so one instance can serve independent sessions.
+mod attachment;
 mod control;
 mod hooks;
 mod interaction;
@@ -69,6 +70,10 @@ pub struct LoopConfig {
     pub steps: Option<u32>,
     /// OpenCode-compatible attachment image normalization policy.
     pub attachment_image: AttachmentImageConfig,
+    /// Char cap for text files attached by reference (before line-window
+    /// selection the cap applies to the selected window). Directories and
+    /// binary media are unaffected.
+    pub attachment_text_max_chars: usize,
     pub max_model_retries: u32,
     pub max_overflow_compactions: u32,
     pub max_stop_continuations: u32,
@@ -92,6 +97,7 @@ impl Default for LoopConfig {
             memory_max_chars: 8000,
             steps: None,
             attachment_image: AttachmentImageConfig::default(),
+            attachment_text_max_chars: 50_000,
             max_model_retries: 5,
             max_overflow_compactions: 1,
             max_stop_continuations: 3,

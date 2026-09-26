@@ -7,18 +7,74 @@ use serde_json::Value;
 
 // region:    --- In ---
 
-/// 用户消息附带的多媒体附件（图片等），由前端读取剪贴板/文件后以 base64 传入。
+/// 用户消息附带的附件：内联 base64 媒体，或本地文件引用。
 ///
-/// loop 侧将其转换为 genai 的 [`crate::chat::ContentPart::Binary`]，与文本一同
-/// 投递给模型。`data` 为标准 base64 编码（无 data-URL 前缀）。
+/// 两种形态由 harness 在消息入口（`accept_input`）统一解析为模型可见的
+/// content part：
+/// - [`AttachmentData::Base64`]：媒体（图片/PDF/音频）。图片先归一化
+///   （尺寸/大小上限 + 自动缩放，对齐 opencode `image.ts`），再转 genai
+///   [`crate::chat::ContentPart::Binary`]；
+/// - [`AttachmentData::File`]：本地文件引用（对齐 opencode 的 FilePart：
+///   `file://` URL + `#start-end` 行范围）。文本文件读取后按行窗口截断为
+///   文本 part，图片走归一化，目录展开为一级列表——前端只传几十字节的
+///   引用，读取与限额全部在 harness 侧完成。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserAttachment {
-    /// MIME 类型，如 `image/png`、`image/jpeg`、`application/pdf`。
+    /// MIME 类型（base64 形态必填，如 `image/png`）；File 形态在解析时按
+    /// 扩展名推导并覆盖，序列化时为空则省略。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content_type: String,
-    /// base64 编码的字节内容。
-    pub data: String,
+    /// 附件数据：内联 base64 或文件引用。字段名保持 `data`，旧 wire 消息
+    /// 的 `"data": "<base64>"` 字符串形态仍然可解析（untagged）。
+    pub data: AttachmentData,
     /// 可选的显示名/文件名。
     pub name: Option<String>,
+}
+
+/// 附件数据来源。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AttachmentData {
+    /// 标准 base64 编码（无 data-URL 前缀）——原始 wire 形态。
+    Base64(String),
+    /// 本地文件引用，由 harness 解析。相对路径基于会话 cwd。
+    File(FileRef),
+}
+
+/// 对本地文件的引用；`lines` 为 1-based 闭区间行窗口（如 `#10-20`），
+/// 仅对文本文件生效。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileRef {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<(u32, u32)>,
+}
+
+impl UserAttachment {
+    /// 内联 base64 媒体附件。
+    pub fn base64(
+        content_type: impl Into<String>,
+        data: impl Into<String>,
+        name: Option<String>,
+    ) -> Self {
+        Self {
+            content_type: content_type.into(),
+            data: AttachmentData::Base64(data.into()),
+            name,
+        }
+    }
+
+    /// 本地文件引用；MIME 与内容在 harness 侧解析。
+    pub fn file(path: impl Into<String>, lines: Option<(u32, u32)>) -> Self {
+        Self {
+            content_type: String::new(),
+            data: AttachmentData::File(FileRef {
+                path: path.into(),
+                lines,
+            }),
+            name: None,
+        }
+    }
 }
 
 /// 外界 → loop 的消息（turn 作用域，走 inbox，loop 独占拉取消费）。
