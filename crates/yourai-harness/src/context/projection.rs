@@ -26,6 +26,11 @@ fn estimate(request: &ChatRequest, model: &dyn ModelProvider) -> Result<u64, You
         .ok_or_else(|| error("context", "request budget overflow"))
 }
 /// Valid JSON envelope even when the original output was structured JSON.
+/// Tool outputs are already bounded at intake by the truncation module
+/// (50 KB / 2000 lines, full text spilled to disk); this is the second,
+/// context-budget cap applied at projection time. Compaction-pruned outputs
+/// keep only the status envelope — like opencode's summarization, pruned
+/// details are not recoverable in-context.
 pub(crate) fn preview(
     response: &ToolResponse,
     limit: usize,
@@ -48,14 +53,14 @@ pub(crate) fn preview(
             .chars()
             .rev()
             .collect();
-        let s = serde_json::json!({"truncated":true,"pruned":pruned,"call_id":response.call_id,"status":status,"head":head,"tail":tail,"read":"read_tool_result(call_id, offset, limit)"}).to_string();
+        let s = serde_json::json!({"truncated":true,"pruned":pruned,"call_id":response.call_id,"status":status,"head":head,"tail":tail}).to_string();
         if s.chars().count() <= limit {
             return Ok(s);
         }
         if take == 0 {
             return Err(error(
                 "context",
-                "tool output limit cannot fit status and retrieval pointer",
+                "tool output limit cannot fit the status envelope",
             ));
         }
         take /= 2;

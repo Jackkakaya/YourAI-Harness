@@ -347,18 +347,13 @@ pub(crate) async fn assemble(
         for definition in tools.definitions() {
             if !matches!(
                 definition.name.as_str(),
-                "read_tool_result" | "read" | "write" | "edit" | "shell" | "webfetch" | "websearch"
+                "read" | "write" | "edit" | "shell" | "webfetch" | "websearch"
             ) {
                 registry.register(tools.resolve(definition.name.as_str())?);
             }
         }
     }
     registry.extend(crate::tools::coding_tools(cwd)?);
-    registry.register(Arc::new(crate::tools::result::ReadToolResult {
-        session: id.clone(),
-        store: catalog.clone(),
-        max_chars: policy.tool_output_chars,
-    }));
     let services = crate::context::ContextServices {
         store: Some(catalog.clone()),
         policy,

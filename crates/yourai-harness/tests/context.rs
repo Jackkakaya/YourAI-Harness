@@ -7,7 +7,7 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-use yourai_core::{context::DiscardSink, prelude::*};
+use yourai_core::prelude::*;
 use yourai_harness::{storage::LocalUsage, SqliteStore};
 
 struct Summarizer {
@@ -135,10 +135,10 @@ async fn seed_tools(c: &MemoryContext) {
     .unwrap();
 }
 #[tokio::test]
-async fn projection_is_bounded_valid_json_and_original_is_pageable() {
+async fn projection_is_bounded_valid_json_and_original_is_preserved() {
     let mut p = policy();
     p.tool_output_chars = 512;
-    let (_dir, store, c) = setup(p, Summarizer::new(), None).await;
+    let (_dir, _store, c) = setup(p, Summarizer::new(), None).await;
     let original = json!({"ok":true,"output":"你好🌍".repeat(1000)}).to_string();
     append(
         &c,
@@ -149,44 +149,11 @@ async fn projection_is_bounded_valid_json_and_original_is_pageable() {
     let text = &projected.request.messages[1].content.tool_responses()[0].content;
     assert!(text.chars().count() <= 512);
     assert!(serde_json::from_str::<serde_json::Value>(text).is_ok());
+    // The stored original is untouched — the cap applies at projection only.
     assert_eq!(
         c.records()[1].message.content.tool_responses()[0].content,
         original
     );
-    let reader = yourai_harness::tools::result::ReadToolResult {
-        session: c.session_id().clone(),
-        store,
-        max_chars: 512,
-    };
-    let cancel = CancellationToken::new();
-    let mut offset = 0;
-    let mut reconstructed = String::new();
-    loop {
-        let page = reader
-            .execute(
-                ToolContext {
-                    call_id: "read".into(),
-                    emit: &DiscardSink,
-                    cancel: &cancel,
-                    security: None,
-                    sandbox: None,
-                    interaction: None,
-                },
-                json!({"call_id":"a","offset":offset,"limit":10000}),
-            )
-            .await
-            .unwrap();
-        assert!(page.to_string().chars().count() <= 512);
-        reconstructed.push_str(page["content"].as_str().unwrap());
-        match page["next"].as_u64() {
-            Some(next) => {
-                assert!(next > offset);
-                offset = next;
-            }
-            None => break,
-        }
-    }
-    assert_eq!(reconstructed, original);
 }
 #[tokio::test]
 async fn prune_only_avoids_model_hooks_and_survives_restore_and_fork() {

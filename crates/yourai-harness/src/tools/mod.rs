@@ -7,7 +7,6 @@ pub use web::{WebFetch, WebSearch};
 
 pub use files::{Edit, Read, Write};
 mod registry;
-pub mod result;
 pub use registry::ToolSet;
 pub use truncate::{
     cleanup as truncate_cleanup, clip_line, footnote, init as init_truncation,
