@@ -34,6 +34,15 @@ run_next(limits, outbox, cancel)
             +-- result = Err(TurnFailure)
 ```
 
+`submit` 成功表示已入队，不代表输入已通过附件解析或写入历史。默认 Loop 的输入接纳发生在执行期：
+
+- 明确拒绝（无效附件、UserPromptSubmit 阻止）：发布 `Out::InputRejected { rejection: InputRejected { input, reason } }`，并记录到 `TurnOutput.rejected`；原输入不写历史、不调用模型，也不进入 `pending` 自动重试。`InputRejected` 统一定义于 protocol，原 `session_runtime::InputRejected` 路径继续重导出。
+- 暂时执行失败（存储失败、暂时 I/O 故障、超时或取消）：保留原输入到 `TurnFailure.output.pending`，沿用已有重试约定。
+- `Out::InputRejected` 与 `TurnOutput.rejected` 是同一拒绝的实时通知与最终报告；消费者选择一种恢复渠道，不能当成两次拒绝。非流式 `Agent::run` 调用方需要检查 `rejected`，成功完成接纳判定不等于输入已提交给模型。
+- 附件读取和解码在阻塞工作线程准备；主循环继续响应取消与 deadline。取消后的只读工作可以自行结束，但不提交历史。相对 FileRef 路径基于 `SessionContext.cwd` 解析。
+
+详细状态归属与恢复流程见 [草稿与输入接纳设计](./draft-admission-design.md)。
+
 外层驱动再次调用 run_next 处理后续任务，每个调用的 OutSink 只对应一个 Turn。宿主持有 TurnHandle、转发事件、保证同会话执行互斥。它在返回前将成功或失败报告里的 pending **移动**回宿主队列，报告的 pending 清空；失效 Reply 不得启动下一 Turn。
 
 这不是“一个 submit 就自动启动后台常驻 actor”的接口。宿主可以提供更高层自动驱动入口，但 core 不要求特定调度架构。

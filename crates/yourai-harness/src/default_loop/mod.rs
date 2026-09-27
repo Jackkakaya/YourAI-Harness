@@ -1,5 +1,6 @@
 //! DefaultLoop owns one Turn; session lifecycle and extensions remain outside it.
 //! All state is local to run_turn, so one instance can serve independent sessions.
+mod admission;
 mod attachment;
 mod control;
 mod hooks;

@@ -129,6 +129,15 @@ impl In {
     }
 }
 
+/// Ownership returned to the caller after input rejection. Rejected input is
+/// never also queued for automatic retry; edit or explicitly resubmit it.
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
+#[error("input rejected: {reason}")]
+pub struct InputRejected {
+    pub input: In,
+    pub reason: String,
+}
+
 /// 用户输入的消费时机，取消仍独立走控制通道。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +156,10 @@ pub enum InputMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Out {
+    /// Admission rejected this input before committing history. The same
+    /// rejection is retained in TurnOutput for non-streaming consumers.
+    InputRejected { rejection: InputRejected },
+
     /// 正文流式增量
     Chunk { text: String },
 

@@ -31,26 +31,101 @@ static BASE64: GeneralPurpose = GeneralPurpose::new(
 /// opencode JPEG quality ladder (80 deliberately before 85).
 const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
 
+/// Invalid input requires user correction; unavailable infrastructure remains
+/// an execution failure so the original input can be retried unchanged.
+#[derive(Debug)]
+pub(super) enum ResolveError {
+    Invalid(String),
+    Unavailable(YourAiError),
+}
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(reason) => f.write_str(reason),
+            Self::Unavailable(e) => e.fmt(f),
+        }
+    }
+}
+fn io_error(object: &str, path: &str, error: std::io::Error) -> ResolveError {
+    use std::io::ErrorKind;
+    let reason = if error.kind() == ErrorKind::NotFound {
+        format!("attachment {object} not found: {path}")
+    } else {
+        format!("attachment {object} read failed ({path}): {error}")
+    };
+    match error.kind() {
+        ErrorKind::NotFound
+        | ErrorKind::PermissionDenied
+        | ErrorKind::InvalidData
+        | ErrorKind::InvalidInput => ResolveError::Invalid(reason),
+        _ => ResolveError::Unavailable(
+            yourai_core::ErrorKind::Provider {
+                name: "attachment",
+                message: reason,
+            }
+            .into(),
+        ),
+    }
+}
+fn encode_error(error: image::ImageError) -> ResolveError {
+    ResolveError::Unavailable(
+        ErrorKind::Provider {
+            name: "attachment",
+            message: format!("image re-encode failed: {error}"),
+        }
+        .into(),
+    )
+}
+
+/// Prepare all content before committing any user history. Relative references
+/// resolve against the execution's session cwd, never a frontend's process cwd.
+pub(super) fn message(
+    text: &str,
+    attachments: &[UserAttachment],
+    config: &super::LoopConfig,
+    cwd: Option<&Path>,
+) -> Result<ChatMessage, ResolveError> {
+    if attachments.is_empty() {
+        return Ok(ChatMessage::user(text));
+    }
+    let mut parts = vec![ContentPart::from_text(text)];
+    for original in attachments {
+        let mut attachment = original.clone();
+        if let AttachmentData::File(file) = &mut attachment.data {
+            if Path::new(&file.path).is_relative() {
+                if let Some(cwd) = cwd {
+                    file.path = cwd.join(&file.path).to_string_lossy().into_owned();
+                }
+            }
+        }
+        parts.push(resolve_attachment(&attachment, config)?);
+    }
+    Ok(ChatMessage::user(MessageContent::from_parts(parts)))
+}
+
 /// Resolve one attachment into a model-visible content part.
 pub(super) fn resolve_attachment(
     att: &UserAttachment,
     config: &super::LoopConfig,
-) -> Result<ContentPart, YourAiError> {
+) -> Result<ContentPart, ResolveError> {
     match &att.data {
         AttachmentData::Base64(data) => {
             let ct = att.content_type.trim().to_ascii_lowercase();
             if !(ct.starts_with("image/") || ct.starts_with("audio/") || ct == "application/pdf") {
-                return Err(ErrorKind::Config(format!(
+                return Err(ResolveError::Invalid(format!(
                     "unsupported attachment type '{ct}'; only image/*, audio/*, and application/pdf are accepted"
-                ))
-                .into());
+                )));
             }
             let (mime, payload) = if ct.starts_with("image/") {
                 normalize_image(data, &ct, &config.attachment_image)?
             } else {
                 (ct, data.clone())
             };
-            binary_part(mime, payload, att.name.clone())
+            Ok(ContentPart::from_binary_base64(
+                mime,
+                payload.as_str(),
+                att.name.clone(),
+            ))
         }
         AttachmentData::File(file) => resolve_file(file, config),
     }
@@ -58,35 +133,16 @@ pub(super) fn resolve_attachment(
 
 // ── base64 media ───────────────────────────────────────────────────────
 
-/// How genai handles Binary per provider:
-///
-/// | Provider  | image (base64)          | audio (base64)             | PDF / other (base64)         |
-/// |-----------|-------------------------|----------------------------|------------------------------|
-/// | OpenAI    | `image_url` + data URL  | `input_audio`              | `file` + file_data (data URL)|
-/// | Anthropic | `image` + base64 source | `document` + base64 source | `document` + base64 source   |
-///
-/// Binary parts are only processed in user-role messages (genai adapters
-/// ignore them in assistant/tool roles); we only emit `BinarySource::Base64`,
-/// so both providers are covered (URL-sourced binaries have provider gaps).
-fn binary_part(
-    mime: String,
-    data: String,
-    name: Option<String>,
-) -> Result<ContentPart, YourAiError> {
-    Ok(ContentPart::from_binary_base64(mime, data.as_str(), name))
-}
-
 fn size_error(
     width: u32,
     height: u32,
     bytes: usize,
     cfg: &super::AttachmentImageConfig,
-) -> YourAiError {
-    ErrorKind::Config(format!(
+) -> ResolveError {
+    ResolveError::Invalid(format!(
         "Image {width}x{height} with base64 size {bytes} exceeds configured limits and could not be resized below {}x{}/{} bytes",
         cfg.max_width, cfg.max_height, cfg.max_base64_bytes
     ))
-    .into()
 }
 
 /// Decode, size-check and (if needed) resize one image payload.
@@ -95,12 +151,12 @@ fn normalize_image(
     data: &str,
     ct: &str,
     cfg: &super::AttachmentImageConfig,
-) -> Result<(String, String), YourAiError> {
+) -> Result<(String, String), ResolveError> {
     let bytes = BASE64
         .decode(data.as_bytes())
-        .map_err(|_| ErrorKind::Config("attachment image is not valid base64".into()))?;
+        .map_err(|_| ResolveError::Invalid("attachment image is not valid base64".into()))?;
     let image = image::load_from_memory(&bytes)
-        .map_err(|_| ErrorKind::Config("attachment image could not be decoded".into()))?;
+        .map_err(|_| ResolveError::Invalid("attachment image could not be decoded".into()))?;
     let (width, height) = (image.width(), image.height());
     if width <= cfg.max_width && height <= cfg.max_height && data.len() <= cfg.max_base64_bytes {
         // Fast path: within limits, pass the original payload through
@@ -151,22 +207,22 @@ fn shrink_step(dim: u32) -> u32 {
     }
 }
 
-fn encode_png(image: &image::DynamicImage) -> Result<String, YourAiError> {
+fn encode_png(image: &image::DynamicImage) -> Result<String, ResolveError> {
     let mut buf = Vec::new();
     image
         .to_rgb8()
         .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-        .map_err(|e| ErrorKind::Config(format!("png re-encode failed: {e}")))?;
+        .map_err(encode_error)?;
     Ok(BASE64.encode(&buf))
 }
 
-fn encode_jpeg(image: &image::DynamicImage, quality: u8) -> Result<String, YourAiError> {
+fn encode_jpeg(image: &image::DynamicImage, quality: u8) -> Result<String, ResolveError> {
     let mut buf = Vec::new();
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
     image
         .to_rgb8()
         .write_with_encoder(encoder)
-        .map_err(|e| ErrorKind::Config(format!("jpeg re-encode failed: {e}")))?;
+        .map_err(encode_error)?;
     Ok(BASE64.encode(&buf))
 }
 
@@ -298,11 +354,9 @@ fn classify_path(path: &Path) -> FileKind {
     }
 }
 
-fn resolve_file(file: &FileRef, config: &super::LoopConfig) -> Result<ContentPart, YourAiError> {
+fn resolve_file(file: &FileRef, config: &super::LoopConfig) -> Result<ContentPart, ResolveError> {
     let path = PathBuf::from(&file.path);
-    if !path.exists() {
-        return Err(ErrorKind::Config(format!("attachment file not found: {}", file.path)).into());
-    }
+    std::fs::metadata(&path).map_err(|e| io_error("file", &file.path, e))?;
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -315,36 +369,26 @@ fn resolve_file(file: &FileRef, config: &super::LoopConfig) -> Result<ContentPar
             let data = read_file_base64(&path, display)?;
             let (mime, payload) =
                 normalize_image(&data, "image/png", &config.attachment_image)?;
-            binary_part(mime, payload, path.file_name().and_then(|n| n.to_str()).map(String::from))
+            Ok(ContentPart::from_binary_base64(mime, payload.as_str(), path.file_name().and_then(|n| n.to_str()).map(String::from)))
         }
         FileKind::Audio => {
             let data = read_file_base64(&path, display)?;
             let mime = format!("audio/{ext}");
-            binary_part(
-                mime,
-                data,
-                path.file_name().and_then(|n| n.to_str()).map(String::from),
-            )
+            Ok(ContentPart::from_binary_base64(mime, data.as_str(), path.file_name().and_then(|n| n.to_str()).map(String::from)))
         }
         FileKind::Pdf => {
             let data = read_file_base64(&path, display)?;
-            binary_part(
-                "application/pdf".into(),
-                data,
-                path.file_name().and_then(|n| n.to_str()).map(String::from),
-            )
+            Ok(ContentPart::from_binary_base64("application/pdf", data.as_str(), path.file_name().and_then(|n| n.to_str()).map(String::from)))
         }
         FileKind::Text => text_part(&path, &ext, file.lines, config.attachment_text_max_chars, display),
-        FileKind::Other => Err(ErrorKind::Config(format!(
+        FileKind::Other => Err(ResolveError::Invalid(format!(
             "unsupported attachment file '{display}': unrecognized extension '{ext}' (only text, images, audio, and PDF are supported)"
-        ))
-        .into()),
+        ))),
     }
 }
 
-fn read_file_base64(path: &Path, display: &str) -> Result<String, YourAiError> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| ErrorKind::Config(format!("attachment file read failed ({display}): {e}")))?;
+fn read_file_base64(path: &Path, display: &str) -> Result<String, ResolveError> {
+    let bytes = std::fs::read(path).map_err(|e| io_error("file", display, e))?;
     Ok(BASE64.encode(&bytes))
 }
 
@@ -356,24 +400,21 @@ fn text_part(
     lines: Option<(u32, u32)>,
     max_chars: usize,
     display: &str,
-) -> Result<ContentPart, YourAiError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| ErrorKind::Config(format!("attachment file read failed ({display}): {e}")))?;
+) -> Result<ContentPart, ResolveError> {
+    let content = std::fs::read_to_string(path).map_err(|e| io_error("file", display, e))?;
     let total = content.lines().count() as u32;
     let (selected, range) = match lines {
         Some((start, end)) => {
             let start = start.max(1);
             if end < start {
-                return Err(ErrorKind::Config(format!(
+                return Err(ResolveError::Invalid(format!(
                     "attachment line range {start}-{end} is empty"
-                ))
-                .into());
+                )));
             }
             if start > total {
-                return Err(ErrorKind::Config(format!(
+                return Err(ResolveError::Invalid(format!(
                     "attachment line range {start}-{end} exceeds file length ({total} lines)"
-                ))
-                .into());
+                )));
             }
             let end = end.min(total);
             let window: Vec<&str> = content
@@ -403,18 +444,37 @@ fn text_part(
 }
 
 /// First-level directory listing, formatted like opencode's Read tool output.
-fn directory_part(path: &Path, display: &str) -> Result<ContentPart, YourAiError> {
-    let entries = std::fs::read_dir(path).map_err(|e| {
-        ErrorKind::Config(format!("attachment directory read failed ({display}): {e}"))
-    })?;
+fn directory_part(path: &Path, display: &str) -> Result<ContentPart, ResolveError> {
+    let entries = std::fs::read_dir(path).map_err(|e| io_error("directory", display, e))?;
+    Ok(directory_listing(
+        path,
+        display,
+        entries.map(|entry| {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            Ok((
+                entry.file_name().to_string_lossy().into_owned(),
+                kind.is_dir(),
+            ))
+        }),
+    ))
+}
+
+/// Entry failures mean an incomplete listing, not an invalid directory input.
+/// Keep healthy entries and expose omissions instead of guessing file types.
+fn directory_listing(
+    path: &Path,
+    display: &str,
+    entries: impl IntoIterator<Item = std::io::Result<(String, bool)>>,
+) -> ContentPart {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            dirs.push(format!("{name}/"));
-        } else {
-            files.push(name);
+    let mut skipped = 0;
+    for entry in entries {
+        match entry {
+            Ok((name, true)) => dirs.push(format!("{name}/")),
+            Ok((name, false)) => files.push(name),
+            Err(_) => skipped += 1,
         }
     }
     dirs.sort();
@@ -429,7 +489,10 @@ fn directory_part(path: &Path, display: &str) -> Result<ContentPart, YourAiError
         listing.push('\n');
     }
     listing.push_str(&format!("({total} entries)\n</entries>"));
-    Ok(ContentPart::from_text(listing))
+    if skipped > 0 {
+        listing.push_str(&format!("\n[Incomplete directory listing: {skipped} entries could not be inspected and were skipped.]"));
+    }
+    ContentPart::from_text(listing)
 }
 
 #[cfg(test)]
@@ -711,5 +774,33 @@ mod tests {
         let text = first_text(&resolve_attachment(&att, &config()).unwrap());
         assert!(text.contains("echo hi"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_listing_keeps_healthy_entries_and_reports_entry_failures() {
+        let listing = directory_listing(
+            Path::new("src"),
+            "src",
+            [
+                Ok(("z.rs".into(), false)),
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                Ok(("nested".into(), true)),
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                Ok(("a.rs".into(), false)),
+            ],
+        );
+        let text = first_text(&listing);
+        assert!(text.contains("nested/\na.rs\nz.rs\n(3 entries)"));
+        assert!(text.contains("Incomplete directory listing: 2 entries"));
+        assert!(!text.contains("file not found"));
+    }
+
+    #[test]
+    fn directory_open_failure_names_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let error = directory_part(&missing, "missing").unwrap_err();
+        assert!(matches!(error, ResolveError::Invalid(_)));
+        assert_eq!(error.to_string(), "attachment directory not found: missing");
     }
 }

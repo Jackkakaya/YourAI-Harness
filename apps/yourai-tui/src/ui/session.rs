@@ -2,6 +2,7 @@
 //! session mutations while the UI continues editing, navigating and painting.
 mod runtime;
 mod setup;
+use super::state::ModelInfo;
 use super::{
     overlay::Overlay,
     state::{SessionPickerState, View},
@@ -9,15 +10,12 @@ use super::{
 use crate::config::{Config, Error};
 use runtime::Runtime;
 use serde_json::Value;
-use setup::ModelSelection;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use yourai_core::prelude::*;
 use yourai_harness::{Harness, HarnessConfig};
 
-pub(super) async fn restore_history(h: &Harness, view: &mut View) -> Result<(), YourAiError> {
-    setup::restore_history(h, view).await
-}
+pub(super) use setup::restore_history;
 pub(super) enum Target {
     New,
     Resume(SessionId),
@@ -33,8 +31,8 @@ pub(super) enum Reply {
 enum Effect {
     Listed(Result<Vec<crate::sessions::SessionRow>, YourAiError>),
     Deleted(SessionId, Result<(), YourAiError>),
-    Model(Result<ModelSelection, String>),
-    Opened(Result<Box<(Harness, View)>, (Level, String)>),
+    Model(Result<ModelInfo, String>),
+    Opened(Result<Box<(Harness, super::state::SessionView)>, (Level, String)>),
 }
 pub(super) struct Controller {
     runtime: Runtime,
@@ -127,7 +125,7 @@ impl Controller {
         if !self.available(view) {
             return false;
         }
-        if !self.runtime.idle() || view.active || !view.asks_empty() {
+        if !self.runtime.idle() || view.session.active || !view.asks_empty() {
             view.notice(Level::Warning, "Finish or cancel the current turn, compaction and queued inputs before changing sessions.");
             false
         } else {
@@ -173,9 +171,6 @@ impl Controller {
         if self.idle(view) {
             self.runtime.compact();
         }
-    }
-    pub fn save_title(&mut self, title: String) {
-        self.runtime.save_title(title);
     }
     pub fn set_yolo(&mut self, enabled: bool) -> Result<(), YourAiError> {
         if self.operation.is_some() || self.retired.is_some() {
@@ -333,22 +328,9 @@ impl Controller {
             },
             Effect::Opened(result) => match result {
                 Ok(opened) => {
-                    let (h, mut fresh) = *opened;
-                    // Everything that survives a switch is re-read from the
-                    // live view at apply time: edits made in flight, the
-                    // theme, the model selection and the picker labels. No
-                    // pre-flight capture is needed — operations are
-                    // serialized, so the view cannot be replaced while the
-                    // switch is being prepared.
-                    fresh.editor.text = view.editor.text.clone();
-                    fresh.editor.cursor = view.editor.cursor;
-                    fresh.theme = view.theme;
-                    fresh.model = crate::ui::state::ModelInfo {
-                        label: view.model.label.clone(),
-                        pricing: view.model.pricing,
-                    };
-                    fresh.model_choices = view.model_choices.clone();
-                    *view = fresh;
+                    let (h, fresh) = *opened;
+                    view.session = fresh;
+                    view.overlay = Overlay::None;
                     let old =
                         std::mem::replace(&mut self.runtime, Runtime::new(h, self.limits.clone()));
                     self.retired = Some(tokio::spawn(old.close()));
@@ -480,16 +462,16 @@ mod tests {
             .await
             .unwrap();
         view.overlay = Overlay::None; // user pressed Esc while storage was waiting
-        view.editor.insert("editable while waiting");
+        view.draft.insert("editable while waiting");
         assert!(!controller.submit(
             In::user_text("must not submit during a mutation"),
             &mut view
         ));
-        assert_eq!(view.editor.text, "editable while waiting");
+        assert_eq!(view.draft.text(), "editable while waiting");
         release.send(()).unwrap();
         finish(&mut controller, &mut view).await;
         assert!(matches!(view.overlay, Overlay::None));
-        assert_eq!(view.editor.text, "editable while waiting");
+        assert_eq!(view.draft.text(), "editable while waiting");
         controller.close().await.unwrap();
     }
 
@@ -504,16 +486,38 @@ mod tests {
         assert_eq!(old.host.status(), SessionStatus::Idle);
         controller.switch(Target::New, &mut view);
         assert!(controller.operation.is_some());
-        view.editor.insert("draft typed during opening");
+        view.draft.insert("draft typed during opening");
         view.theme = Theme::Nord;
+        view.model_choices = vec![crate::models::ModelChoice {
+            id: "mock/test".into(),
+            variant: Some("fast".into()),
+            label: "mock/test · fast".into(),
+        }];
+        view.user("belongs to the old session", false);
+        view.session.title = Some("old title".into());
+        view.restore_usage(
+            Usage {
+                input_tokens: 1,
+                output_tokens: 2,
+                total_tokens: 3,
+            },
+            1,
+        );
         // A second operation cannot supersede the first or mutate its settings.
         controller.model("missing/model".into(), None, &mut view);
         finish(&mut controller, &mut view).await;
         assert_ne!(controller.harness().host.context().id, id);
         assert_eq!(old.host.status(), SessionStatus::Closed);
-        assert_eq!(view.editor.text, "draft typed during opening");
+        assert_eq!(view.draft.text(), "draft typed during opening");
         assert_eq!(view.theme, Theme::Nord);
         assert_eq!(view.model.label, "mock/test");
+        assert_eq!(view.model_choices[0].variant.as_deref(), Some("fast"));
+        assert!(!view.items().iter().any(
+            |item| matches!(item, Item::Text { text, .. } if text == "belongs to the old session")
+        ));
+        assert!(view.session.title.is_none());
+        assert_eq!(view.usage().total_tokens, 0);
+        assert_eq!(view.recorded_responses(), 0);
         controller.close().await.unwrap();
     }
 
@@ -564,5 +568,38 @@ mod tests {
         assert!(controller.operation.is_none());
         assert_eq!(controller.harness().host.context().id, id);
         controller.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn invalid_attachment_does_not_replace_draft_or_block_session_switch() {
+        let (dir, mut controller, mut view) = fixture().await;
+        let file = dir.path().join("unsupported.zip");
+        std::fs::write(&file, b"unsupported").unwrap();
+        let input = In::user_text_with_attachments(
+            "inspect @unsupported.zip",
+            vec![UserAttachment::file(file.to_string_lossy(), None)],
+        );
+        assert!(controller.submit(input, &mut view));
+        view.draft.insert("new unsent draft");
+        let id = controller.harness().host.context().id;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                controller.poll(&mut view, None).await;
+                if controller.runtime.idle() && view.items().iter().any(|item| matches!(item, crate::ui::state::Item::Notice { text, .. } if text.starts_with("Input rejected:"))) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(controller.harness().host.queued(), 0);
+        assert_eq!(view.draft.text(), "new unsent draft");
+        assert_eq!(view.draft.attachment_counts(), (0, 0));
+        controller.switch(Target::New, &mut view);
+        finish(&mut controller, &mut view).await;
+        assert_ne!(controller.harness().host.context().id, id);
+        assert_eq!(view.draft.attachment_counts(), (0, 0));
+        let (_, pending) = controller.close().await.unwrap();
+        assert!(pending.is_empty());
     }
 }

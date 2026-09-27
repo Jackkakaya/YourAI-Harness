@@ -1,6 +1,6 @@
 mod tool_output;
+use super::draft::Draft;
 use super::editor::Editor;
-use super::mention;
 use crate::text::{append, append_progress, bounded, pretty};
 use ratatui::text::{Line, Span};
 use serde_json::{json, Value};
@@ -175,21 +175,6 @@ pub struct SessionPickerState {
     pub selected: usize,
 }
 
-/// An attachment staged for the next submit (OpenCode FilePart semantics:
-/// the frontend references files, the harness reads them).
-///
-/// - Clipboard images have an empty `marker` and are always sent.
-/// - File references carry a `marker` (`@relative/path`); they are only sent
-///   while the marker text is still present in the editor, so deleting the
-///   mention also drops the attachment — content and intent cannot drift
-///   apart.
-pub struct PendingAttachment {
-    /// `@relative/path` text that must remain in the editor for the
-    /// attachment to be sent; empty for clipboard images.
-    pub marker: String,
-    pub attachment: UserAttachment,
-}
-
 pub fn clean(text: &str) -> String {
     // Strip terminal controls, including ANSI CSI/OSC sequences, from untrusted output.
     let mut result = String::new();
@@ -232,75 +217,35 @@ pub fn clean(text: &str) -> String {
     result
 }
 
-impl View {
-    /// Attachments that should accompany `text`: clipboard images (empty
-    /// marker) plus file references whose marker is still present.
-    pub fn attachments_for(&self, text: &str) -> Vec<UserAttachment> {
-        self.pending_attachments
-            .iter()
-            .filter(|a| a.marker.is_empty() || marker_present(text, &a.marker))
-            .map(|a| a.attachment.clone())
-            .collect()
-    }
-}
-
-/// Word-boundary-aware marker search: `@src` must not match inside
-/// `@src/main.rs`, and the match must start at a word boundary like the
-/// mention trigger itself.
-fn marker_present(text: &str, marker: &str) -> bool {
-    let mut from = 0;
-    while let Some(offset) = text[from..].find(marker) {
-        let start = from + offset;
-        let end = start + marker.len();
-        let start_ok = start == 0
-            || text[..start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| c.is_whitespace());
-        let end_ok = text[end..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_alphanumeric() && !matches!(c, '/' | '_' | '-' | '.'));
-        if start_ok && end_ok {
-            return true;
-        }
-        from = start + 1;
-    }
-    false
-}
-
+#[derive(Default)]
 pub struct View {
-    pub model_metrics: yourai_harness::model::BudgetSnapshot,
-    pub retry: Option<RetryState>,
+    pub session: SessionView,
     commands: super::commands::Menu,
     pub toast: Option<(String, Instant)>,
     pub theme: super::theme::Theme,
+    pub draft: Draft,
+    pub overlay: super::overlay::Overlay,
+    pub model_choices: Vec<crate::models::ModelChoice>,
+    pub model: ModelInfo,
+}
+
+/// State belonging to one conversation; replaced together on a session switch.
+#[derive(Default)]
+pub struct SessionView {
+    pub model_metrics: yourai_harness::model::BudgetSnapshot,
+    pub retry: Option<RetryState>,
     pub context_usage: Option<yourai_harness::runtime::ContextUsage>,
-    // Timeline state: mutate only through methods so item identities, folds and
-    // the render revision (touch) cannot drift apart.
     items: VecDeque<Item>,
     item_versions: VecDeque<u64>,
-    pub editor: Editor,
     asks: VecDeque<Ask>,
-    /// Staged clipboard images, sent with the next submitted message.
-    pub pending_attachments: Vec<PendingAttachment>,
-    /// `@` file-mention autocomplete state.
-    pub mention: mention::MentionState,
     assistant: Option<usize>,
     thinking: Option<usize>,
     pub navigation: super::navigation::Navigation,
     first_item_id: u64,
     expanded: HashSet<u64>,
     selected: Option<u64>,
-    /// Session title shown in the conversation header; derived from the first prompt.
     pub title: Option<String>,
     pub todos: Todos,
-    pub overlay: super::overlay::Overlay,
-    /// Candidate labels for the model picker.
-    pub model_choices: Vec<String>,
-    /// Current model display label and per-model pricing (input $/M, output
-    /// $/M); always set as a pair, never edited field by field.
-    pub model: ModelInfo,
     usage: Usage,
     recorded_responses: u64,
     pub revision: u64,
@@ -359,52 +304,16 @@ impl Todos {
     }
 }
 /// Model label and pricing travel as one pair through switches and restores.
+#[derive(Default)]
 pub struct ModelInfo {
     pub label: String,
     pub pricing: Option<(f64, f64)>,
 }
-impl Default for View {
-    fn default() -> Self {
-        Self {
-            model_metrics: Default::default(),
-            retry: None,
-            recorded_responses: 0,
-            commands: Default::default(),
-            toast: None,
-            theme: Default::default(),
-            context_usage: None,
-            items: VecDeque::new(),
-            item_versions: VecDeque::new(),
-            editor: Editor::default(),
-            asks: VecDeque::new(),
-            pending_attachments: vec![],
-            mention: mention::MentionState::default(),
-            assistant: None,
-            thinking: None,
-            navigation: Default::default(),
-            first_item_id: 0,
-            expanded: HashSet::new(),
-            selected: None,
-            title: None,
-            todos: Todos::default(),
-            overlay: Default::default(),
-            model_choices: vec![],
-            model: ModelInfo {
-                label: String::new(),
-                pricing: None,
-            },
-            usage: Usage::default(),
-            revision: 0,
-            active: false,
-            since: None,
-        }
-    }
-}
 impl View {
     pub fn model_activity(&self) -> &'static str {
-        if self.assistant.is_some() {
+        if self.session.assistant.is_some() {
             "Responding"
-        } else if self.thinking.is_some() {
+        } else if self.session.thinking.is_some() {
             "Thinking"
         } else {
             "Waiting for model"
@@ -413,48 +322,48 @@ impl View {
 
     /// Whether the item at `index` is the currently streaming thinking block.
     pub fn is_thinking_at(&self, index: usize) -> bool {
-        self.thinking == Some(index)
+        self.session.thinking == Some(index)
     }
 
     /// Stable identity independent of front-of-history eviction.
     pub fn item_id(&self, index: usize) -> u64 {
-        self.first_item_id + index as u64
+        self.session.first_item_id + index as u64
     }
     /// Read-only timeline access; the render cache assumes mutation goes
     /// through the methods below (they maintain ids, folds and `revision`).
     pub fn items(&self) -> &VecDeque<Item> {
-        &self.items
+        &self.session.items
     }
     pub fn item_version(&self, index: usize) -> u64 {
-        self.item_versions[index]
+        self.session.item_versions[index]
     }
     fn item_mut(&mut self, index: usize) -> Option<&mut Item> {
-        if let Some(version) = self.item_versions.get_mut(index) {
+        if let Some(version) = self.session.item_versions.get_mut(index) {
             *version = version.wrapping_add(1);
         }
-        self.items.get_mut(index)
+        self.session.items.get_mut(index)
     }
     pub fn expanded(&self, id: u64) -> bool {
-        self.expanded.contains(&id)
+        self.session.expanded.contains(&id)
     }
     pub fn selected(&self) -> Option<u64> {
-        self.selected
+        self.session.selected
     }
     /// Asks are answered strictly in arrival order; only the front one is editable.
     pub fn asks_empty(&self) -> bool {
-        self.asks.is_empty()
+        self.session.asks.is_empty()
     }
     pub fn ask(&self) -> Option<&Ask> {
-        self.asks.front()
+        self.session.asks.front()
     }
     pub fn ask_mut(&mut self) -> Option<&mut Ask> {
-        self.asks.front_mut()
+        self.session.asks.front_mut()
     }
     pub fn dismiss_ask(&mut self) {
-        self.asks.pop_front();
+        self.session.asks.pop_front();
     }
     pub fn dismiss_asks(&mut self) {
-        self.asks.clear();
+        self.session.asks.clear();
     }
     pub fn foldable(item: &Item) -> bool {
         matches!(
@@ -467,16 +376,19 @@ impl View {
         )
     }
     pub fn toggle(&mut self, id: u64) {
-        let Some(index) = id.checked_sub(self.first_item_id).map(|i| i as usize) else {
+        let Some(index) = id
+            .checked_sub(self.session.first_item_id)
+            .map(|i| i as usize)
+        else {
             return;
         };
-        if !self.items.get(index).is_some_and(Self::foldable) {
+        if !self.session.items.get(index).is_some_and(Self::foldable) {
             return;
         }
-        if !self.expanded.remove(&id) {
-            self.expanded.insert(id);
+        if !self.session.expanded.remove(&id) {
+            self.session.expanded.insert(id);
         }
-        self.selected = Some(id);
+        self.session.selected = Some(id);
         self.touch();
     }
     pub fn toggle_recent(&mut self, thinking: bool) {
@@ -494,16 +406,18 @@ impl View {
             }
         };
         let selected = self
+            .session
             .selected
-            .and_then(|id| id.checked_sub(self.first_item_id))
+            .and_then(|id| id.checked_sub(self.session.first_item_id))
             .map(|i| i as usize)
-            .filter(|i| self.items.get(*i).is_some_and(matches));
-        if let Some(index) = selected.or_else(|| self.items.iter().rposition(matches)) {
+            .filter(|i| self.session.items.get(*i).is_some_and(matches));
+        if let Some(index) = selected.or_else(|| self.session.items.iter().rposition(matches)) {
             self.toggle(self.item_id(index));
         }
     }
     pub fn select_next(&mut self, backwards: bool) {
         let ids: Vec<_> = self
+            .session
             .items
             .iter()
             .enumerate()
@@ -514,6 +428,7 @@ impl View {
             return;
         }
         let current = self
+            .session
             .selected
             .and_then(|id| ids.iter().position(|i| *i == id));
         let next = match current {
@@ -522,16 +437,16 @@ impl View {
             None if backwards => ids.len() - 1,
             None => 0,
         };
-        self.selected = Some(ids[next]);
+        self.session.selected = Some(ids[next]);
         self.touch();
     }
     #[cfg(test)]
     pub fn clear_timeline(&mut self) {
-        self.first_item_id += self.items.len() as u64;
-        self.items.clear();
-        self.item_versions.clear();
-        self.expanded.clear();
-        self.selected = None;
+        self.session.first_item_id += self.session.items.len() as u64;
+        self.session.items.clear();
+        self.session.item_versions.clear();
+        self.session.expanded.clear();
+        self.session.selected = None;
         self.settle();
         self.follow();
     }
@@ -540,62 +455,64 @@ impl View {
     /// are authoritative (overwrite); streaming deltas accumulate on top; a
     /// finished compaction reports replacement totals.
     pub fn restore_usage(&mut self, usage: Usage, responses: u64) {
-        self.usage = usage;
-        self.recorded_responses = responses;
+        self.session.usage = usage;
+        self.session.recorded_responses = responses;
     }
     pub fn replace_usage(&mut self, usage: Usage) {
-        self.usage = usage;
+        self.session.usage = usage;
     }
     pub fn accumulate_usage(&mut self, delta: &Usage) {
-        self.usage.input_tokens = self.usage.input_tokens.saturating_add(delta.input_tokens);
-        self.usage.output_tokens = self.usage.output_tokens.saturating_add(delta.output_tokens);
-        self.usage.total_tokens = self.usage.total_tokens.saturating_add(delta.total_tokens);
+        self.session.usage.input_tokens = self
+            .session
+            .usage
+            .input_tokens
+            .saturating_add(delta.input_tokens);
+        self.session.usage.output_tokens = self
+            .session
+            .usage
+            .output_tokens
+            .saturating_add(delta.output_tokens);
+        self.session.usage.total_tokens = self
+            .session
+            .usage
+            .total_tokens
+            .saturating_add(delta.total_tokens);
     }
     pub fn set_response_count(&mut self, count: u64) {
-        self.recorded_responses = count;
+        self.session.recorded_responses = count;
     }
     pub fn usage(&self) -> &Usage {
-        &self.usage
+        &self.session.usage
     }
     pub fn recorded_responses(&self) -> u64 {
-        self.recorded_responses
+        self.session.recorded_responses
     }
 
     /// The menu is derived from the current draft and focus whenever accessed.
     /// No caller can read stale items or forget a separate synchronization step.
     pub fn menu(&mut self) -> &mut super::commands::Menu {
         self.commands.sync(
-            &self.editor.text,
+            self.draft.text(),
             self.asks_empty() && !self.overlay.is_open(),
         );
         &mut self.commands
     }
-    /// Derive a display title from a prompt; the first non-empty derivation wins.
-    pub fn note_title(&mut self, text: &str) -> Option<String> {
-        if self.title.is_some() {
-            return None;
-        }
-        let derived = derive_title(text)?;
-        self.title = Some(derived.clone());
-        Some(derived)
-    }
-
     pub fn touch(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+        self.session.revision = self.session.revision.wrapping_add(1);
     }
     fn push(&mut self, item: Item) {
-        self.items.push_back(item);
-        self.item_versions.push_back(0);
-        if self.items.len() > MAX_ITEMS {
-            self.items.pop_front();
-            self.item_versions.pop_front();
-            self.expanded.remove(&self.first_item_id);
-            if self.selected == Some(self.first_item_id) {
-                self.selected = None;
+        self.session.items.push_back(item);
+        self.session.item_versions.push_back(0);
+        if self.session.items.len() > MAX_ITEMS {
+            self.session.items.pop_front();
+            self.session.item_versions.pop_front();
+            self.session.expanded.remove(&self.session.first_item_id);
+            if self.session.selected == Some(self.session.first_item_id) {
+                self.session.selected = None;
             }
-            self.first_item_id += 1;
-            self.assistant = self.assistant.and_then(|n| n.checked_sub(1));
-            self.thinking = self.thinking.and_then(|n| n.checked_sub(1));
+            self.session.first_item_id += 1;
+            self.session.assistant = self.session.assistant.and_then(|n| n.checked_sub(1));
+            self.session.thinking = self.session.thinking.and_then(|n| n.checked_sub(1));
         }
         self.touch();
     }
@@ -617,9 +534,9 @@ impl View {
     }
     fn delta(&mut self, role: Role, text: &str) {
         let index = if role == Role::Assistant {
-            self.assistant
+            self.session.assistant
         } else {
-            self.thinking
+            self.session.thinking
         };
         if let Some(i) = index {
             if let Some(Item::Text { text: body, .. }) = self.item_mut(i) {
@@ -632,32 +549,32 @@ impl View {
             role,
             text: bounded(text),
         });
-        let i = Some(self.items.len() - 1);
+        let i = Some(self.session.items.len() - 1);
         if role == Role::Assistant {
-            self.assistant = i;
+            self.session.assistant = i;
         } else {
-            self.thinking = i;
+            self.session.thinking = i;
         }
     }
     /// Host status and forwarded output use separate channels. Idle may arrive before
     /// the final Message, so a status refresh must retain stream merge identities.
     pub fn idle(&mut self) {
-        self.active = false;
-        self.since = None;
-        self.retry = None;
-        self.asks.clear();
+        self.session.active = false;
+        self.session.since = None;
+        self.session.retry = None;
+        self.session.asks.clear();
     }
     pub fn settle(&mut self) {
-        self.retry = None;
-        self.assistant = None;
-        self.thinking = None;
-        self.asks.clear();
-        self.active = false;
-        self.since = None;
-        for (i, item) in self.items.iter_mut().enumerate() {
+        self.session.retry = None;
+        self.session.assistant = None;
+        self.session.thinking = None;
+        self.session.asks.clear();
+        self.session.active = false;
+        self.session.since = None;
+        for (i, item) in self.session.items.iter_mut().enumerate() {
             if let Item::Tool(t) = item {
                 if t.status == ToolStatus::Running {
-                    self.item_versions[i] = self.item_versions[i].wrapping_add(1);
+                    self.session.item_versions[i] = self.session.item_versions[i].wrapping_add(1);
                     t.status = ToolStatus::Interrupted;
                     t.seconds = t.started.map(|s| s.elapsed().as_secs());
                 }
@@ -666,21 +583,30 @@ impl View {
         self.touch();
     }
     pub fn follow(&mut self) {
-        self.navigation.follow();
+        self.session.navigation.follow();
     }
     pub fn event(&mut self, event: Out) {
         match event {
+            Out::InputRejected { rejection } => {
+                self.notice(
+                    Level::Warning,
+                    format!(
+                        "Input rejected: {}. Use ↑ / Ctrl-P to edit a previous input.",
+                        rejection.reason
+                    ),
+                );
+            }
             Out::Chunk { text } => {
-                self.retry = None;
+                self.session.retry = None;
                 self.delta(Role::Assistant, &text);
             }
             Out::Reasoning { text } => {
-                self.retry = None;
+                self.session.retry = None;
                 self.delta(Role::Thinking, &text);
             }
             Out::Message { text } => {
-                self.retry = None;
-                if let Some(i) = self.assistant.take() {
+                self.session.retry = None;
+                if let Some(i) = self.session.assistant.take() {
                     if let Some(Item::Text { text: body, .. }) = self.item_mut(i) {
                         *body = bounded(&text);
                     }
@@ -690,7 +616,7 @@ impl View {
                         text: bounded(&text),
                     });
                 }
-                self.thinking = None;
+                self.session.thinking = None;
                 self.touch();
             }
             Out::Retry {
@@ -699,7 +625,7 @@ impl View {
                 reason,
                 wait_ms,
             } => {
-                self.retry = Some(RetryState {
+                self.session.retry = Some(RetryState {
                     attempt,
                     max,
                     reason: bounded(&reason),
@@ -708,9 +634,9 @@ impl View {
                 self.touch();
             }
             Out::ToolStarted { id, name, input } => {
-                self.retry = None;
-                self.assistant = None;
-                self.thinking = None;
+                self.session.retry = None;
+                self.session.assistant = None;
+                self.session.thinking = None;
                 // write previews the incoming content right away so the card
                 // shows the change (with + gutters) while it runs.
                 let is_write = name == "write";
@@ -825,13 +751,14 @@ impl View {
                         diff_rows: result.diff_rows,
                     })));
                 }
-                self.asks
+                self.session
+                    .asks
                     .retain(|a| a.payload["call_id"].as_str() != Some(&id));
                 self.touch();
             }
             Out::Ask { id, payload } => {
-                if !self.asks.iter().any(|a| a.id == id) {
-                    self.asks.push_back(Ask {
+                if !self.session.asks.iter().any(|a| a.id == id) {
+                    self.session.asks.push_back(Ask {
                         id,
                         details: pretty(&payload),
                         payload,
@@ -849,6 +776,7 @@ impl View {
     }
     fn tool_mut(&mut self, id: &str) -> Option<&mut ToolView> {
         let index = self
+            .session
             .items
             .iter()
             .rposition(|item| matches!(item, Item::Tool(t) if t.id == id))?;
@@ -871,7 +799,7 @@ impl View {
                     _ => Role::Context,
                 };
                 if role == Role::User {
-                    self.editor.remember(&text);
+                    self.draft.remember(&text);
                 }
                 self.push(Item::Text {
                     role,
@@ -916,24 +844,6 @@ impl View {
         self.settle();
         self.follow();
     }
-}
-/// Title from the first line of a prompt: whitespace-collapsed, truncated.
-pub fn derive_title(text: &str) -> Option<String> {
-    let mut title = text
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if title.is_empty() {
-        return None;
-    }
-    if title.chars().count() > 48 {
-        title = title.chars().take(47).collect();
-        title.push('…');
-    }
-    Some(title)
 }
 #[cfg(test)]
 mod tests {
@@ -992,10 +902,8 @@ mod tests {
     }
     #[test]
     fn idle_status_before_final_message_does_not_duplicate_stream() {
-        let mut view = View {
-            active: true,
-            ..Default::default()
-        };
+        let mut view = View::default();
+        view.session.active = true;
         view.user("你好", false);
         view.event(Out::Reasoning {
             text: "thinking".into(),
@@ -1009,6 +917,7 @@ mod tests {
             text: "你好！有什么我可以帮你的？".into(),
         });
         let assistant = view
+            .session
             .items
             .iter()
             .filter_map(|i| match i {
@@ -1029,7 +938,8 @@ mod tests {
             text: "你好！有什么我可以帮你的？".into(),
         });
         assert_eq!(
-            view.items
+            view.session
+                .items
                 .iter()
                 .filter(|i| matches!(
                     i,
@@ -1049,17 +959,17 @@ mod tests {
         let id = view.item_id(0);
         view.toggle(id);
         view.event(Out::Reasoning { text: "b".into() });
-        assert!(view.expanded.contains(&id));
+        assert!(view.session.expanded.contains(&id));
         for _ in 0..MAX_ITEMS {
             view.user("new", false);
         }
-        assert!(!view.expanded.contains(&id));
-        assert!(view.selected.is_none());
+        assert!(!view.session.expanded.contains(&id));
+        assert!(view.session.selected.is_none());
         view.clear_timeline();
         view.event(Out::Reasoning {
             text: "new thinking".into(),
         });
-        assert!(!view.expanded.contains(&view.item_id(0)));
+        assert!(!view.session.expanded.contains(&view.item_id(0)));
     }
 
     #[test]
@@ -1072,9 +982,9 @@ mod tests {
         let runtime = StoredMessage::runtime_context("hook context");
         let mut view = View::default();
         view.restore(vec![user, summary, runtime]);
-        assert_eq!(view.items.len(), 1);
+        assert_eq!(view.session.items.len(), 1);
         assert!(
-            matches!(&view.items[0], Item::Text { role: Role::User, text } if text == "original request")
+            matches!(&view.session.items[0], Item::Text { role: Role::User, text } if text == "original request")
         );
     }
 
@@ -1089,22 +999,28 @@ mod tests {
             id: "mcp".into(),
             payload: json!({"mode":"form", "call_id":"b"}),
         });
-        view.asks[0].editor.insert("parser");
-        assert_eq!(view.asks[0].answer().unwrap(), json!("parser"));
-        view.asks[1].editor.insert("invalid JSON");
-        assert!(view.asks[1].answer().is_err());
-        view.asks[1].editor.set("{\"action\":\"decline\"}".into());
-        assert_eq!(view.asks[1].answer().unwrap(), json!({"action":"decline"}));
+        view.session.asks[0].editor.insert("parser");
+        assert_eq!(view.session.asks[0].answer().unwrap(), json!("parser"));
+        view.session.asks[1].editor.insert("invalid JSON");
+        assert!(view.session.asks[1].answer().is_err());
+        view.session.asks[1].editor.take();
+        view.session.asks[1]
+            .editor
+            .insert("{\"action\":\"decline\"}");
+        assert_eq!(
+            view.session.asks[1].answer().unwrap(),
+            json!({"action":"decline"})
+        );
         view.event(Out::ToolDone {
             id: "a".into(),
             name: "test".into(),
             output: json!({}),
             is_error: false,
         });
-        assert_eq!(view.asks.len(), 1);
-        assert_eq!(view.asks[0].id, "mcp");
+        assert_eq!(view.session.asks.len(), 1);
+        assert_eq!(view.session.asks[0].id, "mcp");
         view.settle();
-        assert!(view.asks.is_empty());
+        assert!(view.session.asks.is_empty());
     }
 
     #[test]
@@ -1115,7 +1031,7 @@ mod tests {
         v.event(Out::Message {
             text: "hello".into(),
         });
-        assert_eq!(v.items.len(), 1);
+        assert_eq!(v.session.items.len(), 1);
         for id in ["a", "b"] {
             v.event(Out::ToolStarted {
                 id: id.into(),
@@ -1141,15 +1057,18 @@ mod tests {
     #[test]
     fn permissions_require_explicit_answer_and_drafts_are_separate() {
         let mut v = View::default();
-        v.editor.insert("draft");
+        v.draft.insert("draft");
         v.event(Out::Ask {
             id: "a".into(),
             payload: json!({"kind":"permission"}),
         });
-        assert!(v.asks[0].answer().is_err());
-        v.asks[0].editor.insert("n");
-        assert_eq!(v.asks[0].answer().unwrap(), json!({"behavior":"deny"}));
-        assert_eq!(v.editor.text, "draft");
+        assert!(v.session.asks[0].answer().is_err());
+        v.session.asks[0].editor.insert("n");
+        assert_eq!(
+            v.session.asks[0].answer().unwrap(),
+            json!({"behavior":"deny"})
+        );
+        assert_eq!(v.draft.text(), "draft");
     }
     #[test]
     fn retry_status_sticks_until_progress_or_settle() {
@@ -1160,10 +1079,10 @@ mod tests {
             reason: "HTTP 429".into(),
             wait_ms: 5000,
         });
-        assert_eq!(v.retry.as_ref().map(|r| r.attempt), Some(1));
-        assert!(v.retry.as_ref().unwrap().until > Instant::now());
+        assert_eq!(v.session.retry.as_ref().map(|r| r.attempt), Some(1));
+        assert!(v.session.retry.as_ref().unwrap().until > Instant::now());
         v.event(Out::Reasoning { text: "r".into() });
-        assert!(v.retry.is_none());
+        assert!(v.session.retry.is_none());
         v.event(Out::Retry {
             attempt: 2,
             max: 2,
@@ -1171,11 +1090,12 @@ mod tests {
             wait_ms: 1000,
         });
         v.settle();
-        assert!(v.retry.is_none());
+        assert!(v.session.retry.is_none());
     }
 
     fn only_tool(v: &View) -> &ToolView {
         let tools: Vec<&ToolView> = v
+            .session
             .items
             .iter()
             .filter_map(|i| match i {
@@ -1356,55 +1276,6 @@ mod tests {
         assert!(t.created);
         assert!(t.content_hl.is_some());
     }
-
-    // ── attachments ────────────────────────────────────────────────────
-
-    fn staged(marker: &str, attachment: UserAttachment) -> PendingAttachment {
-        PendingAttachment {
-            marker: marker.to_owned(),
-            attachment,
-        }
-    }
-
-    #[test]
-    fn clipboard_images_are_always_sent_and_refs_need_their_marker() {
-        let v = View {
-            pending_attachments: vec![
-                staged(
-                    "",
-                    UserAttachment::base64("image/png", "aGVsbG8=", Some("c.png".into())),
-                ),
-                staged(
-                    "@src/main.rs",
-                    UserAttachment::file("/abs/src/main.rs", None),
-                ),
-            ],
-            ..Default::default()
-        };
-        // Marker present → both sent.
-        let atts = v.attachments_for("look at @src/main.rs please");
-        assert_eq!(atts.len(), 2);
-        // Marker deleted → only the clipboard image remains.
-        let atts = v.attachments_for("look at this please");
-        assert_eq!(atts.len(), 1);
-        assert!(matches!(atts[0].data, AttachmentData::Base64(_)));
-    }
-
-    #[test]
-    fn marker_matching_respects_word_boundaries() {
-        let v = View {
-            pending_attachments: vec![staged("@src", UserAttachment::file("/abs/src", None))],
-            ..Default::default()
-        };
-        // `@src` inside `@src/main.rs` is NOT the dir marker.
-        assert!(v.attachments_for("see @src/main.rs").is_empty());
-        // Exact marker (followed by whitespace) matches.
-        assert_eq!(v.attachments_for("see @src now").len(), 1);
-        // Marker at end of text matches.
-        assert_eq!(v.attachments_for("see @src").len(), 1);
-        // Embedded in a word (`foo@src`) does not — mentions need a boundary.
-        assert!(v.attachments_for("see foo@src").is_empty());
-    }
 }
 
 #[cfg(test)]
@@ -1414,11 +1285,11 @@ mod menu_tests {
     #[test]
     fn menu_tracks_draft_and_focus_without_a_sync_call() {
         let mut view = View::default();
-        view.editor.insert("/");
+        view.draft.insert("/");
         view.menu().step(true);
         assert_eq!(view.menu().items()[view.menu().selected].text, "/quit");
-        view.editor.take();
-        view.editor.insert("/co");
+        view.draft.set_text("");
+        view.draft.insert("/co");
         assert_eq!(view.menu().selected, 0);
         assert_eq!(view.menu().items().len(), 2);
         view.overlay = Overlay::Help { scroll: 0 };

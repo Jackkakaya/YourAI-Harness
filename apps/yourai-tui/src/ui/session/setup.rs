@@ -1,12 +1,10 @@
 use crate::config::{Config, Error};
-use crate::ui::state::{derive_title, Item, Role, View};
+use crate::ui::state::{ModelInfo, SessionView, View};
 use std::sync::Arc;
 use yourai_core::prelude::*;
 use yourai_harness::{Harness, HarnessConfig};
 
-pub(super) use crate::ui::state::ModelInfo as ModelSelection;
-
-pub(super) async fn restore_history(h: &Harness, v: &mut View) -> Result<(), YourAiError> {
+pub(in crate::ui) async fn restore_history(h: &Harness, v: &mut View) -> Result<(), YourAiError> {
     let id = h.host.context().id;
     let mut after = 0;
     loop {
@@ -37,35 +35,73 @@ pub(super) async fn restore_history(h: &Harness, v: &mut View) -> Result<(), You
         },
         usage.request_count,
     );
-    // Restore the session title; backfill older sessions from their first prompt.
-    if let Ok(mut meta) = h.sessions.load_session(&id).await {
-        v.title = meta
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_owned);
-        if v.title.is_none() {
-            let first_user = v.items().iter().find_map(|i| match i {
-                Item::Text {
-                    role: Role::User,
-                    text,
-                } => Some(text.as_str()),
-                _ => None,
-            });
-            if let Some(title) = first_user.and_then(derive_title) {
-                meta.title = Some(title.clone());
-                v.title = Some(title);
-                if let Err(e) = h.sessions.save_session(&meta).await {
-                    v.title = None;
-                    v.notice(Level::Warning, format!("Session title not saved: {e}"));
-                }
-            }
-        }
+    match restore_title(h).await {
+        Ok(title) => v.session.title = title,
+        Err(e) => v.notice(Level::Warning, format!("Session title unavailable: {e}")),
     }
     v.settle();
     v.follow();
     Ok(())
+}
+/// One title policy for startup and live sessions. Only committed user messages
+/// are candidates; a failed write leaves the caller free to retry next poll.
+pub(super) async fn restore_title(h: &Harness) -> Result<Option<String>, YourAiError> {
+    let id = h.host.context().id;
+    let mut meta = h.sessions.load_session(&id).await?;
+    if let Some(title) = meta
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        return Ok(Some(title.to_owned()));
+    }
+    let mut after = 0;
+    loop {
+        let page = h
+            .sessions
+            .read_messages(
+                &id,
+                MessageQuery {
+                    after,
+                    active_only: false,
+                    limit: 256,
+                },
+            )
+            .await?;
+        for row in page.messages {
+            if row.summary || row.runtime_context || row.message.role != ChatRole::User {
+                continue;
+            }
+            if let Some(title) = derive_title(&row.message.content.texts().join("\n")) {
+                meta.title = Some(title.clone());
+                h.sessions.save_session(&meta).await?;
+                return Ok(Some(title));
+            }
+        }
+        match page.next {
+            Some(next) if next > after => after = next,
+            _ => return Ok(None),
+        }
+    }
+}
+/// Title from the first line of a prompt: whitespace-collapsed, truncated.
+fn derive_title(text: &str) -> Option<String> {
+    let mut title = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        return None;
+    }
+    if title.chars().count() > 48 {
+        title = title.chars().take(47).collect();
+        title.push('…');
+    }
+    Some(title)
 }
 /// Resolve a config snapshot into the live model, its context policy and the
 /// settings derived from it. The shared resolution behind model switching
@@ -100,7 +136,7 @@ pub(super) async fn switch_model(
     harness: &Harness,
     model_id: &str,
     variant: Option<String>,
-) -> Result<ModelSelection, String> {
+) -> Result<ModelInfo, String> {
     let mut candidate = config.lock().map_err(|e| e.to_string())?.clone();
     candidate.model = model_id.to_string();
     let (model, context, settings) =
@@ -122,7 +158,7 @@ pub(super) async fn switch_model(
     } else {
         model_id.to_string()
     };
-    Ok(ModelSelection { label, pricing })
+    Ok(ModelInfo { label, pricing })
 }
 
 /// Rebuild model-dependent settings from the structured runtime selection.
@@ -149,15 +185,14 @@ fn prepare_session(
 
 /// Open the target session and restore its history into a fresh view.
 /// Runs entirely before the old session is stopped, so any failure leaves
-/// the current session and its UI intact. The fresh view is plain: the
-/// fields that survive a switch are re-read from the live view when the
-/// effect is applied.
+/// the current session and its UI intact. Only conversation state is returned;
+/// application state is never replaced.
 pub(super) async fn open_session(
     config: &Arc<std::sync::Mutex<Config>>,
     template: &HarnessConfig,
     yolo: bool,
     id: Option<SessionId>,
-) -> Result<(Harness, View), (Level, String)> {
+) -> Result<(Harness, SessionView), (Level, String)> {
     let error = |message: String| (Level::Error, message);
     let (mut hc, model) = prepare_session(config, template, id)
         .map_err(|e| error(format!("Could not open session: {e}")))?;
@@ -170,7 +205,7 @@ pub(super) async fn open_session(
         let _ = new_h.close().await;
         return Err(error(format!("Could not restore history: {e}")));
     }
-    Ok((new_h, fresh))
+    Ok((new_h, fresh.session))
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ pub struct History {
     pub messages: Mutex<Vec<ChatMessage>>,
     pub compactions: Mutex<Vec<CompactionTrigger>>,
     pub tokens: AtomicU64,
+    pub append_failures: AtomicU64,
     pub usage: Mutex<Vec<Usage>>,
 }
 impl ContextManager for History {
@@ -32,6 +33,17 @@ impl ContextManager for History {
     }
     fn append(&self, messages: Vec<StoredMessage>) -> BoxFuture<'_, Result<(), YourAiError>> {
         Box::pin(async move {
+            if self
+                .append_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(ErrorKind::Provider {
+                    name: "history",
+                    message: "temporary write failure".into(),
+                }
+                .into());
+            }
             self.messages
                 .lock()
                 .unwrap()

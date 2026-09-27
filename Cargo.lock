@@ -3640,6 +3640,7 @@ dependencies = [
  "libc",
  "pulldown-cmark",
  "ratatui",
+ "rusqlite",
  "serde",
  "serde_json",
  "syntect",

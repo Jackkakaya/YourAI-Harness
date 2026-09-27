@@ -340,8 +340,14 @@ fn is_wsl() -> bool {
 
 #[cfg(target_os = "macos")]
 async fn read_image_macos() -> io::Result<Option<ClipboardImage>> {
-    let file = std::env::temp_dir().join("yourai-clipboard.png");
-    let path = file.to_string_lossy().into_owned();
+    // Each operation owns a unique file. Cancellation/drop cleans it up and
+    // cannot race another read (or another running TUI) over a shared path.
+    let file = tempfile::NamedTempFile::new()?;
+    let path = file
+        .path()
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     let open_line =
         format!("set fileRef to open for access POSIX file \"{path}\" with write permission");
     let args = [
@@ -372,7 +378,7 @@ async fn read_image_macos() -> io::Result<Option<ClipboardImage>> {
     .await
     .unwrap_or(false);
     let result = if ok {
-        tokio::fs::read(&file)
+        tokio::fs::read(file.path())
             .await
             .ok()
             .filter(|b| !b.is_empty())
@@ -383,7 +389,6 @@ async fn read_image_macos() -> io::Result<Option<ClipboardImage>> {
     } else {
         None
     };
-    let _ = tokio::fs::remove_file(&file).await;
     Ok(result)
 }
 

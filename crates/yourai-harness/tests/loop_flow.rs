@@ -702,7 +702,9 @@ async fn rejected_prompt_never_enters_history_or_model() {
     let agent = builder(model.clone(), history.clone(), LoopConfig::default())
         .hooks(hooks)
         .build();
-    assert!(agent.run(In::user_text("blocked")).await.is_ok());
+    let output = agent.run(In::user_text("blocked")).await.unwrap();
+    assert!(output.pending.is_empty());
+    assert_eq!(output.rejected.len(), 1);
     assert!(history.messages().is_empty());
     assert!(model.requests.lock().unwrap().is_empty());
 }
@@ -1021,4 +1023,182 @@ async fn compaction_does_not_consume_step() {
     assert_eq!(result.text, "ok");
     assert_eq!(history.compactions.lock().unwrap().len(), 1);
     assert_eq!(model.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn invalid_attachments_are_returned_without_history_or_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let unsupported = dir.path().join("data.zip");
+    std::fs::write(&unsupported, b"zip").unwrap();
+    let gone = dir.path().join("deleted.rs");
+    std::fs::write(&gone, "text").unwrap();
+    let missing_attachment = UserAttachment::file(gone.to_string_lossy(), None);
+    std::fs::remove_file(&gone).unwrap();
+    for bad in [
+        UserAttachment::file(unsupported.to_string_lossy(), None),
+        missing_attachment,
+        UserAttachment::base64("image/png", "not base64", None),
+    ] {
+        let history = Arc::new(History::default());
+        let model = Arc::new(Model::new(vec![]));
+        let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
+        let input = In::user_text_with_attachments("repair me", vec![bad]);
+        let original = serde_json::to_value(&input).unwrap();
+        let (events, result) = collect(agent.start(input).unwrap()).await;
+        let output = result.unwrap();
+        assert!(output.pending.is_empty());
+        assert_eq!(output.rejected.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&output.rejected[0].input).unwrap(),
+            original
+        );
+        let rejections: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Out::InputRejected { rejection } => Some(rejection),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rejections.len(), 1);
+        assert!(!rejections[0].reason.is_empty());
+        assert_eq!(
+            serde_json::to_value(&rejections[0].input).unwrap(),
+            original
+        );
+        assert!(history.messages().is_empty());
+        assert!(model.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn non_streaming_callers_receive_rejected_input_too() {
+    let history = Arc::new(History::default());
+    let agent = builder(Arc::new(Model::new(vec![])), history, LoopConfig::default()).build();
+    let output = agent
+        .run(In::user_text_with_attachments(
+            "bad",
+            vec![UserAttachment::base64("image/png", "bad", None)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(output.rejected.len(), 1);
+    assert!(output.pending.is_empty());
+}
+
+#[tokio::test]
+async fn temporary_history_failure_preserves_input_for_retry() {
+    let history = Arc::new(History::default());
+    history.append_failures.store(1, Ordering::SeqCst);
+    let model = Arc::new(Model::new(vec![answer("done")]));
+    let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
+    let input = In::user_text_with_attachments(
+        "valid",
+        vec![UserAttachment::base64("image/png", tiny_png_base64(), None)],
+    );
+    let (events, result) = collect(agent.start(input).unwrap()).await;
+    let mut failed = result.unwrap_err();
+    assert_eq!(failed.output.pending.len(), 1);
+    assert!(failed.output.rejected.is_empty());
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Out::InputRejected { .. })));
+    assert!(history.messages().is_empty());
+    assert!(model.requests.lock().unwrap().is_empty());
+    let (_, result) = collect(agent.start(failed.output.pending.remove(0)).unwrap()).await;
+    let output = result.unwrap();
+    assert_eq!(output.text, "done");
+    assert!(output.pending.is_empty());
+    assert!(output.rejected.is_empty());
+    assert_eq!(history.messages().len(), 2);
+}
+
+#[tokio::test]
+async fn relative_file_references_resolve_against_the_session_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("session-only.rs"), "session-local content").unwrap();
+    let history = Arc::new(History::default());
+    let agent = builder(
+        Arc::new(Model::new(vec![answer("done")])),
+        history.clone(),
+        LoopConfig::default(),
+    )
+    .build();
+    let mut options = TurnOptions::default();
+    options.session = Some(Arc::new(SessionContext::new(
+        history.id.clone(),
+        dir.path(),
+    )));
+    let (_, output) = collect(
+        agent
+            .start_with(
+                In::user_text_with_attachments(
+                    "read",
+                    vec![UserAttachment::file("session-only.rs", None)],
+                ),
+                options,
+            )
+            .unwrap(),
+    )
+    .await;
+    assert!(output.unwrap().rejected.is_empty());
+    assert!(history.messages()[0]
+        .content
+        .texts()
+        .join("\n")
+        .contains("session-local content"));
+}
+
+#[tokio::test]
+async fn invalid_steer_does_not_block_valid_steer_or_follow_up() {
+    let history = Arc::new(History::default());
+    let registry = Arc::new(Registry::default());
+    registry.register(Arc::new(Handler::new("tool", Mode::Return)));
+    let agent = builder(
+        Arc::new(Model::new(vec![calls(&["tool"]), answer("done")])),
+        history.clone(),
+        LoopConfig::default(),
+    )
+    .tools(registry)
+    .security(Arc::new(Security::new(ApprovalDecision::Ask)))
+    .build();
+    let mut handle = agent.start(In::user_text("go")).unwrap();
+    let mut rejected = 0;
+    while let Some(event) = handle.outbox.recv().await {
+        match event {
+            Out::Ask { id, .. } => {
+                handle
+                    .inbox
+                    .send(In::user_text_with_attachments(
+                        "invalid",
+                        vec![UserAttachment::base64("image/png", "bad", None)],
+                    ))
+                    .unwrap();
+                handle.inbox.send(In::user_text("valid steer")).unwrap();
+                handle.inbox.send(In::follow_up("later")).unwrap();
+                handle
+                    .inbox
+                    .send(In::Reply {
+                        id,
+                        payload: json!({"behavior":"allow"}),
+                    })
+                    .unwrap();
+            }
+            Out::InputRejected { .. } => rejected += 1,
+            _ => {}
+        }
+    }
+    let output = handle.join().await.unwrap();
+    assert_eq!(output.text, "done");
+    assert_eq!(rejected, 1);
+    assert_eq!(output.rejected.len(), 1);
+    assert_eq!(output.pending.len(), 1);
+    assert!(matches!(&output.pending[0], In::UserText { text, .. } if text == "later"));
+    assert!(history
+        .messages()
+        .iter()
+        .any(|m| m.content.first_text() == Some("valid steer")));
+    assert!(!history
+        .messages()
+        .iter()
+        .any(|m| m.content.first_text() == Some("invalid")));
 }

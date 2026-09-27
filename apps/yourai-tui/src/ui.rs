@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod commands;
+mod draft;
 mod editor;
 mod frame_time;
 mod markdown;
@@ -64,7 +65,7 @@ pub async fn run(
     // Load clean persistent records before opening the alternate screen.
     let mut view = View::default();
     view.theme = theme;
-    view.model_choices = choices.iter().map(|c| c.label.clone()).collect();
+    view.model_choices = choices;
     view.model = state::ModelInfo {
         label: model.into(),
         pricing: {
@@ -92,7 +93,7 @@ pub async fn run(
         yolo,
     };
     let controller = Controller::new(harness, config, config_template, limits, yolo);
-    let mut app = App::new(controller, view, meta, choices);
+    let mut app = App::new(controller, view, meta);
     // Input is delivered by a dedicated reader thread; the UI loop wakes on
     // the channel instead of polling on a timer, so wheel and key events
     // paint immediately (SSH+tmux adds enough latency of its own). The thread
@@ -161,9 +162,8 @@ pub async fn run(
                 }
             }
             app.sync_todos();
-            app.settle_mention().await;
             app.settle_clipboard().await;
-            app.settle_image().await;
+            app.settle_draft().await;
             let (queued, compacting) = app.pressure();
             presentation.request();
             let time = frame_time::FrameTime::now();

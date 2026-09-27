@@ -175,7 +175,7 @@ mod tests {
         };
         assert!(show(&mut view, &mut renderer, &meta));
         assert!(!show(&mut view, &mut renderer, &meta));
-        view.editor.insert("/");
+        view.draft.insert("/");
         assert!(show(&mut view, &mut renderer, &meta));
         view.menu().step(false);
         assert!(show(&mut view, &mut renderer, &meta));
@@ -183,7 +183,10 @@ mod tests {
         assert!(show(&mut view, &mut renderer, &meta));
         assert!(!show(&mut view, &mut renderer, &meta));
         // Moving the cursor changes no text or cell styles.
-        view.editor.left();
+        view.draft.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         assert!(show(&mut view, &mut renderer, &meta));
         // Metadata is outside View and is deliberately not registered anywhere.
         meta.yolo = true;

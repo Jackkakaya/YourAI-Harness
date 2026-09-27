@@ -4,15 +4,16 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{
-    sync::mpsc,
-    task::{JoinHandle, JoinSet},
-};
+use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
 use yourai_harness::Harness;
 
-type Stats = (Option<yourai_harness::runtime::ContextUsage>, Option<u64>);
+type Stats = (
+    Option<yourai_harness::runtime::ContextUsage>,
+    Option<u64>,
+    Result<Option<String>, YourAiError>,
+);
 pub(super) struct Runtime {
     pub h: Arc<Harness>,
     tx: mpsc::UnboundedSender<Out>,
@@ -22,7 +23,6 @@ pub(super) struct Runtime {
     compact: Option<JoinHandle<Option<Usage>>>,
     stats: Option<JoinHandle<Stats>>,
     stats_at: Instant,
-    titles: JoinSet<()>,
     limits: TurnLimits,
 }
 impl Runtime {
@@ -37,7 +37,6 @@ impl Runtime {
             compact: None,
             stats: None,
             stats_at: Instant::now() - Duration::from_secs(2),
-            titles: JoinSet::new(),
             limits,
         }
     }
@@ -94,28 +93,6 @@ impl Runtime {
                 })
         }));
     }
-    pub fn save_title(&mut self, title: String) {
-        let sessions = self.h.sessions.clone();
-        let id = self.h.host.context().id;
-        let tx = self.tx.clone();
-        self.titles.spawn(async move {
-            let saved = async {
-                let mut meta = sessions.load_session(&id).await?;
-                if meta.title.is_none() {
-                    meta.title = Some(title);
-                    sessions.save_session(&meta).await?;
-                }
-                Result::<(), YourAiError>::Ok(())
-            }
-            .await;
-            if let Err(e) = saved {
-                let _ = tx.send(Out::Notice {
-                    level: Level::Warning,
-                    message: format!("Session title not saved: {e}"),
-                });
-            }
-        });
-    }
     /// Only finished tasks are awaited here; storage and model work never hold
     /// the UI loop. Drain output before settling stream identities.
     pub async fn poll(&mut self, view: &mut View, first: Option<Out>) {
@@ -147,11 +124,11 @@ impl Runtime {
             self.h.host.status(),
             SessionStatus::Idle | SessionStatus::Closed
         );
-        if active && !view.active {
-            view.active = true;
-            view.since = Some(Instant::now());
+        if active && !view.session.active {
+            view.session.active = true;
+            view.session.since = Some(Instant::now());
         }
-        if !active && self.rx.is_empty() && (view.active || !view.asks_empty()) {
+        if !active && self.rx.is_empty() && (view.session.active || !view.asks_empty()) {
             view.idle();
         }
         if self.compact.as_ref().is_some_and(|t| t.is_finished()) {
@@ -161,25 +138,42 @@ impl Runtime {
                 _ => {}
             }
         }
-        while self.titles.try_join_next().is_some() {}
-        view.model_metrics = self.h.model_snapshot();
+        view.session.model_metrics = self.h.model_snapshot();
         if self.stats.is_none() && self.stats_at.elapsed() >= Duration::from_secs(1) {
             let host = self.h.host.clone();
             let usage = self.h.usage.clone();
             let id = host.context().id;
+            let h = self.h.clone();
+            let title = view.session.title.clone();
             self.stats = Some(tokio::spawn(async move {
                 let context = tokio::task::spawn_blocking(move || host.context_usage().ok())
                     .await
                     .ok()
                     .flatten();
                 let count = usage.session_usage(&id).await.ok().map(|u| u.request_count);
-                (context, count)
+                let title = match title {
+                    Some(title) => Ok(Some(title)),
+                    None => super::setup::restore_title(&h).await,
+                };
+                (context, count, title)
             }));
             self.stats_at = Instant::now();
         }
         if self.stats.as_ref().is_some_and(|t| t.is_finished()) {
-            let (context, count) = self.stats.take().unwrap().await.unwrap_or_default();
-            view.context_usage = context;
+            let (context, count, title) = match self.stats.take().unwrap().await {
+                Ok(stats) => stats,
+                Err(e) => {
+                    view.toast = Some((format!("Session refresh failed: {e}"), Instant::now()));
+                    return;
+                }
+            };
+            view.session.context_usage = context;
+            match title {
+                Ok(title) => view.session.title = title,
+                Err(e) => {
+                    view.toast = Some((format!("Session title unavailable: {e}"), Instant::now()))
+                }
+            }
             if let Some(count) = count {
                 view.set_response_count(count);
             }
@@ -189,7 +183,7 @@ impl Runtime {
         self.cancel.cancel();
         self.h.host.interrupt();
         if let Some(task) = self.stats.take() {
-            task.abort();
+            let _ = task.await;
         }
         if let Some(task) = self.compact.take() {
             let _ = task.await;
@@ -197,7 +191,134 @@ impl Runtime {
         if let Some(task) = self.driver.take() {
             let _ = task.await;
         }
-        while self.titles.join_next().await.is_some() {}
+        // A fast reply followed by immediate quit/switch may precede the first
+        // refresh. Finish title backfill from committed history before closing.
+        // A title failure must not discard pending inputs returned by close;
+        // the persisted messages allow the same backfill on the next open.
+        let _ = super::setup::restore_title(&self.h).await;
         self.h.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Runtime;
+    use crate::ui::{session, state::View};
+    use std::time::{Duration, Instant};
+    use yourai_core::prelude::*;
+
+    async fn refresh(runtime: &mut Runtime, view: &mut View) {
+        runtime.stats_at = Instant::now() - Duration::from_secs(2);
+        runtime.poll(view, None).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.stats.is_some() {
+                tokio::task::yield_now().await;
+                runtime.poll(view, None).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn title_write_failure_retries_from_committed_history_and_restores_consistently() {
+        let (_dir, mut controller, mut view) = session::fixture().await;
+        let h = controller.harness();
+        let context = h.host.context();
+        // A UI preview is not an admitted input and must never name a session.
+        view.user("uncommitted preview", false);
+        refresh(&mut controller.runtime, &mut view).await;
+        assert!(view.session.title.is_none());
+        h.sessions
+            .append_messages(
+                &context.id,
+                vec![
+                    StoredMessage::runtime_context("hook context"),
+                    StoredMessage::new(ChatMessage::user("  Actual   request\nsecond line")),
+                    StoredMessage::new(ChatMessage::user("later request")),
+                ],
+            )
+            .await
+            .unwrap();
+        let db = rusqlite::Connection::open(context.transcript_path.unwrap()).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_title BEFORE UPDATE OF title ON sessions BEGIN SELECT RAISE(FAIL, 'title write unavailable'); END;").unwrap();
+        refresh(&mut controller.runtime, &mut view).await;
+        assert!(view.session.title.is_none());
+        assert!(h
+            .sessions
+            .load_session(&context.id)
+            .await
+            .unwrap()
+            .title
+            .is_none());
+        assert!(view
+            .toast
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("title write unavailable"));
+        db.execute_batch("DROP TRIGGER fail_title;").unwrap();
+        refresh(&mut controller.runtime, &mut view).await;
+        assert_eq!(view.session.title.as_deref(), Some("Actual request"));
+        assert_eq!(
+            h.sessions.load_session(&context.id).await.unwrap().title,
+            view.session.title
+        );
+        let mut restored = View::default();
+        session::restore_history(&h, &mut restored).await.unwrap();
+        assert_eq!(restored.session.title, view.session.title);
+        controller.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_before_first_refresh_saves_committed_title() {
+        let (_dir, controller, view) = session::fixture().await;
+        let h = controller.harness();
+        let id = h.host.context().id;
+        h.sessions
+            .append_messages(
+                &id,
+                vec![StoredMessage::new(ChatMessage::user("quick reply"))],
+            )
+            .await
+            .unwrap();
+        assert!(view.session.title.is_none());
+        controller.close().await.unwrap();
+        assert_eq!(
+            h.sessions.load_session(&id).await.unwrap().title.as_deref(),
+            Some("quick reply")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_input_does_not_name_session() {
+        let (_dir, mut controller, mut view) = session::fixture().await;
+        let h = controller.harness();
+        let input = In::user_text_with_attachments(
+            "rejected request",
+            vec![UserAttachment::file("missing-file.png", None)],
+        );
+        assert!(controller.submit(input, &mut view));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                controller.poll(&mut view, None).await;
+                if h.host.queued() == 0 && matches!(h.host.status(), SessionStatus::Idle) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        refresh(&mut controller.runtime, &mut view).await;
+        assert!(view.session.title.is_none());
+        assert!(h
+            .sessions
+            .load_session(&h.host.context().id)
+            .await
+            .unwrap()
+            .title
+            .is_none());
+        controller.close().await.unwrap();
     }
 }

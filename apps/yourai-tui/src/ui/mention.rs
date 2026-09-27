@@ -14,7 +14,13 @@
 //! This is the SSH-safe path: it reads the local filesystem, not the clipboard,
 //! so it works inside OrbStack containers and remote shells.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 /// A single file entry in the mention list.
 #[derive(Clone)]
@@ -23,7 +29,7 @@ pub struct MentionEntry {
     pub display: String,
     /// Absolute path on disk.
     pub path: PathBuf,
-    /// True for directories (shown but not attachable).
+    /// Directories can be attached with Enter or explored with Tab.
     pub is_dir: bool,
 }
 
@@ -133,27 +139,64 @@ const MAX_DEPTH: usize = 4;
 /// A mention filesystem scan running off the UI thread. Delivers
 /// `(anchor, query, entries)`; stale results are discarded by comparing
 /// against the live mention state.
-pub(super) type Scan = tokio::task::JoinHandle<(usize, String, Vec<MentionEntry>)>;
-
-/// Abort any in-flight scan and start a fresh one for the current query.
-/// The scan itself is synchronous directory walking; `spawn_blocking` keeps
-/// it off the UI thread.
-pub(super) fn start_scan(task: &mut Option<Scan>, cwd: &Path, anchor: usize, query: String) {
-    if let Some(previous) = task.take() {
-        previous.abort();
+pub(super) struct Scan {
+    task: Option<tokio::task::JoinHandle<(usize, String, Vec<MentionEntry>)>>,
+    cancelled: Arc<AtomicBool>,
+}
+impl Scan {
+    pub fn start(cwd: &Path, anchor: usize, query: String) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = cancelled.clone();
+        let cwd = cwd.to_owned();
+        let task = tokio::task::spawn_blocking(move || {
+            let entries = scan_cancellable(&cwd, &query, &stop);
+            (anchor, query, entries)
+        });
+        Self {
+            task: Some(task),
+            cancelled,
+        }
     }
-    let cwd = cwd.to_path_buf();
-    *task = Some(tokio::task::spawn_blocking(move || {
-        let entries = scan(&cwd, &query);
-        (anchor, query, entries)
-    }));
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_some_and(|t| t.is_finished())
+    }
+    fn abort(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+    pub async fn finish(
+        mut self,
+    ) -> Result<(usize, String, Vec<MentionEntry>), tokio::task::JoinError> {
+        self.task.take().unwrap().await
+    }
+}
+impl Drop for Scan {
+    fn drop(&mut self) {
+        self.abort();
+    }
 }
 
+#[cfg(test)]
 pub fn scan(cwd: &Path, query: &str) -> Vec<MentionEntry> {
+    scan_cancellable(cwd, query, &AtomicBool::new(false))
+}
+
+fn scan_cancellable(cwd: &Path, query: &str, cancelled: &AtomicBool) -> Vec<MentionEntry> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     let mut scanned = 0;
-    scan_dir(cwd, cwd, query, 0, &mut scanned, &mut dirs, &mut files);
+    scan_dir(
+        cwd,
+        cwd,
+        query,
+        0,
+        &mut scanned,
+        &mut dirs,
+        &mut files,
+        cancelled,
+    );
     dirs.sort_by(|a, b| a.display.cmp(&b.display));
     files.sort_by(|a, b| a.display.cmp(&b.display));
     dirs.extend(files);
@@ -161,6 +204,7 @@ pub fn scan(cwd: &Path, query: &str) -> Vec<MentionEntry> {
     dirs
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_dir(
     cwd: &Path,
     dir: &Path,
@@ -169,8 +213,10 @@ fn scan_dir(
     scanned: &mut usize,
     dirs: &mut Vec<MentionEntry>,
     files: &mut Vec<MentionEntry>,
+    cancelled: &AtomicBool,
 ) {
-    if depth > MAX_DEPTH
+    if cancelled.load(Ordering::Relaxed)
+        || depth > MAX_DEPTH
         || *scanned >= MAX_SCANNED_ENTRIES
         || dirs.len() + files.len() >= MAX_ENTRIES
     {
@@ -180,7 +226,10 @@ fn scan_dir(
         return;
     };
     for entry in read_dir.flatten() {
-        if *scanned >= MAX_SCANNED_ENTRIES || dirs.len() + files.len() >= MAX_ENTRIES {
+        if cancelled.load(Ordering::Relaxed)
+            || *scanned >= MAX_SCANNED_ENTRIES
+            || dirs.len() + files.len() >= MAX_ENTRIES
+        {
             return;
         }
         *scanned += 1;
@@ -211,7 +260,16 @@ fn scan_dir(
         if !query.is_empty() && !display.to_lowercase().contains(&query.to_lowercase()) {
             // Even if the directory itself does not match, a child might.
             if is_dir && depth < MAX_DEPTH {
-                scan_dir(cwd, &path, query, depth + 1, scanned, dirs, files);
+                scan_dir(
+                    cwd,
+                    &path,
+                    query,
+                    depth + 1,
+                    scanned,
+                    dirs,
+                    files,
+                    cancelled,
+                );
             }
             continue;
         }
@@ -222,7 +280,16 @@ fn scan_dir(
                 is_dir: true,
             });
             // Recurse into matching directories too.
-            scan_dir(cwd, &path, query, depth + 1, scanned, dirs, files);
+            scan_dir(
+                cwd,
+                &path,
+                query,
+                depth + 1,
+                scanned,
+                dirs,
+                files,
+                cancelled,
+            );
         } else {
             files.push(MentionEntry {
                 display,

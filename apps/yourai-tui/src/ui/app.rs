@@ -5,20 +5,19 @@
 use super::{
     clipboard, commands,
     frame_time::FrameTime,
-    mention,
     overlay::{Action as OverlayAction, Overlay},
     presentation::Canvas,
     render::{Hit, Metadata, Renderer},
     session::{Controller, Reply, Target},
-    state::{self, PendingAttachment, View},
+    state::{self, View},
     theme,
 };
-use crate::{config::Error, models::ModelChoice};
+use crate::config::Error;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::prelude::{Position, Rect};
-use std::{path::PathBuf, time::Instant};
+use std::time::Instant;
 use tokio::task::JoinHandle;
 use yourai_core::prelude::*;
 
@@ -36,40 +35,21 @@ pub(super) struct App {
     view: View,
     meta: Metadata,
     renderer: Renderer,
-    /// `/models` picker entries (id + variant), distinct from the label list
-    /// kept on the view.
-    choices: Vec<ModelChoice>,
     clipboard_task: Option<JoinHandle<std::io::Result<()>>>,
-    /// In-flight clipboard image read (Ctrl+V or empty bracketed paste).
-    image_task: Option<JoinHandle<std::io::Result<Option<clipboard::ClipboardImage>>>>,
-    /// In-flight `@` mention filesystem scan; at most one at a time, aborted
-    /// and replaced whenever the query changes.
-    mention_scan: Option<mention::Scan>,
-    /// Scan root; refreshed when a session switch lands (the cwd may change).
-    cwd: PathBuf,
-    /// The TaskBoard version already reflected in `view.todos`; None means
+    /// The TaskBoard version already reflected in `view.session.todos`; None means
     /// the next sync must run (also reset on session switch).
     synced_todos: Option<u64>,
 }
 
 impl App {
-    pub(super) fn new(
-        controller: Controller,
-        view: View,
-        meta: Metadata,
-        choices: Vec<ModelChoice>,
-    ) -> Self {
-        let cwd = controller.harness().host.context().cwd.clone();
+    pub(super) fn new(controller: Controller, mut view: View, meta: Metadata) -> Self {
+        view.draft.set_cwd(&controller.harness().host.context().cwd);
         Self {
             renderer: Renderer::default(),
             controller,
             view,
             meta,
-            choices,
             clipboard_task: None,
-            image_task: None,
-            mention_scan: None,
-            cwd,
             synced_todos: None,
         }
     }
@@ -88,7 +68,7 @@ impl App {
             let context = self.controller.harness().host.context();
             self.meta.session = context.id.0;
             self.meta.cwd = context.cwd.to_string_lossy().into();
-            self.cwd = context.cwd.clone();
+            self.view.draft.set_cwd(&context.cwd);
             self.renderer = Renderer::default();
             self.synced_todos = None;
         }
@@ -135,7 +115,7 @@ impl App {
                         completed: t.completed,
                     })
                     .collect();
-                self.view.todos.set(todos);
+                self.view.session.todos.set(todos);
             }
         }
     }
@@ -156,89 +136,9 @@ impl App {
         }
     }
 
-    /// Deliver a finished mention scan: stale results (the query moved on)
-    /// are dropped; fresh ones populate the popup and reset the selection.
-    pub(super) async fn settle_mention(&mut self) {
-        if self.mention_scan.as_ref().is_some_and(|t| t.is_finished()) {
-            if let Ok((anchor, query, entries)) = self.mention_scan.take().unwrap().await {
-                if self.view.mention.active
-                    && self.view.mention.anchor == anchor
-                    && self.view.mention.query == query
-                {
-                    self.view.mention.entries = entries;
-                    self.view.mention.selected = 0;
-                }
-            }
-        }
-    }
-
-    /// Reap a finished clipboard image read into the staging list.
-    pub(super) async fn settle_image(&mut self) {
-        if self.image_task.as_ref().is_some_and(|t| t.is_finished()) {
-            let outcome = self.image_task.take().unwrap().await;
-            match outcome {
-                Ok(Ok(Some(img))) => self.stage_clipboard_image(img),
-                Ok(Ok(None)) => {
-                    self.view.notice(Level::Info, "No image in clipboard.");
-                }
-                Ok(Err(e)) => {
-                    self.view
-                        .notice(Level::Error, format!("Clipboard read failed: {e}"));
-                }
-                Err(e) => {
-                    self.view
-                        .notice(Level::Error, format!("Clipboard read failed: {e}"));
-                }
-            }
-        }
-    }
-
-    /// Start an image read off the UI thread; `settle_image` stages the
-    /// result or reports the outcome.
-    fn read_clipboard_image(&mut self) {
-        if let Some(previous) = self.image_task.take() {
-            previous.abort();
-        }
-        self.image_task = Some(tokio::spawn(clipboard::read_image()));
-    }
-
-    /// Stage a clipboard image: empty marker → always sent with the next
-    /// submit.
-    fn stage_clipboard_image(&mut self, img: clipboard::ClipboardImage) {
-        let n = self.view.pending_attachments.len() + 1;
-        let mime = img.mime.clone();
-        self.view.pending_attachments.push(PendingAttachment {
-            marker: String::new(),
-            attachment: UserAttachment::base64(
-                img.mime,
-                img.data,
-                Some(format!("clipboard-{n}.png")),
-            ),
-        });
-        self.view.notice(
-            Level::Info,
-            format!("Image attached ({mime}). Enter to send, Esc to clear."),
-        );
-    }
-
-    /// Re-detect the @ mention state after an editor mutation. Rescans only
-    /// when the mention actually moved or changed — cursor moves within the
-    /// same query must not hit the disk or reset the selection.
-    fn sync_mention(&mut self) {
-        if let Some((anchor, query)) =
-            mention::MentionState::detect(&self.view.editor.text, self.view.editor.cursor)
-        {
-            if !self.view.mention.active
-                || self.view.mention.anchor != anchor
-                || self.view.mention.query != query
-            {
-                self.view.mention.activate(anchor, &query);
-                self.view.mention.entries.clear();
-                let cwd = self.cwd.clone();
-                mention::start_scan(&mut self.mention_scan, &cwd, anchor, query);
-            }
-        } else if self.view.mention.active {
-            self.view.mention.deactivate();
+    pub(super) async fn settle_draft(&mut self) {
+        if let Some((level, message)) = self.view.draft.poll().await {
+            self.view.notice(level, message);
         }
     }
 
@@ -273,6 +173,7 @@ impl App {
         if let Some(task) = self.clipboard_task.take() {
             task.abort();
         }
+        drop(self.view); // Cancel draft-owned work before waiting for session shutdown.
         self.controller.close().await
     }
 
@@ -296,85 +197,13 @@ impl App {
             self.renderer.selection.clear();
             return Flow::Continue;
         }
-        // No selection: Esc drops staged attachments before falling through
-        // to the interrupt handler.
-        if key.code == KeyCode::Esc && !self.view.pending_attachments.is_empty() {
-            self.view.pending_attachments.clear();
-            self.view.notice(Level::Info, "Attachments cleared.");
-            return Flow::Continue;
-        }
         self.renderer.selection.clear();
-        if let Some(action) = self.view.overlay.key(key, self.choices.len()) {
+        if let Some(action) = self.view.overlay.key(key, self.view.model_choices.len()) {
             self.overlay_action(action);
             return Flow::Continue;
         }
-        // ── @ mention autocomplete ───────────────────────
-        // When active, intercept navigation keys before the command menu or
-        // the editor sees them.
-        if self.view.mention.active && self.view.asks_empty() && !ctrl && !alt {
-            match key.code {
-                KeyCode::Up => {
-                    self.view.mention.step(true);
-                    return Flow::Continue;
-                }
-                KeyCode::Down => {
-                    self.view.mention.step(false);
-                    return Flow::Continue;
-                }
-                KeyCode::Esc => {
-                    self.view.mention.deactivate();
-                    return Flow::Continue;
-                }
-                KeyCode::Tab => {
-                    let entry = self.view.mention.current().cloned();
-                    match entry {
-                        None => return Flow::Continue,
-                        Some(entry) if entry.is_dir => {
-                            // Tab on directory: expand (down-drill).
-                            let replace = format!("@{}", entry.display);
-                            let anchor = self.view.mention.anchor;
-                            let end = anchor + 1 + self.view.mention.query.len();
-                            self.view
-                                .editor
-                                .replace_range(anchor..end, &format!("{replace}/"));
-                            self.sync_mention();
-                            return Flow::Continue;
-                        }
-                        // Tab on file: same as Enter (select) — fall through.
-                        Some(_) => {}
-                    }
-                }
-                KeyCode::Enter => {}
-                _ => return Flow::Continue,
-            }
-            // ── File/directory selection (Tab or Enter) ──
-            // Both stage a file reference: the editor keeps a short `@path`
-            // marker, the harness reads the file (text window, image
-            // normalization, directory listing) at submit time. No content is
-            // inlined here.
-            if let Some(entry) = self.view.mention.current().cloned() {
-                let display = entry.display.clone();
-                let anchor = self.view.mention.anchor;
-                let end = anchor + 1 + self.view.mention.query.len();
-                self.view.mention.deactivate();
-                self.view
-                    .editor
-                    .replace_range(anchor..end, &format!("@{display} "));
-                let marker = format!("@{display}");
-                // Re-attaching replaces the previous staging for the same
-                // marker instead of duplicating.
-                self.view.pending_attachments.retain(|a| a.marker != marker);
-                self.view.pending_attachments.push(PendingAttachment {
-                    marker,
-                    attachment: UserAttachment::file(
-                        entry.path.to_string_lossy().into_owned(),
-                        None,
-                    ),
-                });
-                self.view
-                    .notice(Level::Info, format!("Attached {display}. Esc to clear."));
-                return Flow::Continue;
-            }
+        if self.view.asks_empty() && self.view.draft.intercept(key) {
+            return Flow::Continue;
         }
         let commands = self.view.menu().items();
         if !commands.is_empty() && !ctrl && !alt {
@@ -393,10 +222,10 @@ impl App {
                 }
                 KeyCode::Tab | KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                     let command = commands[self.view.menu().selected.min(commands.len() - 1)];
-                    self.view.editor.take();
-                    self.view.editor.insert(command.text);
+                    self.view.draft.set_text("");
+                    self.view.draft.insert(command.text);
                     if command.argument {
-                        self.view.editor.insert(" ");
+                        self.view.draft.insert(" ");
                     }
                     if key.code == KeyCode::Tab || command.argument {
                         return Flow::Continue;
@@ -419,25 +248,21 @@ impl App {
             KeyCode::F(6) => {
                 self.view
                     .select_next(key.modifiers.contains(KeyModifiers::SHIFT));
-                self.view.navigation.reveal(self.view.selected());
+                self.view.session.navigation.reveal(self.view.selected());
             }
             KeyCode::Char('t') if ctrl => {
-                self.view.todos.panel = !self.view.todos.panel;
+                self.view.session.todos.panel = !self.view.session.todos.panel;
             }
             KeyCode::Char('o') if ctrl => {
                 self.view.toggle_recent(false);
-                self.view.navigation.reveal(self.view.selected());
+                self.view.session.navigation.reveal(self.view.selected());
             }
             KeyCode::Char('r') if ctrl => {
                 self.view.toggle_recent(true);
-                self.view.navigation.reveal(self.view.selected());
+                self.view.session.navigation.reveal(self.view.selected());
             }
             KeyCode::Char('b') if ctrl => self.view.overlay = Overlay::Stats { scroll: 0 },
             KeyCode::Char('y') if ctrl => self.view.theme = self.view.theme.next(),
-            // Ctrl+V: paste an image from the clipboard. Text paste still
-            // arrives via bracketed-paste Event::Paste; this reads image data
-            // that bracketed paste cannot carry.
-            KeyCode::Char('v') if ctrl => self.read_clipboard_image(),
             KeyCode::Home if ctrl => self.renderer.latest_turn(&mut self.view),
             KeyCode::Up if ctrl => {
                 self.renderer.jump_turn(&mut self.view, true);
@@ -462,8 +287,8 @@ impl App {
                     ask.scroll = ask.scroll.saturating_add(5);
                 }
             }
-            KeyCode::PageUp if alt => self.view.todos.nudge(5, true),
-            KeyCode::PageDown if alt => self.view.todos.nudge(5, false),
+            KeyCode::PageUp if alt => self.view.session.todos.nudge(5, true),
+            KeyCode::PageDown if alt => self.view.session.todos.nudge(5, false),
             KeyCode::PageUp => self.renderer.scroll(&mut self.view, 10, true),
             KeyCode::PageDown => self.renderer.scroll(&mut self.view, 10, false),
             KeyCode::Esc | KeyCode::Char('c') if key.code == KeyCode::Esc || ctrl => {
@@ -482,9 +307,7 @@ impl App {
                 if let Some(ask) = self.view.ask_mut() {
                     ask.editor.key(key);
                 } else {
-                    self.view.editor.key(key);
-                    // After each keystroke, check for an @ mention trigger.
-                    self.sync_mention();
+                    self.view.draft.key(key);
                 }
             }
         }
@@ -525,14 +348,14 @@ impl App {
     /// terminals cannot paste images as text); best-effort image read so
     /// Ctrl+V also works when the terminal intercepts it.
     fn paste(&mut self, text: &str) {
-        if text.is_empty() {
-            self.read_clipboard_image();
-        } else if self.view.overlay.is_open() {
+        if self.view.overlay.is_open() {
             self.view.overlay.paste(text);
         } else if let Some(ask) = self.view.ask_mut() {
             ask.editor.insert(text);
+        } else if text.is_empty() {
+            self.view.draft.read_image();
         } else {
-            self.view.editor.insert(text);
+            self.view.draft.insert(text);
         }
     }
 
@@ -562,8 +385,8 @@ impl App {
             }
             return Flow::Continue;
         }
-        let text = self.view.editor.text.clone();
-        if text.trim().is_empty() && self.view.pending_attachments.is_empty() {
+        let text = self.view.draft.text().to_owned();
+        if self.view.draft.is_empty() {
             return Flow::Continue;
         }
         // Command dispatch: parse in commands.rs, side effects here.
@@ -573,16 +396,16 @@ impl App {
             Some(commands::Parsed::Quit) => return Flow::Quit,
             Some(commands::Parsed::Help) => {
                 self.view.overlay = Overlay::Help { scroll: 0 };
-                self.view.editor.take();
+                self.view.draft.set_text("");
                 return Flow::Continue;
             }
             Some(commands::Parsed::Status) => {
                 self.view.overlay = Overlay::Stats { scroll: 0 };
-                self.view.editor.take();
+                self.view.draft.set_text("");
                 return Flow::Continue;
             }
             Some(commands::Parsed::New) => {
-                self.view.editor.take();
+                self.view.draft.set_text("");
                 self.controller.switch(Target::New, &mut self.view);
                 return Flow::Continue;
             }
@@ -598,13 +421,13 @@ impl App {
                         return Flow::Continue;
                     }
                 };
-                self.view.editor.take();
+                self.view.draft.set_text("");
                 self.set_yolo(enabled);
                 return Flow::Continue;
             }
             Some(commands::Parsed::Continue) => {
                 self.controller.resume(&mut self.view);
-                self.view.editor.take();
+                self.view.draft.set_text("");
                 return Flow::Continue;
             }
             Some(commands::Parsed::Theme(name)) => {
@@ -625,11 +448,11 @@ impl App {
                         ),
                     },
                 }
-                self.view.editor.take();
+                self.view.draft.set_text("");
                 return Flow::Continue;
             }
             Some(commands::Parsed::Models { id, variant }) => {
-                self.view.editor.take();
+                self.view.draft.set_text("");
                 match id {
                     None => self.view.overlay = Overlay::Models(0),
                     Some(model_id) => {
@@ -639,12 +462,12 @@ impl App {
                 return Flow::Continue;
             }
             Some(commands::Parsed::Sessions) => {
-                self.view.editor.take();
+                self.view.draft.set_text("");
                 self.controller.list(&mut self.view);
                 return Flow::Continue;
             }
             Some(commands::Parsed::Compact) => {
-                self.view.editor.take();
+                self.view.draft.set_text("");
                 self.controller.compact(&mut self.view);
                 return Flow::Continue;
             }
@@ -665,7 +488,12 @@ impl App {
             Some(body) => (true, body),
             None => (false, text.clone()),
         };
-        let atts = self.view.attachments_for(&text);
+        if self.view.draft.reading_image() {
+            self.view
+                .notice(Level::Info, "Reading clipboard image; wait before sending.");
+            return Flow::Continue;
+        }
+        let atts = self.view.draft.attachments();
         let n_images = atts
             .iter()
             .filter(|a| matches!(a.data, AttachmentData::Base64(_)))
@@ -694,9 +522,7 @@ impl App {
         if self.controller.submit(input, &mut self.view) {
             // Clear attachments only after a successful submit, so a failure
             // (e.g. turn-in-flight rejection) preserves them for retry.
-            self.view.pending_attachments.clear();
-            self.view.editor.remember(&text);
-            self.view.editor.take();
+            self.view.draft.submitted();
             let mut display = body.clone();
             if n_images > 0 {
                 display.push_str(&format!(" [img×{n_images}]"));
@@ -706,9 +532,6 @@ impl App {
             }
             self.view.user(&display, queued);
             self.view.follow();
-            if let Some(title) = self.view.note_title(&body) {
-                self.controller.save_title(title);
-            }
         }
         Flow::Continue
     }
@@ -717,7 +540,7 @@ impl App {
         match action {
             OverlayAction::None => {}
             OverlayAction::Model(index) => {
-                if let Some(choice) = self.choices.get(index) {
+                if let Some(choice) = self.view.model_choices.get(index) {
                     self.controller.model(
                         choice.id.clone(),
                         choice.variant.clone(),
@@ -784,13 +607,13 @@ pub(super) fn click_dispatch(renderer: &mut Renderer, view: &mut View, x: u16, y
             view.follow();
         }
         Some(Hit::Command(command)) => {
-            view.editor.take();
-            view.editor.insert(command.text);
+            view.draft.set_text("");
+            view.draft.insert(command.text);
             if command.argument {
-                view.editor.insert(" ");
+                view.draft.insert(" ");
             }
         }
-        Some(Hit::TodoToggle) => view.todos.panel = !view.todos.panel,
+        Some(Hit::TodoToggle) => view.session.todos.panel = !view.session.todos.panel,
         Some(Hit::Block(id)) => {
             renderer.anchor(view, id, y);
             view.toggle(id);
@@ -802,8 +625,8 @@ pub(super) fn click_dispatch(renderer: &mut Renderer, view: &mut View, x: u16, y
 /// Route a wheel event: the Todo panel scrolls its own list (when visible),
 /// everything else scrolls the transcript; reaching the bottom re-follows.
 pub(super) fn wheel_dispatch(renderer: &mut Renderer, view: &mut View, x: u16, y: u16, up: bool) {
-    if renderer.wheel_on_todo(x, y, view.todos.panel) {
-        view.todos.nudge(1, up);
+    if renderer.wheel_on_todo(x, y, view.session.todos.panel) {
+        view.session.todos.nudge(1, up);
     } else {
         renderer.scroll(view, 3, up);
     }
@@ -866,7 +689,7 @@ mod tests {
             trusted_shell: false,
             yolo: false,
         };
-        let app = App::new(controller, view, meta, vec![]);
+        let app = App::new(controller, view, meta);
         (dir, app)
     }
     fn last_notice(view: &View) -> Option<(Level, &str)> {
@@ -890,7 +713,7 @@ mod tests {
     async fn plain_keys_edit_the_draft() {
         let (_dir, mut app) = fixture().await;
         type_text(&mut app, "hello world");
-        assert_eq!(app.view.editor.text, "hello world");
+        assert_eq!(app.view.draft.text(), "hello world");
         // Release events and resizes never reach the editor.
         app.handle(Event::Key(KeyEvent {
             code: KeyCode::Char('x'),
@@ -898,7 +721,7 @@ mod tests {
             kind: KeyEventKind::Release,
             state: crossterm::event::KeyEventState::NONE,
         }));
-        assert_eq!(app.view.editor.text, "hello world");
+        assert_eq!(app.view.draft.text(), "hello world");
         app.close().await.unwrap();
     }
 
@@ -915,7 +738,7 @@ mod tests {
         // An empty draft submits nothing.
         let (_dir3, mut app3) = fixture().await;
         assert_eq!(app3.handle(key(KeyCode::Enter)), Flow::Continue);
-        assert_eq!(app3.view.editor.text, "");
+        assert_eq!(app3.view.draft.text(), "");
         assert!(app3.view.items().is_empty());
     }
 
@@ -953,7 +776,7 @@ mod tests {
         let (_dir, mut app) = fixture().await;
         assert_eq!(app.handle(alt(KeyCode::Char('c'))), Flow::Continue);
         // Nothing was selected: no clipboard task, no 'c' in the draft.
-        assert_eq!(app.view.editor.text, "");
+        assert_eq!(app.view.draft.text(), "");
         assert!(app.clipboard_task.is_none());
         app.close().await.unwrap();
     }
@@ -965,7 +788,7 @@ mod tests {
         app.handle(key(KeyCode::Enter));
         // The completion filled "/help" and fell through to the submit path.
         assert!(matches!(app.view.overlay, Overlay::Help { .. }));
-        assert_eq!(app.view.editor.text, "");
+        assert_eq!(app.view.draft.text(), "");
         app.close().await.unwrap();
     }
 
@@ -974,13 +797,13 @@ mod tests {
         let (_dir, mut app) = fixture().await;
         type_text(&mut app, "/the");
         app.handle(key(KeyCode::Tab));
-        assert_eq!(app.view.editor.text, "/theme");
+        assert_eq!(app.view.draft.text(), "/theme");
         assert!(!app.view.overlay.is_open());
-        app.view.editor.take();
+        app.view.draft.set_text("");
         type_text(&mut app, "/qu");
         app.handle(key(KeyCode::Enter));
         // /queue takes an argument: Enter completes it but does not submit.
-        assert_eq!(app.view.editor.text, "/queue ");
+        assert_eq!(app.view.draft.text(), "/queue ");
         assert!(app.view.items().is_empty());
         app.close().await.unwrap();
     }
@@ -994,7 +817,7 @@ mod tests {
             last_notice(&app.view),
             Some((Level::Warning, "Unknown command. /help lists commands."))
         );
-        assert_eq!(app.view.editor.text, "/nope");
+        assert_eq!(app.view.draft.text(), "/nope");
         app.close().await.unwrap();
     }
 
@@ -1008,8 +831,8 @@ mod tests {
             Some((Level::Warning, "Usage: /yolo [on|off]"))
         );
         // A usage error keeps the draft for editing, like unknown commands.
-        assert_eq!(app.view.editor.text, "/yolo junk");
-        app.view.editor.take();
+        assert_eq!(app.view.draft.text(), "/yolo junk");
+        app.view.draft.set_text("");
         type_text(&mut app, "/yolo on");
         app.handle(key(KeyCode::Enter));
         assert!(app.controller.yolo());
@@ -1024,7 +847,7 @@ mod tests {
             false,
         );
         assert!(app.meta.yolo);
-        assert_eq!(app.view.editor.text, "");
+        assert_eq!(app.view.draft.text(), "");
         app.close().await.unwrap();
     }
 
@@ -1033,14 +856,14 @@ mod tests {
         let (_dir, mut app) = fixture().await;
         type_text(&mut app, "first task");
         app.handle(key(KeyCode::Enter));
-        assert_eq!(app.view.editor.text, "");
+        assert_eq!(app.view.draft.text(), "");
         assert!(app.view.items().iter().any(|i| matches!(
             i,
             Item::Text { role: Role::User, text } if text.contains("first task")
         )));
         // Ctrl-P recalls the remembered draft.
         app.handle(ctrl(KeyCode::Char('p')));
-        assert_eq!(app.view.editor.text, "first task");
+        assert_eq!(app.view.draft.text(), "first task");
         app.close().await.unwrap();
     }
 
@@ -1054,7 +877,7 @@ mod tests {
         type_text(&mut app, "draft typed while opening");
         finish(&mut app).await;
         assert_ne!(app.controller.harness().host.context().id, old);
-        assert_eq!(app.view.editor.text, "draft typed while opening");
+        assert_eq!(app.view.draft.text(), "draft typed while opening");
         assert_ne!(app.meta.session, old.0);
         app.close().await.unwrap();
     }
@@ -1065,7 +888,7 @@ mod tests {
         let tasks = app.controller.harness().tasks.clone().unwrap();
         app.sync_todos();
         let cached = app.synced_todos;
-        assert!(app.view.todos.is_empty());
+        assert!(app.view.session.todos.is_empty());
         // An unchanged board is not re-copied.
         app.sync_todos();
         assert_eq!(app.synced_todos, cached);
@@ -1076,8 +899,11 @@ mod tests {
             .unwrap();
         app.sync_todos();
         assert_ne!(app.synced_todos, cached);
-        assert_eq!(app.view.todos.items().len(), 1);
-        assert_eq!(app.view.todos.items()[0].text, "write the regression first");
+        assert_eq!(app.view.session.todos.items().len(), 1);
+        assert_eq!(
+            app.view.session.todos.items()[0].text,
+            "write the regression first"
+        );
         app.close().await.unwrap();
     }
 
@@ -1091,16 +917,102 @@ mod tests {
             selected: 0,
         });
         app.handle(Event::Paste("previous ".into()));
-        assert_eq!(app.view.editor.text, "");
+        assert_eq!(app.view.draft.text(), "");
         // Esc closes the picker; paste then lands in the draft editor.
         app.handle(key(KeyCode::Esc));
         assert!(!app.view.overlay.is_open());
         app.handle(Event::Paste("draft".into()));
-        assert_eq!(app.view.editor.text, "draft");
+        assert_eq!(app.view.draft.text(), "draft");
         // Mouse events never reach the transcript while a modal is open.
         app.view.overlay = Overlay::Help { scroll: 0 };
         app.handle(mouse(MouseEventKind::Down(MouseButton::Left), 40, 10));
         assert!(!app.renderer.selection.active());
+        app.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn review_mention_allows_typing_query() {
+        let (_dir, mut app) = fixture().await;
+        type_text(&mut app, "@src");
+        assert_eq!(app.view.draft.text(), "@src");
+    }
+    #[tokio::test]
+    async fn review_paste_refreshes_mention_query() {
+        let (_dir, mut app) = fixture().await;
+        type_text(&mut app, "@");
+        app.handle(Event::Paste("src".into()));
+        assert_eq!(app.view.draft.mention().query, "src");
+    }
+    #[tokio::test]
+    async fn review_overlay_escape_preserves_draft_attachment() {
+        let (_dir, mut app) = fixture().await;
+        app.view
+            .draft
+            .stage_image(super::clipboard::ClipboardImage {
+                mime: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            });
+        app.handle(key(KeyCode::F(1)));
+        app.handle(key(KeyCode::Esc));
+        assert_eq!(app.view.draft.attachments().len(), 1);
+        assert!(!app.view.overlay.is_open());
+    }
+    #[tokio::test]
+    async fn review_switch_preserves_whole_draft() {
+        let (_dir, mut app) = fixture().await;
+        type_text(&mut app, "/new");
+        app.handle(key(KeyCode::Enter));
+        type_text(&mut app, "draft typed while opening");
+        app.view
+            .draft
+            .stage_image(super::clipboard::ClipboardImage {
+                mime: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            });
+        finish(&mut app).await;
+        assert_eq!(app.view.draft.text(), "draft typed while opening");
+        assert_eq!(app.view.draft.attachments().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_input_uses_normal_history_without_overwriting_new_edits() {
+        let (_dir, mut app) = fixture().await;
+        type_text(&mut app, "inspect image");
+        app.view
+            .draft
+            .stage_image(super::clipboard::ClipboardImage {
+                mime: "image/png".into(),
+                data: "invalid".into(),
+            });
+        app.handle(key(KeyCode::Enter));
+        type_text(&mut app, "new unsent draft");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                app.poll(None).await;
+                if matches!(last_notice(&app.view), Some((Level::Warning, text)) if text.starts_with("Input rejected:")) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert_eq!(app.view.draft.text(), "new unsent draft");
+        app.handle(key(KeyCode::Up));
+        assert_eq!(app.view.draft.text(), "inspect image");
+        assert_eq!(
+            app.view.draft.attachments()[0].name.as_deref(),
+            Some("clipboard-1.png")
+        );
+        app.handle(key(KeyCode::Down));
+        assert_eq!(app.view.draft.text(), "new unsent draft");
+        assert!(app.view.draft.attachments().is_empty());
+        app.handle(ctrl(KeyCode::Char('u')));
+        type_text(&mut app, "/new");
+        app.handle(key(KeyCode::Enter));
+        finish(&mut app).await;
+        app.handle(key(KeyCode::Up));
+        assert_eq!(app.view.draft.text(), "inspect image");
+        assert_eq!(app.view.draft.attachment_counts(), (1, 0));
+        // No rejection-specific copy in history: a second Up stays at this input.
+        app.handle(key(KeyCode::Up));
+        app.handle(key(KeyCode::Down));
+        assert_eq!(app.view.draft.text(), "");
         app.close().await.unwrap();
     }
 }

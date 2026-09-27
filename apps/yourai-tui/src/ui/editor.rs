@@ -21,13 +21,10 @@ fn classify(g: &str) -> WordClass {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Editor {
     pub text: String,
     pub cursor: usize,
-    history: Vec<String>,
-    position: Option<usize>,
-    draft: String,
 }
 impl Editor {
     pub fn insert(&mut self, text: &str) {
@@ -236,47 +233,9 @@ impl Editor {
             self.cursor += g.len();
         }
     }
-    pub fn set(&mut self, text: String) {
-        self.text = text;
-        self.cursor = self.text.len();
-    }
     pub fn take(&mut self) -> String {
         self.cursor = 0;
-        self.position = None;
         std::mem::take(&mut self.text)
-    }
-    pub fn remember(&mut self, text: &str) {
-        if !text.is_empty() && self.history.last().is_none_or(|s| s != text) {
-            self.history.push(text.into());
-        }
-        if self.history.len() > 100 {
-            self.history.remove(0);
-        }
-        self.position = None;
-    }
-    pub fn history(&mut self, previous: bool) {
-        if self.history.is_empty() {
-            return;
-        }
-        if previous {
-            let n = match self.position {
-                Some(n) => n.saturating_sub(1),
-                None => {
-                    self.draft = self.text.clone();
-                    self.history.len() - 1
-                }
-            };
-            self.position = Some(n);
-            self.set(self.history[n].clone());
-        } else if let Some(n) = self.position {
-            if n + 1 < self.history.len() {
-                self.position = Some(n + 1);
-                self.set(self.history[n + 1].clone());
-            } else {
-                self.position = None;
-                self.set(self.draft.clone());
-            }
-        }
     }
     /// Wrapped editor lines and the cursor cell, using the same grapheme layout.
     pub fn layout(&self, width: usize) -> (Vec<String>, usize, usize) {
@@ -308,7 +267,7 @@ impl Editor {
         }
         (lines, cursor.0, cursor.1)
     }
-    /// The readline keymap: history on Ctrl-P/N and edge-of-buffer Up/Down,
+    /// The readline text-editing keymap. Draft owns input history.
     /// word movement on Alt-B/F and Ctrl-Left/Right, unix kill commands, and
     /// plain insertion. Input interpretation lives on the interpreted type,
     /// mirroring `Overlay::key`.
@@ -325,25 +284,8 @@ impl Editor {
             {
                 self.insert("\n")
             }
-            // History navigation: Ctrl-P / Ctrl-N (readline) and Up / Down when
-            // the cursor sits on the first / last logical line (shell behaviour).
-            // In the middle of a multiline buffer, Up / Down move across rows.
-            KeyCode::Char('p') if ctrl => self.history(true),
-            KeyCode::Char('n') if ctrl => self.history(false),
-            KeyCode::Up => {
-                if self.on_first_line() {
-                    self.history(true);
-                } else {
-                    self.vertical(-1);
-                }
-            }
-            KeyCode::Down => {
-                if self.on_last_line() {
-                    self.history(false);
-                } else {
-                    self.vertical(1);
-                }
-            }
+            KeyCode::Up => self.vertical(-1),
+            KeyCode::Down => self.vertical(1),
             // Word-level movement (Alt-B/F, Ctrl-Left/Right).
             KeyCode::Left if ctrl || alt => self.word_left(),
             KeyCode::Right if ctrl || alt => self.word_right(),
@@ -416,16 +358,6 @@ mod tests {
         assert_eq!(e.cursor, "before @文件 ".len());
     }
 
-    #[test]
-    fn history_restores_draft() {
-        let mut e = Editor::default();
-        e.remember("old");
-        e.insert("draft");
-        e.history(true);
-        assert_eq!(e.text, "old");
-        e.history(false);
-        assert_eq!(e.text, "draft");
-    }
     #[test]
     fn wrapping_cursor_and_vertical_movement() {
         let mut e = Editor::default();
@@ -526,46 +458,5 @@ mod tests {
         e.vertical(-1);
         assert!(e.on_first_line());
         assert!(!e.on_last_line());
-    }
-    #[test]
-    fn up_down_history_only_on_boundary_lines() {
-        let mut e = Editor::default();
-        e.remember("older");
-        // Single line: Up navigates history.
-        e.insert("draft");
-        assert!(e.on_first_line() && e.on_last_line());
-        // emulate `edit` Up handler
-        if e.on_first_line() {
-            e.history(true);
-        } else {
-            e.vertical(-1);
-        }
-        assert_eq!(e.text, "older");
-        if e.on_last_line() {
-            e.history(false);
-        } else {
-            e.vertical(1);
-        }
-        assert_eq!(e.text, "draft");
-        // Multiline: Up on second line moves cursor, not history.
-        let mut e = Editor::default();
-        e.remember("older");
-        e.insert("line1\nline2");
-        assert_eq!(e.cursor, "line1\nline2".len());
-        // cursor on last line; Up should move to first line.
-        if e.on_first_line() {
-            e.history(true);
-        } else {
-            e.vertical(-1);
-        }
-        assert_eq!(e.cursor, "line1".len());
-        assert_eq!(e.text, "line1\nline2");
-        // Now on first line; Up navigates history.
-        if e.on_first_line() {
-            e.history(true);
-        } else {
-            e.vertical(-1);
-        }
-        assert_eq!(e.text, "older");
     }
 }

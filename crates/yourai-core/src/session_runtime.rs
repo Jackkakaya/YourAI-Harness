@@ -56,13 +56,7 @@ pub enum SessionStatus {
     Closed,
 }
 
-/// 输入未被接纳时归还所有权。宿主不得既返回本错误又把输入留在队列。
-#[derive(Debug, thiserror::Error)]
-#[error("session input rejected: {reason}")]
-pub struct InputRejected {
-    pub input: In,
-    pub reason: String,
-}
+pub use crate::protocol::InputRejected;
 
 /// 一个已结束 Turn 的报告；执行故障也在 result 中，而不是 run_next 的外层 Err。
 #[derive(Debug)]

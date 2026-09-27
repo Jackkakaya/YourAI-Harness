@@ -16,6 +16,9 @@ pub struct TurnOutput {
     pub text: String,
     pub usage: Option<crate::protocol::Usage>,
     pub pending: Vec<crate::protocol::In>,
+    /// Inputs explicitly rejected before history commit, not pending retries.
+    /// Streaming callers see the same records via Out::InputRejected.
+    pub rejected: Vec<crate::protocol::InputRejected>,
 }
 
 impl TurnOutput {
@@ -24,6 +27,7 @@ impl TurnOutput {
             text: text.into(),
             usage: None,
             pending: Vec::new(),
+            rejected: Vec::new(),
         }
     }
 }

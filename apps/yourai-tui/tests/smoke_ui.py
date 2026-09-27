@@ -128,7 +128,10 @@ with tempfile.TemporaryDirectory() as tmp:
         captured.clear()
         wait_completed(db_path, 'main', 2)
         os.write(master, b'/clear\r')
-        wait_for(b'New session')
+        # Titles follow committed history on background refresh; a quick turn
+        # can finish while the footer still says New session. Wait for the
+        # new host's notice, not a footer that need not emit different pixels.
+        wait_for(b'Session ready')
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before_new + 2
         captured.clear()
         os.write(master, b'after reset\r')

@@ -10,8 +10,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 /// ^B dashboard overlay (replaces the old sidebar content).
-pub(super) fn stats_overlay(f: &mut Canvas, area: Rect, v: &View, m: &Metadata, queued: usize) {
-    let _ = queued;
+pub(super) fn stats_overlay(f: &mut Canvas, area: Rect, v: &View, m: &Metadata) {
     let width = area.width.min(64);
     let mut lines: Vec<Line<'static>> = vec![];
     // Session section.
@@ -21,14 +20,14 @@ pub(super) fn stats_overlay(f: &mut Canvas, area: Rect, v: &View, m: &Metadata, 
         &format!(
             "session {} · {} calls",
             m.session.chars().take(8).collect::<String>(),
-            v.model_metrics.calls
+            v.session.model_metrics.calls
         ),
         MUTED,
     ));
     lines.push(Line::default());
     // Context section.
     lines.push(label("Context", TEXT).style(Style::default().bold()));
-    if let Some(usage) = &v.context_usage {
+    if let Some(usage) = &v.session.context_usage {
         let used = usage.estimated_tokens;
         if let Some(window) = usage.context_window.filter(|w| *w > 0) {
             let ratio = used as f64 / window as f64;
@@ -65,7 +64,7 @@ pub(super) fn stats_overlay(f: &mut Canvas, area: Rect, v: &View, m: &Metadata, 
     } else {
         lines.push(label("Estimate unavailable", MUTED));
     }
-    let metrics = &v.model_metrics.requests;
+    let metrics = &v.session.model_metrics.requests;
     if metrics.journal_errors > 0 {
         lines.push(label("Request log write failed", RED));
     }
@@ -75,7 +74,7 @@ pub(super) fn stats_overlay(f: &mut Canvas, area: Rect, v: &View, m: &Metadata, 
     lines.push(label(
         &format!(
             "{} calls · {} in last 60s",
-            v.model_metrics.calls, metrics.attempts_last_minute
+            v.session.model_metrics.calls, metrics.attempts_last_minute
         ),
         TEXT,
     ));
@@ -310,9 +309,9 @@ pub(super) fn model_picker_overlay(f: &mut Canvas, area: Rect, v: &View) {
     };
     let rows: Vec<PickRow> = choices
         .iter()
-        .map(|label| PickRow {
-            body: label.clone(),
-            current: label == &v.model.label,
+        .map(|choice| PickRow {
+            body: choice.label.clone(),
+            current: choice.label == v.model.label,
         })
         .collect();
     pick_list(
@@ -515,7 +514,13 @@ mod tests {
     #[test]
     fn pickers_fit_small_terminals_and_scroll_to_selected_rows() {
         let mut v = View::default();
-        v.model_choices = (0..100).map(|i| format!("model-{i:03}")).collect();
+        v.model_choices = (0..100)
+            .map(|i| crate::models::ModelChoice {
+                id: format!("model-{i:03}"),
+                label: format!("model-{i:03}"),
+                variant: None,
+            })
+            .collect();
         v.overlay = Overlay::Sessions(SessionPickerState {
             pending_delete: None,
             rows: (0..100)

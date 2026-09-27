@@ -127,7 +127,8 @@ impl Renderer {
     /// Remember the screen row a block header was clicked at, so the next
     /// frame pins that line back where the user grabbed it.
     pub fn anchor(&self, v: &mut View, id: u64, y: u16) {
-        v.navigation
+        v.session
+            .navigation
             .anchor(id, y.saturating_sub(self.layout.transcript.y) as usize);
     }
 
@@ -144,7 +145,7 @@ impl Renderer {
     /// one row per event reads as laggy crawling on remote links even when
     /// every frame lands on time. Clamped to the current layout.
     pub fn scroll(&self, v: &mut View, rows: usize, up: bool) {
-        v.navigation.scroll(
+        v.session.navigation.scroll(
             rows,
             up,
             self.layout
@@ -155,11 +156,12 @@ impl Renderer {
     }
 
     pub fn latest_turn(&self, v: &mut View) {
-        v.navigation
+        v.session
+            .navigation
             .turn(self.layout.turns.last().map(|(_, id)| *id));
     }
     pub fn jump_turn(&self, v: &mut View, previous: bool) {
-        v.navigation.jump(
+        v.session.navigation.jump(
             &self.layout.turns,
             self.layout.lines.len(),
             self.layout.transcript.height as usize,
@@ -242,7 +244,7 @@ impl Renderer {
         // Stage 2: navigation — pending intents resolve against the new
         // layout. This and the anchor above are the only View writes in the
         // prepare path.
-        v.navigation.resolve(
+        v.session.navigation.resolve(
             self.layout.lines.len(),
             self.layout.transcript.height as usize,
             &self.layout.headers,
@@ -258,11 +260,11 @@ impl Renderer {
         let content_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
         // Todo panel appears only when there are tasks to inspect.
         // Preserve a readable conversation column; compact windows use the task dock.
-        let sidebar_visible = v.todos.panel_open() && area.width >= 100;
+        let sidebar_visible = v.session.todos.panel_open() && area.width >= 100;
         let panel_w = (area.width / 3).clamp(28, 40);
         // The composer owns the whole window width, independently of Todo.
         let width = content_area.width.saturating_sub(4).max(2) as usize;
-        let (editor_lines, _, _) = v.editor.layout(width);
+        let (editor_lines, _, _) = v.draft.editor().layout(width);
         // One editable row plus breathing room; grow only as the draft wraps.
         let input_height = editor_lines
             .len()
@@ -271,9 +273,9 @@ impl Renderer {
             .min(usize::from((area.height / 3).clamp(3, 8)))
             .min(usize::from(area.height.saturating_sub(6))) as u16;
         let input_height = if v.asks_empty() { input_height } else { 0 };
-        let busy = v.active || compact || !v.asks_empty();
+        let busy = v.session.active || compact || !v.asks_empty();
         let activity_height = if busy { 1 } else { 0 };
-        let narrow_dock = if !sidebar_visible && v.todos.panel_open() {
+        let narrow_dock = if !sidebar_visible && v.session.todos.panel_open() {
             1
         } else {
             0
@@ -305,21 +307,24 @@ impl Renderer {
         let inner = cols[0];
         // The reading anchor is extracted from the OLD layout before the
         // transcript rect is replaced.
-        let reading_anchor = (v.navigation.offset() > 0)
+        let reading_anchor = (v.session.navigation.offset() > 0)
             .then(|| {
-                layout.lines.anchor_at(
-                    layout
-                        .lines
-                        .len()
-                        .saturating_sub(v.navigation.offset() + layout.transcript.height as usize),
-                )
+                layout.lines.anchor_at(layout.lines.len().saturating_sub(
+                    v.session.navigation.offset() + layout.transcript.height as usize,
+                ))
             })
             .flatten();
         layout.transcript = inner;
         layout.panel = cols.get(1).copied();
         layout.rows = rows.to_vec();
         let preview_rows = edit_preview_quota(inner.height);
-        let key = (v.revision, inner.width, inner.height, v.theme, v.active);
+        let key = (
+            v.session.revision,
+            inner.width,
+            inner.height,
+            v.theme,
+            v.session.active,
+        );
         if self.key != Some(key) {
             (layout.lines, layout.headers) = self.timeline.layout(
                 v,
@@ -328,7 +333,8 @@ impl Renderer {
                 self.tick,
             );
             if let Some(line) = reading_anchor.and_then(|anchor| layout.lines.locate(anchor)) {
-                v.navigation
+                v.session
+                    .navigation
                     .preserve_line(line, layout.lines.len(), inner.height as usize);
             }
             self.key = Some(key);
@@ -353,7 +359,10 @@ impl Renderer {
         let rows = layout.rows.clone();
         let footer_lines = footer_lines(area.width as usize, v, m, queued);
         let height = inner.height as usize;
-        let end = layout.lines.len().saturating_sub(v.navigation.offset());
+        let end = layout
+            .lines
+            .len()
+            .saturating_sub(v.session.navigation.offset());
         let start = end.saturating_sub(height);
         let mut visible = layout.lines.viewport(start..end);
         // Only visible tool headers need animation or mouse hit regions.
@@ -388,12 +397,7 @@ impl Renderer {
         }
         // Staged-attachment badge on the input block: clipboard images and
         // @file references wait for the next submit; Esc clears them.
-        let n_img = v
-            .pending_attachments
-            .iter()
-            .filter(|a| a.marker.is_empty())
-            .count();
-        let n_ref = v.pending_attachments.len() - n_img;
+        let (n_img, n_ref) = v.draft.attachment_counts();
         let badge = match (n_img, n_ref) {
             (0, 0) => String::new(),
             (0, r) => format!(" {r} ref · Esc clears "),
@@ -402,10 +406,10 @@ impl Renderer {
         };
         draw_editor(
             f,
-            &v.editor,
+            v.draft.editor(),
             rows[4],
             v.asks_empty() && !v.overlay.is_open(),
-            if v.active {
+            if v.session.active {
                 "Add guidance…"
             } else {
                 "Ask anything…"
@@ -413,7 +417,7 @@ impl Renderer {
             &badge,
         );
         // Show one recovery action only while reading history; keep idle input quiet.
-        if v.navigation.offset() > 0 && rows[4].height >= 3 && !v.overlay.is_open() {
+        if v.session.navigation.offset() > 0 && rows[4].height >= 3 && !v.overlay.is_open() {
             let label = "↓ Latest";
             if rows[4].width >= label.width() as u16 + 4 {
                 let rect = Rect::new(
@@ -508,8 +512,12 @@ impl Renderer {
             );
         }
         // @ mention autocomplete popup.
-        if v.mention.active && !v.mention.entries.is_empty() {
-            let entries = &v.mention.entries;
+        if v.asks_empty()
+            && !v.overlay.is_open()
+            && v.draft.mention().active
+            && !v.draft.mention().entries.is_empty()
+        {
+            let entries = &v.draft.mention().entries;
             let height = (entries.len() as u16 + 2).min(rows[4].y.saturating_sub(area.y));
             let rect = Rect::new(
                 inner.x,
@@ -519,7 +527,11 @@ impl Renderer {
             );
             f.render_widget(Clear, rect);
             let visible = height.saturating_sub(2) as usize;
-            let start = v.mention.selected.saturating_sub(visible.saturating_sub(1));
+            let start = v
+                .draft
+                .mention()
+                .selected
+                .saturating_sub(visible.saturating_sub(1));
             let lines = entries
                 .iter()
                 .enumerate()
@@ -530,16 +542,24 @@ impl Renderer {
                     Line::from(Span::styled(
                         format!(
                             " {} {:<40}",
-                            if i == v.mention.selected { "›" } else { " " },
+                            if i == v.draft.mention().selected {
+                                "›"
+                            } else {
+                                " "
+                            },
                             format!("{icon} {}", e.display)
                         ),
                         Style::default()
-                            .fg(if i == v.mention.selected {
+                            .fg(if i == v.draft.mention().selected {
                                 ACCENT
                             } else {
                                 TEXT
                             })
-                            .bg(if i == v.mention.selected { BG } else { PANEL }),
+                            .bg(if i == v.draft.mention().selected {
+                                BG
+                            } else {
+                                PANEL
+                            }),
                     ))
                 })
                 .collect::<Vec<_>>();
@@ -562,7 +582,7 @@ impl Renderer {
         }
         match &v.overlay {
             Overlay::None => {}
-            Overlay::Stats { .. } => stats_overlay(f, area, v, m, queued),
+            Overlay::Stats { .. } => stats_overlay(f, area, v, m),
             Overlay::Models(_) => model_picker_overlay(f, area, v),
             Overlay::LoadingSessions => {
                 let rect = crate::picker::centered(area, 40, 3);
@@ -630,7 +650,7 @@ fn activity(v: &View, compact: bool, now: std::time::Instant) -> String {
     if compact {
         return "Compacting context".into();
     }
-    if let Some(retry) = &v.retry {
+    if let Some(retry) = &v.session.retry {
         let seconds = retry
             .until
             .saturating_duration_since(now)
@@ -657,7 +677,8 @@ fn activity(v: &View, compact: bool, now: std::time::Instant) -> String {
     v.model_activity().into()
 }
 fn elapsed_str(v: &View, now: std::time::Instant) -> String {
-    v.since
+    v.session
+        .since
         .map(|t| {
             let s = now.saturating_duration_since(t).as_secs();
             if s >= 60 {
@@ -670,7 +691,7 @@ fn elapsed_str(v: &View, now: std::time::Instant) -> String {
 }
 /// Context pressure ratio for color thresholds.
 fn ctx_pressure(v: &View) -> Option<f64> {
-    let usage = v.context_usage.as_ref()?;
+    let usage = v.session.context_usage.as_ref()?;
     let used = usage.estimated_tokens;
     usage
         .context_window
@@ -811,10 +832,19 @@ fn sidebar(f: &mut Canvas, area: Rect, v: &View) -> (Option<Rect>, Option<Rect>)
         .style(Style::default().bg(CODE_SURFACE));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let done = v.todos.items().iter().filter(|t| t.completed).count();
+    let done = v
+        .session
+        .todos
+        .items()
+        .iter()
+        .filter(|t| t.completed)
+        .count();
     f.render_widget(
-        Paragraph::new(format!(" Todo · {done}/{} · ^T", v.todos.items().len()))
-            .style(Style::default().fg(TEXT).bold()),
+        Paragraph::new(format!(
+            " Todo · {done}/{} · ^T",
+            v.session.todos.items().len()
+        ))
+        .style(Style::default().fg(TEXT).bold()),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
     let body = Rect::new(
@@ -823,9 +853,9 @@ fn sidebar(f: &mut Canvas, area: Rect, v: &View) -> (Option<Rect>, Option<Rect>)
         inner.width,
         inner.height.saturating_sub(2),
     );
-    let current = v.todos.items().iter().position(|t| !t.completed);
+    let current = v.session.todos.items().iter().position(|t| !t.completed);
     let mut lines = Vec::new();
-    for (i, todo) in v.todos.items().iter().enumerate() {
+    for (i, todo) in v.session.todos.items().iter().enumerate() {
         let (mark, color) = if todo.completed {
             ("✓", GREEN)
         } else if current == Some(i) {
@@ -861,6 +891,7 @@ fn sidebar(f: &mut Canvas, area: Rect, v: &View) -> (Option<Rect>, Option<Rect>)
         }
     }
     let scroll = v
+        .session
         .todos
         .scroll_within(lines.len().saturating_sub(body.height as usize));
     f.render_widget(
@@ -909,9 +940,16 @@ fn wrap_todo_text(text: &str, width: usize) -> Vec<String> {
 
 /// Narrow-screen single-line TODO dock (between ask and input).
 fn draw_narrow_todo_dock(f: &mut Canvas, area: Rect, v: &View) {
-    let done = v.todos.items().iter().filter(|t| t.completed).count();
-    let total = v.todos.items().len();
+    let done = v
+        .session
+        .todos
+        .items()
+        .iter()
+        .filter(|t| t.completed)
+        .count();
+    let total = v.session.todos.items().len();
     let next = v
+        .session
         .todos
         .items()
         .iter()
@@ -963,6 +1001,7 @@ fn footer_lines(width: usize, v: &View, m: &Metadata, queued: usize) -> Vec<Line
         })
         .unwrap_or_else(|| "—".into());
     let rate = v
+        .session
         .model_metrics
         .requests
         .last_output_tokens_per_second
@@ -1007,7 +1046,7 @@ fn footer_lines(width: usize, v: &View, m: &Metadata, queued: usize) -> Vec<Line
     let overflow = if omitted { " …" } else { "" };
     let right_width = metrics.width() + overflow.width() + 3 + permission.width();
     let left_width = width.saturating_sub(right_width + 2);
-    let title = v.title.as_deref().unwrap_or("New session");
+    let title = v.session.title.as_deref().unwrap_or("New session");
     // A partial title competes with the path and conveys little: show it whole or omit it.
     let show_title = !omitted && title.width() + 3 + m.cwd.width() <= left_width;
     let title_label = if show_title {
@@ -1066,7 +1105,7 @@ fn label(s: &str, color: Color) -> Line<'static> {
 }
 fn help(f: &mut Canvas, area: Rect, scroll: u16) {
     let rect = crate::picker::centered(area, 78, area.height.saturating_sub(2) as usize);
-    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nCtrl-V          Paste image from clipboard (Esc clears)\n@               Reference a file (text inlined; images/PDF attached)\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y/n + Enter (YOLO skips approvals).";
+    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nCtrl-V          Paste image from clipboard (Esc clears)\n@               Reference a file (text inlined; images/PDF attached)\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/continue       Retry pending execution failures\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y/n + Enter (YOLO skips approvals).";
     let lines: Vec<_> = text
         .lines()
         .flat_map(|line| {
@@ -1137,7 +1176,7 @@ mod tests {
         for stream in [false, true] {
             let mut samples = vec![];
             for i in 0..120 {
-                v.navigation.set_offset(100 + (i % 30) * 3);
+                v.session.navigation.set_offset(100 + (i % 30) * 3);
                 if stream {
                     v.event(Out::Chunk {
                         text: "More output. ".into(),
@@ -1179,7 +1218,7 @@ mod tests {
         let mut samples = Vec::new();
         let mut bytes = 0;
         for i in 0..121 {
-            v.navigation.set_offset(100 + i * 3);
+            v.session.navigation.set_offset(100 + i * 3);
             output.borrow_mut().clear();
             let start = Instant::now();
             terminal
@@ -1215,20 +1254,23 @@ mod tests {
         v.event(Out::Message {
             text: "## Result\n**Done**, with `code`.".into(),
         });
-        v.context_usage = Some(yourai_harness::runtime::ContextUsage {
+        v.session.context_usage = Some(yourai_harness::runtime::ContextUsage {
             estimated_tokens: 32_000,
             context_window: Some(128_000),
             input_budget: Some(119_000),
             output_reserve: 8_000,
         });
-        v.model_metrics.calls = 8;
-        v.model_metrics.requests.failed = 3;
-        v.model_metrics.requests.rate_limited = 3;
-        v.model_metrics.requests.completed = 5;
-        v.model_metrics.requests.last_output_tokens_per_second = Some(47.5);
-        v.model_metrics.requests.cache_read_tokens = 80;
-        v.model_metrics.requests.cache_known_input_tokens = 100;
-        v.model_metrics.requests.cache_reported_responses = 1;
+        v.session.model_metrics.calls = 8;
+        v.session.model_metrics.requests.failed = 3;
+        v.session.model_metrics.requests.rate_limited = 3;
+        v.session.model_metrics.requests.completed = 5;
+        v.session
+            .model_metrics
+            .requests
+            .last_output_tokens_per_second = Some(47.5);
+        v.session.model_metrics.requests.cache_read_tokens = 80;
+        v.session.model_metrics.requests.cache_known_input_tokens = 100;
+        v.session.model_metrics.requests.cache_reported_responses = 1;
         v.restore_usage(
             yourai_core::prelude::Usage {
                 input_tokens: 125_000,
@@ -1278,7 +1320,7 @@ mod tests {
                 .unwrap();
             }
         }
-        v.editor.insert("/");
+        v.draft.insert("/");
         v.toast = Some(("✓ Copied".into(), std::time::Instant::now()));
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
@@ -1301,10 +1343,10 @@ mod tests {
             .copied()
             .unwrap();
         super::super::app::click_dispatch(&mut renderer, &mut v, rect.x, rect.y);
-        assert_eq!(v.editor.text, "/queue ");
-        v.editor.take();
+        assert_eq!(v.draft.text(), "/queue ");
+        v.draft.set_text("");
         v.toast = None;
-        v.context_usage.as_mut().unwrap().context_window = None;
+        v.session.context_usage.as_mut().unwrap().context_window = None;
         v.overlay = Overlay::Stats { scroll: 0 };
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
@@ -1358,7 +1400,7 @@ mod tests {
             .unwrap();
         }
         v.user("Review code", false);
-        v.active = true;
+        v.session.active = true;
         v.event(Out::Reasoning {
             text: "checking".into(),
         });
@@ -1393,12 +1435,12 @@ mod tests {
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
-        v.navigation.anchor(0, 0);
-        v.navigation.reveal(Some(0));
+        v.session.navigation.anchor(0, 0);
+        v.session.navigation.reveal(Some(0));
 
         v.follow();
-        v.navigation.resolve(100, 10, &[(0, 0)], &[]);
-        assert_eq!(v.navigation.offset(), 0);
+        v.session.navigation.resolve(100, 10, &[(0, 0)], &[]);
+        assert_eq!(v.session.navigation.offset(), 0);
         assert_ne!(
             pulse_color(0.0, super::super::theme::Theme::Dark),
             pulse_color(1.0, super::super::theme::Theme::Dark)
@@ -1487,7 +1529,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let mut renderer = Renderer::default();
         let mut v = View::default();
-        v.title = Some("Fix parser crash".into());
+        v.session.title = Some("Fix parser crash".into());
         let mut todos: Vec<Todo> = (0..9)
             .map(|i| Todo {
                 id: format!("t{i}"),
@@ -1495,7 +1537,7 @@ mod tests {
                 completed: i == 0,
             })
             .collect();
-        v.todos.set(todos.clone());
+        v.session.todos.set(todos.clone());
         v.event(Out::Reasoning {
             text: "a thought".into(),
         });
@@ -1548,20 +1590,20 @@ mod tests {
         // Clicking the Todo title toggles the panel off.
         let hit = renderer.layout.todo_hit.unwrap();
         super::super::app::click_dispatch(&mut renderer, &mut v, hit.x, hit.y);
-        assert!(!v.todos.panel);
+        assert!(!v.session.todos.panel);
         let text = draw(&mut terminal, &mut renderer, &mut v).join("\n");
         // With panel off, Todo items are not visible.
         assert!(!text.contains("Task number 0"));
         // Re-open via the field directly (wide screen has no dock to click).
-        v.todos.panel = true;
+        v.session.todos.panel = true;
         draw(&mut terminal, &mut renderer, &mut v);
         // Wheel over the TODO list scrolls it, not the transcript.
         let area = renderer.layout.todo_area.unwrap();
         super::super::app::wheel_dispatch(&mut renderer, &mut v, area.x, area.y, false);
-        assert_eq!(v.todos.scroll(), 1);
+        assert_eq!(v.session.todos.scroll(), 1);
         todos.retain(|t| t.id != "t8");
-        v.todos.set(todos);
-        assert_eq!(v.todos.scroll(), 1);
+        v.session.todos.set(todos);
+        assert_eq!(v.session.todos.scroll(), 1);
         // Reasoning renders italic + dim; tool output uses its own color.
         let thinking_id = (0..v.items().len())
             .map(|i| v.item_id(i))
@@ -1634,7 +1676,7 @@ mod tests {
             v.event(Out::Reasoning {
                 text: "Inspect the parser boundary and preserve existing behavior.".into(),
             });
-            v.todos.set(vec![
+            v.session.todos.set(vec![
                 super::super::state::Todo {
                     id: "a".into(),
                     text: "Inspect parser".into(),
@@ -1671,7 +1713,7 @@ mod tests {
                 input: json!({"command":"cargo test --workspace"}),
             });
             v.event(Out::ToolDone{id:"c1".into(),name:"shell".into(),output:json!({"ok":true,"exit_code":0,"termination":"exit","stdout":"171 tests passed","output_complete":true}),is_error:false});
-            v.editor
+            v.draft
                 .insert("再检查一下边界条件\nKeep the public API unchanged.");
             let m = Metadata {
                 session: "12345678-session".into(),
@@ -1719,7 +1761,7 @@ mod tests {
         let mut v = View::default();
         v.theme = Theme::Dark;
         v.user("Fix the parser boundary and verify the change.", false);
-        v.active = true;
+        v.session.active = true;
         for (id, name, input, output, error) in [
             (
                 "read-a",
@@ -1822,7 +1864,7 @@ mod tests {
             yolo: false,
         };
         for scroll in [0, 20, 100] {
-            v.navigation.set_offset(scroll);
+            v.session.navigation.set_offset(scroll);
             terminal
                 .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
                 .unwrap();
@@ -1847,12 +1889,12 @@ mod tests {
             super::super::app::wheel_dispatch(&mut renderer, &mut v, 1, 1, true);
         }
         let top = renderer.layout.lines.len() - renderer.layout.transcript.height as usize;
-        assert_eq!(v.navigation.offset(), top);
+        assert_eq!(v.session.navigation.offset(), top);
         super::super::app::wheel_dispatch(&mut renderer, &mut v, 1, 1, false);
-        assert_eq!(v.navigation.offset(), top - 3);
+        assert_eq!(v.session.navigation.offset(), top - 3);
         let hit = renderer.layout.follow_hit.unwrap();
         super::super::app::click_dispatch(&mut renderer, &mut v, hit.x, hit.y);
-        assert_eq!(v.navigation.offset(), 0);
+        assert_eq!(v.session.navigation.offset(), 0);
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
@@ -1862,7 +1904,7 @@ mod tests {
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
         let start = renderer.layout.lines.len()
-            - v.navigation.offset()
+            - v.session.navigation.offset()
             - renderer.layout.transcript.height as usize;
         assert_eq!(start, renderer.timeline.turns[0].0);
     }
@@ -1871,7 +1913,7 @@ mod tests {
     fn composer_grows_across_full_width_and_keeps_cursor_above_single_footer() {
         let mut v = View::default();
         v.theme = Theme::Dark;
-        v.todos.set(vec![super::super::state::Todo {
+        v.session.todos.set(vec![super::super::state::Todo {
             id: "task".into(),
             text: "A task should never narrow the composer".into(),
             completed: false,
@@ -1890,8 +1932,8 @@ mod tests {
                 "one\ntwo\nthree",
                 "long line 中文🙂 ".repeat(100).as_str(),
             ] {
-                v.editor = Editor::default();
-                v.editor.insert(text);
+                v.draft.set_text("");
+                v.draft.insert(text);
                 terminal
                     .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
                     .unwrap();
@@ -1972,8 +2014,8 @@ mod tests {
 
         // A turn starts: busy indicator with the pulse animation.
         v.user("Fix the parser boundary conditions", false);
-        v.active = true;
-        v.since = Some(std::time::Instant::now());
+        v.session.active = true;
+        v.session.since = Some(std::time::Instant::now());
         frame!("user prompt submitted", SessionStatus::Idle);
         std::thread::sleep(std::time::Duration::from_millis(120));
         frame!("busy tick +120ms (pulse color only)", SessionStatus::Idle);
@@ -2054,10 +2096,12 @@ mod regression_tests {
         let mut renderer = Renderer::default();
         let area = Rect::new(0, 0, 80, 24);
         renderer.prepare(area, &mut view, &meta, FrameTime::now(), 0, false);
-        view.navigation.set_offset(300);
+        view.session.navigation.set_offset(300);
         renderer.prepare(area, &mut view, &meta, FrameTime::now(), 0, false);
         let top = |r: &Renderer, v: &View| {
-            r.layout.lines.len() - v.navigation.offset() - r.layout.transcript.height as usize
+            r.layout.lines.len()
+                - v.session.navigation.offset()
+                - r.layout.transcript.height as usize
         };
         let before = renderer
             .layout
@@ -2104,20 +2148,20 @@ mod regression_tests {
         renderer.latest_turn(&mut view);
         draw(&mut terminal, &mut renderer, &mut view);
         let start = renderer.layout.lines.len()
-            - view.navigation.offset()
+            - view.session.navigation.offset()
             - renderer.layout.transcript.height as usize;
         assert_eq!(start, renderer.timeline.turns[1].0);
         renderer.jump_turn(&mut view, true);
         draw(&mut terminal, &mut renderer, &mut view);
         let start = renderer.layout.lines.len()
-            - view.navigation.offset()
+            - view.session.navigation.offset()
             - renderer.layout.transcript.height as usize;
         assert_eq!(start, renderer.timeline.turns[0].0);
         renderer.jump_turn(&mut view, false);
         draw(&mut terminal, &mut renderer, &mut view);
         assert_eq!(
             renderer.layout.lines.len()
-                - view.navigation.offset()
+                - view.session.navigation.offset()
                 - renderer.layout.transcript.height as usize,
             renderer.timeline.turns[1].0
         );
@@ -2127,18 +2171,18 @@ mod regression_tests {
         renderer.latest_turn(&mut view);
         draw(&mut terminal, &mut renderer, &mut view);
         let start = renderer.layout.lines.len()
-            - view.navigation.offset()
+            - view.session.navigation.offset()
             - renderer.layout.transcript.height as usize;
         assert_eq!(start, renderer.timeline.turns[1].0);
 
         view.follow();
         draw(&mut terminal, &mut renderer, &mut view);
-        assert_eq!(view.navigation.offset(), 0);
+        assert_eq!(view.session.navigation.offset(), 0);
     }
     #[test]
     fn footer_measures_unicode_long_labels_and_large_metrics() {
         let mut v = View::default();
-        v.title = Some("这是一个很长的会话标题 🔎 review ".repeat(6));
+        v.session.title = Some("这是一个很长的会话标题 🔎 review ".repeat(6));
         v.model.label = "provider/very-long-model-name-with-reasoning-variant".repeat(3);
         v.restore_usage(
             yourai_core::prelude::Usage {
@@ -2147,7 +2191,10 @@ mod regression_tests {
             },
             0,
         );
-        v.model_metrics.requests.last_output_tokens_per_second = Some(f64::MAX);
+        v.session
+            .model_metrics
+            .requests
+            .last_output_tokens_per_second = Some(f64::MAX);
         let m = Metadata {
             session: "test".into(),
             cwd: "/Users/开发者/workspaces/很长的目录名字/YourAI-Harness".into(),
@@ -2173,7 +2220,7 @@ mod regression_tests {
                 assert!(text.contains(field));
             }
         }
-        v.title = Some("Review".into());
+        v.session.title = Some("Review".into());
         v.model.label = "mock/model".into();
         v.restore_usage(
             yourai_core::prelude::Usage {
@@ -2182,7 +2229,10 @@ mod regression_tests {
             },
             0,
         );
-        v.model_metrics.requests.last_output_tokens_per_second = Some(47.5);
+        v.session
+            .model_metrics
+            .requests
+            .last_output_tokens_per_second = Some(47.5);
         let lines = footer_lines(120, &v, &m, 0);
         assert_eq!(lines.len(), 1, "footer must always use one row");
         assert!(
@@ -2227,7 +2277,7 @@ mod regression_tests {
     fn narrow_footer_preserves_permissions_and_all_dashboard_sizes_fit() {
         let mut v = View::default();
         v.model.label = "provider/model".into();
-        v.context_usage = Some(yourai_harness::runtime::ContextUsage {
+        v.session.context_usage = Some(yourai_harness::runtime::ContextUsage {
             estimated_tokens: 90000,
             context_window: Some(100000),
             input_budget: Some(90000),
@@ -2289,10 +2339,10 @@ mod clock_tests {
             unix_seconds: seconds as i64,
         };
         let mut view = View::default();
-        view.active = true;
-        view.since = Some(start);
+        view.session.active = true;
+        view.session.since = Some(start);
         view.toast = Some(("copied".into(), start));
-        view.retry = Some(RetryState {
+        view.session.retry = Some(RetryState {
             attempt: 1,
             max: 3,
             reason: "retry".into(),

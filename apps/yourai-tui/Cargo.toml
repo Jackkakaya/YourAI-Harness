@@ -26,7 +26,7 @@ syntect = { version = "5", default-features = false, features = [
     "default-fancy",
 ] }
 
-[dev-dependencies]
+# Own per-operation clipboard temporary files, including cancellation cleanup.
 tempfile = "3"
 
 # Keep module boundaries compiler-checked: no crate-internal glob imports
@@ -34,3 +34,6 @@ tempfile = "3"
 # clippy.toml; test modules opt out locally.
 [lints.clippy]
 wildcard_imports = "warn"
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
