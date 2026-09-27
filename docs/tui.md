@@ -60,7 +60,7 @@ cargo run -p yourai-tui
 - `variants` 会合并到模型 `options`；含 `"disabled": true` 的 variant 不会出现在 `/models` 选择器中。
 - 可选 `pricing` 使用每百万 token 的美元价格：`{"input": 5.0, "output": 15.0}`。状态栏和仪表盘会显示估算成本；未配置时不显示。
 
-未配置窗口时会提示预算未知，自动摘要关闭，手动摘要报配置错误。工具输出预览默认 16000 字符；原文可用 read_tool_result 分页读取。
+未配置窗口时会提示预算未知，自动摘要关闭，手动摘要报配置错误。工具输出在入库前已由截断模块限制在 2000 行 / 50KB 内（超限全文落盘 spill 文件，结果内 marker 指向文件路径）；投影层另有 16000 字符预览上限，pruned 的旧结果只保留状态信封。
 
 仅验证配置、不请求模型：
 
@@ -108,7 +108,7 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --resume 会话ID
 
 `--resume` 不带 ID 时进入启动会话选择器（launcher）：搜索框过滤 title/id/model，`↑↓`/`Ctrl-P/N` 移动，`Enter` 恢复选中会话，`Esc` 开启全新会话，`Ctrl-Q` 直接退出。恢复会话会继续使用原历史；界面恢复原始历史消息（不重复展示压缩摘要）。退出时尚未处理的输入由 close 交还，打印在终端，由调用者决定是否再次提交。
 
-TUI 复用 Harness → SessionHost → DefaultLoop，默认安装代码读写、shell、Web、历史工具结果读取和任务板；`extensions = true` 安装子代理、工作区、记忆和技能扩展。请求错误显示在界面，修改配置后退出重启即可。真实模型连通性由你配置服务后验证。
+TUI 复用 Harness → SessionHost → DefaultLoop，默认安装 read/write/edit、shell、Web 工具和任务板；`extensions = true` 安装子代理、工作区、记忆和技能扩展。TUI 可通过 Ctrl+V 剪贴板发送图片，或 `@` 引用文件/目录（前端只传引用，文本行窗口/图片归一化/目录列表由 harness 在提交时解析，base64 附件统一受 20MB 上限保护）。请求错误显示在界面，修改配置后退出重启即可。真实模型连通性由你配置服务后验证。
 
 离线终端冒烟测试使用本地模拟 HTTP 服务和伪终端，不调用外部模型：
 

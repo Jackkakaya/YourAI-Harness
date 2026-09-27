@@ -47,10 +47,13 @@ impl State<'_> {
         let post = if aborted {
             if let Some(runtime) = &self.tc.snap.hooks {
                 let invocation = self.invocation(event);
-                tokio::time::timeout(self.config.cleanup_timeout, runtime.dispatch(&invocation))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
+                match self.config.cleanup_timeout {
+                    Some(t) => tokio::time::timeout(t, runtime.dispatch(&invocation))
+                        .await
+                        .ok()
+                        .and_then(Result::ok),
+                    None => runtime.dispatch(&invocation).await.ok(),
+                }
             } else {
                 None
             }
@@ -106,6 +109,15 @@ impl State<'_> {
                 name: call.fn_name.clone(),
                 message: "tool was not offered in this model request".into(),
             })?;
+        // OpenCode doom-loop gate: count consecutive identical tool executions
+        // (name + arguments) and require approval once the threshold is reached.
+        let signature = (call.fn_name.clone(), call.fn_arguments.to_string());
+        let repeat = matches!(&self.last_tool, Some(prev) if *prev == signature);
+        self.doom_streak = if repeat { self.doom_streak + 1 } else { 1 };
+        self.last_tool = Some(signature);
+        if self.doom_streak >= super::DOOM_LOOP_THRESHOLD {
+            self.doom_loop_check(call).await?;
+        }
         let pre = self
             .hook(HookEvent::PreToolUse {
                 tool_name: call.fn_name.clone(),
@@ -136,18 +148,6 @@ impl State<'_> {
         }
         self.approve(call, &handler, permission).await?;
         self.tc.check_control()?;
-        let limit = self
-            .tc
-            .info
-            .options
-            .limits
-            .max_tool_calls
-            .unwrap_or(self.config.max_tool_calls)
-            .min(self.config.max_tool_calls);
-        if self.tool_calls >= limit {
-            return Err(AbortReason::LimitReached(TurnLimit::ToolCalls).into());
-        }
-        self.tool_calls += 1;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let bridge = Bridge { tx };
         let cancel = self.tc.cancel.child_token();
@@ -176,7 +176,10 @@ impl State<'_> {
                 biased;
                 _ = self.tc.cancel.cancelled() => return Err(AbortReason::Cancelled.into()),
                 _ = self.tc.outbox.closed() => return Err(AbortReason::Disconnected.into()),
-                _ = tokio::time::sleep_until(deadline.into()) => return Err(self.timeout_error("tool")),
+                _ = async { match deadline {
+                    Some(d) => tokio::time::sleep_until(d.into()).await,
+                    None => std::future::pending().await,
+                }} => return Err(self.timeout_error("tool")),
                 result = &mut future => return result,
                 Some(mut pending) = rx.recv() => {
                     if pending.reply.is_closed() { continue; }
@@ -184,7 +187,10 @@ impl State<'_> {
                         let _ = pending.reply.send(Err(ErrorKind::Config("invalid or duplicate interaction identity".into()).into()));
                         continue;
                     }
-                    pending.request.deadline = Some(pending.request.deadline.unwrap_or(deadline).min(deadline));
+                    pending.request.deadline = match (pending.request.deadline, deadline) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
                     let interaction_deadline = pending.request.deadline.unwrap();
                     let response = tokio::select! {
                         biased;
@@ -202,6 +208,101 @@ impl State<'_> {
                 }
             }
         }
+    }
+    /// OpenCode doom-loop gate: the same tool was invoked with identical input
+    /// `DOOM_LOOP_THRESHOLD` times in a row. Route through the permission flow
+    /// (hook, then interactive ask) so a runaway loop can be approved or broken.
+    /// A security provider that bypasses approvals (e.g. yolo) skips the gate.
+    async fn doom_loop_check(&mut self, call: &ToolCall) -> Result<(), YourAiError> {
+        if self
+            .tc
+            .snap
+            .security
+            .as_ref()
+            .is_some_and(|s| s.bypass_approvals())
+        {
+            return Ok(());
+        }
+        self.notice(
+            Level::Warning,
+            format!(
+                "Doom loop suspected: `{}` called {}x with identical input; approval required.",
+                call.fn_name, self.doom_streak
+            ),
+        )?;
+        let result = self
+            .hook(HookEvent::PermissionRequest {
+                tool_name: call.fn_name.clone(),
+                tool_input: call.fn_arguments.clone(),
+                permission_suggestions: None,
+            })
+            .await?;
+        self.apply_common(&result)?;
+        if !result.common.blocking_errors.is_empty() {
+            return Err(ErrorKind::Tool {
+                name: call.fn_name.clone(),
+                message: hooks::feedback(&result).join("\n"),
+            }
+            .into());
+        }
+        let decision = match result.outcome {
+            HookPointOutcome::PermissionRequest(o) => o.decision,
+            _ => return Err(ErrorKind::Loop("invalid PermissionRequest outcome".into()).into()),
+        };
+        let decision = match decision {
+            Some(decision) => decision,
+            None => {
+                // No hook decided; ask interactively. Fail closed on disconnect
+                // so a producer-less context still breaks the loop.
+                let reply = self
+                    .ask(
+                        uuid::Uuid::new_v4().to_string(),
+                        json!({
+                            "kind": "doom_loop",
+                            "call_id": call.call_id,
+                            "tool_name": call.fn_name,
+                            "input": call.fn_arguments,
+                            "streak": self.doom_streak,
+                        }),
+                        self.tc
+                            .info
+                            .options
+                            .limits
+                            .approval_timeout
+                            .or(self.config.approval_timeout),
+                    )
+                    .await;
+                match reply {
+                    Ok(value) => parse_decision(value)?,
+                    Err(e @ YourAiError::Aborted(_)) => return Err(e),
+                    Err(e) => PermissionRequestDecision {
+                        behavior: PermissionRequestBehavior::Deny,
+                        updated_input: None,
+                        updated_permissions: vec![],
+                        message: Some(e.to_string()),
+                        interrupt: false,
+                    },
+                }
+            }
+        };
+        if decision.interrupt {
+            return Err(AbortReason::HookStopped(
+                decision
+                    .message
+                    .unwrap_or_else(|| "doom loop interrupted".into()),
+            )
+            .into());
+        }
+        if decision.behavior == PermissionRequestBehavior::Deny {
+            return Err(ErrorKind::Tool {
+                name: call.fn_name.clone(),
+                message: decision
+                    .message
+                    .unwrap_or_else(|| "doom loop denied".into()),
+            }
+            .into());
+        }
+        Ok(())
     }
     async fn security(
         &mut self,
@@ -272,7 +373,7 @@ impl State<'_> {
                     let decision = match decision {
                         Some(decision) => decision,
                         None => {
-                            let reply = self.ask(uuid::Uuid::new_v4().to_string(), json!({"kind":"permission", "call_id":call.call_id, "tool_name":call.fn_name, "input":call.fn_arguments}), self.tc.info.options.limits.approval_timeout.unwrap_or(self.config.approval_timeout)).await;
+                            let reply = self.ask(uuid::Uuid::new_v4().to_string(), json!({"kind":"permission", "call_id":call.call_id, "tool_name":call.fn_name, "input":call.fn_arguments}), self.tc.info.options.limits.approval_timeout.or(self.config.approval_timeout)).await;
                             match reply {
                                 Ok(reply) => parse_decision(reply)?,
                                 Err(e @ YourAiError::Aborted(_)) => return Err(e),

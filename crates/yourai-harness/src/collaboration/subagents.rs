@@ -33,7 +33,7 @@ impl SubagentTool {
     pub async fn stop_all(&self) -> Result<(), YourAiError> {
         let children: Vec<_> = self.children.lock().unwrap().values().cloned().collect();
         for child in children {
-            child.close(Duration::from_secs(10)).await?;
+            child.close(Some(Duration::from_secs(10))).await?;
         }
         Ok(())
     }
@@ -118,11 +118,11 @@ impl SubagentTool {
                 .await?;
             parent.consume_hook(&stop, false)?;
             if stop.common.blocking_errors.is_empty() {
-                child.close(Duration::from_secs(10)).await?;
+                child.close(Some(Duration::from_secs(10))).await?;
                 return Ok(json!({"agent_id":id,"text":last}));
             }
             if continuation == 3 {
-                child.close(Duration::from_secs(10)).await?;
+                child.close(Some(Duration::from_secs(10))).await?;
                 return Err(error("subagent", "SubagentStop continuation limit"));
             }
             child
@@ -149,7 +149,7 @@ impl Drop for ChildCleanup {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let child = self.0.clone();
             runtime.spawn(async move {
-                let _ = child.close(Duration::from_secs(10)).await;
+                let _ = child.close(Some(Duration::from_secs(10))).await;
             });
         }
     }

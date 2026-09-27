@@ -42,6 +42,104 @@ async fn streamed_answer_commits_once_and_usage_is_delta() {
     );
 }
 #[tokio::test]
+async fn image_attachment_is_committed_as_binary_and_reaches_the_model() {
+    let history = Arc::new(History::default());
+    let model = Arc::new(Model::new(vec![answer("ok")]));
+    let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
+    // attachment resolution decodes and normalizes image attachments, so the
+    // payload must be a real image.
+    let data = tiny_png_base64();
+    let (_events, result) = collect(
+        agent
+            .start(In::user_text_with_attachments(
+                "describe this",
+                vec![UserAttachment::base64(
+                    "image/png",
+                    data,
+                    Some("clip.png".into()),
+                )],
+            ))
+            .unwrap(),
+    )
+    .await;
+    result.unwrap();
+
+    // The committed user message carries the text plus one Binary image part.
+    let user = &history.messages()[0];
+    assert_eq!(user.role, ChatRole::User);
+    assert_eq!(user.content.texts(), vec!["describe this"]);
+    let binaries = user.content.binaries();
+    assert_eq!(binaries.len(), 1);
+    assert_eq!(binaries[0].content_type, "image/png");
+    assert_eq!(binaries[0].name.as_deref(), Some("clip.png"));
+    assert!(binaries[0].is_image());
+
+    // The image reaches the model request unchanged (projection keeps User
+    // Binary parts when limit_tools is true, as build_request does).
+    let req = &model.requests.lock().unwrap()[0];
+    let req_user = req
+        .request
+        .messages
+        .iter()
+        .find(|m| m.role == ChatRole::User)
+        .unwrap();
+    assert_eq!(req_user.content.binaries().len(), 1);
+}
+
+#[tokio::test]
+async fn file_reference_attachment_becomes_bounded_text_in_history() {
+    let history = Arc::new(History::default());
+    let model = Arc::new(Model::new(vec![answer("reviewed")]));
+    let agent = builder(model, history.clone(), LoopConfig::default()).build();
+
+    // A real file on disk, referenced (not inlined) by the frontend.
+    let dir = std::env::temp_dir().join("yourai_loop_file_ref");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("notes.rs");
+    std::fs::write(&file, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
+
+    let (_events, result) = collect(
+        agent
+            .start(In::user_text_with_attachments(
+                "review this",
+                vec![UserAttachment::file(
+                    file.to_string_lossy().into_owned(),
+                    Some((2, 3)),
+                )],
+            ))
+            .unwrap(),
+    )
+    .await;
+    result.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The referenced file is read harness-side and committed as a text part
+    // (provenance note + line window + fence), never as a Binary part.
+    let user = &history.messages()[0];
+    assert_eq!(user.role, ChatRole::User);
+    assert!(user.content.binaries().is_empty());
+    let text = user.content.texts().join("\n");
+    assert!(text.contains("review this"), "{text}");
+    assert!(text.contains("[Attached file"), "{text}");
+    assert!(text.contains("lines 2-3"), "{text}");
+    assert!(text.contains("fn two() {}"), "{text}");
+    assert!(text.contains("fn three() {}"), "{text}");
+    assert!(!text.contains("fn one()"), "{text}");
+}
+
+/// Real 8x8 PNG, base64-encoded — the loop decodes image attachments for
+/// normalization, so fabricated payloads are rejected.
+fn tiny_png_base64() -> String {
+    let img = image::DynamicImage::new_rgb8(8, 8);
+    let mut buf = Vec::new();
+    img.to_rgb8()
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .unwrap();
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(&buf)
+}
+#[tokio::test]
 async fn tools_record_success_and_failure_then_model_continues() {
     let history = Arc::new(History::default());
     let model = Arc::new(Model::new(vec![calls(&["ok", "bad"]), answer("done")]));
@@ -400,7 +498,7 @@ async fn model_call_limit_forces_final_text_only_summary() {
     .tools(registry)
     .build();
     let mut options = TurnOptions::default();
-    options.limits.max_model_calls = Some(2);
+    options.limits.steps = Some(2);
     let result = agent.run_with(In::user_text("go"), options).await.unwrap();
     assert_eq!(result.text, "final summary");
     let requests = model.requests.lock().unwrap();
@@ -418,33 +516,60 @@ async fn model_call_limit_forces_final_text_only_summary() {
         .unwrap_or(&[])
         .is_empty());
     assert_eq!(h.inputs.lock().unwrap().len(), 1);
+    // OpenCode runner alignment: the final request carries an assistant-role
+    // MAX_STEPS_PROMPT prefill (request-only, never persisted) and forbids
+    // tool calls at the API level.
+    let last = requests[1].request.messages.last().unwrap();
+    assert_eq!(last.role, ChatRole::Assistant);
+    assert!(last
+        .content
+        .first_text()
+        .is_some_and(|t| t.contains("MAXIMUM STEPS REACHED")));
+    assert_eq!(requests[1].options.tool_choice, Some(ToolChoice::None));
 }
 #[tokio::test]
 async fn model_call_limit_never_executes_calls_from_the_final_step() {
     let h = Arc::new(Handler::new("tool", Mode::Return));
     let registry = Arc::new(Registry::default());
     registry.register(h.clone());
-    let model = Arc::new(Model::new(vec![calls(&["tool"])]));
-    let agent = builder(
-        model.clone(),
-        Arc::new(History::default()),
-        LoopConfig::default(),
-    )
-    .tools(registry)
-    .build();
+    // The final step still returns a tool call; opencode failUnsettledTools
+    // semantics feed an explicit failure result back so the model can produce
+    // the required text-only summary on the next iteration.
+    let model = Arc::new(Model::new(vec![calls(&["tool"]), answer("wrapped up")]));
+    let history = Arc::new(History::default());
+    let agent = builder(model.clone(), history.clone(), LoopConfig::default())
+        .tools(registry)
+        .build();
     let mut options = TurnOptions::default();
-    options.limits.max_model_calls = Some(1);
+    options.limits.steps = Some(1);
     let result = agent.run_with(In::user_text("go"), options).await.unwrap();
     assert!(h.inputs.lock().unwrap().is_empty());
-    assert_eq!(result.text, "");
+    assert_eq!(result.text, "wrapped up");
     let requests = model.requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0]
-        .request
-        .tools
-        .as_deref()
-        .unwrap_or(&[])
-        .is_empty());
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(request.request.tools.as_deref().unwrap_or(&[]).is_empty());
+        assert_eq!(request.options.tool_choice, Some(ToolChoice::None));
+    }
+    // The refused call is persisted as an error tool result so history stays
+    // complete for the next turn.
+    let tool_message = history
+        .messages()
+        .into_iter()
+        .find(|m| m.role == ChatRole::Tool)
+        .expect("refused tool call must leave a tool-result record");
+    let response = tool_message
+        .content
+        .parts()
+        .iter()
+        .find_map(|part| match part {
+            ContentPart::ToolResponse(response) => Some(response),
+            _ => None,
+        })
+        .unwrap();
+    assert!(response
+        .content
+        .contains("Tools are disabled after the maximum agent steps"));
 }
 #[tokio::test]
 async fn invisible_failure_announces_structured_retry_status() {
@@ -472,7 +597,7 @@ async fn invisible_failure_announces_structured_retry_status() {
             seen.push((attempt, max, wait_ms));
         }
     }
-    assert_eq!(seen, vec![(1, 2, 0)]);
+    assert_eq!(seen, vec![(1, 5, 0)]);
     assert_eq!(handle.join().await.unwrap().text, "resumed");
 }
 #[tokio::test]
@@ -525,28 +650,44 @@ async fn visible_model_failure_is_not_retried_and_fires_stop_failure() {
         .contains(&HookEventKind::StopFailure));
 }
 #[tokio::test]
-async fn deadlines_and_zero_model_budget_stop_before_side_effects() {
-    for deadline in [false, true] {
-        let model = Arc::new(Model::new(vec![answer("never")]));
-        let agent = builder(
-            model.clone(),
-            Arc::new(History::default()),
-            LoopConfig::default(),
-        )
-        .build();
-        let mut options = TurnOptions::default();
-        if deadline {
-            options.limits.deadline = Some(Instant::now());
-        } else {
-            options.limits.max_model_calls = Some(0);
-        }
-        let error = agent
-            .run_with(In::user_text("go"), options)
-            .await
-            .unwrap_err();
-        assert!(matches!(*error.error, YourAiError::Aborted(_)));
-        assert!(model.requests.lock().unwrap().is_empty());
-    }
+async fn deadlines_and_zero_steps_stop_before_side_effects() {
+    let model = Arc::new(Model::new(vec![answer("never")]));
+    let agent = builder(
+        model.clone(),
+        Arc::new(History::default()),
+        LoopConfig::default(),
+    )
+    .build();
+    let mut options = TurnOptions::default();
+    options.limits.deadline = Some(Instant::now());
+    let error = agent
+        .run_with(In::user_text("go"), options)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        *error.error,
+        YourAiError::Aborted(AbortReason::DeadlineExceeded)
+    ));
+    assert!(model.requests.lock().unwrap().is_empty());
+
+    let model = Arc::new(Model::new(vec![answer("never")]));
+    let agent = builder(
+        model.clone(),
+        Arc::new(History::default()),
+        LoopConfig::default(),
+    )
+    .build();
+    let mut options = TurnOptions::default();
+    options.limits.steps = Some(0);
+    let error = agent
+        .run_with(In::user_text("go"), options)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        *error.error,
+        YourAiError::Error(ErrorKind::Config(_))
+    ));
+    assert!(model.requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -616,37 +757,6 @@ async fn invalid_hook_arguments_and_truncated_calls_never_execute() {
             );
         }
     }
-}
-#[tokio::test]
-async fn tool_budget_ends_turn_and_completes_remaining_call_records() {
-    let history = Arc::new(History::default());
-    let h = Arc::new(Handler::new("tool", Mode::Return));
-    let registry = Arc::new(Registry::default());
-    registry.register(h.clone());
-    let agent = builder(
-        Arc::new(Model::new(vec![calls(&["tool", "tool"])])),
-        history.clone(),
-        LoopConfig {
-            max_tool_calls: 1,
-            ..Default::default()
-        },
-    )
-    .tools(registry)
-    .build();
-    let failure = agent.run(In::user_text("go")).await.unwrap_err();
-    assert!(matches!(
-        *failure.error,
-        YourAiError::Aborted(AbortReason::LimitReached(TurnLimit::ToolCalls))
-    ));
-    assert_eq!(h.inputs.lock().unwrap().len(), 1);
-    assert_eq!(
-        history
-            .messages()
-            .iter()
-            .filter(|m| m.role == ChatRole::Tool)
-            .count(),
-        2
-    );
 }
 #[tokio::test(start_paused = true)]
 async fn tool_timeout_becomes_tool_result_and_continues() {
@@ -877,7 +987,73 @@ async fn permission_hook_modified_scope_is_rechecked_against_hard_policy() {
 }
 
 #[tokio::test]
-async fn retry_cannot_exceed_final_model_call_budget() {
+async fn doom_loop_gates_third_identical_tool_call() {
+    let h = Arc::new(Handler::new("tool", Mode::Return));
+    let registry = Arc::new(Registry::default());
+    registry.register(h.clone());
+    let hooks = Arc::new(Hooks::new(|_, r| {
+        if let HookPointOutcome::PermissionRequest(o) = &mut r.outcome {
+            o.decision = Some(PermissionRequestDecision {
+                behavior: PermissionRequestBehavior::Deny,
+                updated_input: None,
+                updated_permissions: vec![],
+                message: Some("doom loop".into()),
+                interrupt: false,
+            });
+        }
+    }));
+    let tool_step = |id: &str| events(vec![end("", vec![call(id, "tool")])]);
+    let model = Arc::new(Model::new(vec![
+        tool_step("c0"),
+        tool_step("c1"),
+        tool_step("c2"),
+        answer("recovered"),
+    ]));
+    let agent = builder(model, Arc::new(History::default()), LoopConfig::default())
+        .tools(registry)
+        .hooks(hooks)
+        .build();
+    let result = agent.run(In::user_text("go")).await.unwrap();
+    assert_eq!(result.text, "recovered");
+    // First two identical calls ran; the third was gated as a doom loop and denied.
+    assert_eq!(h.inputs.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn doom_loop_passes_when_approved() {
+    let h = Arc::new(Handler::new("tool", Mode::Return));
+    let registry = Arc::new(Registry::default());
+    registry.register(h.clone());
+    let hooks = Arc::new(Hooks::new(|_, r| {
+        if let HookPointOutcome::PermissionRequest(o) = &mut r.outcome {
+            o.decision = Some(PermissionRequestDecision {
+                behavior: PermissionRequestBehavior::Allow,
+                updated_input: None,
+                updated_permissions: vec![],
+                message: None,
+                interrupt: false,
+            });
+        }
+    }));
+    let tool_step = |id: &str| events(vec![end("", vec![call(id, "tool")])]);
+    let model = Arc::new(Model::new(vec![
+        tool_step("c0"),
+        tool_step("c1"),
+        tool_step("c2"),
+        answer("done"),
+    ]));
+    let agent = builder(model, Arc::new(History::default()), LoopConfig::default())
+        .tools(registry)
+        .hooks(hooks)
+        .build();
+    let result = agent.run(In::user_text("go")).await.unwrap();
+    assert_eq!(result.text, "done");
+    // All three identical calls executed after the doom-loop gate was approved.
+    assert_eq!(h.inputs.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn retry_respects_max_retries_limit() {
     let mut model = Model::new(vec![error_stream(), answer("must not run")]);
     model.recovery = ModelRecovery::Retry;
     let model = Arc::new(model);
@@ -886,39 +1062,29 @@ async fn retry_cannot_exceed_final_model_call_budget() {
         Arc::new(History::default()),
         LoopConfig {
             retry_delay: Duration::ZERO,
+            max_model_retries: 0,
             ..Default::default()
         },
     )
     .build();
-    let mut options = TurnOptions::default();
-    options.limits.max_model_calls = Some(1);
-    let err = agent
-        .run_with(In::user_text("go"), options)
-        .await
-        .unwrap_err();
+    let err = agent.run(In::user_text("go")).await.unwrap_err();
     assert!(matches!(
         *err.error,
-        YourAiError::Aborted(AbortReason::LimitReached(TurnLimit::ModelCalls))
+        YourAiError::Error(ErrorKind::Provider { name: "model", .. })
     ));
     assert_eq!(model.requests.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
-async fn compaction_consuming_budget_prevents_another_model_call() {
+async fn compaction_does_not_consume_step() {
     let history = Arc::new(History::default());
     history.tokens.store(100, Ordering::SeqCst);
-    let model = Arc::new(Model::new(vec![answer("must not run")]));
+    let model = Arc::new(Model::new(vec![answer("ok")]));
     let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
     let mut options = TurnOptions::default();
-    options.limits.max_model_calls = Some(1);
-    let err = agent
-        .run_with(In::user_text("go"), options)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        *err.error,
-        YourAiError::Aborted(AbortReason::LimitReached(TurnLimit::ModelCalls))
-    ));
+    options.limits.steps = Some(1);
+    let result = agent.run_with(In::user_text("go"), options).await.unwrap();
+    assert_eq!(result.text, "ok");
     assert_eq!(history.compactions.lock().unwrap().len(), 1);
-    assert!(model.requests.lock().unwrap().is_empty());
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
 }

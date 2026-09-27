@@ -7,6 +7,83 @@ use serde_json::Value;
 
 // region:    --- In ---
 
+/// Maximum decoded size accepted for one user attachment (20 MiB) — the most
+/// restrictive ceiling across the providers genai targets (OpenAI ~20 MB,
+/// Anthropic ~32 MB base64). Frontends should enforce this before
+/// reading/encoding files; loops must enforce it again because protocol
+/// inputs are untrusted.
+pub const MAX_USER_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// 用户消息附带的附件：内联 base64 媒体，或本地文件引用。
+///
+/// 两种形态由 harness 在消息入口（`accept_input`）统一解析为模型可见的
+/// content part：
+/// - [`AttachmentData::Base64`]：媒体（图片/PDF/音频）。图片先归一化
+///   （尺寸/大小上限 + 自动缩放，对齐 opencode `image.ts`），再转 genai
+///   [`crate::chat::ContentPart::Binary`]；
+/// - [`AttachmentData::File`]：本地文件引用（对齐 opencode 的 FilePart：
+///   `file://` URL + `#start-end` 行范围）。文本文件读取后按行窗口截断为
+///   文本 part，图片走归一化，目录展开为一级列表——前端只传几十字节的
+///   引用，读取与限额全部在 harness 侧完成。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserAttachment {
+    /// MIME 类型（base64 形态必填，如 `image/png`）；File 形态在解析时按
+    /// 扩展名推导并覆盖，序列化时为空则省略。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_type: String,
+    /// 附件数据：内联 base64 或文件引用。字段名保持 `data`，旧 wire 消息
+    /// 的 `"data": "<base64>"` 字符串形态仍然可解析（untagged）。
+    pub data: AttachmentData,
+    /// 可选的显示名/文件名。
+    pub name: Option<String>,
+}
+
+/// 附件数据来源。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AttachmentData {
+    /// 标准 base64 编码（无 data-URL 前缀）——原始 wire 形态。
+    Base64(String),
+    /// 本地文件引用，由 harness 解析。相对路径基于会话 cwd。
+    File(FileRef),
+}
+
+/// 对本地文件的引用；`lines` 为 1-based 闭区间行窗口（如 `#10-20`），
+/// 仅对文本文件生效。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileRef {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<(u32, u32)>,
+}
+
+impl UserAttachment {
+    /// 内联 base64 媒体附件。
+    pub fn base64(
+        content_type: impl Into<String>,
+        data: impl Into<String>,
+        name: Option<String>,
+    ) -> Self {
+        Self {
+            content_type: content_type.into(),
+            data: AttachmentData::Base64(data.into()),
+            name,
+        }
+    }
+
+    /// 本地文件引用；MIME 与内容在 harness 侧解析。
+    pub fn file(path: impl Into<String>, lines: Option<(u32, u32)>) -> Self {
+        Self {
+            content_type: String::new(),
+            data: AttachmentData::File(FileRef {
+                path: path.into(),
+                lines,
+            }),
+            name: None,
+        }
+    }
+}
+
 /// 外界 → loop 的消息（turn 作用域，走 inbox，loop 独占拉取消费）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -18,6 +95,10 @@ pub enum In {
         /// 旧 wire 消息缺省为 Steer。
         #[serde(default)]
         mode: InputMode,
+        /// 随消息附带的多媒体附件（图片/PDF 等）。旧 wire 消息缺省为空，
+        /// 因此反序列化历史消息时向后兼容。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<UserAttachment>,
     },
 
     /// 对一切 [`Out::Ask`] 的答复（审批/提问/表单/计划确认/MCP elicitation）
@@ -30,6 +111,7 @@ impl In {
         In::UserText {
             text: text.into(),
             mode: InputMode::Steer,
+            attachments: vec![],
         }
     }
 
@@ -37,6 +119,19 @@ impl In {
         In::UserText {
             text: text.into(),
             mode: InputMode::FollowUp,
+            attachments: vec![],
+        }
+    }
+
+    /// 便捷构造：用户输入 + 多媒体附件（图片等）。
+    pub fn user_text_with_attachments(
+        text: impl Into<String>,
+        attachments: Vec<UserAttachment>,
+    ) -> Self {
+        In::UserText {
+            text: text.into(),
+            mode: InputMode::Steer,
+            attachments,
         }
     }
 }

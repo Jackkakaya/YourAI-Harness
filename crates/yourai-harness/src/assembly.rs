@@ -146,12 +146,8 @@ impl Harness {
         meta.model = Some(model.model_iden().into());
         catalog.save_session(&meta).await?;
         let dir = catalog.directory(&id)?;
-        let budget = ModelBudget::configured(
-            config.max_shared_model_calls,
-            config.max_known_tokens,
-            config.request_policy.clone(),
-            (*catalog.store).clone(),
-        )?;
+        let budget =
+            ModelBudget::configured(config.request_policy.clone(), (*catalog.store).clone())?;
         let model: Arc<dyn ModelProvider> = Arc::new(MeteredModel {
             inner: model,
             budget: budget.clone(),
@@ -166,7 +162,7 @@ impl Harness {
                 tools: None,
                 usage: Some(usage.clone()),
                 timeout: Duration::from_secs(60),
-                max_model_calls: 8,
+                steps: 8,
             },
         )));
         hooks
@@ -275,6 +271,13 @@ impl Harness {
         if let Some(subagents) = &subagents {
             tools.register(subagents.clone());
         }
+        // Initialize opencode-aligned tool-output truncation with a spill
+        // directory under the session data root (opencode: data/tool-output).
+        // Spill files let the model re-read truncated shell/web output via read.
+        crate::tools::init_truncation(
+            config.root.join("tool-output"),
+            crate::tools::TruncateLimits::default(),
+        );
         Ok(Self {
             normal_security,
             provider_budgets: Mutex::new(HashMap::from([(
@@ -411,7 +414,7 @@ impl Harness {
     }
 
     pub async fn close(&self) -> Result<Vec<In>, YourAiError> {
-        self.host.close(Duration::from_secs(15)).await
+        self.host.close(Some(Duration::from_secs(15))).await
     }
 }
 
@@ -433,18 +436,13 @@ pub(crate) async fn assemble(
         for definition in tools.definitions() {
             if !matches!(
                 definition.name.as_str(),
-                "read_tool_result" | "read" | "write" | "edit" | "shell" | "webfetch" | "websearch"
+                "read" | "write" | "edit" | "shell" | "webfetch" | "websearch"
             ) {
                 registry.register(tools.resolve(definition.name.as_str())?);
             }
         }
     }
     registry.extend(crate::tools::coding_tools(cwd)?);
-    registry.register(Arc::new(crate::tools::result::ReadToolResult {
-        session: id.clone(),
-        store: catalog.clone(),
-        max_chars: policy.tool_output_chars,
-    }));
     let services = crate::context::ContextServices {
         store: Some(catalog.clone()),
         policy,

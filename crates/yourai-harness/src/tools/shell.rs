@@ -69,7 +69,7 @@ impl ToolHandler for Shell {
             }
             #[cfg(unix)]
             {
-                run(tc, &i.command, &cwd, Duration::from_millis(timeout)).await
+                run(&tc, &i.command, &cwd, Duration::from_millis(timeout)).await
             }
             #[cfg(not(unix))]
             {
@@ -84,7 +84,7 @@ impl ToolHandler for Shell {
 }
 #[cfg(unix)]
 async fn run(
-    tc: ToolContext<'_>,
+    tc: &ToolContext<'_>,
     command: &str,
     cwd: &Path,
     timeout: Duration,
@@ -102,7 +102,7 @@ async fn run(
         sandbox.apply(&mut cmd)?;
     }
     cmd.process_group(0);
-    check_cancel(&tc)?;
+    check_cancel(tc)?;
     let mut child = cmd.spawn().map_err(|e| error("shell", e))?;
     let group = ProcessGroup(child.id().expect("spawned child has a pid"));
     let mut out = child.stdout.take().unwrap();
@@ -154,7 +154,58 @@ async fn run(
     } else {
         termination
     };
-    Ok(
-        json!({"ok":termination=="exit" && status.success(),"exit_code":status.code(),"stdout":String::from_utf8_lossy(&stdout),"stderr":String::from_utf8_lossy(&stderr),"termination":termination,"output_complete":oeof && eeof,"cwd":cwd_str}),
-    )
+    shell_result(&ShellOutput {
+        cwd: cwd_str,
+        termination,
+        oeof,
+        eeof,
+        status,
+        call_id: &tc.call_id,
+        stdout,
+        stderr,
+    })
+    .await
+}
+
+/// Captured shell execution state, passed to [`shell_result`] for truncation.
+struct ShellOutput<'a> {
+    cwd: &'a str,
+    termination: &'a str,
+    oeof: bool,
+    eeof: bool,
+    status: std::process::ExitStatus,
+    call_id: &'a str,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Apply opencode-aligned truncation (`Truncate.output`: MAX_LINES=2000,
+/// MAX_BYTES=50KB) to the combined shell output that the model receives.
+/// The raw capture buffer is still bounded by `MAX_OUTPUT_BYTES` during
+/// streaming so a runaway command cannot exhaust memory; only the returned
+/// result is trimmed to the model-facing budget. When a spill directory is
+/// configured, the full output is saved to a file referenced in the result.
+async fn shell_result(out: &ShellOutput<'_>) -> Result<Value, YourAiError> {
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    let stdout_t = truncate_output(&stdout_str, out.call_id);
+    let stderr_t = truncate_output(&stderr_str, out.call_id);
+    let mut result = json!({
+        "ok": out.termination == "exit" && out.status.success(),
+        "exit_code": out.status.code(),
+        "stdout": stdout_t.content,
+        "stderr": stderr_t.content,
+        "termination": out.termination,
+        "output_complete": out.oeof && out.eeof && !stdout_t.is_truncated() && !stderr_t.is_truncated(),
+        "cwd": out.cwd,
+    });
+    if let Some(obj) = result.as_object_mut() {
+        if let Some(note) = footnote(&stdout_t) {
+            obj.insert("stdout_truncated".into(), json!(note));
+        }
+        if let Some(note) = footnote(&stderr_t) {
+            obj.insert("stderr_truncated".into(), json!(note));
+        }
+    }
+    Ok(result)
 }
