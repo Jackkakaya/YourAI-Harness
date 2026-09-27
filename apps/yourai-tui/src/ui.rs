@@ -4,6 +4,7 @@ mod commands;
 mod editor;
 mod frame_time;
 mod markdown;
+mod mention;
 mod navigation;
 mod overlay;
 mod presentation;
@@ -160,7 +161,9 @@ pub async fn run(
                 }
             }
             app.sync_todos();
+            app.settle_mention().await;
             app.settle_clipboard().await;
+            app.settle_image().await;
             let (queued, compacting) = app.pressure();
             presentation.request();
             let time = frame_time::FrameTime::now();
