@@ -10,23 +10,6 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use yourai_core::{context::DiscardSink, prelude::*, runtime_event::RuntimeEvent};
 use yourai_harness::{collaboration::*, *};
-
-#[test]
-fn default_agent_budgets_are_unlimited() {
-    let loop_config = default_loop::LoopConfig::default();
-    assert_eq!(loop_config.steps, None);
-    // OpenCode attachment.image defaults: 5 MiB base64 / 2000x2000 / resize.
-    assert!(loop_config.attachment_image.auto_resize);
-    assert_eq!(loop_config.attachment_image.max_width, 2000);
-    assert_eq!(loop_config.attachment_image.max_height, 2000);
-    assert_eq!(
-        loop_config.attachment_image.max_base64_bytes,
-        5 * 1024 * 1024
-    );
-    // Text files attached by reference are capped at 50k chars.
-    assert_eq!(loop_config.attachment_text_max_chars, 50_000);
-}
-
 fn context(
     id: SessionId,
     model: Arc<dyn ModelProvider>,
@@ -98,16 +81,8 @@ async fn host_drives_durable_followups_and_close_is_idempotent() {
         .iter()
         .all(|r| r.result.as_ref().unwrap().pending.is_empty()));
     assert_eq!(h.status(), SessionStatus::Idle);
-    assert!(h
-        .close(Some(Duration::from_secs(1)))
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(h
-        .close(Some(Duration::from_secs(1)))
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(h.close(Duration::from_secs(1)).await.unwrap().is_empty());
+    assert!(h.close(Duration::from_secs(1)).await.unwrap().is_empty());
     assert!(h.submit(In::user_text("closed")).is_err());
     let seen = hooks.seen.lock().unwrap();
     assert!(seen.contains(&HookEventKind::SessionStart));
@@ -159,10 +134,7 @@ async fn dropping_driver_cancels_but_supervisor_preserves_followup() {
     .await
     .unwrap();
     assert_eq!(h.queued(), 1);
-    assert_eq!(
-        h.close(Some(Duration::from_secs(1))).await.unwrap().len(),
-        1
-    );
+    assert_eq!(h.close(Duration::from_secs(1)).await.unwrap().len(), 1);
 }
 #[tokio::test]
 async fn queued_input_restores_and_runtime_events_are_deduplicated() {
@@ -342,7 +314,7 @@ async fn file_watcher_reports_actual_changes_and_stops_on_close() {
     })
     .await
     .unwrap();
-    h.close(Some(Duration::from_secs(1))).await.unwrap();
+    h.close(Duration::from_secs(1)).await.unwrap();
 }
 #[tokio::test]
 async fn worktrees_are_created_and_removed_by_git() {
@@ -431,7 +403,7 @@ async fn crash_recovery_closes_unmatched_calls_without_executing() {
         )
         .await
         .unwrap();
-    h.close(Some(Duration::from_secs(1))).await.unwrap();
+    h.close(Duration::from_secs(1)).await.unwrap();
     drop(h);
     let recovered = host(dir.path(), model, None).await;
     let rows = store
@@ -443,7 +415,7 @@ async fn crash_recovery_closes_unmatched_calls_without_executing() {
     assert!(rows[1].message.content.tool_responses()[0]
         .content
         .contains("unknown"));
-    recovered.close(Some(Duration::from_secs(1))).await.unwrap();
+    recovered.close(Duration::from_secs(1)).await.unwrap();
 }
 
 struct SummaryModel;
@@ -578,7 +550,7 @@ async fn manual_compact_emits_hooks_and_accounting() {
 }
 #[tokio::test]
 async fn shared_budget_counts_main_stream_and_compaction_model() {
-    let budget = ModelBudget::new();
+    let budget = ModelBudget::new(Some(2), None);
     let streaming = MeteredModel {
         inner: Arc::new(Model::new(vec![answer("hi")])),
         budget: budget.clone(),
@@ -592,11 +564,10 @@ async fn shared_budget_counts_main_stream_and_compaction_model() {
     let mut stream = streaming.stream_events(request.clone()).await.unwrap();
     while stream.next().await.is_some() {}
     summary.complete(request.clone()).await.unwrap();
-    // No shared call limit; a third call also succeeds.
-    summary.complete(request).await.unwrap();
+    assert!(summary.complete(request).await.is_err());
     let snapshot = budget.snapshot();
-    assert_eq!(snapshot.calls, 3);
-    assert_eq!(snapshot.usage.total_tokens, 29);
+    assert_eq!(snapshot.calls, 2);
+    assert_eq!(snapshot.usage.total_tokens, 16);
 }
 #[tokio::test]
 async fn async_hook_completion_routes_to_own_session_and_wakes_host() {
@@ -631,7 +602,7 @@ async fn async_hook_completion_routes_to_own_session_and_wakes_host() {
             .content
             .first_text()
             .is_some_and(|t| t.contains("background-feedback"))));
-    h.close(Some(Duration::from_secs(1))).await.unwrap();
+    h.close(Duration::from_secs(1)).await.unwrap();
 }
 #[tokio::test]
 async fn catalog_create_fork_list_delete_are_persistent() {
@@ -656,8 +627,8 @@ async fn concurrent_close_runs_session_end_once_and_releases_history_lock() {
     .await;
     h.submit(In::follow_up("handoff")).unwrap();
     let (a, b) = tokio::join!(
-        h.close(Some(Duration::from_secs(1))),
-        h.close(Some(Duration::from_secs(1)))
+        h.close(Duration::from_secs(1)),
+        h.close(Duration::from_secs(1))
     );
     assert_eq!(a.unwrap().len() + b.unwrap().len(), 1);
     assert_eq!(
@@ -673,7 +644,7 @@ async fn concurrent_close_runs_session_end_once_and_releases_history_lock() {
     // Reopen with the original Arc still alive: explicit close must release both locks.
     let next = host(dir.path(), Arc::new(Model::new(vec![])), None).await;
     assert_eq!(next.status(), SessionStatus::Idle);
-    next.close(Some(Duration::from_secs(1))).await.unwrap();
+    next.close(Duration::from_secs(1)).await.unwrap();
 }
 #[tokio::test]
 async fn permission_updates_are_atomic_persistent_and_cannot_expand_scope() {
@@ -782,19 +753,18 @@ async fn harness_runs_real_task_tool_through_loop_and_restores_session() {
 #[tokio::test]
 async fn agent_hook_uses_real_loop_and_shared_budget() {
     use yourai_harness::hooks::{HookModelExecutor, HookModelRequest};
-    let budget = ModelBudget::new();
+    let budget = ModelBudget::new(Some(1), None);
     let executor = assembly::model_hooks::DefaultHookModelExecutor {
         model: Arc::new(MeteredModel {
-            inner: Arc::new(Model::new(vec![
-                answer(r#"{"ok":false,"reason":"unfinished"}"#),
-                answer(r#"{"ok":true}"#),
-            ])),
+            inner: Arc::new(Model::new(vec![answer(
+                r#"{"ok":false,"reason":"unfinished"}"#,
+            )])),
             budget: budget.clone(),
         }),
         tools: None,
         usage: None,
         timeout: Duration::from_secs(1),
-        steps: 2,
+        max_model_calls: 2,
     };
     let request = HookModelRequest {
         prompt: "evaluate".into(),
@@ -811,10 +781,7 @@ async fn agent_hook_uses_real_loop_and_shared_budget() {
     assert!(!result.ok);
     assert_eq!(result.reason.as_deref(), Some("unfinished"));
     assert_eq!(budget.snapshot().calls, 1);
-    // No shared call limit; a second evaluation also succeeds.
-    let result2 = executor.evaluate(request).await.unwrap();
-    assert!(result2.ok);
-    assert_eq!(budget.snapshot().calls, 2);
+    assert!(executor.evaluate(request).await.is_err());
 }
 #[tokio::test]
 async fn watched_directory_detects_created_and_deleted_children() {
@@ -856,7 +823,7 @@ async fn watched_directory_detects_created_and_deleted_children() {
             std::fs::remove_file(&file).unwrap();
         }
     }
-    h.close(Some(Duration::from_secs(1))).await.unwrap();
+    h.close(Duration::from_secs(1)).await.unwrap();
 }
 
 #[tokio::test]
@@ -875,7 +842,7 @@ async fn closing_session_cancels_its_background_command() {
         Some(runtime.clone()),
     )
     .await;
-    h.close(Some(Duration::from_secs(1))).await.unwrap();
+    h.close(Duration::from_secs(1)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(!marker.exists());
 }
@@ -922,7 +889,7 @@ async fn shared_hook_runtime_keeps_background_contexts_session_local() {
         .unwrap()
         .result
         .unwrap();
-        h.close(Some(Duration::from_secs(1))).await.unwrap();
+        h.close(Duration::from_secs(1)).await.unwrap();
     }
     for model in [a, b] {
         assert_eq!(
@@ -1143,7 +1110,7 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
         .unwrap()
         .contains(&HookEventKind::PreCompact));
     assert_eq!(usage.session_usage(&id).await.unwrap().request_count, 1);
-    h.close(Some(Duration::from_secs(1))).await.unwrap();
+    h.close(Duration::from_secs(1)).await.unwrap();
 }
 
 #[tokio::test]
@@ -1212,7 +1179,7 @@ async fn rate_limit_attempts_stop_at_retry_limit() {
         }
     }
     let provider = Arc::new(Limited(std::sync::atomic::AtomicUsize::new(0)));
-    let budget = ModelBudget::new();
+    let budget = ModelBudget::new(None, None);
     let model = Arc::new(MeteredModel {
         inner: provider.clone(),
         budget: budget.clone(),
@@ -1221,7 +1188,6 @@ async fn rate_limit_attempts_stop_at_retry_limit() {
         .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop::new(
             yourai_harness::default_loop::LoopConfig {
                 retry_delay: Duration::ZERO,
-                max_model_retries: 2,
                 ..Default::default()
             },
         )))
@@ -1234,13 +1200,9 @@ async fn rate_limit_attempts_stop_at_retry_limit() {
     assert_eq!(metrics.calls, 3);
     assert_eq!(metrics.requests.rate_limited, 3);
     assert_eq!(metrics.requests.active, 0);
-    // OpenCode session/retry.ts parity: 2s initial delay with exponential
-    // backoff (×2, 25% jitter), 30s ceiling without retry-after headers,
-    // and RETRY_MAX_RETRIES = 5 (the AI SDK layer retries zero times).
-    let defaults = yourai_harness::default_loop::LoopConfig::default();
-    assert_eq!(defaults.retry_delay, Duration::from_secs(2));
-    assert_eq!(defaults.retry_max_delay, Duration::from_secs(30));
-    assert_eq!(defaults.max_model_retries, 5);
+    assert!(
+        yourai_harness::default_loop::LoopConfig::default().retry_delay >= Duration::from_secs(2)
+    );
 }
 
 #[tokio::test]
@@ -1249,6 +1211,7 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
     let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
     config.system_prompt = Some("test".into());
     config.context_policy.context_window = Some(64_000);
+    config.max_shared_model_calls = Some(2);
     let old = Arc::new(Model::new(vec![answer("first")]));
     let h = Harness::open(config, old.clone()).await.unwrap();
     h.host.submit(In::user_text("one")).unwrap();
@@ -1265,7 +1228,7 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
         .unwrap();
     assert_eq!(h.budget.snapshot().calls, 1);
 
-    let new = Arc::new(Model::new(vec![answer("second")]));
+    let new = Arc::new(Model::new(vec![answer("second"), answer("over budget")]));
     let policy = ContextPolicy {
         context_window: Some(32_000),
         output_reserve: 2048,
@@ -1315,6 +1278,20 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
         .messages
         .iter()
         .any(|m| m.content.first_text() == Some("first")));
+    h.host.submit(In::user_text("three")).unwrap();
+    assert!(h
+        .host
+        .run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .is_err());
+    assert_eq!(new.requests.lock().unwrap().len(), 1);
     h.close().await.unwrap();
 }
 

@@ -281,7 +281,7 @@ impl MemoryContext {
                 ));
             }
             if options.calls.load(Ordering::Acquire) >= options.max_model_calls {
-                return Err(ErrorKind::Loop("compaction model call limit reached".into()).into());
+                return Err(AbortReason::LimitReached(TurnLimit::ModelCalls).into());
             }
             if cancel.is_cancelled() {
                 return Err(AbortReason::Cancelled.into());

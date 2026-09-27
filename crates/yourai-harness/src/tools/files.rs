@@ -171,15 +171,10 @@ impl ToolHandler for Read {
             }
             let start = i.offset - 1;
             let end = start.saturating_add(i.limit).min(lines.len());
-            // opencode read.ts clips lines longer than MAX_LINE_LENGTH with a
-            // suffix so a minified file cannot blow up a single result page.
             let body = lines[start..end]
                 .iter()
                 .enumerate()
-                .map(|(n, line)| {
-                    let clipped = clip_line(line);
-                    format!("{}|{}", i.offset + n, clipped)
-                })
+                .map(|(n, line)| format!("{}|{}", i.offset + n, line))
                 .collect::<String>();
             check_cancel(&tc)?;
             Ok(

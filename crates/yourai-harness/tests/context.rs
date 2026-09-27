@@ -7,7 +7,7 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-use yourai_core::prelude::*;
+use yourai_core::{context::DiscardSink, prelude::*};
 use yourai_harness::{storage::LocalUsage, SqliteStore};
 
 struct Summarizer {
@@ -135,10 +135,10 @@ async fn seed_tools(c: &MemoryContext) {
     .unwrap();
 }
 #[tokio::test]
-async fn projection_is_bounded_valid_json_and_original_is_preserved() {
+async fn projection_is_bounded_valid_json_and_original_is_pageable() {
     let mut p = policy();
     p.tool_output_chars = 512;
-    let (_dir, _store, c) = setup(p, Summarizer::new(), None).await;
+    let (_dir, store, c) = setup(p, Summarizer::new(), None).await;
     let original = json!({"ok":true,"output":"你好🌍".repeat(1000)}).to_string();
     append(
         &c,
@@ -149,11 +149,44 @@ async fn projection_is_bounded_valid_json_and_original_is_preserved() {
     let text = &projected.request.messages[1].content.tool_responses()[0].content;
     assert!(text.chars().count() <= 512);
     assert!(serde_json::from_str::<serde_json::Value>(text).is_ok());
-    // The stored original is untouched — the cap applies at projection only.
     assert_eq!(
         c.records()[1].message.content.tool_responses()[0].content,
         original
     );
+    let reader = yourai_harness::tools::result::ReadToolResult {
+        session: c.session_id().clone(),
+        store,
+        max_chars: 512,
+    };
+    let cancel = CancellationToken::new();
+    let mut offset = 0;
+    let mut reconstructed = String::new();
+    loop {
+        let page = reader
+            .execute(
+                ToolContext {
+                    call_id: "read".into(),
+                    emit: &DiscardSink,
+                    cancel: &cancel,
+                    security: None,
+                    sandbox: None,
+                    interaction: None,
+                },
+                json!({"call_id":"a","offset":offset,"limit":10000}),
+            )
+            .await
+            .unwrap();
+        assert!(page.to_string().chars().count() <= 512);
+        reconstructed.push_str(page["content"].as_str().unwrap());
+        match page["next"].as_u64() {
+            Some(next) => {
+                assert!(next > offset);
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(reconstructed, original);
 }
 #[tokio::test]
 async fn prune_only_avoids_model_hooks_and_survives_restore_and_fork() {
@@ -704,50 +737,6 @@ async fn compact_uses_message_content_without_opening_media_locations() {
     assert!(c
         .build_request(&[])
         .unwrap()
-        .request
-        .messages
-        .last()
-        .unwrap()
-        .content
-        .parts()
-        .iter()
-        .any(|p| matches!(p, ContentPart::Binary(_))));
-}
-
-/// Regression for the attachment feature: `GenaiModel` must implement
-/// `media_tokens`. Before it did, the fail-closed trait default made
-/// `MemoryContext::build_request` reject every request whose history
-/// contained a Binary part ("media budgeting/capability is not configured").
-#[tokio::test]
-async fn binary_attachment_builds_request_with_genai_model() {
-    use base64::Engine as _;
-    let model = yourai_harness::GenaiModel::new(genai::Client::builder().build(), "test-model");
-    let (_dir, _store, c) = setup(policy(), Arc::new(model), None).await;
-    // Blank 2000x2000 PNG — compresses to a tiny payload but keeps full
-    // dimensions for the estimator.
-    let img = image::DynamicImage::new_rgb8(2000, 2000);
-    let mut buf = Vec::new();
-    img.to_rgb8()
-        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-        .unwrap();
-    let data = base64::engine::general_purpose::STANDARD.encode(&buf);
-    append(
-        &c,
-        vec![ChatMessage::user(MessageContent::from_parts(vec![
-            ContentPart::from_text("describe this"),
-            ContentPart::from_binary_base64("image/png", data.as_str(), None),
-        ]))],
-    )
-    .await;
-    let request = c.build_request(&[]).unwrap();
-    // 2000x2000 -> max(anthropic 1568^2/750 = 3279, openai 4 tiles = 765).
-    assert!(
-        request.estimated_tokens >= 3279,
-        "image tokens must be counted: {}",
-        request.estimated_tokens
-    );
-    // ... and the Binary part survives into the outgoing request.
-    assert!(request
         .request
         .messages
         .last()

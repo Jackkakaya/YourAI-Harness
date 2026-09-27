@@ -105,12 +105,12 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
 ③ ContextManager 调 SessionManager 保存，成功后追加到内存
 ④ build_request 检查单条结果大小
     ├─ 未超限 → 正常内容
-    └─ 超限 → 有界预览（头尾 + 状态信封） + 截断标记
+    └─ 超限 → 有界预览 + 截断标记 + 完整结果读取入口
 ```
 
-超长正文放入合法 JSON 预览，保留头尾、call_id、ok/error/exit_code 状态；包装与提示合计受字符上限约束。无法容纳必要状态时明确报错。媒体用量交给 ModelProvider.media_tokens；默认适配器尚未提供估算，遇到媒体明确报错，不按 base64 长度伪估算。
+超长正文放入合法 JSON 预览，保留头尾、call_id、ok/error/exit_code 和读取入口；包装与提示合计受字符上限约束。无法容纳必要状态时明确报错。媒体用量交给 ModelProvider.media_tokens；默认适配器尚未提供估算，遇到媒体明确报错，不按 base64 长度伪估算。
 
-原文、call_id 和 active 状态不变。工具输出在入库前已由截断模块限制（2000 行 / 50KB，超限全文写入 spill 文件，模型可用 `read` 工具回看）；投影层是第二级上限，pruned 的旧结果只保留状态信封——与 OpenCode 的摘要化一致，被清理的细节不在上下文内恢复。
+原文、call_id 和 active 状态不变。完整结果通过 `read_tool_result(call_id, offset, limit)` 工具调用 SessionManager 分页读取，每次返回同样受展示上限约束。
 
 ### 4.2 compact 内部：先尝试清理旧工具输出
 
@@ -118,7 +118,7 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
 
 ```text
 ① 选择近期保护区之外、尚未清理的合格结果
-② 在内部副本上替换成“简短状态 + call_id”的信封
+② 在内部副本上替换成“简短状态 + call_id + 读取入口”
 ③ 计算整个批次的回收量
     ├─ 无候选 / 回收不足 → 保持原视图，进入摘要判断
     └─ 满足回收门槛 → 计算清理后的完整请求用量
@@ -222,7 +222,7 @@ SQLite v2 增加 nullable `messages.tool_output_pruned_at`（UTC 毫秒），启
 | 记录状态 | 原文 | 发给模型 |
 |---|---|---|
 | active，未清理 | 保留 | 正常内容或有界预览 |
-| active，已清理 | 保留 | 简短状态、call_id |
+| active，已清理 | 保留 | 简短状态、call_id、读取入口 |
 | compacted | 保留 | 原消息不发送，由摘要承接 |
 
 - restore 读取清理标记，fork 复制标记；配置变更不自动清除标记。

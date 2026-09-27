@@ -386,20 +386,6 @@ impl Renderer {
         if v.items().is_empty() {
             welcome(f, inner);
         }
-        // Staged-attachment badge on the input block: clipboard images and
-        // @file references wait for the next submit; Esc clears them.
-        let n_img = v
-            .pending_attachments
-            .iter()
-            .filter(|a| a.marker.is_empty())
-            .count();
-        let n_ref = v.pending_attachments.len() - n_img;
-        let badge = match (n_img, n_ref) {
-            (0, 0) => String::new(),
-            (0, r) => format!(" {r} ref · Esc clears "),
-            (i, 0) => format!(" {i} img · Esc clears "),
-            (i, r) => format!(" {i} img · {r} ref · Esc clears "),
-        };
         draw_editor(
             f,
             &v.editor,
@@ -410,7 +396,6 @@ impl Renderer {
             } else {
                 "Ask anything…"
             },
-            &badge,
         );
         // Show one recovery action only while reading history; keep idle input quiet.
         if v.navigation.offset() > 0 && rows[4].height >= 3 && !v.overlay.is_open() {
@@ -503,54 +488,6 @@ impl Renderer {
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(BORDER))
                             .title(" Commands · ↑↓ · Enter · Tab "),
-                    ),
-                rect,
-            );
-        }
-        // @ mention autocomplete popup.
-        if v.mention.active && !v.mention.entries.is_empty() {
-            let entries = &v.mention.entries;
-            let height = (entries.len() as u16 + 2).min(rows[4].y.saturating_sub(area.y));
-            let rect = Rect::new(
-                inner.x,
-                rows[4].y.saturating_sub(height),
-                inner.width.min(62),
-                height,
-            );
-            f.render_widget(Clear, rect);
-            let visible = height.saturating_sub(2) as usize;
-            let start = v.mention.selected.saturating_sub(visible.saturating_sub(1));
-            let lines = entries
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(visible)
-                .map(|(i, e)| {
-                    let icon = if e.is_dir { "📁" } else { "📄" };
-                    Line::from(Span::styled(
-                        format!(
-                            " {} {:<40}",
-                            if i == v.mention.selected { "›" } else { " " },
-                            format!("{icon} {}", e.display)
-                        ),
-                        Style::default()
-                            .fg(if i == v.mention.selected {
-                                ACCENT
-                            } else {
-                                TEXT
-                            })
-                            .bg(if i == v.mention.selected { BG } else { PANEL }),
-                    ))
-                })
-                .collect::<Vec<_>>();
-            f.render_widget(
-                Paragraph::new(lines)
-                    .style(Style::default().bg(PANEL))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(BORDER))
-                            .title(" @ files · ↑↓ · Enter · Esc "),
                     ),
                 rect,
             );
@@ -742,27 +679,13 @@ fn welcome(f: &mut Canvas, area: Rect) {
     f.render_widget(Paragraph::new(lines), rect);
 }
 
-fn draw_editor(
-    f: &mut Canvas,
-    e: &Editor,
-    area: Rect,
-    focus: bool,
-    placeholder: &str,
-    badge: &str,
-) {
+fn draw_editor(f: &mut Canvas, e: &Editor, area: Rect, focus: bool, placeholder: &str) {
     if area.is_empty() {
         return;
     }
-    let mut block = Block::default()
+    let block = Block::default()
         .style(Style::default().bg(PANEL).fg(TEXT))
         .padding(ratatui::widgets::Padding::new(3, 1, 1, 1));
-    if !badge.is_empty() {
-        // Staged-attachment counts ride on the input block's first row.
-        block = block.title(
-            Line::from(Span::styled(badge.to_owned(), Style::default().fg(MUTED)))
-                .alignment(ratatui::layout::Alignment::Right),
-        );
-    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     if !inner.is_empty() {
@@ -1066,7 +989,7 @@ fn label(s: &str, color: Color) -> Line<'static> {
 }
 fn help(f: &mut Canvas, area: Rect, scroll: u16) {
     let rect = crate::picker::centered(area, 78, area.height.saturating_sub(2) as usize);
-    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nCtrl-V          Paste image from clipboard (Esc clears)\n@               Reference a file (text inlined; images/PDF attached)\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y/n + Enter (YOLO skips approvals).";
+    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y/n + Enter (YOLO skips approvals).";
     let lines: Vec<_> = text
         .lines()
         .flat_map(|line| {

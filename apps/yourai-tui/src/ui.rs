@@ -4,7 +4,6 @@ mod commands;
 mod editor;
 mod frame_time;
 mod markdown;
-mod mention;
 mod navigation;
 mod overlay;
 mod presentation;
@@ -145,7 +144,8 @@ pub async fn run(
                         }
                         // The reader thread only dies with the process; treat
                         // a closed channel like a quit.
-                        None => return Ok::<(), Error>(()),                    }
+                        None => return Ok::<(), Error>(()),
+                    }
                 }
                 _ = tick.tick() => {}
                 _ = tokio::time::sleep_until(presentation.deadline()), if presentation.pending() => {}
@@ -160,9 +160,7 @@ pub async fn run(
                 }
             }
             app.sync_todos();
-            app.settle_mention().await;
             app.settle_clipboard().await;
-            app.settle_image().await;
             let (queued, compacting) = app.pressure();
             presentation.request();
             let time = frame_time::FrameTime::now();

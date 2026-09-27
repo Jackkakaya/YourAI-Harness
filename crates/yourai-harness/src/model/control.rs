@@ -117,7 +117,7 @@ impl ModelBudget {
                 let now = Instant::now();
                 let until = deadlines.0.max(deadlines.1);
                 if until <= now {
-                    self.reserve();
+                    self.reserve()?;
                     deadlines.0 = now
                         + self
                             .control
@@ -169,6 +169,8 @@ mod tests {
     use super::*;
     fn budget(policy: RequestPolicy) -> std::sync::Arc<ModelBudget> {
         ModelBudget::configured(
+            None,
+            None,
             policy,
             SqliteStore::open(std::path::Path::new(":memory:")).unwrap(),
         )
@@ -274,9 +276,11 @@ mod tests {
 mod provider_tests {
     use super::*;
     #[tokio::test(start_paused = true)]
-    async fn provider_gates_are_independent_and_accounting_is_shared() {
+    async fn provider_gates_are_independent_but_hard_budget_is_shared() {
         let store = SqliteStore::open(std::path::Path::new(":memory:")).unwrap();
         let a = ModelBudget::configured(
+            Some(2),
+            None,
             RequestPolicy {
                 rpm: Some(1),
                 ..Default::default()
@@ -293,6 +297,7 @@ mod provider_tests {
             .unwrap();
         assert_eq!(a.snapshot().calls, 2);
         assert_eq!(b.snapshot().calls, 2);
+        assert!(b.admit().await.is_err());
         assert!(!a.control.remaining().is_zero());
         assert!(b.control.remaining().is_zero());
     }

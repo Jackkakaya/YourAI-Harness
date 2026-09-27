@@ -79,7 +79,15 @@ async fn coding_loop_modifies_tests_and_persists_results() {
         .tools
         .clone()
         .unwrap();
-    for name in ["read", "write", "edit", "shell", "webfetch", "websearch"] {
+    for name in [
+        "read",
+        "write",
+        "edit",
+        "shell",
+        "read_tool_result",
+        "webfetch",
+        "websearch",
+    ] {
         assert!(offered.iter().any(|t| t.name.as_str() == name));
     }
     let id = h.host.context().id;
@@ -105,17 +113,17 @@ async fn coding_loop_modifies_tests_and_persists_results() {
         5
     );
     let model = Arc::new(Model::new(vec![
-        invoke("re-read", "read", json!({"path":"answer.txt"})),
+        invoke("fetch", "read_tool_result", json!({"call_id":"test-1"})),
         answer("restored"),
     ]));
     let mut cfg = HarnessConfig::new(root, d.path().into());
     cfg.resume = Some(id);
-    let h = Harness::open(cfg, model.clone()).await.unwrap();
-    // Approve any permission request so the resumed turn cannot stall.
+    let h = Harness::open(cfg, model).await.unwrap();
+    // read_tool_result is an existing separate tool; explicitly grant its permission.
     HookRegistry::register(
         h.hooks.as_ref(),
         NativeHookRegistration {
-            id: "allow-read".into(),
+            id: "allow-result".into(),
             event: HookEventKind::PermissionRequest,
             matcher: None,
             handler: Arc::new(Approve),
@@ -128,7 +136,7 @@ async fn coding_loop_modifies_tests_and_persists_results() {
     .await
     .unwrap();
     h.host
-        .submit(In::user_text("read the fixed answer"))
+        .submit(In::user_text("read the earlier test output"))
         .unwrap();
     let capture = Capture(Mutex::new(vec![]));
     h.host
@@ -138,18 +146,7 @@ async fn coding_loop_modifies_tests_and_persists_results() {
         .unwrap()
         .result
         .unwrap();
-    assert!(capture.0.lock().unwrap().iter().any(|o|matches!(o,Out::ToolDone{name,output,..} if name=="read" && output["content"].as_str().unwrap().contains("correct"))));
-    // The restored session projects the earlier tool responses back into
-    // the model context (the first shell failure is still visible).
-    assert!(model.requests.lock().unwrap()[0]
-        .request
-        .messages
-        .iter()
-        .any(|m| m
-            .content
-            .tool_responses()
-            .iter()
-            .any(|r| r.content.contains("expected correct"))));
+    assert!(capture.0.lock().unwrap().iter().any(|o|matches!(o,Out::ToolDone{name,output,..} if name=="read_tool_result" && output["content"].as_str().unwrap().contains("expected correct"))));
     h.close().await.unwrap();
 }
 struct Approve;
@@ -284,9 +281,7 @@ async fn child_restore_rebinds_builtin_working_directory() {
     .unwrap();
     assert!(child.path().join("child.txt").exists());
     assert!(!d.path().join("child.txt").exists());
-    host.close(Some(std::time::Duration::from_secs(1)))
-        .await
-        .unwrap();
+    host.close(std::time::Duration::from_secs(1)).await.unwrap();
     h.close().await.unwrap();
 }
 

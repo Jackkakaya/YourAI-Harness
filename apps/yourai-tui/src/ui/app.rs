@@ -5,12 +5,11 @@
 use super::{
     clipboard, commands,
     frame_time::FrameTime,
-    mention,
     overlay::{Action as OverlayAction, Overlay},
     presentation::Canvas,
     render::{Hit, Metadata, Renderer},
     session::{Controller, Reply, Target},
-    state::{self, PendingAttachment, View},
+    state::{self, View},
     theme,
 };
 use crate::{config::Error, models::ModelChoice};
@@ -18,7 +17,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::prelude::{Position, Rect};
-use std::{path::PathBuf, time::Instant};
+use std::time::Instant;
 use tokio::task::JoinHandle;
 use yourai_core::prelude::*;
 
@@ -40,13 +39,6 @@ pub(super) struct App {
     /// kept on the view.
     choices: Vec<ModelChoice>,
     clipboard_task: Option<JoinHandle<std::io::Result<()>>>,
-    /// In-flight clipboard image read (Ctrl+V or empty bracketed paste).
-    image_task: Option<JoinHandle<std::io::Result<Option<clipboard::ClipboardImage>>>>,
-    /// In-flight `@` mention filesystem scan; at most one at a time, aborted
-    /// and replaced whenever the query changes.
-    mention_scan: Option<mention::Scan>,
-    /// Scan root; refreshed when a session switch lands (the cwd may change).
-    cwd: PathBuf,
     /// The TaskBoard version already reflected in `view.todos`; None means
     /// the next sync must run (also reset on session switch).
     synced_todos: Option<u64>,
@@ -59,7 +51,6 @@ impl App {
         meta: Metadata,
         choices: Vec<ModelChoice>,
     ) -> Self {
-        let cwd = controller.harness().host.context().cwd.clone();
         Self {
             renderer: Renderer::default(),
             controller,
@@ -67,9 +58,6 @@ impl App {
             meta,
             choices,
             clipboard_task: None,
-            image_task: None,
-            mention_scan: None,
-            cwd,
             synced_todos: None,
         }
     }
@@ -88,7 +76,6 @@ impl App {
             let context = self.controller.harness().host.context();
             self.meta.session = context.id.0;
             self.meta.cwd = context.cwd.to_string_lossy().into();
-            self.cwd = context.cwd.clone();
             self.renderer = Renderer::default();
             self.synced_todos = None;
         }
@@ -156,92 +143,6 @@ impl App {
         }
     }
 
-    /// Deliver a finished mention scan: stale results (the query moved on)
-    /// are dropped; fresh ones populate the popup and reset the selection.
-    pub(super) async fn settle_mention(&mut self) {
-        if self.mention_scan.as_ref().is_some_and(|t| t.is_finished()) {
-            if let Ok((anchor, query, entries)) = self.mention_scan.take().unwrap().await {
-                if self.view.mention.active
-                    && self.view.mention.anchor == anchor
-                    && self.view.mention.query == query
-                {
-                    self.view.mention.entries = entries;
-                    self.view.mention.selected = 0;
-                }
-            }
-        }
-    }
-
-    /// Reap a finished clipboard image read into the staging list.
-    pub(super) async fn settle_image(&mut self) {
-        if self.image_task.as_ref().is_some_and(|t| t.is_finished()) {
-            let outcome = self.image_task.take().unwrap().await;
-            match outcome {
-                Ok(Ok(Some(img))) => self.stage_clipboard_image(img),
-                Ok(Ok(None)) => {
-                    self.view.notice(Level::Info, "No image in clipboard.");
-                }
-                Ok(Err(e)) => {
-                    self.view
-                        .notice(Level::Error, format!("Clipboard read failed: {e}"));
-                }
-                Err(e) => {
-                    self.view
-                        .notice(Level::Error, format!("Clipboard read failed: {e}"));
-                }
-            }
-        }
-    }
-
-    /// Start an image read off the UI thread; `settle_image` stages the
-    /// result or reports the outcome.
-    fn read_clipboard_image(&mut self) {
-        if let Some(previous) = self.image_task.take() {
-            previous.abort();
-        }
-        self.image_task = Some(tokio::spawn(clipboard::read_image()));
-    }
-
-    /// Stage a clipboard image: empty marker → always sent with the next
-    /// submit.
-    fn stage_clipboard_image(&mut self, img: clipboard::ClipboardImage) {
-        let n = self.view.pending_attachments.len() + 1;
-        let mime = img.mime.clone();
-        self.view.pending_attachments.push(PendingAttachment {
-            marker: String::new(),
-            attachment: UserAttachment::base64(
-                img.mime,
-                img.data,
-                Some(format!("clipboard-{n}.png")),
-            ),
-        });
-        self.view.notice(
-            Level::Info,
-            format!("Image attached ({mime}). Enter to send, Esc to clear."),
-        );
-    }
-
-    /// Re-detect the @ mention state after an editor mutation. Rescans only
-    /// when the mention actually moved or changed — cursor moves within the
-    /// same query must not hit the disk or reset the selection.
-    fn sync_mention(&mut self) {
-        if let Some((anchor, query)) =
-            mention::MentionState::detect(&self.view.editor.text, self.view.editor.cursor)
-        {
-            if !self.view.mention.active
-                || self.view.mention.anchor != anchor
-                || self.view.mention.query != query
-            {
-                self.view.mention.activate(anchor, &query);
-                self.view.mention.entries.clear();
-                let cwd = self.cwd.clone();
-                mention::start_scan(&mut self.mention_scan, &cwd, anchor, query);
-            }
-        } else if self.view.mention.active {
-            self.view.mention.deactivate();
-        }
-    }
-
     /// `(queued inputs, compacting)` for the status line.
     pub(super) fn pressure(&self) -> (usize, bool) {
         (
@@ -296,85 +197,10 @@ impl App {
             self.renderer.selection.clear();
             return Flow::Continue;
         }
-        // No selection: Esc drops staged attachments before falling through
-        // to the interrupt handler.
-        if key.code == KeyCode::Esc && !self.view.pending_attachments.is_empty() {
-            self.view.pending_attachments.clear();
-            self.view.notice(Level::Info, "Attachments cleared.");
-            return Flow::Continue;
-        }
         self.renderer.selection.clear();
         if let Some(action) = self.view.overlay.key(key, self.choices.len()) {
             self.overlay_action(action);
             return Flow::Continue;
-        }
-        // ── @ mention autocomplete ───────────────────────
-        // When active, intercept navigation keys before the command menu or
-        // the editor sees them.
-        if self.view.mention.active && self.view.asks_empty() && !ctrl && !alt {
-            match key.code {
-                KeyCode::Up => {
-                    self.view.mention.step(true);
-                    return Flow::Continue;
-                }
-                KeyCode::Down => {
-                    self.view.mention.step(false);
-                    return Flow::Continue;
-                }
-                KeyCode::Esc => {
-                    self.view.mention.deactivate();
-                    return Flow::Continue;
-                }
-                KeyCode::Tab => {
-                    let entry = self.view.mention.current().cloned();
-                    match entry {
-                        None => return Flow::Continue,
-                        Some(entry) if entry.is_dir => {
-                            // Tab on directory: expand (down-drill).
-                            let replace = format!("@{}", entry.display);
-                            let anchor = self.view.mention.anchor;
-                            let end = anchor + 1 + self.view.mention.query.len();
-                            self.view
-                                .editor
-                                .replace_range(anchor..end, &format!("{replace}/"));
-                            self.sync_mention();
-                            return Flow::Continue;
-                        }
-                        // Tab on file: same as Enter (select) — fall through.
-                        Some(_) => {}
-                    }
-                }
-                KeyCode::Enter => {}
-                _ => return Flow::Continue,
-            }
-            // ── File/directory selection (Tab or Enter) ──
-            // Both stage a file reference: the editor keeps a short `@path`
-            // marker, the harness reads the file (text window, image
-            // normalization, directory listing) at submit time. No content is
-            // inlined here.
-            if let Some(entry) = self.view.mention.current().cloned() {
-                let display = entry.display.clone();
-                let anchor = self.view.mention.anchor;
-                let end = anchor + 1 + self.view.mention.query.len();
-                self.view.mention.deactivate();
-                self.view
-                    .editor
-                    .replace_range(anchor..end, &format!("@{display} "));
-                let marker = format!("@{display}");
-                // Re-attaching replaces the previous staging for the same
-                // marker instead of duplicating.
-                self.view.pending_attachments.retain(|a| a.marker != marker);
-                self.view.pending_attachments.push(PendingAttachment {
-                    marker,
-                    attachment: UserAttachment::file(
-                        entry.path.to_string_lossy().into_owned(),
-                        None,
-                    ),
-                });
-                self.view
-                    .notice(Level::Info, format!("Attached {display}. Esc to clear."));
-                return Flow::Continue;
-            }
         }
         let commands = self.view.menu().items();
         if !commands.is_empty() && !ctrl && !alt {
@@ -434,10 +260,6 @@ impl App {
             }
             KeyCode::Char('b') if ctrl => self.view.overlay = Overlay::Stats { scroll: 0 },
             KeyCode::Char('y') if ctrl => self.view.theme = self.view.theme.next(),
-            // Ctrl+V: paste an image from the clipboard. Text paste still
-            // arrives via bracketed-paste Event::Paste; this reads image data
-            // that bracketed paste cannot carry.
-            KeyCode::Char('v') if ctrl => self.read_clipboard_image(),
             KeyCode::Home if ctrl => self.renderer.latest_turn(&mut self.view),
             KeyCode::Up if ctrl => {
                 self.renderer.jump_turn(&mut self.view, true);
@@ -483,8 +305,6 @@ impl App {
                     ask.editor.key(key);
                 } else {
                     self.view.editor.key(key);
-                    // After each keystroke, check for an @ mention trigger.
-                    self.sync_mention();
                 }
             }
         }
@@ -520,14 +340,9 @@ impl App {
         }
     }
 
-    /// Paste routing: overlay query → pending ask → the draft editor. Empty
-    /// bracketed paste usually means the clipboard holds an image (most
-    /// terminals cannot paste images as text); best-effort image read so
-    /// Ctrl+V also works when the terminal intercepts it.
+    /// Paste routing: overlay query → pending ask → the draft editor.
     fn paste(&mut self, text: &str) {
-        if text.is_empty() {
-            self.read_clipboard_image();
-        } else if self.view.overlay.is_open() {
+        if self.view.overlay.is_open() {
             self.view.overlay.paste(text);
         } else if let Some(ask) = self.view.ask_mut() {
             ask.editor.insert(text);
@@ -563,7 +378,7 @@ impl App {
             return Flow::Continue;
         }
         let text = self.view.editor.text.clone();
-        if text.trim().is_empty() && self.view.pending_attachments.is_empty() {
+        if text.trim().is_empty() {
             return Flow::Continue;
         }
         // Command dispatch: parse in commands.rs, side effects here.
@@ -665,46 +480,15 @@ impl App {
             Some(body) => (true, body),
             None => (false, text.clone()),
         };
-        let atts = self.view.attachments_for(&text);
-        let n_images = atts
-            .iter()
-            .filter(|a| matches!(a.data, AttachmentData::Base64(_)))
-            .count();
-        let n_refs = atts.len() - n_images;
-        // /queue is a mid-turn steer; it cannot carry attachments (images or
-        // file references).
-        if queued && !atts.is_empty() {
-            self.view.notice(
-                Level::Warning,
-                "Attachments cannot be queued. Send without /queue, or press Esc to clear them.",
-            );
-            return Flow::Continue;
-        }
-        // Allow image-only messages (no text body).
-        if body.trim().is_empty() && atts.is_empty() {
-            return Flow::Continue;
-        }
         let input = if queued {
             In::follow_up(&body)
-        } else if atts.is_empty() {
-            In::user_text(&body)
         } else {
-            In::user_text_with_attachments(&body, atts)
+            In::user_text(&body)
         };
         if self.controller.submit(input, &mut self.view) {
-            // Clear attachments only after a successful submit, so a failure
-            // (e.g. turn-in-flight rejection) preserves them for retry.
-            self.view.pending_attachments.clear();
             self.view.editor.remember(&text);
             self.view.editor.take();
-            let mut display = body.clone();
-            if n_images > 0 {
-                display.push_str(&format!(" [img×{n_images}]"));
-            }
-            if n_refs > 0 {
-                display.push_str(&format!(" [ref×{n_refs}]"));
-            }
-            self.view.user(&display, queued);
+            self.view.user(&body, queued);
             self.view.follow();
             if let Some(title) = self.view.note_title(&body) {
                 self.controller.save_title(title);

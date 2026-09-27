@@ -58,27 +58,16 @@ impl State<'_> {
             )
             .into());
         }
-        if self.forced_final {
-            // opencode runner (llm.ts "isLastStep"): append an assistant-role
-            // MAX_STEPS_PROMPT prefill to the outgoing request only — never to
-            // persisted history — and forbid tool calls at the API level.
-            prepared
-                .request
-                .messages
-                .push(ChatMessage::assistant(super::MAX_STEPS_PROMPT));
-        }
+        self.check_model_budget()?;
         let request = prepared.request;
         let observed_request = request.clone();
-        let mut options = self
+        let options = self
             .history
             .default_options()
             .with_capture_content(true)
             .with_capture_tool_calls(true)
             .with_capture_usage(true)
             .with_capture_reasoning_content(true);
-        if self.forced_final {
-            options = options.with_tool_choice(ToolChoice::None);
-        }
         let model = self.model.clone();
         let model_timeout = self.tc.info.options.limits.model_timeout;
         let header_timeout = model_timeout.unwrap_or(self.config.model_header_timeout);

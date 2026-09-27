@@ -9,7 +9,7 @@ pub struct DefaultHookModelExecutor {
     pub tools: Option<Arc<dyn ToolRegistry>>,
     pub usage: Option<Arc<dyn UsageTracker>>,
     pub timeout: Duration,
-    pub steps: u32,
+    pub max_model_calls: u32,
 }
 impl HookModelExecutor for DefaultHookModelExecutor {
     fn evaluate<'a>(
@@ -39,7 +39,7 @@ impl HookModelExecutor for DefaultHookModelExecutor {
                         .context_manager(history)
                         .agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
                             crate::default_loop::LoopConfig {
-                                steps: Some(self.steps),
+                                max_model_calls: Some(self.max_model_calls),
                                 ..Default::default()
                             },
                         )));

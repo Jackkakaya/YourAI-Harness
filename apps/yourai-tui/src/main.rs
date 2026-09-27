@@ -127,7 +127,7 @@ async fn run() -> Result<(), Error> {
     config_template.resume = None;
     let harness = Harness::open(hc, model).await?;
     let mut limits = TurnLimits::default();
-    limits.steps = config.configured_steps()?;
+    limits.max_model_calls = config.max_model_calls;
     let config_clone_model = match &config.selected_variant {
         Some(variant) => format!("{} · {variant}", config.model),
         None => config.model.clone(),
