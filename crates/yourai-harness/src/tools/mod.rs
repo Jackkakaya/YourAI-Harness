@@ -6,7 +6,6 @@ pub use web::{WebFetch, WebSearch};
 
 pub use files::{Edit, Read, Write};
 mod registry;
-pub mod result;
 pub use registry::ToolSet;
 
 use serde_json::{json, Value};

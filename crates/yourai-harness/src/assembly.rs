@@ -33,8 +33,6 @@ pub struct HarnessConfig {
     pub memory_provider: Option<Arc<dyn MemoryProvider>>,
     pub skill_provider: Option<Arc<dyn SkillProvider>>,
     pub memory_search_limit: usize,
-    pub max_shared_model_calls: Option<u64>,
-    pub max_known_tokens: Option<u64>,
     pub request_policy: crate::model::RequestPolicy,
     /// Stable provider key used to retain admission state across model switches.
     pub model_provider: String,
@@ -58,8 +56,6 @@ impl HarnessConfig {
             memory_provider: None,
             skill_provider: None,
             memory_search_limit: 0,
-            max_shared_model_calls: Some(256),
-            max_known_tokens: None,
             request_policy: Default::default(),
             model_provider: String::new(),
             model_header_timeout: None,
@@ -146,12 +142,8 @@ impl Harness {
         meta.model = Some(model.model_iden().into());
         catalog.save_session(&meta).await?;
         let dir = catalog.directory(&id)?;
-        let budget = ModelBudget::configured(
-            config.max_shared_model_calls,
-            config.max_known_tokens,
-            config.request_policy.clone(),
-            (*catalog.store).clone(),
-        )?;
+        let budget =
+            ModelBudget::configured(config.request_policy.clone(), (*catalog.store).clone())?;
         let model: Arc<dyn ModelProvider> = Arc::new(MeteredModel {
             inner: model,
             budget: budget.clone(),
@@ -166,7 +158,7 @@ impl Harness {
                 tools: None,
                 usage: Some(usage.clone()),
                 timeout: Duration::from_secs(60),
-                max_model_calls: 8,
+                steps: 8,
             },
         )));
         hooks
@@ -433,18 +425,13 @@ pub(crate) async fn assemble(
         for definition in tools.definitions() {
             if !matches!(
                 definition.name.as_str(),
-                "read_tool_result" | "read" | "write" | "edit" | "shell" | "webfetch" | "websearch"
+                "read" | "write" | "edit" | "shell" | "webfetch" | "websearch"
             ) {
                 registry.register(tools.resolve(definition.name.as_str())?);
             }
         }
     }
     registry.extend(crate::tools::coding_tools(cwd)?);
-    registry.register(Arc::new(crate::tools::result::ReadToolResult {
-        session: id.clone(),
-        store: catalog.clone(),
-        max_chars: policy.tool_output_chars,
-    }));
     let services = crate::context::ContextServices {
         store: Some(catalog.clone()),
         policy,

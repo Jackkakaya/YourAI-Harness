@@ -31,31 +31,20 @@ impl std::fmt::Display for TurnId {
     }
 }
 
-/// Loop 接受的执行约束。None 表示未指定，0 表示不允许相应调用。
+/// Loop 接受的执行约束。None 表示未指定。
 ///
-/// Core 传递限制，Loop 负责在实际操作边界执行它们；这不是强制终止器。
-/// 模型重试计入 model_calls，工具计数在进入实际执行前增加。
-/// 压缩、模型 Hook 等额外模型调用需要实现方接入同一记账路径。
-/// 不提供“全局费用预算”，避免在尚未统一记账时作出错误保证。
+/// `steps` 与 OpenCode 的 agent `steps` 一致：它计算 agentic iteration，
+/// 重试和压缩内部模型调用不额外消耗 step；达到最后一步时应禁用工具并强制文本收尾。
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct TurnLimits {
-    pub max_model_calls: Option<u32>,
-    pub max_tool_calls: Option<u32>,
+    pub steps: Option<u32>,
     /// 绝对截止时间；重试、审批、压缩不得重新开始总计时。
     pub deadline: Option<Instant>,
     pub model_timeout: Option<Duration>,
     pub tool_timeout: Option<Duration>,
     pub approval_timeout: Option<Duration>,
     pub hook_timeout: Option<Duration>,
-}
-
-/// 可解释的额度耗尽原因。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TurnLimit {
-    ModelCalls,
-    ToolCalls,
 }
 
 /// 宿主交给 Agent 的单次执行参数。

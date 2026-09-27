@@ -167,8 +167,10 @@ impl State<'_> {
         index: usize,
         initial: bool,
     ) -> Result<bool, YourAiError> {
-        let text = match &self.queued[index] {
-            In::UserText { text, .. } => text.clone(),
+        let (text, attachments) = match &self.queued[index] {
+            In::UserText {
+                text, attachments, ..
+            } => (text.clone(), attachments.clone()),
             _ => return Ok(false),
         };
         let hook = self
@@ -183,7 +185,19 @@ impl State<'_> {
             return Ok(false);
         }
         let history = self.history.clone();
-        let mut record = StoredMessage::new(ChatMessage::user(&text));
+        // Build the user message. Attachments (inline base64 media or file
+        // references) are resolved into genai content parts — see
+        // `default_loop::attachment` for media normalization and file handling.
+        let message = if attachments.is_empty() {
+            ChatMessage::user(&text)
+        } else {
+            let mut parts = vec![ContentPart::from_text(text.clone())];
+            for att in &attachments {
+                parts.push(super::attachment::resolve_attachment(att, self.config)?);
+            }
+            ChatMessage::user(MessageContent::from_parts(parts))
+        };
+        let mut record = StoredMessage::new(message);
         if initial && self.config.memory_search_limit > 0 && !text.trim().is_empty() {
             if let Some(memory) = self.tc.snap.memory.clone() {
                 let cancel = self.tc.cancel.clone();

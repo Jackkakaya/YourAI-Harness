@@ -24,6 +24,9 @@ similar = "2"
 httpdate = "1"
 html2md = "0.2.15"
 pulldown-cmark = { version = "0.13", default-features = false }
+# Attachment image normalization (resize ladder); mirrors opencode image.ts.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+base64 = "0.22"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 [dev-dependencies]

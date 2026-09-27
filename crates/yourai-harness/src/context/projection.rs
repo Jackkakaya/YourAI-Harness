@@ -48,7 +48,7 @@ pub(crate) fn preview(
             .chars()
             .rev()
             .collect();
-        let s = serde_json::json!({"truncated":true,"pruned":pruned,"call_id":response.call_id,"status":status,"head":head,"tail":tail,"read":"read_tool_result(call_id, offset, limit)"}).to_string();
+        let s = serde_json::json!({"truncated":true,"pruned":pruned,"call_id":response.call_id,"status":status,"head":head,"tail":tail}).to_string();
         if s.chars().count() <= limit {
             return Ok(s);
         }
