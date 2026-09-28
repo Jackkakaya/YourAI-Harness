@@ -30,24 +30,6 @@ fn additional(r: &HookDispatchResult) -> Vec<String> {
         _ => vec![],
     }
 }
-fn notices(r: &HookDispatchResult) -> Vec<String> {
-    r.common
-        .system_messages
-        .iter()
-        .cloned()
-        .chain(
-            r.common
-                .messages
-                .iter()
-                .filter(|m| {
-                    !r.runs
-                        .iter()
-                        .any(|run| run.hook_id == m.hook_id && run.suppress_output)
-                })
-                .map(|m| m.content.clone()),
-        )
-        .collect()
-}
 impl MemoryContext {
     async fn hook(
         &self,
@@ -56,7 +38,7 @@ impl MemoryContext {
     ) -> Result<HookDispatchResult, YourAiError> {
         let kind = event.kind();
         let result = match &execution.hooks {
-            Some(hooks) => tokio::time::timeout(
+            Some(hooks) => crate::time::timeout(
                 self.services.hook_timeout,
                 hooks.dispatch(&HookInvocation::new(execution.hook_base.clone(), event)),
             )
@@ -64,11 +46,7 @@ impl MemoryContext {
             .map_err(|_| error("compact", "hook deadline exceeded"))??,
             None => HookDispatchResult::empty(kind),
         };
-        if result.event != kind
-            || result.outcome.event_name() != HookDispatchResult::empty(kind).outcome.event_name()
-        {
-            return Err(error("compact", "hook returned mismatched event"));
-        }
+        result.validate_for(kind)?;
         Ok(result)
     }
     pub(super) async fn maintain(
@@ -389,7 +367,7 @@ impl MemoryContext {
             after,
             "summary committed",
         );
-        outcome.notices = notices(&pre);
+        outcome.notices = pre.notices().map(str::to_owned).collect::<Vec<_>>();
         let usages = options.usage.lock().unwrap().clone();
         let usage: Vec<_> = usages
             .iter()
@@ -418,7 +396,9 @@ impl MemoryContext {
             .await
         {
             Ok(post) => {
-                outcome.notices.extend(notices(&post));
+                outcome
+                    .notices
+                    .extend(post.notices().map(str::to_owned).collect::<Vec<_>>());
                 let context = additional(&post);
                 if !context.is_empty() {
                     if let Err(e) = self

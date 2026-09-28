@@ -103,34 +103,6 @@ fn derive_title(text: &str) -> Option<String> {
     }
     Some(title)
 }
-/// Resolve a config snapshot into the live model, its context policy and the
-/// settings derived from it. The shared resolution behind model switching
-/// and session opening; the caller decides which parts to persist.
-fn resolve_selection(
-    candidate: &Config,
-    variant: Option<&str>,
-) -> Result<
-    (
-        Arc<dyn ModelProvider>,
-        ContextPolicy,
-        yourai_harness::assembly::ModelSettings,
-    ),
-    Error,
-> {
-    let (model, context) = candidate.resolve(variant)?;
-    let (header_timeout, chunk_timeout) = candidate.model_timeouts()?;
-    Ok((
-        model,
-        context,
-        yourai_harness::assembly::ModelSettings {
-            provider: candidate.provider_id().into(),
-            requests: candidate.request_policy()?,
-            header_timeout,
-            chunk_timeout,
-        },
-    ))
-}
-
 pub(super) async fn switch_model(
     config: &Arc<std::sync::Mutex<Config>>,
     harness: &Harness,
@@ -139,8 +111,13 @@ pub(super) async fn switch_model(
 ) -> Result<ModelInfo, String> {
     let mut candidate = config.lock().map_err(|e| e.to_string())?.clone();
     candidate.model = model_id.to_string();
-    let (model, context, settings) =
-        resolve_selection(&candidate, variant.as_deref()).map_err(|e| e.to_string())?;
+    let crate::config::ResolvedModel {
+        model,
+        context,
+        settings,
+    } = candidate
+        .resolve(variant.as_deref())
+        .map_err(|e| e.to_string())?;
     candidate.context = context.clone();
     candidate.selected_variant = variant.clone();
     harness
@@ -172,15 +149,11 @@ fn prepare_session(
         .map_err(|e| Error::from(e.to_string()))?
         .clone();
     let variant = candidate.selected_variant.clone();
-    let (model, context, settings) = resolve_selection(&candidate, variant.as_deref())?;
+    let selection = candidate.resolve(variant.as_deref())?;
     let mut hc = template.clone();
     hc.resume = id;
-    hc.context_policy = context;
-    hc.model_provider = settings.provider;
-    hc.request_policy = settings.requests;
-    (hc.model_header_timeout, hc.model_chunk_timeout) =
-        (settings.header_timeout, settings.chunk_timeout);
-    Ok((hc, model))
+    selection.apply_to(&mut hc);
+    Ok((hc, selection.model))
 }
 
 /// Open the target session and restore its history into a fresh view.
@@ -230,7 +203,7 @@ mod switch_tests {
             }}
         }))
         .unwrap();
-        let (model, context) = cfg.resolve(None).unwrap();
+        let crate::config::ResolvedModel { model, context, .. } = cfg.resolve(None).unwrap();
         cfg.context = context;
         let mut hc = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
         hc.system_prompt = Some("test".into());

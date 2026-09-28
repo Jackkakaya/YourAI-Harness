@@ -73,7 +73,7 @@ impl Workspace {
                 trigger: trigger.into(),
             })
             .await?;
-        host.consume_hook(&result, true)
+        host.consume_hook_async(&result, true).await
     }
     pub async fn load_instructions(&self, path: &Path, reason: &str) -> Result<(), YourAiError> {
         let host = self.host()?;
@@ -98,12 +98,12 @@ impl Workspace {
                 parent_file_path: None,
             })
             .await?;
-        host.consume_hook(&result, false)?;
+        host.consume_hook_async(&result, false).await?;
         host.context.lock().unwrap().instructions.insert(
             path.clone(),
             format!("[Instructions: {}]\n{content}", path.display()),
         );
-        host.watch_path(path)?;
+        host.watch_path_async(path).await?;
         Ok(())
     }
     pub async fn notify(&self, message: &str, kind: &str) -> Result<(), YourAiError> {
@@ -115,13 +115,14 @@ impl Workspace {
                 notification_type: kind.into(),
             })
             .await?;
-        host.consume_hook(&result, false)?;
-        host.post_event(RuntimeEvent {
+        host.consume_hook_async(&result, false).await?;
+        host.post_event_async(RuntimeEvent {
             id: uuid::Uuid::new_v4().to_string(),
             context: None,
             notice: Some(message.into()),
             wake: false,
-        })?;
+        })
+        .await?;
         Ok(())
     }
     pub async fn change_config(&self, source: &str, value: Value) -> Result<(), YourAiError> {
@@ -139,7 +140,7 @@ impl Workspace {
             })
             .await;
         let _ = std::fs::remove_file(candidate);
-        host.consume_hook(&result?, true)?;
+        host.consume_hook_async(&result?, true).await?;
         atomic_write(&path, &value)?;
         config.apply(&host);
         Ok(())
@@ -166,13 +167,13 @@ impl Workspace {
                 new_cwd: new.to_string_lossy().into_owned(),
             })
             .await?;
-        host.consume_hook(&result, true)?;
+        host.consume_hook_async(&result, true).await?;
         if let HookPointOutcome::CwdChanged(o) = result.outcome {
             for p in o.watch_paths {
-                host.watch_path(PathBuf::from(p))?;
+                host.watch_path_async(PathBuf::from(p)).await?;
             }
         }
-        host.set_cwd(new)
+        host.set_cwd_async(new).await
     }
     pub async fn create_worktree(&self, name: &str) -> Result<PathBuf, YourAiError> {
         let host = self.host()?;
@@ -190,7 +191,7 @@ impl Workspace {
         let result = host
             .dispatch(HookEvent::WorktreeCreate { name: name.into() })
             .await?;
-        host.consume_hook(&result, true)?;
+        host.consume_hook_async(&result, true).await?;
         let custom = match result.outcome {
             HookPointOutcome::WorktreeCreate(o) => o.worktree_path,
             _ => None,
@@ -240,7 +241,7 @@ impl Workspace {
                 worktree_path: path.to_string_lossy().into_owned(),
             })
             .await?;
-        host.consume_hook(&result, true)?;
+        host.consume_hook_async(&result, true).await?;
         git(
             &host.context().cwd,
             &[
@@ -288,12 +289,14 @@ impl Workspace {
                     let current = match file_snapshot(&root) {
                         Ok(snapshot) => snapshot,
                         Err(e) => {
-                            let _ = host.post_event(RuntimeEvent {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                context: None,
-                                notice: Some(format!("File watcher: {e}")),
-                                wake: false,
-                            });
+                            let _ = host
+                                .post_event_async(RuntimeEvent {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    context: None,
+                                    notice: Some(format!("File watcher: {e}")),
+                                    wake: false,
+                                })
+                                .await;
                             continue;
                         }
                     };
@@ -319,19 +322,21 @@ impl Workspace {
                                 })
                                 .await;
                             if let Ok(r) = result {
-                                let _ = host.consume_hook(&r, false);
+                                let _ = host.consume_hook_async(&r, false).await;
                                 if let HookPointOutcome::FileChanged(o) = r.outcome {
                                     for p in o.watch_paths {
-                                        let _ = host.watch_path(PathBuf::from(p));
+                                        let _ = host.watch_path_async(PathBuf::from(p)).await;
                                     }
                                 }
                             }
-                            let _ = host.post_event(RuntimeEvent {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                context: Some(format!("File {event}: {}", path.display())),
-                                notice: None,
-                                wake: false,
-                            });
+                            let _ = host
+                                .post_event_async(RuntimeEvent {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    context: Some(format!("File {event}: {}", path.display())),
+                                    notice: None,
+                                    wake: false,
+                                })
+                                .await;
                         }
                     }
                 }

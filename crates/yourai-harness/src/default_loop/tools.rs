@@ -18,15 +18,20 @@ impl State<'_> {
             name: call.fn_name.clone(),
             input: call.fn_arguments.clone(),
         })?;
+        self.tool_cleanup_deadline = None;
         let result = self.tool_body(&mut call).await;
         let aborted = result
             .as_ref()
             .err()
             .is_some_and(|e| matches!(e, YourAiError::Aborted(_)));
-        let (mut output, is_error) = match &result {
-            Ok(value) => (value.clone(), false),
-            Err(error) => (json!({"error":error.to_string()}), true),
-        };
+        let (mut output, is_error) = self
+            .tool_completion
+            .take()
+            .map(|(_, output, is_error)| (output, is_error))
+            .unwrap_or_else(|| match &result {
+                Ok(value) => (value.clone(), false),
+                Err(error) => (json!({"error":error.to_string()}), true),
+            });
         self.tool_completion = Some((call.clone(), output.clone(), is_error));
         let event = match &result {
             Ok(value) => HookEvent::PostToolUse {
@@ -43,14 +48,21 @@ impl State<'_> {
                 is_interrupt: Some(aborted),
             },
         };
-        // On cancellation, invoke failure reporting with a separate bounded cleanup wait.
+        // Tool settling and cancellation reporting share one grace period.
         let post = if aborted {
             if let Some(runtime) = &self.tc.snap.hooks {
                 let invocation = self.invocation(event);
-                tokio::time::timeout(self.config.cleanup_timeout, runtime.dispatch(&invocation))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
+                let deadline = self.tool_cleanup_deadline.unwrap_or_else(|| {
+                    tokio::time::Instant::now() + self.config.tool_cleanup_timeout
+                });
+                if deadline <= tokio::time::Instant::now() {
+                    None
+                } else {
+                    tokio::time::timeout_at(deadline, runtime.dispatch(&invocation))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                }
             } else {
                 None
             }
@@ -150,21 +162,21 @@ impl State<'_> {
         };
         let future = handler.execute(tool_context, call.fn_arguments.clone());
         tokio::pin!(future);
-        let deadline = self.deadline(Some(
+        let deadline = self.deadline(
             self.tc
                 .info
                 .options
                 .limits
                 .tool_timeout
-                .unwrap_or(self.config.tool_timeout),
-        ));
+                .or(self.config.tool_timeout),
+        );
         let mut request_ids = HashSet::new();
         loop {
             tokio::select! {
                 biased;
-                _ = self.tc.cancel.cancelled() => return Err(AbortReason::Cancelled.into()),
-                _ = self.tc.outbox.closed() => return Err(AbortReason::Disconnected.into()),
-                _ = tokio::time::sleep_until(deadline.into()) => return Err(self.timeout_error("tool")),
+                _ = self.tc.cancel.cancelled() => return self.settle_cancelled_tool(call, &cancel, &mut future, AbortReason::Cancelled.into()).await,
+                _ = self.tc.outbox.closed() => return self.settle_cancelled_tool(call, &cancel, &mut future, AbortReason::Disconnected.into()).await,
+                _ = crate::time::sleep_until(deadline) => return Err(self.timeout_error("tool")),
                 result = &mut future => return result,
                 Some(mut pending) = rx.recv() => {
                     if pending.reply.is_closed() { continue; }
@@ -172,17 +184,20 @@ impl State<'_> {
                         let _ = pending.reply.send(Err(ErrorKind::Config("invalid or duplicate interaction identity".into()).into()));
                         continue;
                     }
-                    pending.request.deadline = Some(pending.request.deadline.unwrap_or(deadline).min(deadline));
-                    let interaction_deadline = pending.request.deadline.unwrap();
+                    pending.request.deadline = match (pending.request.deadline, deadline) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    let interaction_deadline = pending.request.deadline;
                     let response = tokio::select! {
                         biased;
                         result = &mut future => return result,
                         _ = pending.reply.closed() => continue,
-                        result = tokio::time::timeout_at(interaction_deadline.into(), self.service_interaction(pending.request)) => result,
+                        _ = crate::time::sleep_until(interaction_deadline) => Err(self.timeout_error("interaction")),
+                        result = self.service_interaction(pending.request) => result,
                     };
-                    let response = response.unwrap_or_else(|_| Err(self.timeout_error("interaction")));
                     let terminal = response.as_ref().err().is_some_and(|e| matches!(e, YourAiError::Aborted(_)));
-                    if terminal { return Err(response.unwrap_err()); }
+                    if terminal { return self.settle_cancelled_tool(call, &cancel, &mut future, response.unwrap_err()).await; }
                     let _ = pending.reply.send(response);
                 }
                 input = self.tc.inbox.recv(), if !self.input_closed => match input {
@@ -190,6 +205,26 @@ impl State<'_> {
                 }
             }
         }
+    }
+    async fn settle_cancelled_tool(
+        &mut self,
+        call: &ToolCall,
+        cancel: &tokio_util::sync::CancellationToken,
+        future: impl std::future::Future<Output = Result<Value, YourAiError>>,
+        cause: YourAiError,
+    ) -> Result<Value, YourAiError> {
+        cancel.cancel();
+        let deadline = tokio::time::Instant::now() + self.config.tool_cleanup_timeout;
+        self.tool_cleanup_deadline = Some(deadline);
+        if let Ok(result) = tokio::time::timeout_at(deadline, future).await {
+            let (output, is_error) = match result {
+                Ok(value) => (value, false),
+                Err(error) => (json!({"error":error.to_string()}), true),
+            };
+            // Preserve any actual completion; cancellation still terminates the turn.
+            self.tool_completion = Some((call.clone(), output, is_error));
+        }
+        Err(cause)
     }
     async fn security(
         &mut self,
@@ -260,7 +295,7 @@ impl State<'_> {
                     let decision = match decision {
                         Some(decision) => decision,
                         None => {
-                            let reply = self.ask(uuid::Uuid::new_v4().to_string(), json!({"kind":"permission", "call_id":call.call_id, "tool_name":call.fn_name, "input":call.fn_arguments}), self.tc.info.options.limits.approval_timeout.unwrap_or(self.config.approval_timeout)).await;
+                            let reply = self.ask(uuid::Uuid::new_v4().to_string(), json!({"kind":"permission", "call_id":call.call_id, "tool_name":call.fn_name, "input":call.fn_arguments}), self.tc.info.options.limits.approval_timeout.or(self.config.approval_timeout)).await;
                             match reply {
                                 Ok(reply) => parse_decision(reply)?,
                                 Err(e @ YourAiError::Aborted(_)) => return Err(e),

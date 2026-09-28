@@ -1,5 +1,7 @@
+mod configured;
 mod control;
 mod metrics;
+pub use configured::ConfiguredModel;
 pub use control::RequestPolicy;
 use futures_util::StreamExt;
 use metrics::Attempt;
@@ -24,6 +26,7 @@ pub struct GenaiModel {
     client: genai::Client,
     model: String,
     headers: genai::Headers,
+    timeouts: ModelTimeouts,
 }
 impl GenaiModel {
     pub fn new(client: genai::Client, model: impl Into<String>) -> Self {
@@ -31,6 +34,7 @@ impl GenaiModel {
             client,
             model: model.into(),
             headers: genai::Headers::default(),
+            timeouts: ModelTimeouts::default(),
         }
     }
     /// Defaults applied to every request, including compaction and child agents.
@@ -38,16 +42,56 @@ impl GenaiModel {
         self.headers = headers;
         self
     }
+    /// Applied to every network call, including collected compaction responses.
+    pub fn with_timeouts(
+        mut self,
+        header: Option<std::time::Duration>,
+        chunk: Option<std::time::Duration>,
+    ) -> Self {
+        if let Some(header) = header {
+            self.timeouts.headers = header;
+        }
+        if let Some(chunk) = chunk {
+            self.timeouts.read = chunk;
+        }
+        self
+    }
+    async fn open_stream(
+        &self,
+        request: ModelRequest,
+    ) -> Result<(genai::ModelIden, ModelEventStream), YourAiError> {
+        let request = self.request(request);
+        let response = self
+            .client
+            .exec_chat_stream(&self.model, request.request, Some(&request.options))
+            .await
+            .map_err(|source| YourAiError::from(ErrorKind::Model { source }))?;
+        Ok((
+            response.model_iden,
+            Box::pin(
+                response
+                    .stream
+                    .map(|item| item.map_err(|source| ErrorKind::Model { source }.into())),
+            ),
+        ))
+    }
     fn request(&self, mut request: ModelRequest) -> ModelRequest {
         let mut headers = self.headers.clone();
         if let Some(overrides) = &request.options.extra_headers {
             headers.merge_with(overrides);
         }
         request.options.extra_headers = Some(headers);
+        self.timeouts.apply(&mut request.options);
         request
     }
 }
 impl ModelProvider for GenaiModel {
+    fn timeouts(&self) -> ModelTimeouts {
+        self.timeouts
+    }
+    fn uses_transport_timeouts(&self) -> bool {
+        true
+    }
     fn retry_after(&self, error: &YourAiError) -> Option<std::time::Duration> {
         control::retry_after(error)
     }
@@ -104,31 +148,46 @@ impl ModelProvider for GenaiModel {
         };
         Ok(image_media_tokens(width, height))
     }
-    fn complete<'a>(&'a self, r: ModelRequest) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
-        let r = self.request(r);
+    fn complete<'a>(
+        &'a self,
+        mut r: ModelRequest,
+    ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
         Box::pin(async move {
-            self.client
-                .exec_chat(&self.model, r.request, Some(&r.options))
-                .await
-                .map_err(|source| ErrorKind::Model { source }.into())
+            // Collect a stream so a progressing summary has no total wall-clock limit.
+            r.options = r
+                .options
+                .with_capture_content(true)
+                .with_capture_tool_calls(true)
+                .with_capture_reasoning_content(true)
+                .with_capture_usage(true);
+            let (id, mut stream) = self.open_stream(r).await?;
+            while let Some(event) = stream.next().await {
+                if let ChatStreamEvent::End(end) = event? {
+                    return Ok(ChatResponse {
+                        content: end.captured_content.unwrap_or_default(),
+                        reasoning_content: end.captured_reasoning_content,
+                        stop_reason: end.captured_stop_reason,
+                        usage: end.captured_usage.unwrap_or_default(),
+                        response_id: end.captured_response_id,
+                        model_iden: id.clone(),
+                        provider_model_iden: id,
+                        captured_raw_body: None,
+                    });
+                }
+            }
+            Err(crate::error(
+                "model",
+                "model stream ended without a terminal response",
+            ))
         })
     }
     fn stream_events<'a>(
         &'a self,
         r: ModelRequest,
     ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
-        let r = self.request(r);
         Box::pin(async move {
-            let response = self
-                .client
-                .exec_chat_stream(&self.model, r.request, Some(&r.options))
-                .await
-                .map_err(|source| YourAiError::from(ErrorKind::Model { source }))?;
-            Ok(Box::pin(
-                response
-                    .stream
-                    .map(|item| item.map_err(|source| ErrorKind::Model { source }.into())),
-            ) as ModelEventStream)
+            let (_, stream) = self.open_stream(r).await?;
+            Ok(stream)
         })
     }
     fn model_iden(&self) -> &str {
@@ -187,24 +246,30 @@ impl ModelBudget {
         Ok(Arc::new(Self {
             state: Arc::new(Mutex::new(BudgetSnapshot::default())),
             starts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-            control: control::RequestControl::new(policy, Some(store)),
+            control: control::RequestControl::new(
+                policy,
+                Some(crate::storage::request_log::RequestLog::new(store)?),
+            ),
         }))
     }
     /// Provider-specific admission, retaining shared accounting and hard limits.
-    pub(crate) fn for_provider(
-        &self,
-        policy: RequestPolicy,
-        store: crate::SqliteStore,
-    ) -> Result<Arc<Self>, YourAiError> {
+    pub(crate) fn for_provider(&self, policy: RequestPolicy) -> Result<Arc<Self>, YourAiError> {
         policy.validate()?;
         Ok(Arc::new(Self {
             state: self.state.clone(),
             starts: self.starts.clone(),
-            control: control::RequestControl::new(policy, Some(store)),
+            control: control::RequestControl::new(policy, self.control.log.clone()),
         }))
+    }
+    pub async fn flush(&self) -> Result<(), YourAiError> {
+        if let Some(log) = &self.control.log {
+            log.flush().await?;
+        }
+        Ok(())
     }
     pub fn snapshot(&self) -> BudgetSnapshot {
         let mut snapshot = self.state.lock().unwrap().clone();
+        snapshot.requests.journal_errors += self.control.log.as_ref().map_or(0, |log| log.errors());
         let mut starts = self.starts.lock().unwrap();
         starts.retain(|t| t.elapsed() < std::time::Duration::from_secs(60));
         snapshot.requests.attempts_last_minute = starts.len() as u64;
@@ -226,6 +291,12 @@ pub struct MeteredModel {
     pub budget: Arc<ModelBudget>,
 }
 impl ModelProvider for MeteredModel {
+    fn timeouts(&self) -> ModelTimeouts {
+        self.inner.timeouts()
+    }
+    fn uses_transport_timeouts(&self) -> bool {
+        self.inner.uses_transport_timeouts()
+    }
     fn media_tokens(&self, part: &ContentPart) -> Result<u64, YourAiError> {
         self.inner.media_tokens(part)
     }
@@ -285,12 +356,13 @@ impl ModelProvider for MeteredModel {
         })
     }
     fn retry_after(&self, e: &YourAiError) -> Option<std::time::Duration> {
-        Some(
-            self.budget
-                .control
-                .remaining()
-                .max(self.inner.retry_after(e).unwrap_or_default()),
-        )
+        let hint = self.inner.retry_after(e);
+        let remaining = self.budget.control.remaining();
+        if remaining.is_zero() {
+            hint
+        } else {
+            Some(remaining.max(hint.unwrap_or_default()))
+        }
     }
     fn recovery(&self, e: &YourAiError) -> ModelRecovery {
         self.inner.recovery(e)
@@ -306,6 +378,12 @@ pub(crate) struct SourceModel {
     pub source: &'static str,
 }
 impl ModelProvider for SourceModel {
+    fn timeouts(&self) -> ModelTimeouts {
+        self.inner.timeouts()
+    }
+    fn uses_transport_timeouts(&self) -> bool {
+        self.inner.uses_transport_timeouts()
+    }
     fn complete<'a>(
         &'a self,
         mut r: ModelRequest,

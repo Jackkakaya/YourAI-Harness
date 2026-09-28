@@ -97,7 +97,7 @@ impl TaskBoard {
                 team_name: Some(self.team.clone()),
             })
             .await?;
-        host.consume_hook(&result, true)?;
+        host.consume_hook_async(&result, true).await?;
         let mut tasks = self.tasks.lock().unwrap();
         let mut next = tasks.clone();
         next.insert(task.id.clone(), task.clone());
@@ -131,7 +131,7 @@ impl TaskBoard {
                 team_name: Some(self.team.clone()),
             })
             .await?;
-        host.consume_hook(&result, true)?;
+        host.consume_hook_async(&result, true).await?;
         let mut tasks = self.tasks.lock().unwrap();
         let mut next = tasks.clone();
         next.get_mut(id).unwrap().completed = true;
@@ -158,7 +158,7 @@ impl TaskBoard {
                 team_name: self.team.clone(),
             })
             .await?;
-        host.consume_hook(&result, true)
+        host.consume_hook_async(&result, true).await
     }
 }
 impl ToolHandler for TaskBoard {

@@ -75,7 +75,6 @@ pub struct Harness {
     normal_security: Arc<dyn SecurityProvider>,
     provider_budgets: Mutex<HashMap<(String, crate::model::RequestPolicy), Arc<ModelBudget>>>,
     current_budget: Mutex<Arc<ModelBudget>>,
-    main_loop_config: crate::default_loop::LoopConfig,
     /// Shared persistence interface for frontends reading clean session history.
     pub sessions: Arc<dyn SessionManager>,
     pub host: Arc<SessionHost>,
@@ -95,6 +94,11 @@ impl Harness {
         model: Arc<dyn ModelProvider>,
     ) -> Result<Self, YourAiError> {
         config.context_policy.validate()?;
+        let model = crate::model::ConfiguredModel::wrap(
+            model,
+            config.model_header_timeout,
+            config.model_chunk_timeout,
+        )?;
         let catalog = Arc::new(SessionCatalog::new(&config.root)?);
         let source = if config.resume.is_some() {
             "resume"
@@ -200,21 +204,13 @@ impl Harness {
         if let Some(provider) = agent.ctx().try_memory() {
             crate::memory::register(hooks.as_ref(), provider, catalog.clone(), id.clone()).await?;
         }
-        let loop_defaults = crate::default_loop::LoopConfig::default();
-        let main_loop_config = crate::default_loop::LoopConfig {
-            memory_search_limit: config.memory_search_limit,
-            model_header_timeout: config
-                .model_header_timeout
-                .unwrap_or(loop_defaults.model_header_timeout),
-            model_chunk_timeout: config
-                .model_chunk_timeout
-                .unwrap_or(loop_defaults.model_chunk_timeout),
-            ..loop_defaults
-        };
         agent
             .ctx()
             .set_agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
-                main_loop_config.clone(),
+                crate::default_loop::LoopConfig {
+                    memory_search_limit: config.memory_search_limit,
+                    ..Default::default()
+                },
             )));
         if let Some(provider) = config.skill_provider {
             agent.ctx().set_skills(provider);
@@ -242,12 +238,13 @@ impl Harness {
         )
         .await?;
         for notice in prompt_notices {
-            host.post_event(yourai_core::runtime_event::RuntimeEvent {
+            host.post_event_async(yourai_core::runtime_event::RuntimeEvent {
                 id: uuid::Uuid::new_v4().to_string(),
                 context: None,
                 notice: Some(notice),
                 wake: false,
-            })?;
+            })
+            .await?;
         }
         let workspace = if config.extensions {
             Some(host.workspace()?)
@@ -274,7 +271,6 @@ impl Harness {
                 budget.clone(),
             )])),
             current_budget: Mutex::new(budget.clone()),
-            main_loop_config,
             sessions: catalog,
             host,
             tools,
@@ -338,28 +334,31 @@ impl Harness {
         settings: Option<ModelSettings>,
     ) -> Result<(), YourAiError> {
         policy.validate()?;
+        let model = if let Some(settings) = &settings {
+            crate::model::ConfiguredModel::wrap(
+                model,
+                settings.header_timeout,
+                settings.chunk_timeout,
+            )?
+        } else {
+            model
+        };
         let _gate = self.host.try_operation()?;
-        let selected_budget =
-            if let Some(settings) = &settings {
-                if let Some(budget) = self
-                    .provider_budgets
-                    .lock()
-                    .unwrap()
-                    .get(&(settings.provider.clone(), settings.requests.clone()))
-                    .cloned()
-                {
-                    budget
-                } else {
-                    self.budget.for_provider(
-                        settings.requests.clone(),
-                        SqliteStore::open(&self.host.context().transcript_path.ok_or_else(
-                            || ErrorKind::Config("session database missing".into()),
-                        )?)?,
-                    )?
-                }
+        let selected_budget = if let Some(settings) = &settings {
+            if let Some(budget) = self
+                .provider_budgets
+                .lock()
+                .unwrap()
+                .get(&(settings.provider.clone(), settings.requests.clone()))
+                .cloned()
+            {
+                budget
             } else {
-                self.current_budget.lock().unwrap().clone()
-            };
+                self.budget.for_provider(settings.requests.clone())?
+            }
+        } else {
+            self.current_budget.lock().unwrap().clone()
+        };
         let id = self.host.context().id;
         let history = MemoryContext::new(
             id.clone(),
@@ -379,18 +378,6 @@ impl Harness {
             budget: selected_budget.clone(),
         });
         if let Some(settings) = settings {
-            let defaults = crate::default_loop::LoopConfig::default();
-            let mut config = self.main_loop_config.clone();
-            config.model_header_timeout = settings
-                .header_timeout
-                .unwrap_or(defaults.model_header_timeout);
-            config.model_chunk_timeout = settings
-                .chunk_timeout
-                .unwrap_or(defaults.model_chunk_timeout);
-            self.host
-                .agent
-                .ctx()
-                .set_agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(config)));
             self.provider_budgets.lock().unwrap().insert(
                 (settings.provider, settings.requests),
                 selected_budget.clone(),
@@ -403,7 +390,12 @@ impl Harness {
     }
 
     pub async fn close(&self) -> Result<Vec<In>, YourAiError> {
-        self.host.close(Duration::from_secs(15)).await
+        self.host.finish_close(None).await?;
+        if let Err(error) = self.budget.flush().await {
+            // Diagnostic failure must not swallow the user's pending inputs.
+            self.host.close_warning(&error);
+        }
+        Ok(self.host.take_closed_inputs())
     }
 }
 

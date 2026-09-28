@@ -1,34 +1,26 @@
 //! One admission/cooldown gate for every model sharing this Harness budget.
 use super::ModelBudget;
+use crate::storage::request_log::RequestLog;
+#[cfg(test)]
 use crate::SqliteStore;
 use serde::{Deserialize, Serialize};
 use std::{sync::Mutex, time::Duration};
 use tokio::time::Instant;
 use yourai_core::prelude::*;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RequestPolicy {
     /// Optional known provider quota. Requests are paced evenly, without a burst allowance.
     pub rpm: Option<u32>,
-    /// Shared fallback when a transient HTTP 429 supplies no usable delay.
+    /// Opt-in shared fallback for HTTP 429 without a server delay; zero disables it.
     pub cooldown_seconds: u64,
-}
-impl Default for RequestPolicy {
-    fn default() -> Self {
-        Self {
-            rpm: None,
-            cooldown_seconds: 60,
-        }
-    }
 }
 impl RequestPolicy {
     pub fn validate(&self) -> Result<(), YourAiError> {
-        if self.rpm.is_some_and(|n| n == 0 || n > 60_000)
-            || !(1..=3600).contains(&self.cooldown_seconds)
-        {
+        if self.rpm.is_some_and(|n| n == 0 || n > 60_000) || self.cooldown_seconds > 3600 {
             return Err(ErrorKind::Config(
-                "requests.rpm must be 1..60000; cooldown_seconds must be 1..3600".into(),
+                "requests.rpm must be 1..60000; cooldown_seconds must be 0..3600".into(),
             )
             .into());
         }
@@ -38,7 +30,7 @@ impl RequestPolicy {
 pub(super) struct RequestControl {
     policy: RequestPolicy,
     deadlines: Mutex<(Instant, Instant)>, // next paced admission, shared cooldown
-    store: Option<SqliteStore>,
+    pub(super) log: Option<std::sync::Arc<RequestLog>>,
     run_id: String,
 }
 impl Default for RequestControl {
@@ -47,11 +39,11 @@ impl Default for RequestControl {
     }
 }
 impl RequestControl {
-    pub fn new(policy: RequestPolicy, store: Option<SqliteStore>) -> Self {
+    pub fn new(policy: RequestPolicy, log: Option<std::sync::Arc<RequestLog>>) -> Self {
         Self {
             policy,
             deadlines: Mutex::new((Instant::now(), Instant::now())),
-            store,
+            log,
             run_id: uuid::Uuid::new_v4().to_string(),
         }
     }
@@ -78,16 +70,23 @@ impl RequestControl {
         request: &ModelRequest,
         model: &str,
     ) -> Result<Option<String>, YourAiError> {
-        let Some(store) = &self.store else {
+        let Some(log) = &self.log else {
             return Ok(None);
         };
         let id = uuid::Uuid::new_v4().to_string();
-        store.with(|db| {
+        let row_id = id.clone();
+        let run = self.run_id.clone();
+        let session = request.session_id.clone();
+        let source = request.source;
+        let model = model.to_owned();
+        let turn = request.turn_id.clone();
+        let attempt = request.attempt;
+        let started = crate::storage::sqlite::now();
+        log.write(move |store| store.with(|db| {
             db.execute("INSERT INTO model_requests(request_id,run_id,session_id,source,model,started_at,turn_id,attempt,outcome) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'started')",
-                rusqlite::params![id, self.run_id, request.session_id, request.source, model, crate::storage::sqlite::now(), request.turn_id, request.attempt])
-                .map_err(|e| crate::error("request_log", e))?;
+                rusqlite::params![row_id, run, session, source, model, started, turn, attempt]).map_err(|e| crate::error("request_log", e))?;
             Ok(())
-        })?;
+        }))?;
         Ok(Some(id))
     }
     pub fn finish(
@@ -97,13 +96,15 @@ impl RequestControl {
         status: Option<u16>,
         elapsed: Duration,
     ) -> Result<(), YourAiError> {
-        if let (Some(store), Some(id)) = (&self.store, id) {
-            store.with(|db| {
+        if let (Some(log), Some(id)) = (&self.log, id) {
+            let id = id.to_owned();
+            let outcome = outcome.to_owned();
+            log.write(move |store| store.with(|db| {
                 db.execute("UPDATE model_requests SET outcome=?2,http_status=?3,duration_ms=?4 WHERE request_id=?1",
                     rusqlite::params![id, outcome, status, elapsed.as_millis().min(i64::MAX as u128) as i64])
                     .map_err(|e| crate::error("request_log", e))?;
                 Ok(())
-            })?;
+            }))?;
         }
         Ok(())
     }
@@ -147,21 +148,30 @@ pub(super) fn transient_limit(error: &YourAiError) -> bool {
 
 /// Preserve server timing when the SDK exposes it; do not guess vendor-specific body units.
 pub(super) fn retry_after(error: &YourAiError) -> Option<Duration> {
+    // Accept fractional server values and cap before Duration/Instant arithmetic.
+    fn duration(value: &str, scale: f64) -> Option<Duration> {
+        let value = value.trim().parse::<f64>().ok()?;
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        Some(Duration::from_millis(
+            (value * scale).ceil().min(i32::MAX as f64) as u64,
+        ))
+    }
     if let Some(ms) = error
         .model_http_header("retry-after-ms")
-        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|v| duration(v, 1.0))
     {
-        return Some(Duration::from_millis(ms));
+        return Some(ms);
     }
     let value = error.model_http_header("retry-after")?.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
+    if let Some(seconds) = duration(value, 1000.0) {
+        return Some(seconds);
     }
     let date = httpdate::parse_http_date(value).ok()?;
-    Some(
-        date.duration_since(std::time::SystemTime::now())
-            .unwrap_or_default(),
-    )
+    date.duration_since(std::time::SystemTime::now())
+        .ok()
+        .map(|d| d.min(Duration::from_millis(i32::MAX as u64)))
 }
 
 #[cfg(test)]
@@ -209,6 +219,19 @@ mod tests {
         let delay = retry_after(&http_error("retry-after", &future)).unwrap();
         assert!(delay.as_secs() >= 118 && delay.as_secs() <= 120);
         assert!(retry_after(&http_error("retry-after", "invalid")).is_none());
+        assert_eq!(
+            retry_after(&http_error("retry-after", "0.25")),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            retry_after(&http_error("retry-after-ms", "1.5")),
+            Some(Duration::from_millis(2))
+        );
+        assert_eq!(
+            retry_after(&http_error("retry-after", "1e100")),
+            Some(Duration::from_millis(i32::MAX as u64))
+        );
+        assert!(retry_after(&http_error("retry-after", "-1")).is_none());
     }
     #[tokio::test(start_paused = true)]
     async fn concurrent_callers_get_distinct_paced_slots() {
@@ -257,7 +280,10 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn cooldown_is_shared_and_can_be_extended_during_wait() {
-        let budget = budget(RequestPolicy::default());
+        let budget = budget(RequestPolicy {
+            cooldown_seconds: 60,
+            ..Default::default()
+        });
         budget.control.cool_down(None);
         let other = budget.clone();
         let waiting = tokio::spawn(async move { other.admit().await.unwrap() });
@@ -279,12 +305,12 @@ mod provider_tests {
         let a = ModelBudget::configured(
             RequestPolicy {
                 rpm: Some(1),
-                ..Default::default()
+                cooldown_seconds: 60,
             },
             store.clone(),
         )
         .unwrap();
-        let b = a.for_provider(RequestPolicy::default(), store).unwrap();
+        let b = a.for_provider(RequestPolicy::default()).unwrap();
         a.admit().await.unwrap();
         a.control.cool_down(None);
         tokio::time::timeout(Duration::from_millis(1), b.admit())

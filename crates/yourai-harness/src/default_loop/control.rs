@@ -7,16 +7,16 @@ use yourai_core::prelude::*;
 
 impl State<'_> {
     pub(crate) fn op_timeout(&self) -> Option<Duration> {
-        Some(self.config.operation_timeout)
+        self.config.operation_timeout
     }
-    pub(crate) fn deadline(&self, timeout: Option<Duration>) -> Instant {
-        let local = Instant::now() + timeout.unwrap_or(self.config.operation_timeout);
-        self.tc
-            .info
-            .options
-            .limits
-            .deadline
-            .map_or(local, |total| local.min(total))
+    pub(crate) fn deadline(&self, timeout: Option<Duration>) -> Option<Instant> {
+        let local = timeout
+            .or(self.config.operation_timeout)
+            .map(|d| Instant::now() + d);
+        match (local, self.tc.info.options.limits.deadline) {
+            (Some(local), Some(total)) => Some(local.min(total)),
+            (local, total) => local.or(total),
+        }
     }
     pub(crate) fn timeout_error(&self, phase: &'static str) -> YourAiError {
         if self
@@ -85,15 +85,22 @@ impl State<'_> {
         timeout: Option<Duration>,
         phase: &'static str,
     ) -> Result<T, YourAiError> {
+        self.wait_until(future, self.deadline(timeout), phase).await
+    }
+    pub(crate) async fn wait_until<T>(
+        &mut self,
+        future: impl Future<Output = Result<T, YourAiError>>,
+        deadline: Option<Instant>,
+        phase: &'static str,
+    ) -> Result<T, YourAiError> {
         self.tc.check_control()?;
-        let deadline = self.deadline(timeout);
         tokio::pin!(future);
         loop {
             tokio::select! {
                 biased;
                 _ = self.tc.cancel.cancelled() => return Err(AbortReason::Cancelled.into()),
                 _ = self.tc.outbox.closed() => return Err(AbortReason::Disconnected.into()),
-                _ = tokio::time::sleep_until(deadline.into()) => return Err(self.timeout_error(phase)),
+                _ = crate::time::sleep_until(deadline) => return Err(self.timeout_error(phase)),
                 result = &mut future => return result,
                 input = self.tc.inbox.recv(), if !self.input_closed => match input {
                     Some(input) => self.route(input), None => self.input_closed = true,
@@ -191,7 +198,7 @@ impl State<'_> {
         let unresolved = std::mem::take(&mut self.unresolved);
         let completed = self.tool_completion.take();
         let partial = self.partial_message.take();
-        // One cleanup deadline for the entire batch, independent of cancelled Turn token.
+        // Optional host policy bounds the batch; tool failure hooks have a separate grace.
         let cleanup = async {
             if let Some(partial) = partial {
                 history.append(vec![StoredMessage::new(partial)]).await?;
@@ -212,7 +219,7 @@ impl State<'_> {
             }
             Ok::<_, YourAiError>(())
         };
-        let failure = match tokio::time::timeout(self.config.cleanup_timeout, cleanup).await {
+        let failure = match crate::time::timeout(self.config.cleanup_timeout, cleanup).await {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e.to_string()),
             Err(_) => Some("cleanup timed out".into()),

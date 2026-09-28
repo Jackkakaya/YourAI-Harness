@@ -50,7 +50,7 @@ impl State<'_> {
         &mut self,
         id: String,
         payload: Value,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<Value, YourAiError> {
         self.tc.check_control()?;
         // Discard pre-sent replies before publishing a new request.
@@ -59,13 +59,13 @@ impl State<'_> {
             id: id.clone(),
             payload,
         })?;
-        let deadline = self.deadline(Some(timeout));
+        let deadline = self.deadline(timeout);
         loop {
             tokio::select! {
                 biased;
                 _ = self.tc.cancel.cancelled() => return Err(AbortReason::Cancelled.into()),
                 _ = self.tc.outbox.closed() => return Err(AbortReason::Disconnected.into()),
-                _ = tokio::time::sleep_until(deadline.into()) => return Err(self.timeout_error("approval")),
+                _ = crate::time::sleep_until(deadline) => return Err(self.timeout_error("approval")),
                 input = self.tc.inbox.recv() => match input {
                     Some(In::Reply { id: reply_id, payload }) if reply_id == id => return Ok(payload),
                     Some(input) => self.route(input),
@@ -78,18 +78,16 @@ impl State<'_> {
         &mut self,
         request: InteractionRequest,
     ) -> Result<Value, YourAiError> {
-        let timeout = request
-            .deadline
-            .map(|d| d.saturating_duration_since(Instant::now()))
-            .unwrap_or(self.config.approval_timeout)
-            .min(
-                self.tc
-                    .info
-                    .options
-                    .limits
-                    .approval_timeout
-                    .unwrap_or(self.config.approval_timeout),
-            );
+        let timeout = [
+            request
+                .deadline
+                .map(|d| d.saturating_duration_since(Instant::now())),
+            self.tc.info.options.limits.approval_timeout,
+            self.config.approval_timeout,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let mut payload = request.payload.clone();
         if let Some(object) = payload.as_object_mut() {
             object.insert("call_id".into(), json!(request.call_id));

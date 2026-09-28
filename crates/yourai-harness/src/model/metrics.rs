@@ -262,3 +262,60 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_attempts_do_not_block_and_flush_in_order_across_provider_switches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::SqliteStore::open(&dir.path().join("log.sqlite3")).unwrap();
+        let budget = ModelBudget::configured(Default::default(), store.clone()).unwrap();
+        let other = budget.for_provider(Default::default()).unwrap();
+        let (locked, acquired) = tokio::sync::oneshot::channel();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let db = store.clone();
+        let lock = std::thread::spawn(move || {
+            db.with(|_| {
+                locked.send(()).unwrap();
+                waiting
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap()
+        });
+        acquired.await.unwrap();
+        let started = Instant::now();
+        for budget in [budget.clone(), other] {
+            budget.reserve();
+            drop(Attempt::start(
+                budget,
+                &ModelRequest::new(ChatRequest::from_user("hello"), ChatOptions::default()),
+                "test",
+            ));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), budget.flush())
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        budget.flush().await.unwrap();
+        lock.join().unwrap();
+        let rows: (i64, i64) = store
+            .with(|db| {
+                db.query_row(
+                    "SELECT COUNT(*), SUM(outcome='cancelled') FROM model_requests",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| crate::error("test", e))
+            })
+            .unwrap();
+        assert_eq!(rows, (2, 2));
+        assert_eq!(budget.snapshot().requests.cancelled, 2);
+        assert_eq!(budget.snapshot().requests.journal_errors, 0);
+    }
+}

@@ -610,6 +610,35 @@ pub struct HookDispatchResult {
 }
 
 impl HookDispatchResult {
+    /// Shared contract for every lifecycle consumer, including custom runtimes.
+    pub fn validate_for(&self, event: HookEventKind) -> Result<(), YourAiError> {
+        if self.event != event
+            || self.outcome.event_name() != Self::empty(event).outcome.event_name()
+        {
+            return Err(crate::ErrorKind::Provider {
+                name: "hook",
+                message: "HookRuntime returned a mismatched event or outcome".into(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+    pub fn visible_messages(&self) -> impl Iterator<Item = &HookMessage> {
+        self.common.messages.iter().filter(|m| {
+            !self
+                .runs
+                .iter()
+                .any(|r| r.hook_id == m.hook_id && r.suppress_output)
+        })
+    }
+    pub fn notices(&self) -> impl Iterator<Item = &str> {
+        self.common
+            .system_messages
+            .iter()
+            .map(String::as_str)
+            .chain(self.visible_messages().map(|m| m.content.as_str()))
+    }
+
     /// 无 hook 匹配时的空结果。
     pub fn empty(event: HookEventKind) -> Self {
         let outcome = match event.as_str() {
@@ -845,5 +874,23 @@ mod tests {
         assert_eq!(names.len(), 28);
         assert!(names.contains("PreToolUse"));
         assert!(names.contains("FileChanged"));
+    }
+}
+
+#[cfg(test)]
+mod result_contract_tests {
+    use super::*;
+    #[test]
+    fn every_event_checks_both_discriminator_and_outcome() {
+        for event in HookEventKind::ALL {
+            let mut result = HookDispatchResult::empty(event);
+            result.validate_for(event).unwrap();
+            result.outcome = if event == HookEventKind::PreToolUse {
+                HookPointOutcome::SessionStart(SessionStartOutcome::default())
+            } else {
+                HookPointOutcome::PreToolUse(PreToolUseOutcome::default())
+            };
+            assert!(result.validate_for(event).is_err());
+        }
     }
 }

@@ -1,3 +1,4 @@
+mod journal;
 use crate::{
     error,
     storage::{atomic_write, read_json},
@@ -20,8 +21,9 @@ use yourai_core::{
 
 #[derive(Clone)]
 pub struct HostConfig {
-    pub hook_timeout: Duration,
-    pub cleanup_timeout: Duration,
+    pub hook_timeout: Option<Duration>,
+    /// Optional supervisor quarantine bound after cancellation.
+    pub cleanup_timeout: Option<Duration>,
     pub allow_background_wake: bool,
     pub max_followups: usize,
     pub instruction_paths: Vec<PathBuf>,
@@ -30,8 +32,8 @@ pub struct HostConfig {
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
-            hook_timeout: Duration::from_secs(30),
-            cleanup_timeout: Duration::from_secs(10),
+            hook_timeout: None,
+            cleanup_timeout: None,
             allow_background_wake: true,
             max_followups: 64,
             instruction_paths: vec![],
@@ -57,6 +59,7 @@ struct Live {
     inbox: Option<mpsc::UnboundedSender<In>>,
     cancel: Option<CancellationToken>,
     asks: HashSet<String>,
+    closed_pending: Vec<In>,
 }
 pub struct SessionHost {
     self_ref: std::sync::OnceLock<std::sync::Weak<SessionHost>>,
@@ -65,6 +68,7 @@ pub struct SessionHost {
     pub(crate) dir: PathBuf,
     config: HostConfig,
     live: Mutex<Live>,
+    journal_gate: Mutex<()>,
     events: Arc<RuntimeEvents>,
     operation: Arc<tokio::sync::Mutex<()>>,
     workspace: std::sync::OnceLock<Arc<crate::workspace::Workspace>>,
@@ -175,12 +179,14 @@ impl SessionHost {
             agent,
             dir,
             config,
+            journal_gate: Mutex::new(()),
             live: Mutex::new(Live {
                 journal,
                 status: SessionStatus::Idle,
                 inbox: None,
                 cancel: None,
                 asks: HashSet::new(),
+                closed_pending: vec![],
             }),
             events,
             operation: Arc::new(tokio::sync::Mutex::new(())),
@@ -193,7 +199,7 @@ impl SessionHost {
         });
         let _ = host.self_ref.set(Arc::downgrade(&host));
         host.reconcile_history().await?;
-        host.persist()?;
+        host.persist().await?;
         host.attach_background();
         if host.dir.join("config.json").exists() {
             read_json::<crate::workspace::RuntimeConfig>(&host.dir.join("config.json"))?
@@ -214,7 +220,7 @@ impl SessionHost {
         }
         if was_interrupted {
             host.reconcile_history().await?;
-            host.post_event(RuntimeEvent{id:format!("recovered-{}",uuid::Uuid::new_v4()),context:None,notice:Some("Previous execution was interrupted; tools were not replayed. Inspect interrupted_inputs() before continuing.".into()),wake:false})?;
+            host.post_event_async(RuntimeEvent{id:format!("recovered-{}",uuid::Uuid::new_v4()),context:None,notice:Some("Previous execution was interrupted; tools were not replayed. Inspect interrupted_inputs() before continuing.".into()),wake:false}).await?;
         }
         let result = host
             .dispatch(HookEvent::SessionStart {
@@ -222,13 +228,14 @@ impl SessionHost {
                 model: host.agent.ctx().try_model().map(|m| m.model_iden().into()),
             })
             .await?;
-        host.consume_hook(&result, false)?;
+        host.consume_hook_async(&result, false).await?;
         if let HookPointOutcome::SessionStart(o) = result.outcome {
             for path in o.watch_paths {
-                host.watch_path(PathBuf::from(path))?;
+                host.watch_path_async(PathBuf::from(path)).await?;
             }
             if let Some(message) = o.initial_user_message {
-                host.submit(In::user_text(message))
+                host.submit_async(In::user_text(message))
+                    .await
                     .map_err(|e| error("host", e))?;
             }
         }
@@ -237,14 +244,6 @@ impl SessionHost {
                 .start_watching(Duration::from_millis(250))?;
         }
         Ok(host)
-    }
-    fn persist_locked(&self, l: &Live) -> Result<(), YourAiError> {
-        let mut journal = l.journal.clone();
-        journal.events = self.events.pending();
-        atomic_write(&self.dir.join("host.json"), &journal)
-    }
-    fn persist(&self) -> Result<(), YourAiError> {
-        self.persist_locked(&self.live.lock().unwrap())
     }
     pub fn workspace(self: &Arc<Self>) -> Result<Arc<crate::workspace::Workspace>, YourAiError> {
         if let Some(ws) = self.workspace.get() {
@@ -275,12 +274,12 @@ impl SessionHost {
         } else {
             self.context().cwd.join(path)
         };
-        let mut l = self.live.lock().unwrap();
-        if !l.journal.watch.contains(&path) {
-            l.journal.watch.push(path);
+        let mut journal = self.journal();
+        if !journal.watch.contains(&path) {
+            journal.watch.push(path);
         }
-        self.persist_locked(&l)?;
-        drop(l);
+        journal.commit()?;
+        drop(journal);
         if let Some(host) = self.self_ref.get().and_then(std::sync::Weak::upgrade) {
             host.workspace()?
                 .start_watching(Duration::from_millis(250))?;
@@ -288,30 +287,25 @@ impl SessionHost {
         Ok(())
     }
     pub fn post_event(&self, event: RuntimeEvent) -> Result<bool, YourAiError> {
-        let mut l = self.live.lock().unwrap();
+        let mut journal = self.journal();
         if self.closing.is_cancelled() {
             return Err(error("host", "session closing"));
         }
-        if l.journal.seen.contains(&event.id) {
+        if journal.seen.contains(&event.id) {
             return Ok(false);
         }
-        let old = l.journal.clone();
-        l.journal.seen.insert(event.id.clone());
-        l.journal.events = self.events.pending();
-        l.journal.events.push(event.clone());
+        journal.seen.insert(event.id.clone());
+        journal.events.push(event.clone());
         if event.wake
             && self.config.allow_background_wake
-            && matches!(l.status, SessionStatus::Idle)
-            && l.journal.queue.is_empty()
+            && self.status() == SessionStatus::Idle
+            && journal.queue.is_empty()
         {
-            l.journal
+            journal
                 .queue
                 .push_back(In::follow_up("Process the pending runtime event."));
         }
-        if let Err(e) = atomic_write(&self.dir.join("host.json"), &l.journal) {
-            l.journal = old;
-            return Err(e);
-        }
+        journal.commit()?;
         self.events.push(event);
         self.notify.notify_one();
         Ok(true)
@@ -330,12 +324,10 @@ impl SessionHost {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         let invocation = HookInvocation::new(base, event);
-        let result = tokio::time::timeout(self.config.hook_timeout, hooks.dispatch(&invocation))
+        let result = crate::time::timeout(self.config.hook_timeout, hooks.dispatch(&invocation))
             .await
             .map_err(|_| error("hook", "host hook timed out"))??;
-        if result.event != invocation.event.kind() {
-            return Err(error("hook", "mismatched event"));
-        }
+        result.validate_for(invocation.event.kind())?;
         Ok(result)
     }
     pub(crate) fn consume_hook(
@@ -361,18 +353,7 @@ impl SessionHost {
             HookPointOutcome::Generic(o) => o.additional_contexts.clone(),
             _ => vec![],
         };
-        let mut notices = r.common.system_messages.clone();
-        notices.extend(
-            r.common
-                .messages
-                .iter()
-                .filter(|m| {
-                    !r.runs
-                        .iter()
-                        .any(|run| run.hook_id == m.hook_id && run.suppress_output)
-                })
-                .map(|m| m.content.clone()),
-        );
+        let notices: Vec<_> = r.notices().collect();
         if !contexts.is_empty() || !notices.is_empty() {
             self.post_event(RuntimeEvent {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -406,23 +387,30 @@ impl SessionHost {
                         } else {
                             format!("{}\n{}", e.stdout, e.stderr)
                         };
-                        if let Err(err) = host.post_event(RuntimeEvent {
-                            id: e.task_id,
-                            context: wake.then(|| text.clone()),
-                            notice: Some(text),
-                            wake,
-                        }) {
+                        if let Err(err) = host
+                            .post_event_async(RuntimeEvent {
+                                id: e.task_id,
+                                context: wake.then(|| text.clone()),
+                                notice: Some(text),
+                                wake,
+                            })
+                            .await
+                        {
                             host.live.lock().unwrap().journal.last_error = Some(err.to_string());
                         }
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        let _ = host.post_event(RuntimeEvent {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            context: None,
-                            notice: Some(format!("Lost {n} background events; inspect hook logs")),
-                            wake: false,
-                        });
+                        let _ = host
+                            .post_event_async(RuntimeEvent {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                context: None,
+                                notice: Some(format!(
+                                    "Lost {n} background events; inspect hook logs"
+                                )),
+                                wake: false,
+                            })
+                            .await;
                     }
                     Err(_) => break,
                 }
@@ -503,7 +491,7 @@ impl SessionHost {
                     }
                 }
                 self.events.ack(&event.id);
-                self.persist()?;
+                self.persist().await?;
             }
             if self.queued() > 0 {
                 let reports = self.run_until_idle(limits.clone(), out, cancel).await?;
@@ -528,9 +516,9 @@ impl SessionHost {
             .map_err(|_| error("host", "session is busy"))
     }
     pub(crate) fn set_cwd(&self, cwd: PathBuf) -> Result<(), YourAiError> {
-        let mut l = self.live.lock().unwrap();
-        l.journal.cwd = cwd.clone();
-        self.persist_locked(&l)?;
+        let mut journal = self.journal();
+        journal.cwd = cwd.clone();
+        journal.commit()?;
         self.context.lock().unwrap().cwd = cwd;
         Ok(())
     }
@@ -543,48 +531,51 @@ impl SessionRuntime for SessionHost {
     fn status(&self) -> SessionStatus {
         self.live.lock().unwrap().status.clone()
     }
+    /// Synchronous compatibility entry point; async callers use submit_async.
     fn submit(&self, input: In) -> Result<(), InputRejected> {
-        let mut l = self.live.lock().unwrap();
         let reject = |reason: String| InputRejected {
             input: input.clone(),
             reason,
         };
-        if self.closing.is_cancelled() {
-            return Err(reject("session closing".into()));
-        }
+        // Replies are ephemeral and never wait for the journal writer.
         if let In::Reply { id, .. } = &input {
-            if !l.asks.remove(id) {
+            let mut live = self.live.lock().unwrap();
+            if self.closing.is_cancelled() {
+                return Err(reject("session closing".into()));
+            }
+            if !live.asks.remove(id) {
                 return Err(reject("no matching active interaction".into()));
             }
-            return l
+            return live
                 .inbox
                 .as_ref()
                 .ok_or_else(|| reject("no active turn".into()))?
                 .send(input.clone())
                 .map_err(|_| reject("turn inbox closed".into()));
         }
+        let mut journal = self.journal();
+        if self.closing.is_cancelled() {
+            return Err(reject("session closing".into()));
+        }
+        let inbox = self.live.lock().unwrap().inbox.clone();
         let steer = matches!(
             input,
             In::UserText {
                 mode: InputMode::Steer,
                 ..
             }
-        ) && l.inbox.is_some();
-        let old = l.journal.clone();
+        ) && inbox.is_some();
         if steer {
-            l.journal.active.push(input.clone());
+            journal.active.push(input.clone());
         } else {
-            l.journal.queue.push_back(input.clone());
+            journal.queue.push_back(input.clone());
         }
-        if let Err(e) = self.persist_locked(&l) {
-            l.journal = old;
-            return Err(reject(e.to_string()));
-        }
-        if steer && l.inbox.as_ref().unwrap().send(input.clone()).is_err() {
-            l.journal.active.pop();
-            l.journal.queue.push_back(input);
-            if let Err(e) = self.persist_locked(&l) {
-                l.journal.last_error = Some(e.to_string());
+        journal.commit().map_err(|e| reject(e.to_string()))?;
+        if steer && inbox.unwrap().send(input.clone()).is_err() {
+            journal.active.pop();
+            journal.queue.push_back(input);
+            if let Err(e) = journal.commit() {
+                journal.retain_for_recovery(&e);
             }
         }
         self.notify.notify_one();
@@ -607,40 +598,8 @@ impl SessionRuntime for SessionHost {
             } else {
                 0
             };
-            let (mut handle, turn_id) = {
-                let mut l = self.live.lock().unwrap();
-                let Some(first) = l.journal.queue.pop_front() else {
-                    return Ok(None);
-                };
-                l.journal.active = vec![first.clone()];
-                if let Err(e) = self.persist_locked(&l) {
-                    l.journal.active.clear();
-                    l.journal.queue.push_front(first);
-                    return Err(e);
-                }
-                let mut options = TurnOptions::default();
-                options.session = Some(Arc::new(self.context()));
-                options.limits = limits;
-                options.events = Some(self.events.clone());
-                let handle = match self.agent.start_with(first.clone(), options) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        l.journal.active.clear();
-                        l.journal.queue.push_front(first);
-                        self.persist_locked(&l)?;
-                        return Err(e);
-                    }
-                };
-                let id = handle.info.id.clone();
-                l.status = SessionStatus::Running {
-                    turn_id: id.clone(),
-                };
-                l.inbox = Some(handle.inbox.clone());
-                l.cancel = Some(handle.cancel.clone());
-                (handle, id)
-            };
-            let task_cancel = handle.cancel.clone();
-            let guard = CancelGuard(task_cancel.clone());
+            let request_cancel = cancel.child_token();
+            let guard = CancelGuard(request_cancel.clone());
             let (tx, mut rx) = mpsc::unbounded_channel();
             let (done, result) = oneshot::channel();
             let host = self
@@ -648,11 +607,71 @@ impl SessionRuntime for SessionHost {
                 .get()
                 .and_then(std::sync::Weak::upgrade)
                 .ok_or_else(|| error("host", "host released"))?;
-            let task_id = turn_id.clone();
             tokio::spawn(async move {
                 let _gate = gate;
+                let start_cancel = request_cancel.clone();
+                let start = host
+                    .blocking(move |host| {
+                        let mut journal = host.journal();
+                        if host.closing.is_cancelled() {
+                            return Err(error("host", "session closing"));
+                        }
+                        let Some(first) = journal.queue.pop_front() else {
+                            return Ok(None);
+                        };
+                        journal.active = vec![first.clone()];
+                        journal.commit()?;
+                        if host.closing.is_cancelled() || start_cancel.is_cancelled() {
+                            journal.restore_unstarted(first)?;
+                            return Err(AbortReason::Cancelled.into());
+                        }
+                        let mut options = TurnOptions::default();
+                        options.session = Some(Arc::new(host.context()));
+                        options.limits = limits;
+                        options.events = Some(host.events.clone());
+                        let handle = match host.agent.start_with(first.clone(), options) {
+                            Ok(handle) => handle,
+                            Err(e) => {
+                                journal.restore_unstarted(first)?;
+                                return Err(e);
+                            }
+                        };
+                        let id = handle.info.id.clone();
+                        let mut live = host.live.lock().unwrap();
+                        live.status = SessionStatus::Running {
+                            turn_id: id.clone(),
+                        };
+                        live.inbox = Some(handle.inbox.clone());
+                        live.cancel = Some(handle.cancel.clone());
+                        // Close may have raced the durable start before the cancel
+                        // handle was published. Holding live here closes that gap.
+                        if host.closing.is_cancelled() {
+                            live.status = SessionStatus::Closing;
+                            handle.cancel.cancel();
+                        }
+                        Ok(Some((handle, id)))
+                    })
+                    .await
+                    .and_then(|r| r);
+                let (mut handle, task_id) = match start {
+                    Ok(Some(start)) => start,
+                    Ok(None) => {
+                        let _ = done.send(Ok(None));
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = done.send(Err(e));
+                        return;
+                    }
+                };
+                let task_cancel = handle.cancel.clone();
+                if request_cancel.is_cancelled() {
+                    task_cancel.cancel();
+                }
+                let mut request_cancelled = request_cancel.is_cancelled();
                 let mut cancelled_at = None;
                 let mut timed_out = false;
+                let mut cancel_consumed = false;
                 loop {
                     let timeout = async {
                         match cancelled_at {
@@ -662,7 +681,8 @@ impl SessionRuntime for SessionHost {
                     };
                     tokio::select! {biased;
                                            _=timeout=>{timed_out=true;break},
-                                           _=task_cancel.cancelled(),if cancelled_at.is_none()=>{cancelled_at=Some(tokio::time::Instant::now()+host.config.cleanup_timeout);},
+                                           _=request_cancel.cancelled(),if !request_cancelled=>{request_cancelled=true;task_cancel.cancel();},
+                                           _=task_cancel.cancelled(),if !cancel_consumed=>{cancel_consumed=true;cancelled_at=host.config.cleanup_timeout.map(|t|tokio::time::Instant::now()+t);},
                                            event=handle.outbox.recv()=>match event{Some(event)=>{if let Out::Ask{id,..}=&event{host.live.lock().unwrap().asks.insert(id.clone());}
                     if tx.send(event).is_err(){task_cancel.cancel();}},None=>break}
                                        }
@@ -676,53 +696,56 @@ impl SessionRuntime for SessionHost {
                 } else {
                     handle.join().await
                 };
-                {
-                    let mut l = host.live.lock().unwrap();
-                    l.inbox = None;
-                    l.cancel = None;
-                    l.asks.clear();
-                    let output = match &mut result {
-                        Ok(o) => o,
-                        Err(e) => &mut e.output,
-                    };
-                    let pending = std::mem::take(&mut output.pending);
-                    for input in pending.into_iter().rev() {
-                        if matches!(input, In::UserText { .. }) {
-                            l.journal.queue.push_front(input);
-                        }
-                    }
-                    if timed_out {
-                        let uncertain = std::mem::take(&mut l.journal.active);
-                        l.journal.interrupted.extend(uncertain);
-                    }
-                    l.journal.active.clear();
-                    l.journal.last_error = result.as_ref().err().map(ToString::to_string);
-                    if timed_out {
-                        host.closing.cancel();
-                    }
-                    l.status = if host.closing.is_cancelled() {
-                        SessionStatus::Closing
-                    } else {
-                        SessionStatus::Idle
-                    };
-                    if host.events.pending().iter().any(|e| e.wake)
-                        && l.journal.queue.is_empty()
-                        && host.config.allow_background_wake
-                    {
-                        l.journal
-                            .queue
-                            .push_back(In::follow_up("Process the pending runtime event."));
-                    }
-                    if let Err(e) = host.persist_locked(&l) {
-                        host.closing.cancel();
-                        l.status = SessionStatus::Closing;
-                        let output = match result {
+                let settled = host
+                    .blocking(move |host| {
+                        let mut journal = host.journal();
+                        let output = match &mut result {
                             Ok(o) => o,
-                            Err(f) => f.output,
+                            Err(e) => &mut e.output,
                         };
-                        result = Err(TurnFailure::new(e, output));
-                    }
-                }
+                        for input in std::mem::take(&mut output.pending).into_iter().rev() {
+                            if matches!(input, In::UserText { .. }) {
+                                journal.queue.push_front(input);
+                            }
+                        }
+                        if timed_out {
+                            let uncertain = std::mem::take(&mut journal.active);
+                            journal.interrupted.extend(uncertain);
+                        }
+                        journal.active.clear();
+                        journal.last_error = result.as_ref().err().map(ToString::to_string);
+                        if timed_out {
+                            host.closing.cancel();
+                        }
+                        if host.events.pending().iter().any(|e| e.wake)
+                            && journal.queue.is_empty()
+                            && host.config.allow_background_wake
+                        {
+                            journal
+                                .queue
+                                .push_back(In::follow_up("Process the pending runtime event."));
+                        }
+                        if let Err(e) = journal.commit() {
+                            journal.retain_for_recovery(&e);
+                            let output = match result {
+                                Ok(o) => o,
+                                Err(f) => f.output,
+                            };
+                            result = Err(TurnFailure::new(e, output));
+                        }
+                        let mut live = host.live.lock().unwrap();
+                        live.inbox = None;
+                        live.cancel = None;
+                        live.asks.clear();
+                        live.status = if host.closing.is_cancelled() {
+                            SessionStatus::Closing
+                        } else {
+                            SessionStatus::Idle
+                        };
+                        result
+                    })
+                    .await;
+                let result = settled.unwrap_or_else(|e| Err(TurnFailure::from(e)));
                 // Stop hooks have settled and history + host journal are committed.
                 // This notification cannot change the turn outcome or request continuation.
                 if result.is_ok() {
@@ -743,9 +766,7 @@ impl SessionRuntime for SessionHost {
                         {
                             Ok(r) => {
                                 for message in r
-                                    .common
-                                    .messages
-                                    .iter()
+                                    .visible_messages()
                                     .map(|m| m.content.clone())
                                     .chain(r.common.system_messages.iter().cloned())
                                     .chain(
@@ -767,10 +788,10 @@ impl SessionRuntime for SessionHost {
                         }
                     }
                 }
-                let _ = done.send(SessionTurn {
+                let _ = done.send(Ok(Some(SessionTurn {
                     turn_id: task_id,
                     result,
-                });
+                })));
                 host.notify.notify_waiters();
             });
             while let Some(event) = tokio::select! {biased;_=cancel.cancelled()=>{guard.0.cancel();rx.recv().await},_=outbox.closed()=>{guard.0.cancel();rx.recv().await},e=rx.recv()=>e}
@@ -781,7 +802,7 @@ impl SessionRuntime for SessionHost {
             }
             let report = result.await.map_err(|e| error("host", e))?;
             drop(guard);
-            Ok(Some(report))
+            report
         })
     }
     fn interrupt(&self) {
@@ -798,10 +819,7 @@ impl SessionRuntime for SessionHost {
             let _gate = self.try_operation()?;
             self.live.lock().unwrap().status = SessionStatus::Compacting;
             let _status = StatusGuard(self);
-            let deadline = request
-                .deadline
-                .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(120));
-            request.deadline = Some(deadline);
+            let deadline = request.deadline;
             let token = cancel.child_token();
             let _cancel_guard = token.clone().drop_guard();
             let task = async {
@@ -826,64 +844,83 @@ impl SessionRuntime for SessionHost {
                 history.compact(request, &execution, &token).await
             };
             tokio::pin!(task);
-            tokio::select! { r=&mut task=>r, _=self.closing.cancelled()=>{ token.cancel(); task.await }, _=cancel.cancelled()=>Err(AbortReason::Cancelled.into()), _=tokio::time::sleep_until(deadline.into())=>Err(AbortReason::DeadlineExceeded.into()) }
+            tokio::select! { r=&mut task=>r, _=self.closing.cancelled()=>{ token.cancel(); task.await }, _=cancel.cancelled()=>Err(AbortReason::Cancelled.into()), _=crate::time::sleep_until(deadline)=>Err(AbortReason::DeadlineExceeded.into()) }
         })
     }
-    fn close<'a>(&'a self, timeout: Duration) -> BoxFuture<'a, Result<Vec<In>, YourAiError>> {
+    fn close<'a>(
+        &'a self,
+        timeout: Option<Duration>,
+    ) -> BoxFuture<'a, Result<Vec<In>, YourAiError>> {
         Box::pin(async move {
+            self.finish_close(timeout).await?;
+            Ok(self.take_closed_inputs())
+        })
+    }
+}
+impl SessionHost {
+    pub(crate) fn take_closed_inputs(&self) -> Vec<In> {
+        std::mem::take(&mut self.live.lock().unwrap().closed_pending)
+    }
+    pub(crate) fn close_warning(&self, error: &YourAiError) {
+        self.live.lock().unwrap().journal.last_error = Some(error.to_string());
+    }
+    /// Finish durable cleanup without transferring ownership of pending inputs.
+    pub(crate) async fn finish_close(&self, timeout: Option<Duration>) -> Result<(), YourAiError> {
+        if self.status() == SessionStatus::Closed {
+            return Ok(());
+        }
+        self.closing.cancel();
+        self.interrupt();
+        {
+            let mut live = self.live.lock().unwrap();
+            if live.status == SessionStatus::Closed {
+                return Ok(());
+            }
+            live.status = SessionStatus::Closing;
+        }
+        crate::time::timeout(timeout, async {
+            let gate = self.operation.clone().lock_owned().await;
             if self.status() == SessionStatus::Closed {
-                return Ok(vec![]);
+                return Ok(());
             }
-            self.closing.cancel();
-            self.interrupt();
-            {
-                let mut live = self.live.lock().unwrap();
-                if live.status == SessionStatus::Closed {
-                    return Ok(vec![]);
-                }
-                live.status = SessionStatus::Closing;
+            if let Some(ws) = self.workspace.get() {
+                ws.stop_watching().await;
             }
-            tokio::time::timeout(timeout, async {
-                let _gate = self.operation.lock().await;
-                if self.status() == SessionStatus::Closed {
-                    return Ok(vec![]);
-                }
-                if let Some(ws) = self.workspace.get() {
-                    ws.stop_watching().await;
-                }
-                let children: Vec<_> = self
-                    .children
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter_map(std::sync::Weak::upgrade)
-                    .collect();
-                for child in children {
-                    child.close(self.config.cleanup_timeout).await?;
-                }
-                let tasks = std::mem::take(&mut *self.background.lock().unwrap());
-                for t in &tasks {
-                    t.abort();
-                }
-                for t in tasks {
-                    let _ = t.await;
-                }
-                // Closing hooks may report errors, but cannot prevent resource release.
-                let hook_result = tokio::time::timeout(
-                    timeout / 4,
-                    self.dispatch(HookEvent::SessionEnd {
-                        reason: "shutdown".into(),
-                    }),
-                )
-                .await
-                .map_err(|_| error("hook", "SessionEnd cleanup deadline exceeded"))
-                .and_then(|r| r);
-                if let Some(hooks) = self.agent.ctx().try_hooks() {
-                    hooks.shutdown_session(&self.context().id.0).await?;
-                }
-                let mut l = self.live.lock().unwrap();
+            let children: Vec<_> = self
+                .children
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect();
+            for child in children {
+                child.close(self.config.cleanup_timeout.or(timeout)).await?;
+            }
+            let tasks = std::mem::take(&mut *self.background.lock().unwrap());
+            for t in &tasks {
+                t.abort();
+            }
+            for t in tasks {
+                let _ = t.await;
+            }
+            // Closing hooks may report errors, but cannot prevent resource release.
+            let hook_result = crate::time::timeout(
+                timeout.map(|t| t / 4),
+                self.dispatch(HookEvent::SessionEnd {
+                    reason: "shutdown".into(),
+                }),
+            )
+            .await
+            .map_err(|_| error("hook", "SessionEnd cleanup deadline exceeded"))
+            .and_then(|r| r);
+            if let Some(hooks) = self.agent.ctx().try_hooks() {
+                hooks.shutdown_session(&self.context().id.0).await?;
+            }
+            self.blocking(move |host| {
+                let _gate = gate;
+                let mut journal = host.journal();
                 match hook_result {
-                    Err(e) => l.journal.last_error = Some(e.to_string()),
+                    Err(e) => journal.last_error = Some(e.to_string()),
                     Ok(r) => {
                         let errors: Vec<_> = r
                             .common
@@ -893,24 +930,32 @@ impl SessionRuntime for SessionHost {
                             .map(|m| m.content.clone())
                             .collect();
                         if !errors.is_empty() {
-                            l.journal.last_error = Some(errors.join("\n"));
+                            journal.last_error = Some(errors.join("\n"));
                         }
                     }
                 }
-                let pending: Vec<_> = l.journal.queue.drain(..).collect();
-                l.journal.closed = true;
-                if let Err(e) = self.persist_locked(&l) {
-                    l.journal.queue.extend(pending);
-                    l.journal.closed = false;
+                let pending: Vec<_> = journal.queue.drain(..).collect();
+                journal.closed = true;
+                if let Err(e) = journal.commit() {
+                    journal.queue.extend(pending);
+                    journal.closed = false;
                     return Err(e);
                 }
-                FileExt::unlock(&self._lock).map_err(|e| error("host", e))?;
-                l.status = SessionStatus::Closed;
-                Ok(pending)
+                // Retain the handoff before any fallible/cancellable step.
+                host.live.lock().unwrap().closed_pending.extend(pending);
+                FileExt::unlock(&host._lock).map_err(|e| error("host", e))?;
+                host.live.lock().unwrap().status = SessionStatus::Closed;
+                Ok(())
             })
-            .await
-            .map_err(|_| error("host", "close timed out; session remains Closing"))?
+            .await?
         })
+        .await
+        .map_err(|_| {
+            error(
+                "host",
+                "close timed out; retry close to finish cleanup and collect pending inputs",
+            )
+        })?
     }
 }
 impl Drop for SessionHost {

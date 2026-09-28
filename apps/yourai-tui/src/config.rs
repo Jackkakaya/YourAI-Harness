@@ -109,6 +109,21 @@ pub struct Limits {
     pub output: Option<u32>,
 }
 
+pub struct ResolvedModel {
+    pub model: Arc<GenaiModel>,
+    pub context: yourai_core::prelude::ContextPolicy,
+    pub settings: yourai_harness::assembly::ModelSettings,
+}
+impl ResolvedModel {
+    pub fn apply_to(&self, config: &mut yourai_harness::HarnessConfig) {
+        config.context_policy = self.context.clone();
+        config.model_provider = self.settings.provider.clone();
+        config.request_policy = self.settings.requests.clone();
+        config.model_header_timeout = self.settings.header_timeout;
+        config.model_chunk_timeout = self.settings.chunk_timeout;
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path).map_err(|_| {
@@ -146,13 +161,6 @@ impl Config {
             }
         }
         Ok(config)
-    }
-    /// Provider id ("provider" of "provider/model"); empty when unprefixed.
-    pub fn provider_id(&self) -> &str {
-        self.model
-            .split_once('/')
-            .map(|(p, _)| p)
-            .unwrap_or_default()
     }
     fn selected_provider(&self) -> Result<&ProviderConfig, Error> {
         let (provider, _) = self
@@ -198,11 +206,8 @@ impl Config {
     /// callers explicitly adopt the policy (typically `self.context = …`),
     /// keeping the model→context coupling visible at each call site instead
     /// of hidden behind a mutation here.
-    pub fn resolve(
-        &self,
-        variant: Option<&str>,
-    ) -> Result<(Arc<GenaiModel>, yourai_core::prelude::ContextPolicy), Error> {
-        self.request_policy()?;
+    pub fn resolve(&self, variant: Option<&str>) -> Result<ResolvedModel, Error> {
+        let requests = self.request_policy()?;
         if self.steps == Some(0) {
             return Err("steps must be a positive integer".into());
         }
@@ -316,8 +321,22 @@ impl Config {
             .map(|(k, v)| Ok((k, expand(&v)?)))
             .collect::<Result<_, Error>>()?;
         let client = provider.client(provider_id, chat)?;
-        let model = Arc::new(GenaiModel::new(client, name).with_headers(headers.into()));
-        Ok((model, context))
+        let (header_timeout, chunk_timeout) = self.model_timeouts()?;
+        let model = Arc::new(
+            GenaiModel::new(client, name)
+                .with_headers(headers.into())
+                .with_timeouts(header_timeout, chunk_timeout),
+        );
+        Ok(ResolvedModel {
+            model,
+            context,
+            settings: yourai_harness::assembly::ModelSettings {
+                provider: provider_id.into(),
+                requests,
+                header_timeout,
+                chunk_timeout,
+            },
+        })
     }
 }
 /// Resolves the XDG base directory for configuration.
@@ -471,7 +490,7 @@ mod tests {
         })).unwrap();
         assert!(config.system_prompt.is_none());
         assert_eq!(config.session_dir, PathBuf::from(".yourai/sessions"));
-        assert_eq!(config.resolve(None).unwrap().0.model_iden(), "glm");
+        assert_eq!(config.resolve(None).unwrap().model.model_iden(), "glm");
         let client = config.provider["gateway"]
             .client("gateway", ChatOptions::default())
             .unwrap();
@@ -494,7 +513,7 @@ mod tests {
     fn selects_model_and_variant_without_resolving_unused_credentials() {
         use yourai_core::model::ModelProvider;
         let config = config();
-        let (model, context) = config.resolve(Some("short")).unwrap();
+        let ResolvedModel { model, context, .. } = config.resolve(Some("short")).unwrap();
         assert_eq!(model.model_iden(), "actual-api-model");
         // The returned policy carries the model's limits and the variant's
         // output reserve; adopting it is the caller's explicit choice.

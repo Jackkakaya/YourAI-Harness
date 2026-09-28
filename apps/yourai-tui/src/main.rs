@@ -81,8 +81,9 @@ async fn run() -> Result<(), Error> {
         );
         return Ok(());
     }
-    let (model, context) = config.resolve(variant.as_deref())?;
-    config.context = context;
+    let selection = config.resolve(variant.as_deref())?;
+    let model = selection.model.clone();
+    config.context = selection.context.clone();
     config.selected_variant = variant;
     if config.context.input_budget().is_none() {
         eprintln!("Context window unknown: configure provider.<id>.models.<id>.limit.context to enable automatic/manual summarization.");
@@ -98,8 +99,6 @@ async fn run() -> Result<(), Error> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("TUI requires an interactive terminal".into());
     }
-    let request_policy = config.request_policy()?;
-    let (model_header_timeout, model_chunk_timeout) = config.model_timeouts()?;
     let choices = crate::models::model_choices(&config);
     // Bare `--resume` opens the launcher; Esc there falls through to a fresh session.
     if resume.as_ref().is_some_and(|SessionId(id)| id.is_empty()) {
@@ -111,11 +110,7 @@ async fn run() -> Result<(), Error> {
         }
     }
     let mut hc = HarnessConfig::new(config.session_dir.clone(), std::env::current_dir()?);
-    hc.model_provider = config.provider_id().into();
-    hc.request_policy = request_policy.clone();
-    hc.model_header_timeout = model_header_timeout;
-    hc.model_chunk_timeout = model_chunk_timeout;
-    hc.context_policy = config.context.clone();
+    selection.apply_to(&mut hc);
     hc.resume = resume.take();
     hc.system_prompt = config.system_prompt.clone();
     hc.prompt = config.prompt.clone();

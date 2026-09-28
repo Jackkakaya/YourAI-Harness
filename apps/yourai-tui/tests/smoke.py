@@ -54,7 +54,12 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
-        if len(requests) == 1 and not single_request:
+        compact = any(m.get('role') == 'system' and 'Summarize for continuation' in str(m.get('content'))
+                      for m in body.get('messages', []))
+        if compact:
+            delta = {'content': 'Prior task list is complete.'}
+            reason = 'stop'
+        elif len(requests) == 1 and not single_request:
             delta = {'tool_calls': [{'index': 0, 'id': 'call-smoke', 'type': 'function',
                      'function': {'name': 'tasks', 'arguments': '{"action":"create","subject":"Review parser"}'}}]}
             reason = 'tool_calls'
@@ -206,6 +211,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert child.returncode == 0
         assert termios.tcgetattr(slave) == original, 'terminal mode was not restored'
         assert len(requests) == 4
+        assert requests[3][2].get('stream') is True, 'compaction must use a progressing stream'
         assert all(value == 'model' for value in config_headers)
         for _, _, body in requests:
             assert body.get('max_tokens', body.get('max_completion_tokens')) == 4096, body

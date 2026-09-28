@@ -4,7 +4,6 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{Arc, Mutex, Weak},
-    time::Duration,
 };
 use yourai_core::prelude::*;
 /// Subagents are independent sessions. Parent owns cancellation and observes child output.
@@ -33,7 +32,7 @@ impl SubagentTool {
     pub async fn stop_all(&self) -> Result<(), YourAiError> {
         let children: Vec<_> = self.children.lock().unwrap().values().cloned().collect();
         for child in children {
-            child.close(Duration::from_secs(10)).await?;
+            child.close(None).await?;
         }
         Ok(())
     }
@@ -62,7 +61,7 @@ impl SubagentTool {
                 agent_type: "worker".into(),
             })
             .await?;
-        parent.consume_hook(&start, true)?;
+        parent.consume_hook_async(&start, true).await?;
         let child = SessionHost::restore(
             &root,
             meta.id,
@@ -84,7 +83,8 @@ impl SubagentTool {
             .insert(id.clone(), child.clone());
         let _cleanup = ChildCleanup(child.clone());
         child
-            .submit(In::user_text(prompt))
+            .submit_async(In::user_text(prompt))
+            .await
             .map_err(|e| error("subagent", e))?;
         let mut last = String::new();
         for continuation in 0..=3 {
@@ -95,7 +95,7 @@ impl SubagentTool {
                 tokio::select! {biased;
                     result=&mut work=>break result?,
                     Some(event)=rx.recv()=>match event{
-                        Out::Ask{id:request_id,payload}=>{let reply=tc.ask(InteractionKind::Question,json!({"child_id":id,"request":payload})).await?;child.submit(In::Reply{id:request_id,payload:reply}).map_err(|e|error("subagent",e))?;},
+                        Out::Ask{id:request_id,payload}=>{let reply=tc.ask(InteractionKind::Question,json!({"child_id":id,"request":payload})).await?;child.submit_async(In::Reply{id:request_id,payload:reply}).await.map_err(|e|error("subagent",e))?;},
                         other=>{if !tc.emit_progress(json!({"child_id":id,"event":other})){child.interrupt();return Err(AbortReason::Disconnected.into());}}
                     }
                 }
@@ -116,17 +116,17 @@ impl SubagentTool {
                     last_assistant_message: Some(last.clone()),
                 })
                 .await?;
-            parent.consume_hook(&stop, false)?;
+            parent.consume_hook_async(&stop, false).await?;
             if stop.common.blocking_errors.is_empty() {
-                child.close(Duration::from_secs(10)).await?;
+                child.close(None).await?;
                 return Ok(json!({"agent_id":id,"text":last}));
             }
             if continuation == 3 {
-                child.close(Duration::from_secs(10)).await?;
+                child.close(None).await?;
                 return Err(error("subagent", "SubagentStop continuation limit"));
             }
             child
-                .submit(In::user_text(
+                .submit_async(In::user_text(
                     stop.common
                         .blocking_errors
                         .iter()
@@ -134,6 +134,7 @@ impl SubagentTool {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 ))
+                .await
                 .map_err(|e| error("subagent", e))?;
         }
         Err(error("subagent", "unreachable continuation state"))
@@ -149,7 +150,7 @@ impl Drop for ChildCleanup {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let child = self.0.clone();
             runtime.spawn(async move {
-                let _ = child.close(Duration::from_secs(10)).await;
+                let _ = child.close(None).await;
             });
         }
     }

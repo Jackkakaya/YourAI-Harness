@@ -6,6 +6,7 @@ mod control;
 mod hooks;
 mod interaction;
 mod model;
+mod retry;
 mod tools;
 
 use std::{
@@ -81,14 +82,16 @@ pub struct LoopConfig {
     pub max_permission_rechecks: u32,
     pub retry_delay: Duration,
     pub retry_max_delay: Duration,
-    pub operation_timeout: Duration,
-    pub model_header_timeout: Duration,
-    pub model_chunk_timeout: Duration,
-    /// Tool execution deadline, separate from model/storage operation timeouts.
-    pub tool_timeout: Duration,
-    pub approval_timeout: Duration,
-    pub hook_timeout: Duration,
-    pub cleanup_timeout: Duration,
+    /// Optional bound for generic provider operations; no implicit turn deadline.
+    pub operation_timeout: Option<Duration>,
+    /// Optional host tool bound. Built-in tools own their default timeouts.
+    pub tool_timeout: Option<Duration>,
+    pub approval_timeout: Option<Duration>,
+    pub hook_timeout: Option<Duration>,
+    /// Optional bound for durable cleanup, independent of the cancelled turn.
+    pub cleanup_timeout: Option<Duration>,
+    /// Grace for tools to settle after cancellation, shared with failure reporting.
+    pub tool_cleanup_timeout: Duration,
 }
 impl Default for LoopConfig {
     fn default() -> Self {
@@ -105,13 +108,12 @@ impl Default for LoopConfig {
             max_permission_rechecks: 1,
             retry_delay: Duration::from_secs(2),
             retry_max_delay: Duration::from_secs(30),
-            operation_timeout: Duration::from_secs(120),
-            model_header_timeout: Duration::from_secs(300),
-            model_chunk_timeout: Duration::from_secs(300),
-            tool_timeout: Duration::from_secs(610),
-            approval_timeout: Duration::from_secs(300),
-            hook_timeout: Duration::from_secs(30),
-            cleanup_timeout: Duration::from_secs(5),
+            operation_timeout: None,
+            tool_timeout: None,
+            approval_timeout: None,
+            hook_timeout: None,
+            cleanup_timeout: None,
+            tool_cleanup_timeout: Duration::from_millis(250),
         }
     }
 }
@@ -165,6 +167,7 @@ impl AgentLoop for DefaultLoop {
                 call_ids: HashSet::new(),
                 unresolved: VecDeque::new(),
                 tool_completion: None,
+                tool_cleanup_deadline: None,
                 partial_message: None,
                 request_observation: None,
                 deferred_context: vec![],
@@ -207,6 +210,7 @@ struct State<'a> {
     partial_message: Option<ChatMessage>,
     request_observation: Option<RequestObservation>,
     tool_completion: Option<(ToolCall, serde_json::Value, bool)>,
+    tool_cleanup_deadline: Option<tokio::time::Instant>,
 }
 
 impl State<'_> {
@@ -289,20 +293,13 @@ impl State<'_> {
                             }
                             ModelRecovery::Retry if retries < self.config.max_model_retries => {
                                 new_step = false;
-                                let base = self
-                                    .config
-                                    .retry_delay
-                                    .saturating_mul(1u32 << retries.min(10));
-                                // Jitter avoids synchronized retries; zero stays useful for deterministic tests.
-                                let jitter = if base.is_zero() {
-                                    Duration::ZERO
-                                } else {
-                                    base / 4 * (uuid::Uuid::new_v4().as_u128() % 100) as u32 / 100
-                                };
-                                let delay = base
-                                    .saturating_add(jitter)
-                                    .min(self.config.retry_max_delay)
-                                    .max(self.model.retry_after(&error).unwrap_or_default());
+                                let delay = retry::delay(
+                                    self.config,
+                                    retries,
+                                    &error,
+                                    self.model.retry_after(&error),
+                                    (uuid::Uuid::new_v4().as_u128() % 100) as u32,
+                                );
                                 retries += 1;
                                 self.send(Out::Retry {
                                     attempt: retries,
@@ -316,7 +313,9 @@ impl State<'_> {
                                         tokio::time::sleep(delay).await;
                                         Ok(())
                                     },
-                                    delay.checked_add(self.config.operation_timeout),
+                                    self.config
+                                        .operation_timeout
+                                        .and_then(|op| delay.checked_add(op)),
                                     "retry",
                                 )
                                 .await?;
@@ -442,7 +441,7 @@ impl State<'_> {
     }
     async fn compact(&mut self, trigger: CompactionTrigger) -> Result<(), YourAiError> {
         let mut request = CompactionRequest::new(trigger);
-        request.deadline = Some(self.deadline(self.op_timeout()));
+        request.deadline = self.deadline(self.op_timeout());
         request.tools = self
             .tc
             .snap

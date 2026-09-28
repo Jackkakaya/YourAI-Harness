@@ -22,6 +22,27 @@ pub enum ModelRecovery {
     Compact,
 }
 
+/// Defaults owned by the selected model, shared by every execution entry point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelTimeouts {
+    pub headers: std::time::Duration,
+    pub read: std::time::Duration,
+}
+impl Default for ModelTimeouts {
+    fn default() -> Self {
+        Self {
+            headers: std::time::Duration::from_secs(300),
+            read: std::time::Duration::from_secs(300),
+        }
+    }
+}
+impl ModelTimeouts {
+    pub fn apply(self, options: &mut ChatOptions) {
+        options.stream_header_timeout.get_or_insert(self.headers);
+        options.stream_read_timeout.get_or_insert(self.read);
+    }
+}
+
 /// 一次模型调用的完整参数。
 #[derive(Debug, Clone)]
 pub struct ModelRequest {
@@ -54,6 +75,16 @@ impl ModelRequest {
 }
 
 pub trait ModelProvider: Send + Sync {
+    fn timeouts(&self) -> ModelTimeouts {
+        ModelTimeouts::default()
+    }
+
+    /// True when stream_header_timeout/stream_read_timeout are enforced around
+    /// HTTP headers and raw body reads. The loop must not add event-idle timers.
+    fn uses_transport_timeouts(&self) -> bool {
+        false
+    }
+
     /// Shared provider cooldown remaining after a failure. Does not consume an attempt.
     fn retry_after(&self, _error: &YourAiError) -> Option<std::time::Duration> {
         None

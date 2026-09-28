@@ -40,22 +40,17 @@ impl State<'_> {
             return Ok(HookDispatchResult::empty(kind));
         };
         let invocation = self.invocation(event);
-        let timeout = Some(
-            self.tc
-                .info
-                .options
-                .limits
-                .hook_timeout
-                .unwrap_or(self.config.hook_timeout),
-        );
+        let timeout = self
+            .tc
+            .info
+            .options
+            .limits
+            .hook_timeout
+            .or(self.config.hook_timeout);
         let result = self
             .wait(hooks.dispatch(&invocation), timeout, "hook")
             .await?;
-        if result.event != kind
-            || result.outcome.event_name() != HookDispatchResult::empty(kind).outcome.event_name()
-        {
-            return Err(ErrorKind::Loop("HookRuntime returned a mismatched event".into()).into());
-        }
+        result.validate_for(kind)?;
         if let Some(obs) = &self.tc.snap.observability {
             for run in &result.runs {
                 obs.timing(
@@ -71,21 +66,15 @@ impl State<'_> {
         for text in &result.common.system_messages {
             self.notice(Level::Info, text)?;
         }
-        for message in &result.common.messages {
-            let suppressed = result
-                .runs
-                .iter()
-                .any(|r| r.hook_id == message.hook_id && r.suppress_output);
-            if !suppressed {
-                self.notice(
-                    if message.kind == HookMessageKind::NonBlockingError {
-                        Level::Warning
-                    } else {
-                        Level::Info
-                    },
-                    &message.content,
-                )?;
-            }
+        for message in result.visible_messages() {
+            self.notice(
+                if message.kind == HookMessageKind::NonBlockingError {
+                    Level::Warning
+                } else {
+                    Level::Info
+                },
+                &message.content,
+            )?;
         }
         if result.common.prevent_continuation {
             return Err(AbortReason::HookStopped(

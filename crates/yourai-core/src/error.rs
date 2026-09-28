@@ -18,49 +18,53 @@ pub enum YourAiError {
 }
 
 impl YourAiError {
-    /// Some SDK paths preserve headers (non-streaming); streaming HttpError currently does not.
-    pub fn model_http_header(&self, name: &str) -> Option<&str> {
+    /// One place understands the SDK's nested streaming/non-streaming errors.
+    fn model_error_leaf(&self) -> Option<&(dyn std::error::Error + 'static)> {
         let Self::Error(ErrorKind::Model { source }) = self else {
             return None;
         };
-        let mut current = source;
+        let mut current: &(dyn std::error::Error + 'static) = source;
         for _ in 0..16 {
-            match current {
-                genai::Error::WebModelCall {
-                    webc_error: genai::webc::Error::ResponseFailedStatus { headers, .. },
-                    ..
-                } => return headers.get(name)?.to_str().ok(),
-                genai::Error::WebStream { error, .. } => {
-                    current = error.downcast_ref::<genai::Error>()?
-                }
-                _ => return None,
+            match current.downcast_ref::<genai::Error>() {
+                Some(genai::Error::WebStream { error, .. }) => current = error.as_ref(),
+                Some(genai::Error::WebModelCall { webc_error, .. }) => return Some(webc_error),
+                _ => return Some(current),
             }
         }
         None
     }
-    /// HTTP status/body preserved inside the SDK's typed streaming error wrappers.
-    /// Never classify errors by searching their human-readable display text.
-    pub fn model_http_error(&self) -> Option<(u16, &str)> {
-        let Self::Error(ErrorKind::Model { source }) = self else {
-            return None;
-        };
-        let mut current = source;
-        for _ in 0..16 {
-            match current {
-                genai::Error::HttpError { status, body, .. } => {
-                    return Some((status.as_u16(), body.as_str()))
-                }
-                genai::Error::WebModelCall {
-                    webc_error: genai::webc::Error::ResponseFailedStatus { status, body, .. },
-                    ..
-                } => return Some((status.as_u16(), body)),
-                genai::Error::WebStream { error, .. } => {
-                    current = error.downcast_ref::<genai::Error>()?
-                }
-                _ => return None,
+    pub fn model_has_http_headers(&self) -> bool {
+        matches!(
+            self.model_error_leaf()
+                .and_then(|e| e.downcast_ref::<genai::webc::Error>()),
+            Some(genai::webc::Error::ResponseFailedStatus { .. })
+        )
+    }
+    pub fn model_http_header(&self, name: &str) -> Option<&str> {
+        match self
+            .model_error_leaf()?
+            .downcast_ref::<genai::webc::Error>()?
+        {
+            genai::webc::Error::ResponseFailedStatus { headers, .. } => {
+                headers.get(name)?.to_str().ok()
             }
+            _ => None,
         }
-        None
+    }
+    /// Typed status/body; never classify errors by their display text.
+    pub fn model_http_error(&self) -> Option<(u16, &str)> {
+        let error = self.model_error_leaf()?;
+        if let Some(genai::Error::HttpError { status, body, .. }) =
+            error.downcast_ref::<genai::Error>()
+        {
+            return Some((status.as_u16(), body));
+        }
+        match error.downcast_ref::<genai::webc::Error>()? {
+            genai::webc::Error::ResponseFailedStatus { status, body, .. } => {
+                Some((status.as_u16(), body))
+            }
+            _ => None,
+        }
     }
 }
 

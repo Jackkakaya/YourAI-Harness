@@ -1,0 +1,2 @@
+# Preserve upstream formatting and unified-diff context in the vendored SDK.
+vendor/genai/** -whitespace

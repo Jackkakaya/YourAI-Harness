@@ -14,22 +14,13 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
 
+#[derive(Default)]
 pub struct ContextServices {
     /// Used only for ephemeral contexts; durable contexts restore their snapshot.
     pub system_prompt: String,
     pub store: Option<Arc<dyn SessionManager>>,
-    pub hook_timeout: std::time::Duration,
+    pub hook_timeout: Option<std::time::Duration>,
     pub policy: ContextPolicy,
-}
-impl Default for ContextServices {
-    fn default() -> Self {
-        Self {
-            system_prompt: String::new(),
-            store: None,
-            hook_timeout: std::time::Duration::from_secs(30),
-            policy: ContextPolicy::default(),
-        }
-    }
 }
 #[derive(Default)]
 struct View {
@@ -349,14 +340,12 @@ impl ContextManager for MemoryContext {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>> {
         Box::pin(async move {
-            let deadline = options
-                .deadline
-                .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(120));
+            let deadline = options.deadline;
             let committed = AtomicBool::new(false);
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => if committed.load(Ordering::Acquire) { Err(error("compact", "summary committed; cancelled during PostCompact")) } else { Err(AbortReason::Cancelled.into()) },
-                _ = tokio::time::sleep_until(deadline.into()) => if committed.load(Ordering::Acquire) { Err(error("compact", "summary committed; deadline exceeded during PostCompact")) } else { Err(AbortReason::DeadlineExceeded.into()) },
+                _ = crate::time::sleep_until(deadline) => if committed.load(Ordering::Acquire) { Err(error("compact", "summary committed; deadline exceeded during PostCompact")) } else { Err(AbortReason::DeadlineExceeded.into()) },
                 result = self.maintain(options, execution, cancel, &committed) => result
             }
         })

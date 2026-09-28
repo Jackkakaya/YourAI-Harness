@@ -1,4 +1,5 @@
 use crate::error;
+pub(crate) mod request_log;
 pub mod sqlite;
 pub(crate) mod table;
 mod usage;

@@ -24,12 +24,32 @@ pub(super) struct Runtime {
     stats: Option<JoinHandle<Stats>>,
     stats_at: Instant,
     limits: TurnLimits,
+    submissions: Option<mpsc::UnboundedSender<In>>,
+    submitter: JoinHandle<()>,
+    pending_submissions: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Runtime {
     pub fn new(h: Harness, limits: TurnLimits) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let h = Arc::new(h);
+        let (submissions, mut inputs) = mpsc::unbounded_channel();
+        let pending_submissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pending = pending_submissions.clone();
+        let host = h.host.clone();
+        let events = tx.clone();
+        let submitter = tokio::spawn(async move {
+            while let Some(input) = inputs.recv().await {
+                if let Err(rejection) = host.submit_async(input).await {
+                    let _ = events.send(Out::InputRejected { rejection });
+                }
+                pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
         Self {
-            h: Arc::new(h),
+            h,
+            submissions: Some(submissions),
+            submitter,
+            pending_submissions,
             tx,
             rx,
             cancel: CancellationToken::new(),
@@ -39,6 +59,27 @@ impl Runtime {
             stats_at: Instant::now() - Duration::from_secs(2),
             limits,
         }
+    }
+    /// Queue in input order; durable rejection returns through the normal event reducer.
+    pub fn submit(&mut self, input: In) -> bool {
+        self.pending_submissions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .submissions
+            .as_ref()
+            .is_some_and(|tx| tx.send(input).is_ok())
+        {
+            true
+        } else {
+            self.pending_submissions
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+    }
+    pub fn submitting(&self) -> bool {
+        self.pending_submissions
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
     }
     pub fn resume(&mut self) {
         if self.driver.is_none() {
@@ -58,7 +99,8 @@ impl Runtime {
         self.rx.recv().await
     }
     pub fn idle(&self) -> bool {
-        matches!(self.h.host.status(), SessionStatus::Idle)
+        !self.submitting()
+            && matches!(self.h.host.status(), SessionStatus::Idle)
             && !self.compacting()
             && self.h.host.queued() == 0
     }
@@ -120,10 +162,11 @@ impl Runtime {
             }
             view.settle();
         }
-        let active = !matches!(
-            self.h.host.status(),
-            SessionStatus::Idle | SessionStatus::Closed
-        );
+        let active = self.submitting()
+            || !matches!(
+                self.h.host.status(),
+                SessionStatus::Idle | SessionStatus::Closed
+            );
         if active && !view.session.active {
             view.session.active = true;
             view.session.since = Some(Instant::now());
@@ -182,6 +225,8 @@ impl Runtime {
     pub async fn close(mut self) -> Result<Vec<In>, YourAiError> {
         self.cancel.cancel();
         self.h.host.interrupt();
+        self.submissions.take();
+        let _ = self.submitter.await;
         if let Some(task) = self.stats.take() {
             let _ = task.await;
         }

@@ -756,3 +756,61 @@ async fn binary_attachment_builds_request_with_genai_model() {
         .iter()
         .any(|p| matches!(p, ContentPart::Binary(_))));
 }
+
+#[tokio::test(start_paused = true)]
+async fn compaction_has_no_implicit_deadline_but_honors_explicit_deadline_and_cancel() {
+    use std::time::{Duration, Instant};
+    struct SlowPreCompact;
+    impl HookRuntime for SlowPreCompact {
+        fn dispatch<'a>(
+            &'a self,
+            i: &'a HookInvocation,
+        ) -> BoxFuture<'a, Result<HookDispatchResult, YourAiError>> {
+            Box::pin(async move {
+                if matches!(i.event, HookEvent::PreCompact { .. }) {
+                    tokio::time::sleep(Duration::from_secs(121)).await;
+                }
+                Ok(HookDispatchResult::empty(i.event.kind()))
+            })
+        }
+    }
+    for mode in ["unlimited", "deadline", "cancel"] {
+        let id = SessionId::new();
+        let mut services = ContextServices::new(&id);
+        services.policy = policy();
+        services.hooks = Some(Arc::new(SlowPreCompact));
+        let context = MemoryContext::new(id, Summarizer::new(), services);
+        append(
+            &context,
+            vec![
+                ChatMessage::user("old task".repeat(500)),
+                ChatMessage::assistant("completed"),
+                ChatMessage::user("next"),
+            ],
+        )
+        .await;
+        let mut request = manual();
+        let cancel = CancellationToken::new();
+        if mode == "deadline" {
+            request.deadline = Some(Instant::now());
+        }
+        if mode == "cancel" {
+            cancel.cancel();
+        }
+        let result = context.compact(request, &cancel).await;
+        match mode {
+            "unlimited" => {
+                result.unwrap();
+                assert!(context.records().iter().any(|r| r.summary));
+            }
+            "deadline" => assert!(matches!(
+                result.unwrap_err(),
+                YourAiError::Aborted(AbortReason::DeadlineExceeded)
+            )),
+            _ => assert!(matches!(
+                result.unwrap_err(),
+                YourAiError::Aborted(AbortReason::Cancelled)
+            )),
+        }
+    }
+}

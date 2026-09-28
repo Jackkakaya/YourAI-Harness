@@ -98,8 +98,16 @@ async fn host_drives_durable_followups_and_close_is_idempotent() {
         .iter()
         .all(|r| r.result.as_ref().unwrap().pending.is_empty()));
     assert_eq!(h.status(), SessionStatus::Idle);
-    assert!(h.close(Duration::from_secs(1)).await.unwrap().is_empty());
-    assert!(h.close(Duration::from_secs(1)).await.unwrap().is_empty());
+    assert!(h
+        .close(Some(Duration::from_secs(1)))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(h
+        .close(Some(Duration::from_secs(1)))
+        .await
+        .unwrap()
+        .is_empty());
     assert!(h.submit(In::user_text("closed")).is_err());
     let seen = hooks.seen.lock().unwrap();
     assert!(seen.contains(&HookEventKind::SessionStart));
@@ -151,7 +159,10 @@ async fn dropping_driver_cancels_but_supervisor_preserves_followup() {
     .await
     .unwrap();
     assert_eq!(h.queued(), 1);
-    assert_eq!(h.close(Duration::from_secs(1)).await.unwrap().len(), 1);
+    assert_eq!(
+        h.close(Some(Duration::from_secs(1))).await.unwrap().len(),
+        1
+    );
 }
 #[tokio::test]
 async fn queued_input_restores_and_runtime_events_are_deduplicated() {
@@ -331,7 +342,7 @@ async fn file_watcher_reports_actual_changes_and_stops_on_close() {
     })
     .await
     .unwrap();
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 #[tokio::test]
 async fn worktrees_are_created_and_removed_by_git() {
@@ -420,7 +431,7 @@ async fn crash_recovery_closes_unmatched_calls_without_executing() {
         )
         .await
         .unwrap();
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
     drop(h);
     let recovered = host(dir.path(), model, None).await;
     let rows = store
@@ -432,7 +443,7 @@ async fn crash_recovery_closes_unmatched_calls_without_executing() {
     assert!(rows[1].message.content.tool_responses()[0]
         .content
         .contains("unknown"));
-    recovered.close(Duration::from_secs(1)).await.unwrap();
+    recovered.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 
 struct SummaryModel;
@@ -620,7 +631,7 @@ async fn async_hook_completion_routes_to_own_session_and_wakes_host() {
             .content
             .first_text()
             .is_some_and(|t| t.contains("background-feedback"))));
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 #[tokio::test]
 async fn catalog_create_fork_list_delete_are_persistent() {
@@ -645,8 +656,8 @@ async fn concurrent_close_runs_session_end_once_and_releases_history_lock() {
     .await;
     h.submit(In::follow_up("handoff")).unwrap();
     let (a, b) = tokio::join!(
-        h.close(Duration::from_secs(1)),
-        h.close(Duration::from_secs(1))
+        h.close(Some(Duration::from_secs(1))),
+        h.close(Some(Duration::from_secs(1)))
     );
     assert_eq!(a.unwrap().len() + b.unwrap().len(), 1);
     assert_eq!(
@@ -662,7 +673,7 @@ async fn concurrent_close_runs_session_end_once_and_releases_history_lock() {
     // Reopen with the original Arc still alive: explicit close must release both locks.
     let next = host(dir.path(), Arc::new(Model::new(vec![])), None).await;
     assert_eq!(next.status(), SessionStatus::Idle);
-    next.close(Duration::from_secs(1)).await.unwrap();
+    next.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 #[tokio::test]
 async fn permission_updates_are_atomic_persistent_and_cannot_expand_scope() {
@@ -845,7 +856,7 @@ async fn watched_directory_detects_created_and_deleted_children() {
             std::fs::remove_file(&file).unwrap();
         }
     }
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 
 #[tokio::test]
@@ -864,7 +875,7 @@ async fn closing_session_cancels_its_background_command() {
         Some(runtime.clone()),
     )
     .await;
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(!marker.exists());
 }
@@ -911,7 +922,7 @@ async fn shared_hook_runtime_keeps_background_contexts_session_local() {
         .unwrap()
         .result
         .unwrap();
-        h.close(Duration::from_secs(1)).await.unwrap();
+        h.close(Some(Duration::from_secs(1))).await.unwrap();
     }
     for model in [a, b] {
         assert_eq!(
@@ -1132,7 +1143,7 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
         .unwrap()
         .contains(&HookEventKind::PreCompact));
     assert_eq!(usage.session_usage(&id).await.unwrap().request_count, 1);
-    h.close(Duration::from_secs(1)).await.unwrap();
+    h.close(Some(Duration::from_secs(1))).await.unwrap();
 }
 
 #[tokio::test]
@@ -1207,25 +1218,32 @@ async fn rate_limit_attempts_stop_at_retry_limit() {
         budget: budget.clone(),
     });
     let agent = Agent::builder()
-        .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop::new(
-            yourai_harness::default_loop::LoopConfig {
-                retry_delay: Duration::ZERO,
-                max_model_retries: 2,
-                ..Default::default()
-            },
-        )))
+        .agent_loop(Arc::new(default_loop::DefaultLoop::default()))
         .model(model)
         .context_manager(Arc::new(History::default()))
         .build();
-    assert!(agent.run(In::user_text("hello")).await.is_err());
-    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let (events, result) = collect(agent.start(In::user_text("hello")).unwrap()).await;
+    assert!(result.is_err());
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 6);
+    let waits: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Out::Retry { wait_ms, .. } => Some(*wait_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(waits.len(), 5);
+    for (actual, base) in waits.iter().zip([2000, 4000, 8000, 16000, 30000]) {
+        assert!(
+            *actual >= base && *actual <= (base * 5 / 4).min(30000),
+            "unexpected wait {actual}"
+        );
+    }
     let metrics = budget.snapshot();
-    assert_eq!(metrics.calls, 3);
-    assert_eq!(metrics.requests.rate_limited, 3);
+    assert_eq!(metrics.calls, 6);
+    assert_eq!(metrics.requests.rate_limited, 6);
     assert_eq!(metrics.requests.active, 0);
-    assert!(
-        yourai_harness::default_loop::LoopConfig::default().retry_delay >= Duration::from_secs(2)
-    );
+    assert_eq!(metrics.requests.cooldown_seconds, 0);
 }
 
 #[tokio::test]
@@ -1350,7 +1368,9 @@ async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
     h.close().await.unwrap();
 }
 
-#[tokio::test(start_paused = true)]
+// Real filesystem workers and a paused Tokio clock do not share progress:
+// auto-advance can expire the outer guard while fsync is still running.
+#[tokio::test]
 async fn model_switch_publishes_chunk_timeout_with_model() {
     let dir = TempDir::new().unwrap();
     let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
@@ -1386,4 +1406,113 @@ async fn model_switch_publishes_chunk_timeout_with_model() {
     .unwrap();
     assert!(report.result.is_err());
     h.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_can_wait_for_cleanup_without_an_implicit_deadline() {
+    struct SlowEnd;
+    impl HookRuntime for SlowEnd {
+        fn dispatch<'a>(
+            &'a self,
+            i: &'a HookInvocation,
+        ) -> BoxFuture<'a, Result<HookDispatchResult, YourAiError>> {
+            Box::pin(async move {
+                if matches!(i.event, HookEvent::SessionEnd { .. }) {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                }
+                Ok(HookDispatchResult::empty(i.event.kind()))
+            })
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let h = host(
+        dir.path(),
+        Arc::new(Model::new(vec![])),
+        Some(Arc::new(SlowEnd)),
+    )
+    .await;
+    let start = tokio::time::Instant::now();
+    h.close(None).await.unwrap();
+    assert!(start.elapsed() >= Duration::from_secs(20));
+    assert_eq!(h.status(), SessionStatus::Closed);
+    h.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn harness_model_settings_are_inherited_by_child_default_loop() {
+    let dir = TempDir::new().unwrap();
+    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+    config.system_prompt = Some("test".into());
+    config.extensions = true;
+    config.yolo = true;
+    config.model_header_timeout = Some(Duration::from_secs(7));
+    config.model_chunk_timeout = Some(Duration::from_secs(11));
+    let mut spawn = call("spawn", "subagent");
+    spawn.fn_arguments = json!({"prompt":"child task"});
+    let model = Arc::new(Model::new(vec![
+        events(vec![end("", vec![spawn])]),
+        answer("child done"),
+        answer("parent done"),
+    ]));
+    let h = Harness::open(config, model.clone()).await.unwrap();
+    h.host.submit_async(In::user_text("go")).await.unwrap();
+    let result = h
+        .host
+        .run_next(
+            TurnLimits::default(),
+            &DiscardSink,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.result.unwrap().text, "parent done");
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_ne!(requests[0].session_id, requests[1].session_id);
+        for request in requests.iter() {
+            assert_eq!(
+                request.options.stream_header_timeout,
+                Some(Duration::from_secs(7))
+            );
+            assert_eq!(
+                request.options.stream_read_timeout,
+                Some(Duration::from_secs(11))
+            );
+        }
+    }
+    h.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn host_rejects_matching_event_with_wrong_hook_outcome() {
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(SqliteStore::open(&dir.path().join("db.sqlite3")).unwrap());
+    let id = store.create_session("").await.unwrap().id;
+    let model = Arc::new(Model::new(vec![]));
+    let hooks = Arc::new(Hooks::new(|_, result| {
+        result.outcome = HookPointOutcome::PreToolUse(Default::default());
+    }));
+    let history = context(id.clone(), model.clone(), store.clone(), None);
+    let agent = Agent::builder()
+        .agent_loop(Arc::new(default_loop::DefaultLoop::default()))
+        .model(model)
+        .context_manager(history)
+        .session(store)
+        .hooks(hooks)
+        .build();
+    let result = SessionHost::open(
+        dir.path(),
+        SessionContext::new(id, dir.path()),
+        agent,
+        HostConfig::default(),
+        "startup",
+    )
+    .await;
+    assert!(result
+        .err()
+        .expect("wrong outcome must fail host startup")
+        .to_string()
+        .contains("mismatched"));
 }

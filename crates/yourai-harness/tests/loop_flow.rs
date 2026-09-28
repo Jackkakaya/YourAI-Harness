@@ -476,13 +476,20 @@ async fn slow_but_progressing_stream_completes_beyond_total_budget() {
     let agent = builder(
         Arc::new(Model::new(vec![Box::pin(stream)])),
         Arc::new(History::default()),
-        LoopConfig {
-            model_chunk_timeout: Duration::from_millis(200),
-            ..Default::default()
-        },
+        LoopConfig::default(),
     )
     .build();
-    assert_eq!(agent.run(In::user_text("go")).await.unwrap().text, "ab");
+    assert_eq!(
+        agent
+            .run_with(
+                In::user_text("go"),
+                model_timeout(Duration::from_millis(200))
+            )
+            .await
+            .unwrap()
+            .text,
+        "ab"
+    );
 }
 #[tokio::test]
 async fn model_call_limit_forces_final_text_only_summary() {
@@ -605,13 +612,16 @@ async fn silent_stream_still_fails_on_per_event_timeout() {
     let agent = builder(
         Arc::new(Model::new(vec![Box::pin(futures_util::stream::pending())])),
         Arc::new(History::default()),
-        LoopConfig {
-            model_chunk_timeout: Duration::from_millis(50),
-            ..Default::default()
-        },
+        LoopConfig::default(),
     )
     .build();
-    let error = agent.run(In::user_text("go")).await.unwrap_err();
+    let error = agent
+        .run_with(
+            In::user_text("go"),
+            model_timeout(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap_err();
     assert!(matches!(
         *error.error,
         YourAiError::Error(ErrorKind::Provider { name: "model", .. })
@@ -1201,4 +1211,206 @@ async fn invalid_steer_does_not_block_valid_steer_or_follow_up() {
         .messages()
         .iter()
         .any(|m| m.content.first_text() == Some("invalid")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_approval_and_tool_questions_survive_long_user_waits() {
+    for permission in [true, false] {
+        let handler = Arc::new(Handler::new(
+            "tool",
+            if permission { Mode::Return } else { Mode::Ask },
+        ));
+        let registry = Arc::new(Registry::default());
+        registry.register(handler.clone());
+        let mut b = builder(
+            Arc::new(Model::new(vec![calls(&["tool"]), answer("done")])),
+            Arc::new(History::default()),
+            LoopConfig::default(),
+        )
+        .tools(registry);
+        if permission {
+            b = b.security(Arc::new(Security::new(ApprovalDecision::Ask)));
+        }
+        let agent = b.build();
+        let mut handle = agent
+            .start_with(
+                In::user_text("go"),
+                model_timeout(Duration::from_secs(86_400)),
+            )
+            .unwrap();
+        let mut asks = 0;
+        while let Some(event) = handle.outbox.recv().await {
+            if let Out::Ask { id, .. } = event {
+                asks += 1;
+                // Exceed both the old 300s approval and 610s outer tool timeout.
+                tokio::time::advance(Duration::from_secs(900)).await;
+                tokio::task::yield_now().await;
+                handle
+                    .inbox
+                    .send(In::Reply {
+                        id,
+                        payload: if permission {
+                            json!({"behavior":"allow"})
+                        } else {
+                            json!({"answer":"yes"})
+                        },
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(handle.join().await.unwrap().text, "done");
+        assert_eq!(asks, if permission { 1 } else { 2 });
+        assert_eq!(handler.inputs.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_tool_bounds_failure_hook_then_records_interruption() {
+    struct StuckFailureHook;
+    impl HookRuntime for StuckFailureHook {
+        fn dispatch<'a>(
+            &'a self,
+            i: &'a HookInvocation,
+        ) -> BoxFuture<'a, Result<HookDispatchResult, YourAiError>> {
+            Box::pin(async move {
+                if matches!(i.event, HookEvent::PostToolUseFailure { .. }) {
+                    std::future::pending::<()>().await;
+                }
+                Ok(HookDispatchResult::empty(i.event.kind()))
+            })
+        }
+    }
+    let registry = Arc::new(Registry::default());
+    registry.register(Arc::new(Handler::new("tool", Mode::Hang)));
+    let history = Arc::new(History::default());
+    let agent = builder(
+        Arc::new(Model::new(vec![calls(&["tool"])])),
+        history.clone(),
+        LoopConfig::default(),
+    )
+    .tools(registry)
+    .hooks(Arc::new(StuckFailureHook))
+    .build();
+    let mut handle = agent.start(In::user_text("go")).unwrap();
+    while let Some(event) = handle.outbox.recv().await {
+        if matches!(event, Out::ToolProgress { .. }) {
+            break;
+        }
+    }
+    let start = tokio::time::Instant::now();
+    handle.interrupt();
+    let (events, result) = tokio::time::timeout(Duration::from_secs(1), collect(handle))
+        .await
+        .unwrap();
+    assert!(matches!(
+        *result.unwrap_err().error,
+        YourAiError::Aborted(AbortReason::Cancelled)
+    ));
+    assert!(tokio::time::Instant::now() - start <= Duration::from_millis(251));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Out::ToolDone { is_error: true, .. })));
+    assert_eq!(
+        history
+            .messages()
+            .iter()
+            .filter(|m| m.role == ChatRole::Tool)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn explicit_deadline_still_cancels_an_unlimited_question() {
+    let registry = Arc::new(Registry::default());
+    registry.register(Arc::new(Handler::new("tool", Mode::Ask)));
+    let agent = builder(
+        Arc::new(Model::new(vec![calls(&["tool"])])),
+        Arc::new(History::default()),
+        LoopConfig::default(),
+    )
+    .tools(registry)
+    .build();
+    let mut options = TurnOptions::default();
+    options.limits.deadline = Some(Instant::now() + Duration::from_millis(50));
+    let mut handle = agent.start_with(In::user_text("go"), options).unwrap();
+    while let Some(event) = handle.outbox.recv().await {
+        if matches!(event, Out::Ask { .. }) {
+            break;
+        }
+    }
+    let (_, result) = tokio::time::timeout(Duration::from_secs(1), collect(handle))
+        .await
+        .unwrap();
+    assert!(matches!(
+        *result.unwrap_err().error,
+        YourAiError::Aborted(AbortReason::DeadlineExceeded)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_tool_can_finish_within_grace_and_preserves_actual_result() {
+    struct SettlingTool;
+    impl ToolHandler for SettlingTool {
+        fn name(&self) -> &str {
+            "tool"
+        }
+        fn definition(&self) -> Tool {
+            Tool::new("tool")
+        }
+        fn security_context(&self, input: &serde_json::Value) -> SecurityContext {
+            SecurityContext {
+                action: "tool".into(),
+                input: input.clone(),
+                is_destructive: false,
+                is_network: false,
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            tc: ToolContext<'a>,
+            _: serde_json::Value,
+        ) -> BoxFuture<'a, Result<serde_json::Value, YourAiError>> {
+            Box::pin(async move {
+                tc.emit_progress(json!("started"));
+                tc.cancel.cancelled().await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok(json!({"completed":true}))
+            })
+        }
+    }
+    let registry = Arc::new(Registry::default());
+    registry.register(Arc::new(SettlingTool));
+    let history = Arc::new(History::default());
+    let agent = builder(
+        Arc::new(Model::new(vec![calls(&["tool"])])),
+        history.clone(),
+        LoopConfig::default(),
+    )
+    .tools(registry)
+    .build();
+    let mut handle = agent.start(In::user_text("go")).unwrap();
+    while let Some(event) = handle.outbox.recv().await {
+        if matches!(event, Out::ToolProgress { .. }) {
+            break;
+        }
+    }
+    handle.interrupt();
+    let (events, result) = tokio::time::timeout(Duration::from_secs(1), collect(handle))
+        .await
+        .unwrap();
+    assert!(matches!(
+        *result.unwrap_err().error,
+        YourAiError::Aborted(AbortReason::Cancelled)
+    ));
+    assert!(events.iter().any(|e| matches!(e, Out::ToolDone { output, is_error: false, .. } if output["completed"] == true)));
+    let messages = history.messages();
+    let result = messages.last().unwrap().content.tool_responses();
+    assert!(result[0].content.contains("completed"));
+}
+
+fn model_timeout(timeout: Duration) -> TurnOptions {
+    let mut options = TurnOptions::default();
+    options.limits.model_timeout = Some(timeout);
+    options
 }

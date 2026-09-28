@@ -52,7 +52,7 @@ run_next(limits, outbox, cancel)
 - `context()` / `status()`：会话环境和展示用状态；不能先读状态再假设操作不会竞争。
 - `interrupt()`：请求取消当前 Turn，不清空后续输入，也不代表清理已经完成。
 - `compact(request, cancel)`：手动压缩，与 Turn 写历史互斥；调用方负责前后 Hook。
-- `close(timeout)`：拒绝新输入、清理当前执行、SessionEnd、释放资源，成功时归还剩余输入。
+- `close(timeout: Option<Duration>)`：拒绝新输入、清理当前执行、SessionEnd、释放资源，成功时归还剩余输入；None 等待清理完成，Some 显式限制整个关闭过程。
 
 `SessionManager` 继续负责元数据；`ContextManager` 负责历史；SessionRuntime 不通过监听 Out 重复保存历史。状态机、互斥、后台事件与恢复策略是未来具体宿主的实现责任。
 
@@ -190,3 +190,22 @@ core 没有新增 DefaultLoop、ToolExecutor、工作区或协作任务 Provider
 - OutSink::closed 默认保持 pending，core 通道实现提供真实关闭信号。
 - AbortReason::HookStopped 表示 Hook 通用停止请求。
 - ContextManager/SessionManager 工具结果提交按 call_id 防重复；ToolHandler 执行 future 须 cancellation-safe。
+
+### 模型传输层超时
+
+`ModelProvider::uses_transport_timeouts()` 默认 false。返回 true 的实现必须将
+`ChatOptions.stream_header_timeout` 用于 HTTP 响应头等待，将
+`stream_read_timeout` 用于每次原始响应体读取；这两个值只用于本地传输，不能发入模型请求 JSON。
+Loop 对这类 Provider 只在外层监听总 deadline、取消和断连；否则仍使用模型事件等待超时。
+所有包装 Provider 必须透传该能力，避免把心跳或未解析完成的数据误判为无进展。
+
+
+### 模型默认值和宿主异步提交
+
+模型默认时限由 `ModelProvider::timeouts()` 提供；LoopConfig 不再定义模型默认时限。
+包装 Provider 必须透传该值。主循环依次采用显式 TurnLimits、请求选项、模型默认值。
+
+默认 SessionHost 保留同步 `submit` 的持久化确认，同时提供 `submit_async`。
+异步入口等待 owned blocking transaction，取消等待不代表撤销已开始的提交。
+宿主状态查询和取消不持有 journal 写事务锁。详细设计见
+[代码质量整改](./architecture-quality-repairs.md)。

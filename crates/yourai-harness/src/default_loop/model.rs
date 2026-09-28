@@ -81,26 +81,42 @@ impl State<'_> {
         }
         let model = self.model.clone();
         let model_timeout = self.tc.info.options.limits.model_timeout;
-        let header_timeout = model_timeout.unwrap_or(self.config.model_header_timeout);
-        let chunk_timeout = model_timeout.unwrap_or(self.config.model_chunk_timeout);
+        let header_timeout = model_timeout
+            .or(options.stream_header_timeout)
+            .unwrap_or(model.timeouts().headers);
+        let chunk_timeout = model_timeout
+            .or(options.stream_read_timeout)
+            .unwrap_or(model.timeouts().read);
         self.model_calls += 1;
         let mut request = ModelRequest::new(request, options);
         request.session_id = Some(self.history.session_id().0.clone());
         request.turn_id = Some(self.tc.info.id.to_string());
         request.attempt = attempt;
+        let transport = model.uses_transport_timeouts();
+        let total_deadline = self.tc.info.options.limits.deadline;
+        if transport {
+            request.options.stream_header_timeout = Some(header_timeout);
+            request.options.stream_read_timeout = Some(chunk_timeout);
+        }
+        let header_deadline = if transport {
+            total_deadline
+        } else {
+            self.deadline(Some(header_timeout))
+        };
         let mut stream = self
-            .wait(model.stream_events(request), Some(header_timeout), "model")
+            .wait_until(model.stream_events(request), header_deadline, "model")
             .await?;
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut saw_tool_chunk = false;
         loop {
+            let deadline = if transport {
+                total_deadline
+            } else {
+                self.deadline(Some(chunk_timeout))
+            };
             let next = self
-                .wait(
-                    async { stream.next().await.transpose() },
-                    Some(chunk_timeout),
-                    "model",
-                )
+                .wait_until(async { stream.next().await.transpose() }, deadline, "model")
                 .await?;
             let Some(event) = next else {
                 return Err(ErrorKind::Provider {

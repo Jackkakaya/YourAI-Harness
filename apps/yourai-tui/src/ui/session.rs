@@ -136,15 +136,12 @@ impl Controller {
         if !self.accepting(view) {
             return false;
         }
-        match self.runtime.h.host.submit(input) {
-            Ok(()) => {
-                self.runtime.resume();
-                true
-            }
-            Err(e) => {
-                view.notice(Level::Error, e.to_string());
-                false
-            }
+        if self.runtime.submit(input) {
+            self.runtime.resume();
+            true
+        } else {
+            view.notice(Level::Error, "Input queue closed; your draft is kept.");
+            false
         }
     }
     /// Reply to a pending ask under the same input guard as `submit`. The
@@ -370,7 +367,7 @@ pub(super) async fn fixture() -> (tempfile::TempDir, Controller, View) {
         "model":"mock/test", "extensions":false,
         "provider":{"mock":{"options":{"baseURL":"http://127.0.0.1:1/v1","apiKey":"test"},"models":{}}}
     })).unwrap();
-    let (model, _) = cfg.resolve(None).unwrap();
+    let model = cfg.resolve(None).unwrap().model;
     let mut hc = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
     hc.system_prompt = Some("test".into());
     let h = Harness::open(hc.clone(), model).await.unwrap();
@@ -601,5 +598,32 @@ mod tests {
         assert_eq!(view.draft.attachment_counts(), (0, 0));
         let (_, pending) = controller.close().await.unwrap();
         assert!(pending.is_empty());
+    }
+    #[tokio::test]
+    async fn failed_async_submission_preserves_new_draft_and_blocks_session_switch_until_settled() {
+        let (_dir, mut controller, mut view) = fixture().await;
+        let id = controller.harness().host.context().id;
+        let journal = controller.template.root.join(&id.0).join("host.json");
+        let backup = journal.with_extension("backup");
+        std::fs::rename(&journal, &backup).unwrap();
+        std::fs::create_dir(&journal).unwrap();
+        assert!(controller.submit(In::user_text("failed input"), &mut view));
+        assert!(!controller.runtime.idle());
+        controller.switch(Target::New, &mut view);
+        assert!(controller.operation.is_none());
+        view.draft.insert("new draft while disk is pending");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                controller.poll(&mut view, None).await;
+                if controller.runtime.idle() && view.items().iter().any(|item| matches!(item, Item::Notice { text, .. } if text.starts_with("Input rejected:"))) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert_eq!(view.draft.text(), "new draft while disk is pending");
+        assert_eq!(controller.harness().host.queued(), 0);
+        assert_eq!(controller.harness().host.context().id, id);
+        std::fs::remove_dir(&journal).unwrap();
+        std::fs::rename(backup, journal).unwrap();
+        controller.close().await.unwrap();
     }
 }

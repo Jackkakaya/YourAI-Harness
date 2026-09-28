@@ -80,6 +80,11 @@ ConcreteHookRuntime 支持 command/http/native/prompt/agent。DefaultHookModelEx
 ## 默认策略的保证边界
 
 - Harness 的共享 ModelBudget 对主模型、compact、模型 Hook、子 Agent 统一记录调用次数并累计已知 token，但只做观测与限速（RequestPolicy 的 RPM/cooldown），不再设调用次数或 token 准入上限——与 OpenCode 一致：执行边界由 per-turn 的 `steps`、deadline 和各超时构成，没有跨 turn 费用硬上限。用量按当前装配生命周期累计，恢复后重新计数，历史用量仍保存。
+- 超时策略以 OpenCode `70a24697ea0028e19f22712fd63059538cb4bee7` 为参照：普通 provider 操作、用户审批、Hook 调度、压缩和持久化清理不再默认设置总时限；相应配置为 `Option<Duration>`，`None` 不启动计时器。显式 turn/compaction deadline、取消和断连仍生效。模型 HTTP 响应头和后续原始字节读取默认各 300 秒，覆盖主循环、压缩、模型 Hook 和子 Agent；SSE 心跳与尚未解析完成的事件也属于读取进展，持续输出不受总耗时限制。压缩通过流式请求收集最终回复。传输层由仓库内固定版本的 genai 补丁实现（`vendor/genai/PATCHES.md`）；ModelProvider 声明 `uses_transport_timeouts()` 后，主循环只保留显式总 deadline/取消/断连，不再叠加模型事件间隔计时。默认 Loop/TurnLimits 的模型时限通过 ChatOptions 传给传输层，MeteredModel 与 SourceModel 保留该能力。未提供传输层计时的自定义 ModelProvider 继续使用原事件级计时兜底。模型底层显式 HTTP 请求 timeout 仍独立生效。
+- 工具不再默认被统一的 610 秒外层计时器截断；由工具自己负责默认超时（shell 默认 120 秒、最大 600 秒，webfetch 自有网络时限），宿主仍可用 `LoopConfig.tool_timeout` / `TurnLimits.tool_timeout` 增加上限。工具内部问题没有 deadline 时也可等待用户回复。
+- 重试最多 5 次，初始 2 秒、指数倍率 2、最多 25% 抖动；无响应头时上限 30 秒，服务端 Retry-After 优先，所有重试等待封顶 `i32::MAX` 毫秒。计量包装层不再把缺失的提示变成零秒提示；共享 provider cooldown 默认关闭（`cooldown_seconds = 0`），不再额外等待 60 秒；用户显式配置的 cooldown/RPM 和服务端提示仍可施加共享准入限制。[OpenCode retry.ts](https://github.com/anomalyco/opencode/blob/70a24697ea0028e19f22712fd63059538cb4bee7/packages/opencode/src/session/retry.ts)
+- 取消收尾区分工具宽限和历史写入：先取消工具 token，再给工具 `tool_cleanup_timeout`（默认 250 毫秒）完成收尾；保留宽限期内返回的真实结果，超时后丢弃 future 并记录中断。取消后的失败 Hook 只使用同一宽限期的剩余时间，不再另加等待。Host 对 cancel 只消费一次，避免无总清理超时时忙循环；可选 `cleanup_timeout` 仍支持隔离不合作的执行。正常 Harness/子 Agent 关闭使用 `close(None)` 等待收尾，调用方可用 `close(Some(duration))` 显式限制关闭期限。[OpenCode cleanup](https://github.com/anomalyco/opencode/blob/70a24697ea0028e19f22712fd63059538cb4bee7/packages/opencode/src/session/processor.ts#L553-L610)
+
 - steps 语义与 OpenCode 对齐：计 agentic iteration，重试与压缩不消耗 step；最后一步不绑定工具定义、请求级追加 assistant 角色 MAX_STEPS_PROMPT prefill（不写入历史）并设 `tool_choice=none`，模型仍返回工具调用时按 failUnsettledTools 语义回写失败结果并继续循环（有界）。
 - 附件协议双形态（`UserAttachment.data`，untagged 保证旧 base64 wire 兼容）：内联 base64 媒体（图片/PDF/音频），或文件引用 `{"path": "...", "lines": [10, 20]}`（OpenCode FilePart 语义，行窗口 1-based 闭区间）。引用形态由 harness 在 `accept_input` 统一解析：文本文件读出并截断为 text part（默认 50k 字符上限 + 行窗口），图片走归一化阶梯，目录展开为一级列表，audio/PDF 转 Binary；前端只传路径不做任何读取。图片附件入库前归一化（对齐 OpenCode image.ts）：5MB base64 与 2000x2000 上限，超限先缩放（Lanczos3，PNG→JPEG 降质阶梯）再拒绝；audio/PDF 尺寸由 provider 侧约束。上下文预算中图片按 provider 计费公式估算（Anthropic (w·h)/750、OpenAI tiles），PDF/音频按字节粗估。
 - ModelProvider 只提供 complete / stream_events；genai 原始流转换封装在 GenaiModel。UsageTracker 只通过 record_event 记录原始用量事件。
@@ -87,3 +92,9 @@ ConcreteHookRuntime 支持 command/http/native/prompt/agent。DefaultHookModelEx
 - 外部副作用和文件历史不能提供跨系统 exactly-once。崩溃后的不确定调用不会自动重试。Provider 自行脱离的任务、进程组之外的进程不在取消保证内。
 - 默认装配不包含业务 shell/file/MCP 客户端或操作系统沙箱。通过 ToolHandler / SandboxProvider 接入；Loop 已实现共用的权限、取消、交互和结果流程。
 - 自动测试使用可控模型，不请求在线模型；GenaiModel 的在线连通性未验证。
+
+
+## 策略归属与持久化更新
+
+模型超时统一由所选模型携带；Hook 共同校验、流式 HTTP 错误元数据、异步 journal
+事务和有序请求日志的实现与取消语义见[代码质量整改](./architecture-quality-repairs.md)。
