@@ -1414,3 +1414,136 @@ fn model_timeout(timeout: Duration) -> TurnOptions {
     options.limits.model_timeout = Some(timeout);
     options
 }
+
+#[tokio::test]
+async fn repeated_calls_use_existing_permission_ui_and_honor_denial() {
+    for allow in [true, false] {
+        let h = Arc::new(Handler::new("tool", Mode::Return));
+        let registry = Arc::new(Registry::default());
+        registry.register(h.clone());
+        let mut streams: Vec<_> = (0..4)
+            .map(|i| events(vec![end("", vec![call(&format!("repeat-{i}"), "tool")])]))
+            .collect();
+        streams.push(answer("done"));
+        let agent = builder(
+            Arc::new(Model::new(streams)),
+            Arc::new(History::default()),
+            LoopConfig::default(),
+        )
+        .tools(registry)
+        .build();
+        let mut handle = agent.start(In::user_text("go")).unwrap();
+        let mut asks = 0;
+        while let Some(event) = handle.outbox.recv().await {
+            if let Out::Ask { id, payload } = event {
+                asks += 1;
+                assert_eq!(payload["kind"], "permission");
+                assert!(payload["reason"].as_str().unwrap().contains("doom_loop"));
+                assert_eq!(payload["tool_name"], "tool");
+                handle
+                    .inbox
+                    .send(In::Reply {
+                        id,
+                        payload: json!({"behavior":if allow {"allow"} else {"deny"}}),
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(handle.join().await.unwrap().text, "done");
+        assert_eq!(asks, 2);
+        assert_eq!(h.inputs.lock().unwrap().len(), if allow { 4 } else { 2 });
+    }
+}
+
+#[tokio::test]
+async fn repeated_calls_allow_hook_rewrites_and_yolo_without_extra_gate() {
+    for yolo in [false, true] {
+        let h = Arc::new(Handler::new("tool", Mode::Return));
+        let registry = Arc::new(Registry::default());
+        registry.register(h.clone());
+        let hooks = Arc::new(Hooks::new(|_, r| {
+            if let HookPointOutcome::PermissionRequest(o) = &mut r.outcome {
+                o.decision = Some(PermissionRequestDecision {
+                    behavior: PermissionRequestBehavior::Allow,
+                    updated_input: Some(json!({"value":2})),
+                    updated_permissions: vec![],
+                    message: None,
+                    interrupt: false,
+                });
+            }
+        }));
+        let mut streams: Vec<_> = (0..3)
+            .map(|i| events(vec![end("", vec![call(&format!("repeat-{i}"), "tool")])]))
+            .collect();
+        streams.push(answer("done"));
+        let agent = builder(
+            Arc::new(Model::new(streams)),
+            Arc::new(History::default()),
+            LoopConfig::default(),
+        )
+        .tools(registry)
+        .hooks(hooks.clone())
+        .build();
+        if yolo {
+            agent
+                .ctx()
+                .set_security(Arc::new(yourai_harness::security::YoloSecurity));
+        }
+        assert_eq!(agent.run(In::user_text("go")).await.unwrap().text, "done");
+        assert_eq!(
+            h.inputs.lock().unwrap()[2],
+            json!({"value":if yolo {1} else {2}})
+        );
+        assert_eq!(
+            hooks
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|kind| **kind == HookEventKind::PermissionRequest)
+                .count(),
+            if yolo { 0 } else { 1 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn managed_output_bounds_post_hook_mcp_results_and_preserves_original_file() {
+    let d = tempfile::tempdir().unwrap();
+    let store = yourai_harness::tools::ToolOutputStore::open(d.path().to_owned()).unwrap();
+    let h = Arc::new(Handler::new("mcp__large", Mode::Return));
+    let registry = Arc::new(Registry::default());
+    registry.register(h);
+    let hooks = Arc::new(Hooks::new(|_, r| {
+        if let HookPointOutcome::PostToolUse(o) = &mut r.outcome {
+            o.updated_mcp_tool_output = Some(json!({"ok":true,"content":"large".repeat(20_000)}));
+        }
+    }));
+    let history = Arc::new(History::default());
+    let agent = builder(
+        Arc::new(Model::new(vec![calls(&["mcp__large"]), answer("done")])),
+        history.clone(),
+        LoopConfig {
+            tool_output: Some(store),
+            ..Default::default()
+        },
+    )
+    .tools(registry)
+    .hooks(hooks)
+    .build();
+    agent.run(In::user_text("go")).await.unwrap();
+    let messages = history.messages();
+    let response = messages
+        .iter()
+        .find(|m| m.role == ChatRole::Tool)
+        .unwrap()
+        .content
+        .tool_responses()[0];
+    let value: serde_json::Value = serde_json::from_str(&response.content).unwrap();
+    assert_eq!(value["truncated"], true);
+    let saved: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(value["output_paths"][0].as_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["content"].as_str().unwrap().len(), 100_000);
+}

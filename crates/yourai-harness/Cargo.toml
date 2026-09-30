@@ -8,7 +8,7 @@ license.workspace = true
 yourai-core = { path = "../yourai-core" }
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tokio-util.workspace = true
 uuid.workspace = true
 genai.workspace = true

@@ -1,5 +1,7 @@
 //! Built-in tools implement Core's existing ToolHandler; no loop or storage dependency.
 mod files;
+mod output;
+pub use output::ToolOutputStore;
 mod shell;
 mod web;
 pub use web::{WebFetch, WebSearch};
@@ -22,6 +24,13 @@ pub const SHELL_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
 
 pub fn coding_tools(cwd: &Path) -> Result<Vec<Arc<dyn ToolHandler>>, YourAiError> {
+    coding_tools_with_output(cwd, None)
+}
+
+pub(crate) fn coding_tools_with_output(
+    cwd: &Path,
+    output: Option<Arc<ToolOutputStore>>,
+) -> Result<Vec<Arc<dyn ToolHandler>>, YourAiError> {
     let cwd = std::fs::canonicalize(cwd).map_err(|e| error("tools", e))?;
     if !cwd.is_dir() {
         return Err(error("tools", "cwd must be a directory"));
@@ -30,7 +39,7 @@ pub fn coding_tools(cwd: &Path) -> Result<Vec<Arc<dyn ToolHandler>>, YourAiError
         Arc::new(Read::new(cwd.clone())),
         Arc::new(Write::new(cwd.clone())),
         Arc::new(Edit::new(cwd.clone())),
-        Arc::new(Shell::new(cwd)),
+        Arc::new(Shell::with_output(cwd, output)),
         Arc::new(WebFetch::new()?),
         Arc::new(WebSearch::new()?),
     ])

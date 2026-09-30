@@ -83,6 +83,13 @@ impl State<'_> {
                 }
             }
         }
+        if !aborted {
+            if let Some(store) = self.config.tool_output.clone() {
+                output = self
+                    .wait(store.bound(&output), self.op_timeout(), "tool-output")
+                    .await?;
+            }
+        }
         self.tool_completion = Some((call.clone(), output.clone(), is_error));
         if aborted {
             return result.map(|_| ());
@@ -146,7 +153,27 @@ impl State<'_> {
         if let Some(schema) = &definition.schema {
             validate_schema(schema, &call.fn_arguments)?;
         }
-        self.approve(call, &handler, permission).await?;
+        let repeat = self
+            .repeated_tool
+            .as_ref()
+            .map_or(1, |(name, input, count)| {
+                if name == &call.fn_name && input == &call.fn_arguments {
+                    count.saturating_add(1)
+                } else {
+                    1
+                }
+            });
+        self.repeated_tool = Some((call.fn_name.clone(), call.fn_arguments.clone(), repeat));
+        let doom_loop = repeat >= 3;
+        self.approve(call, &handler, permission, doom_loop).await?;
+        // Permission hooks may rewrite the input; count what will actually execute.
+        if let Some((name, input, count)) = &mut self.repeated_tool {
+            if input != &call.fn_arguments {
+                *count = 1;
+            }
+            *name = call.fn_name.clone();
+            *input = call.fn_arguments.clone();
+        }
         self.tc.check_control()?;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let bridge = Bridge { tx };
@@ -247,6 +274,7 @@ impl State<'_> {
         call: &mut ToolCall,
         handler: &Arc<dyn ToolHandler>,
         hook_permission: HookPermission,
+        doom_loop: bool,
     ) -> Result<(), YourAiError> {
         if self
             .tc
@@ -268,7 +296,8 @@ impl State<'_> {
             };
             let mut denied = deny;
             if denied.is_none() {
-                let ask = matches!(hook_permission, HookPermission::Ask { .. })
+                let ask = doom_loop
+                    || matches!(hook_permission, HookPermission::Ask { .. })
                     || matches!(security, ApprovalDecision::Ask);
                 if !ask {
                     return Ok(());
@@ -295,7 +324,7 @@ impl State<'_> {
                     let decision = match decision {
                         Some(decision) => decision,
                         None => {
-                            let reply = self.ask(uuid::Uuid::new_v4().to_string(), json!({"kind":"permission", "call_id":call.call_id, "tool_name":call.fn_name, "input":call.fn_arguments}), self.tc.info.options.limits.approval_timeout.or(self.config.approval_timeout)).await;
+                            let reply = self.ask(uuid::Uuid::new_v4().to_string(), json!({"kind":"permission", "reason":if doom_loop { "Repeated identical tool call (doom_loop)" } else { "Tool permission" }, "call_id":call.call_id, "tool_name":call.fn_name, "input":call.fn_arguments}), self.tc.info.options.limits.approval_timeout.or(self.config.approval_timeout)).await;
                             match reply {
                                 Ok(reply) => parse_decision(reply)?,
                                 Err(e @ YourAiError::Aborted(_)) => return Err(e),

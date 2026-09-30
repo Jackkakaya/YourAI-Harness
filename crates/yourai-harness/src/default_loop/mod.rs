@@ -63,6 +63,8 @@ impl Default for AttachmentImageConfig {
 /// Policy defaults, not additional Providers. TurnLimits can impose stricter limits.
 #[derive(Debug, Clone)]
 pub struct LoopConfig {
+    /// Managed output storage; assembled harnesses share their catalog store.
+    pub tool_output: Option<Arc<crate::tools::ToolOutputStore>>,
     /// Explicitly selected skills; listing a skill does not activate it.
     pub skill_ids: Vec<String>,
     pub memory_search_limit: usize,
@@ -95,6 +97,7 @@ pub struct LoopConfig {
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
+            tool_output: None,
             skill_ids: vec![],
             memory_search_limit: 0,
             memory_max_chars: 8000,
@@ -162,6 +165,7 @@ impl AgentLoop for DefaultLoop {
                 step: 0,
                 model_calls: 0,
                 stop_continuations: 0,
+                repeated_tool: None,
                 bound_tools: HashMap::new(),
                 call_ids: HashSet::new(),
                 unresolved: VecDeque::new(),
@@ -202,6 +206,7 @@ struct State<'a> {
     step: u32,
     model_calls: u32,
     stop_continuations: u32,
+    repeated_tool: Option<(String, serde_json::Value, u32)>,
     unresolved: VecDeque<ToolCall>,
     bound_tools: HashMap<String, Arc<dyn ToolHandler>>,
     call_ids: HashSet<String>,
@@ -341,6 +346,14 @@ impl State<'_> {
                 }
             };
             let history = self.history.clone();
+            if message
+                .content
+                .texts()
+                .iter()
+                .any(|text| !text.trim().is_empty())
+            {
+                self.repeated_tool = None;
+            }
             let mut record = StoredMessage::new(message);
             record.model_response = true;
             record.request_observation = self.request_observation.take();

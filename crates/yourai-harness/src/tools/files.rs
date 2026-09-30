@@ -170,15 +170,29 @@ impl ToolHandler for Read {
                 return Err(error(self.name(), "offset is past end of file"));
             }
             let start = i.offset - 1;
-            let end = start.saturating_add(i.limit).min(lines.len());
-            let body = lines[start..end]
-                .iter()
-                .enumerate()
-                .map(|(n, line)| format!("{}|{}", i.offset + n, line))
-                .collect::<String>();
+            let mut end = start;
+            let mut body = String::new();
+            let mut clipped = false;
+            for line in lines.iter().skip(start).take(i.limit) {
+                let (text, newline) = line
+                    .strip_suffix('\n')
+                    .map_or((*line, ""), |text| (text, "\n"));
+                let cut = text.char_indices().nth(2000).map(|(index, _)| index);
+                let text = match cut {
+                    Some(index) => format!("{}... (line truncated to 2000 chars)", &text[..index]),
+                    None => text.to_owned(),
+                };
+                let numbered = format!("{}|{}{}", end + 1, text, newline);
+                if body.len() + numbered.len() > super::output::MAX_BYTES {
+                    break;
+                }
+                clipped |= cut.is_some();
+                body.push_str(&numbered);
+                end += 1;
+            }
             check_cancel(&tc)?;
             Ok(
-                json!({"ok":true,"path":path_str,"offset":i.offset,"next_offset":(end<lines.len()).then_some(end+1),"content":body}),
+                json!({"ok":true,"path":path_str,"offset":i.offset,"next_offset":(end<lines.len()).then_some(end+1),"content":body,"lines_clipped":clipped}),
             )
         })
     }

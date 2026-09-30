@@ -35,7 +35,8 @@ pub(crate) fn preview(
         return Ok(response.content.clone());
     }
     let parsed: Option<serde_json::Value> = serde_json::from_str(&response.content).ok();
-    let status = parsed.as_ref().map(|v| serde_json::json!({"ok":v.get("ok"),"error":v.get("error"),"exit_code":v.get("exit_code")}));
+    let status = parsed.as_ref().map(|v| v.get("status").cloned().unwrap_or_else(|| serde_json::json!({"ok":v.get("ok"),"error":v.get("error"),"exit_code":v.get("exit_code")})));
+    let paths = parsed.as_ref().and_then(|v| v.get("output_paths"));
     let mut take = if pruned { 0 } else { limit / 2 };
     loop {
         let head: String = response.content.chars().take(take / 2).collect();
@@ -48,7 +49,7 @@ pub(crate) fn preview(
             .chars()
             .rev()
             .collect();
-        let s = serde_json::json!({"truncated":true,"pruned":pruned,"call_id":response.call_id,"status":status,"head":head,"tail":tail}).to_string();
+        let s = serde_json::json!({"truncated":true,"pruned":pruned,"call_id":response.call_id,"status":status,"output_paths":paths,"head":head,"tail":tail}).to_string();
         if s.chars().count() <= limit {
             return Ok(s);
         }
@@ -167,5 +168,28 @@ impl MemoryContext {
             return Err(error("assets", "media tool batch has unresolved calls"));
         }
         Ok(messages)
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    #[test]
+    fn projection_and_pruning_preserve_managed_paths_and_exit_status() {
+        let call = ToolCall {
+            call_id: "output-test".into(),
+            fn_name: "shell".into(),
+            fn_arguments: serde_json::json!({}),
+            thought_signatures: None,
+        };
+        let value = serde_json::json!({"status":{"exit_code":7,"ok":false},"output_paths":["/tmp/tool_a.txt","/tmp/tool_b.txt"],"content":"abc".repeat(20_000)});
+        let response = ToolResponse::from_tool_call(&call, value.to_string());
+        for pruned in [false, true] {
+            let result = preview(&response, 512, pruned).unwrap();
+            assert!(result.chars().count() <= 512);
+            let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(parsed["output_paths"], value["output_paths"]);
+            assert_eq!(parsed["status"]["exit_code"], 7);
+        }
     }
 }

@@ -102,3 +102,31 @@ SessionStart/SessionEnd、工作区、配置、指令文件、子 Agent、协作
 ## 验证
 
 `crates/yourai-harness/tests/loop_flow.rs` 使用可控制事件流和内存历史验证完整主链，覆盖审批、Hook 参数修改、硬拒绝、JSON Schema、普通/MCP 交互、压缩、有限重试、Stop、steer/follow-up、取消、断开、超时、预算以及批次收尾；包含真实 ConcreteHookRuntime 注册与效果消费测试。不依赖在线模型或 API Key。
+
+
+## 工具输出存储与重复调用保护
+
+Harness 装配为同一 SessionCatalog 的会话共享不可变的 ToolOutputStore，目录为
+`<root>/tool-output`。每次落盘使用独立 UUID 文件并排他创建，不依赖模型 call_id；
+不同 Harness root 不共享可变配置。后台每小时清理超过七天的受管理普通文件。
+
+DefaultLoop 在 PostToolUse（含 MCP 输出改写）之后统一处理超长结果：默认 2000 行、
+50 KiB，完整 JSON 落盘，头尾预览带 `output_paths`。MemoryContext 仍独立执行请求的
+`tool_output_chars` 限额，但缩减及 prune 都保留文件路径和状态，不裁掉回看入口。
+过期文件不再保证可读；无需额外的 read_tool_result 工具。
+
+已装配的 Shell 为 stdout/stderr 分别流式保存完整字节，每路仅保留固定开头和滚动结尾，返回有界头尾预览。
+输出量本身不终止命令，超时、取消和进程组清理仍生效。`capture_complete` 表示两路采集到 EOF，
+`output_complete` 表示返回文本也未截断；完整内容分别由 stdout_path/stderr_path 指向。
+直接创建 Shell::new（未提供存储）保留原 8 MiB 采集上限，可用 Shell::with_output 显式启用存储。
+Read 保留行分隔符，裁剪超长行，并按 50 KiB 分页；超过 16 MiB 的文件仍使用 shell 定向检索。
+
+连续三个同名同参数工具调用会要求审批；后续相同调用仍需逐次批准。复用现有 PermissionRequest、
+参数改写后的 schema/硬策略复查、PermissionDenied 与 TUI y/n 协议；YOLO 使用已有跳过审批语义。
+用户新输入、assistant 非空文本及不同工具/参数会打断连续计数。计数在本 Turn 内，
+这是适配当前逐步 assistant 消息结构的策略，不声称与 OpenCode 的消息 part 扫描完全相同。
+默认 steps=None 仍无限制，默认模型重试仍为五次。
+
+参考 OpenCode `2fa3363c924c5c3e367b84a87ae478296a0ed59b`：
+`packages/core/src/tool-output-store.ts` 的唯一文件/头尾预览/清理，
+`packages/opencode/src/tool/shell.ts` 的流式落盘，及 session/processor.ts 的权限门控。
