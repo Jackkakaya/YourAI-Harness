@@ -581,7 +581,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 controller.poll(&mut view, None).await;
-                if controller.runtime.idle() && view.items().iter().any(|item| matches!(item, crate::ui::state::Item::Notice { text, .. } if text.starts_with("Input rejected:"))) {
+                // Host completion can race with poll's UI-state snapshot.
+                // Session switching requires both states to have settled.
+                if controller.runtime.idle() && !view.session.active && view.items().iter().any(|item| matches!(item, crate::ui::state::Item::Notice { text, .. } if text.starts_with("Input rejected:"))) {
                     break;
                 }
                 tokio::task::yield_now().await;
