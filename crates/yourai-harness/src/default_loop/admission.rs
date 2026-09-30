@@ -133,6 +133,7 @@ impl State<'_> {
         self.wait(history.append(vec![record]), self.op_timeout(), "history")
             .await?;
         self.queued.remove(index); // Transfer only after a successful commit.
+        self.repeated_tool = None;
         self.add_context(&super::hooks::additional(&hook)).await?;
         Ok(true)
     }

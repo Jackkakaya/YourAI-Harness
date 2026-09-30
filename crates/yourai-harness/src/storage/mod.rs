@@ -68,6 +68,7 @@ fn lock(path: &Path) -> Result<File, YourAiError> {
 /// Session directories hold host/extension state, while all session records use SQLite.
 pub struct SessionCatalog {
     root: PathBuf,
+    pub(crate) tool_output: Arc<crate::tools::ToolOutputStore>,
     pub store: Arc<crate::SqliteStore>,
 }
 impl SessionCatalog {
@@ -98,7 +99,12 @@ impl SessionCatalog {
                 }
             }
         }
-        Ok(Self { root, store })
+        let tool_output = crate::tools::ToolOutputStore::open(root.join("tool-output"))?;
+        Ok(Self {
+            root,
+            store,
+            tool_output,
+        })
     }
     pub fn directory(&self, id: &SessionId) -> Result<PathBuf, YourAiError> {
         if id.0.is_empty() || !id.0.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {

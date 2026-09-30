@@ -209,6 +209,7 @@ impl Harness {
             .set_agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
                 crate::default_loop::LoopConfig {
                     memory_search_limit: config.memory_search_limit,
+                    tool_output: Some(catalog.tool_output.clone()),
                     ..Default::default()
                 },
             )));
@@ -423,7 +424,10 @@ pub(crate) async fn assemble(
             }
         }
     }
-    registry.extend(crate::tools::coding_tools(cwd)?);
+    registry.extend(crate::tools::coding_tools_with_output(
+        cwd,
+        Some(catalog.tool_output.clone()),
+    )?);
     let services = crate::context::ContextServices {
         store: Some(catalog.clone()),
         policy,
@@ -431,7 +435,12 @@ pub(crate) async fn assemble(
     };
     let history = MemoryContext::new(id.clone(), services);
     let mut builder = Agent::builder()
-        .agent_loop(Arc::new(crate::default_loop::DefaultLoop::default()))
+        .agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
+            crate::default_loop::LoopConfig {
+                tool_output: Some(catalog.tool_output.clone()),
+                ..Default::default()
+            },
+        )))
         .model(model)
         .context_manager(history)
         .session(catalog.clone())
