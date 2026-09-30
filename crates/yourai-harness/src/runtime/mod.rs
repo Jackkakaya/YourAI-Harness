@@ -275,6 +275,7 @@ impl SessionHost {
             self.context().cwd.join(path)
         };
         let mut journal = self.journal();
+        self.ensure_open()?;
         if !journal.watch.contains(&path) {
             journal.watch.push(path);
         }
@@ -288,9 +289,7 @@ impl SessionHost {
     }
     pub fn post_event(&self, event: RuntimeEvent) -> Result<bool, YourAiError> {
         let mut journal = self.journal();
-        if self.closing.is_cancelled() {
-            return Err(error("host", "session closing"));
-        }
+        self.ensure_open()?;
         if journal.seen.contains(&event.id) {
             return Ok(false);
         }
@@ -507,16 +506,26 @@ impl SessionHost {
         }
     }
     pub(crate) fn try_operation(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, YourAiError> {
+        self.ensure_open()?;
+        let guard = self
+            .operation
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| error("host", "session is busy"))?;
+        // Check after acquisition: close may have finished while this caller
+        // was about to acquire the operation gate.
+        self.ensure_open()?;
+        Ok(guard)
+    }
+    fn ensure_open(&self) -> Result<(), YourAiError> {
         if self.closing.is_cancelled() {
             return Err(error("host", "session closing"));
         }
-        self.operation
-            .clone()
-            .try_lock_owned()
-            .map_err(|_| error("host", "session is busy"))
+        Ok(())
     }
     pub(crate) fn set_cwd(&self, cwd: PathBuf) -> Result<(), YourAiError> {
         let mut journal = self.journal();
+        self.ensure_open()?;
         journal.cwd = cwd.clone();
         journal.commit()?;
         self.context.lock().unwrap().cwd = cwd;
@@ -817,7 +826,13 @@ impl SessionRuntime for SessionHost {
     ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>> {
         Box::pin(async move {
             let _gate = self.try_operation()?;
-            self.live.lock().unwrap().status = SessionStatus::Compacting;
+            {
+                let mut live = self.live.lock().unwrap();
+                // Publish under the same lock as close so a racing close can
+                // never have its Closing state overwritten by Compacting.
+                self.ensure_open()?;
+                live.status = SessionStatus::Compacting;
+            }
             let _status = StatusGuard(self);
             let deadline = request.deadline;
             let token = cancel.child_token();

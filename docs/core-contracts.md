@@ -186,7 +186,8 @@ core 没有新增 DefaultLoop、ToolExecutor、工作区或协作任务 Provider
 
 ## DefaultLoop 接入时的补充
 
-- ModelProvider::stream_events 默认桥接原 stream；ModelRecovery 和 recovery() 提供保守的恢复分类。
+- ModelProvider::stream_events 提供事件流；ModelRecovery 和 recovery() 提供保守的恢复策略。
+- ModelProvider::classify_error() 提供中立错误分类，默认 Unclassified；core 不解析厂商错误码。默认 recovery() 映射模型分类，Adapter 可独立覆盖。RateLimited 显式启用共享冷却，使用模型的 retry_after 或配置回退；其他分类不会触发共享冷却。GenaiModel 自行解释结构化 HTTP 错误。
 - OutSink::closed 默认保持 pending，core 通道实现提供真实关闭信号。
 - AbortReason::HookStopped 表示 Hook 通用停止请求。
 - ContextManager/SessionManager 工具结果提交按 call_id 防重复；ToolHandler 执行 future 须 cancellation-safe。

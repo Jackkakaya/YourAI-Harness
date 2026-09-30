@@ -22,6 +22,18 @@ pub enum ModelRecovery {
     Compact,
 }
 
+/// Provider-neutral failure semantics, independent of wire format and retry timing.
+/// The selected model owns classification; core does not interpret vendor error codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelErrorClass {
+    QuotaExhausted,
+    ContextOverflow,
+    /// Opts into shared provider cooldown, using retry_after or the configured fallback.
+    RateLimited,
+    ServerError,
+    Unclassified,
+}
+
 /// Defaults owned by the selected model, shared by every execution entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelTimeouts {
@@ -85,7 +97,9 @@ pub trait ModelProvider: Send + Sync {
         false
     }
 
-    /// Shared provider cooldown remaining after a failure. Does not consume an attempt.
+    /// Suggested wait after a failure. Does not consume an attempt.
+    /// A RateLimited classification also applies this hint to shared admission;
+    /// other classes use it only for local retries. Wrappers may merge shared waits.
     fn retry_after(&self, _error: &YourAiError) -> Option<std::time::Duration> {
         None
     }
@@ -103,30 +117,20 @@ pub trait ModelProvider: Send + Sync {
         req: ModelRequest,
     ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>>;
 
-    /// 适配器可以按结构化服务端错误覆盖分类；不以任意错误文本猜测溢出。
+    /// Provider-owned failure semantics. Unknown providers opt out of automatic
+    /// recovery and shared cooldown until they supply a classification.
+    /// Overriding recovery alone does not opt into shared cooldown.
+    fn classify_error(&self, _error: &YourAiError) -> ModelErrorClass {
+        ModelErrorClass::Unclassified
+    }
+
+    /// Adapters may override recovery independently of shared admission policy.
     fn recovery(&self, error: &YourAiError) -> ModelRecovery {
-        if let Some((status, body)) = error.model_http_error() {
-            let code = serde_json::from_str::<serde_json::Value>(body)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/error/code")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned)
-                });
-            if matches!(
-                code.as_deref(),
-                Some("insufficient_quota" | "billing_hard_limit_reached")
-            ) {
-                return ModelRecovery::Fatal;
-            }
-            if code.as_deref() == Some("context_length_exceeded") {
-                return ModelRecovery::Compact;
-            }
-            if status == 429 || (500..600).contains(&status) {
-                return ModelRecovery::Retry;
-            }
+        match self.classify_error(error) {
+            ModelErrorClass::RateLimited | ModelErrorClass::ServerError => ModelRecovery::Retry,
+            ModelErrorClass::ContextOverflow => ModelRecovery::Compact,
+            ModelErrorClass::QuotaExhausted | ModelErrorClass::Unclassified => ModelRecovery::Fatal,
         }
-        ModelRecovery::Fatal
     }
     /// 非流式调用
     fn complete<'a>(

@@ -43,6 +43,9 @@ impl ModelProvider for ConfiguredModel {
     fn retry_after(&self, error: &YourAiError) -> Option<Duration> {
         self.inner.retry_after(error)
     }
+    fn classify_error(&self, error: &YourAiError) -> ModelErrorClass {
+        self.inner.classify_error(error)
+    }
     fn recovery(&self, error: &YourAiError) -> ModelRecovery {
         self.inner.recovery(error)
     }

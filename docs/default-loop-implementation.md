@@ -55,7 +55,7 @@ fn assemble(model: Arc<dyn ModelProvider>, history: Arc<dyn ContextManager>) -> 
 
 必需 ModelProvider、ContextManager。工具、安全、Hook、记忆、技能、用量及可观测性均按需装配。默认不检索记忆、不自动激活所有技能；配置 `memory_search_limit` 和 `skill_ids` 后才使用相应能力。
 
-模型默认走新增的 `ModelProvider::stream_events`，其默认实现桥接已有 `stream`，原适配器无需改动。测试和其他适配器可以直接构造事件流。`ModelProvider::recovery` 默认保守分类结构化 HTTP 错误；适配器可覆盖，不能靠字符串猜测后无限重试。
+模型通过 `ModelProvider::stream_events` 获取事件流。测试和其他适配器可以直接构造事件流。`ModelProvider::recovery` 默认映射 provider 的 `classify_error`；未分类错误默认不可恢复。GenaiModel 自行分类结构化 HTTP 错误，其他适配器可独立实现分类和恢复策略，不能靠字符串猜测后无限重试。
 
 ## 确定的执行语义
 
@@ -73,9 +73,9 @@ fn assemble(model: Arc<dyn ModelProvider>, history: Arc<dyn ContextManager>) -> 
 
 ## 超时、预算和收尾
 
-模型调用额度默认不限（None）；配置限额时达到限额的第 N 次调用为强制收尾步——注入提示词要求仅文本总结、不再提供工具，随后正常结束 Turn，而不是硬中止。显式 0 仍表示不允许调用，在首次调用前硬中止。工具执行默认 256 次、2 次请求重试、1 次连续溢出恢复、3 次 Stop 继续、1 次权限重审。配置可以调整；TurnLimits 的次数与配置取较小值。重试退避初始 2 秒逐次倍增（25% 抖动、封顶 30 秒），服务器 retry-after 优先。
+模型调用额度默认不限（None）；配置限额时达到限额的第 N 次调用为强制收尾步——注入提示词要求仅文本总结、不再提供工具，随后正常结束 Turn，而不是硬中止。显式 0 仍表示不允许调用，在首次调用前硬中止。工具执行默认 256 次、2 次请求重试、1 次连续溢出恢复、3 次 Stop 继续、1 次权限重审。配置可以调整；TurnLimits 的次数与配置取较小值。重试时间由 `model/retry.rs` 集中管理：初始 2 秒逐次倍增，附加至多 25% 抖动；无响应头时默认封顶 30 秒，有响应头时使用全局安全上限（`i32::MAX` 毫秒）。provider 返回的重试提示优先且不追加抖动；GenaiModel 从 Retry-After 解析提示，MeteredModel 与剩余共享冷却取较长者。
 
-总截止时间不因重试、审批或压缩重置。模型时限分两段：请求到建立流（TTLB）与流式相邻事件的空闲间隔，各默认 300 秒，不含整段响应总时长；工具单次时限覆盖执行及内部提问。默认普通操作 120 秒、审批 300 秒、Hook 30 秒、一次收尾等待 5 秒，可配置。
+总截止时间不因重试、审批或压缩重置。模型默认响应头等待与原始数据读取时限各 300 秒，不含整段响应总时长；心跳和未完整事件的原始数据会重置读取等待。GenaiModel 在传输层执行这两个时限，Loop 不重复添加事件空闲计时。普通操作、工具、审批、Hook 和收尾时限默认 None，可显式配置；工具单次时限覆盖执行及内部提问。
 
 模型请求前按完整请求预算触发 compact；provider 明确报告 overflow 时有界重试。ContextManager 内部清理/摘要和提交，Loop 只重建请求。分批摘要按实际尝试调用计数，包括失败和取消；只清理不消耗模型额度。ContextManager 记账，Loop 汇总 Turn 用量。Harness 的共享 MeteredModel 另统一限制主模型、摘要、Hook 模型及子 Agent。
 

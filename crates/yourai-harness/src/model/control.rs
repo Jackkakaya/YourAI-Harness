@@ -54,15 +54,19 @@ impl RequestControl {
             .1
             .saturating_duration_since(Instant::now())
     }
-    pub fn cool_down(&self, delay: Option<Duration>) {
+    /// Consume provider-owned semantics; never inspect vendor errors or HTTP headers.
+    pub fn on_failure(&self, class: ModelErrorClass, hint: Option<Duration>) {
+        if class == ModelErrorClass::RateLimited {
+            self.cool_down(hint);
+        }
+    }
+    fn cool_down(&self, delay: Option<Duration>) {
         let mut deadlines = self.deadlines.lock().unwrap();
         let now = Instant::now();
-        let delay = delay.unwrap_or(Duration::from_secs(self.policy.cooldown_seconds));
-        // Untrusted headers must not panic on an overflowing Instant. Execution deadlines
-        // will abort this wait; never turn an absurd server delay into an immediate retry.
-        let until = now
-            .checked_add(delay)
-            .unwrap_or(now + Duration::from_secs(100 * 365 * 86400));
+        let delay = delay
+            .unwrap_or(Duration::from_secs(self.policy.cooldown_seconds))
+            .min(super::retry::MAX_DELAY);
+        let until = now + delay;
         deadlines.1 = deadlines.1.max(until);
     }
     pub fn start(
@@ -135,44 +139,6 @@ impl ModelBudget {
         }
     }
 }
-pub(super) fn transient_limit(error: &YourAiError) -> bool {
-    let Some((429, body)) = error.model_http_error() else {
-        return false;
-    };
-    let body: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-    !matches!(
-        body.pointer("/error/code").and_then(|v| v.as_str()),
-        Some("insufficient_quota" | "billing_hard_limit_reached")
-    )
-}
-
-/// Preserve server timing when the SDK exposes it; do not guess vendor-specific body units.
-pub(super) fn retry_after(error: &YourAiError) -> Option<Duration> {
-    // Accept fractional server values and cap before Duration/Instant arithmetic.
-    fn duration(value: &str, scale: f64) -> Option<Duration> {
-        let value = value.trim().parse::<f64>().ok()?;
-        if !value.is_finite() || value < 0.0 {
-            return None;
-        }
-        Some(Duration::from_millis(
-            (value * scale).ceil().min(i32::MAX as f64) as u64,
-        ))
-    }
-    if let Some(ms) = error
-        .model_http_header("retry-after-ms")
-        .and_then(|v| duration(v, 1.0))
-    {
-        return Some(ms);
-    }
-    let value = error.model_http_header("retry-after")?.trim();
-    if let Some(seconds) = duration(value, 1000.0) {
-        return Some(seconds);
-    }
-    let date = httpdate::parse_http_date(value).ok()?;
-    date.duration_since(std::time::SystemTime::now())
-        .ok()
-        .map(|d| d.min(Duration::from_millis(i32::MAX as u64)))
-}
 
 #[cfg(test)]
 mod tests {
@@ -183,55 +149,6 @@ mod tests {
             SqliteStore::open(std::path::Path::new(":memory:")).unwrap(),
         )
         .unwrap()
-    }
-    fn http_error(header: &str, value: &str) -> YourAiError {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            header
-                .to_owned()
-                .parse::<reqwest::header::HeaderName>()
-                .unwrap(),
-            value.parse().unwrap(),
-        );
-        ErrorKind::Model {
-            source: genai::Error::WebModelCall {
-                model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "test"),
-                webc_error: genai::webc::Error::ResponseFailedStatus {
-                    status: "429".parse().unwrap(),
-                    body: "{}".into(),
-                    headers: Box::new(headers),
-                },
-            },
-        }
-        .into()
-    }
-    #[test]
-    fn nonstream_status_and_retry_after_headers_survive_sdk_errors() {
-        let error = http_error("retry-after-ms", "1500");
-        assert_eq!(error.model_http_error(), Some((429, "{}")));
-        assert_eq!(retry_after(&error), Some(Duration::from_millis(1500)));
-        assert_eq!(
-            retry_after(&http_error("retry-after", "120")),
-            Some(Duration::from_secs(120))
-        );
-        let future =
-            httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(120));
-        let delay = retry_after(&http_error("retry-after", &future)).unwrap();
-        assert!(delay.as_secs() >= 118 && delay.as_secs() <= 120);
-        assert!(retry_after(&http_error("retry-after", "invalid")).is_none());
-        assert_eq!(
-            retry_after(&http_error("retry-after", "0.25")),
-            Some(Duration::from_millis(250))
-        );
-        assert_eq!(
-            retry_after(&http_error("retry-after-ms", "1.5")),
-            Some(Duration::from_millis(2))
-        );
-        assert_eq!(
-            retry_after(&http_error("retry-after", "1e100")),
-            Some(Duration::from_millis(i32::MAX as u64))
-        );
-        assert!(retry_after(&http_error("retry-after", "-1")).is_none());
     }
     #[tokio::test(start_paused = true)]
     async fn concurrent_callers_get_distinct_paced_slots() {

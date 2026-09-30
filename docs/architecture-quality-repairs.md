@@ -21,6 +21,45 @@ MemoryContext / SQLite 的分工。整理的单位是职责和不变量，不按
 `YourAiError` 只在一个位置解开 SDK 嵌套；重试提示、错误分类和日志共用该解释。
 不从显示字符串猜测状态码。流式与 collected 请求都覆盖真实 HTTP 429 / Retry-After 测试。
 
+`ModelProvider::classify_error()` 是分类的插件接口，返回 core 定义的中立 `ModelErrorClass`。
+core 不解释厂商错误码，默认返回 Unclassified；默认 recovery 只映射模型提供的分类。
+GenaiModel 在私有 `model/failure.rs` 中集中解释 OpenAI 兼容错误码和 HTTP 状态，
+已知额度/上下文错误优先于状态码。其他 provider 可按自己的协议分类，甚至完全不使用 HTTP。
+SDK 的 WebStream、WebModelCall、WebAdapterCall 仍经过 core 的统一原始数据提取路径，
+提取状态/body/headers 不等于决定恢复策略。
+
+| 位置 | 管理内容 |
+| --- | --- |
+| core `ModelProvider` / `ModelErrorClass` | 中立分类和恢复接口，不含厂商协议判断 |
+| GenaiModel / `model/failure.rs` | 具体厂商错误解释；当前为 OpenAI 兼容字段与 HTTP 状态回退 |
+| harness `model/retry.rs` | Genai 的 Retry-After 解析、默认退避/抖动、统一时限上限 |
+| MeteredModel | 调用内部 provider 的分类与提示，协调一次失败的计数和冷却通知 |
+| `model/control.rs` | 接收分类和提示，维护共享准入与冷却，不解析原始错误 |
+| `metrics::Attempt` | 只记账；首次失败返回 true，防止重复通知 |
+
+ConfiguredModel、SourceModel、MeteredModel 均透传 classify_error 和已有 recovery override。
+Loop 仍调用 provider 的 recovery/retry_after；它不会用厂商解析代替插件的决定。
+只有 RateLimited 表示应触发共享冷却，使用内部 provider 的 retry_after，缺少提示时使用
+配置的 cooldown_seconds。其他分类的提示只影响本次重试。额度耗尽、上下文溢出、服务端
+故障的 Genai 分类都不会触发共享限流冷却。`rate_limited` 指标继续统计实际 HTTP 429，
+不把非 HTTP provider 的分类伪装成 HTTP 状态码。
+
+MeteredModel 对同一请求仅在首次失败时通知冷却；重复 Err、End 后 Err、无终止事件的 EOF
+及 Drop 取消都不会额外延长冷却。对外 retry_after 仍将 provider 提示与剩余共享冷却取较长者；
+两者均不存在时返回 None，不能用 Some(0) 跳过正常退避。
+
+Loop 用初始等待与无响应头上限构造 Backoff；retry 模块不依赖 LoopConfig。
+响应头存在但无有效提示时沿用 OpenCode 的全局上限分支，该兼容规则只在默认 retry 实现中。
+解析器、退避和共享冷却统一使用 `i32::MAX` 毫秒上限；零秒提示有效，不附加抖动。
+
+### 自定义模型迁移
+
+以前自定义 ModelProvider 未覆盖 recovery 时，会隐式继承 core 对 genai 429/5xx 的解释。
+现在默认分类为 Unclassified、默认恢复为 Fatal，避免把 Genai 策略强加到其他插件。
+需要自动恢复时实现 classify_error；只有明确返回 RateLimited 才启用共享冷却。
+已有 recovery/retry_after override 保留，但 recovery override 本身不授予共享冷却语义。
+无需引入新的插件注册体系、配置工厂或独立策略 trait。
+
 `HookDispatchResult` 集中检查 event 与 outcome 类型，并提供尊重 suppress_output 的可见消息。
 Loop、compact、Host 各自保留停止、取消和消息路由策略。
 Hook runtime 的纯解析/聚合放在私有 `outcomes` Module，调度和后台生命周期留在 runtime。
@@ -35,6 +74,10 @@ Hook runtime 的纯解析/聚合放在私有 `outcomes` Module，调度和后台
 4. 短暂获取 live 锁，发布已提交的 journal；完成相关运行状态变更。
 
 所有 durable journal 写入及 inbox 的启动/结束切换遵守同一事务锁。
+事务提交统一拒绝 Closed 状态；关闭释放文件锁与发布 Closed 也在该事务锁内完成，
+旧 Host 引用或延迟持久化任务无法覆盖重新打开的会话。Closing 仍允许必要的关闭和恢复
+事务，但 watch_path、set_cwd 等外部修改会拒绝。获取 operation 锁后再次检查关闭状态，
+压缩发布 Compacting 时在 live 锁内复查，避免关闭竞争使状态倒退。
 状态查询、取消和 Reply 不等待文件落盘。输入只在持久化成功后投递给运行中的 Loop。
 
 同步 `submit` / `post_event` 等入口继续提供同步持久化确认，本身仍是阻塞调用。

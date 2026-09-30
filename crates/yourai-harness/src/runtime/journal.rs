@@ -42,6 +42,12 @@ impl Transaction<'_> {
         Ok(())
     }
     pub fn commit(&self) -> Result<(), YourAiError> {
+        // The transaction gate also covers the final unlock in finish_close.
+        // An old host must never overwrite a journal owned by a reopened host.
+        // Closing is still writable for durable cleanup and recovery.
+        if self.host.status() == SessionStatus::Closed {
+            return Err(error("host", "session closed"));
+        }
         atomic_write(&self.host.dir.join("host.json"), &self.candidate)?;
         self.host.live.lock().unwrap().journal = self.candidate.clone();
         Ok(())
@@ -133,6 +139,44 @@ mod tests {
         config.system_prompt = Some("test".into());
         let harness = crate::Harness::open(config, Arc::new(Model)).await.unwrap();
         (dir, harness)
+    }
+    #[tokio::test]
+    async fn closed_host_cannot_overwrite_reopened_session() {
+        let (_dir, harness) = fixture().await;
+        let old = harness.host.clone();
+        harness.close().await.unwrap();
+        let reopened = SessionHost::open(
+            old.dir.clone(),
+            old.context(),
+            old.agent.clone(),
+            HostConfig::default(),
+            "resume",
+        )
+        .await
+        .unwrap();
+        reopened
+            .submit_async(In::user_text("new owner input"))
+            .await
+            .unwrap();
+        let path = old.dir.join("host.json");
+        let saved = std::fs::read(&path).unwrap();
+
+        assert!(old.watch_path_async(old.dir.join("stale")).await.is_err());
+        assert!(old.set_cwd_async(old.dir.join("stale")).await.is_err());
+        // Internal persistence must also reject a late write, independently
+        // of the public mutation entry points' lifecycle checks.
+        assert!(old.persist().await.is_err());
+        assert!(old.try_operation().is_err());
+        assert!(old
+            .compact(
+                CompactionRequest::new(CompactionTrigger::Manual),
+                &CancellationToken::new(),
+            )
+            .await
+            .is_err());
+        assert_eq!(old.status(), SessionStatus::Closed);
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(reopened.close(None).await.unwrap().len(), 1);
     }
     async fn hold_writer(
         host: Arc<SessionHost>,

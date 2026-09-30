@@ -85,7 +85,7 @@ pub mod chat {
 pub use agent_loop::{TurnFailure, TurnResult};
 pub use error::{AbortReason, ErrorKind, YourAiError};
 pub use future::BoxFuture;
-pub use model::ModelRequest;
+pub use model::{ModelErrorClass, ModelRequest};
 pub use ui::OutSink;
 
 /// 一步式引入全部常用项
@@ -113,7 +113,8 @@ pub mod prelude {
         RecallRequest, RecalledMemory,
     };
     pub use crate::model::{
-        ModelEventStream, ModelProvider, ModelRecovery, ModelRequest, ModelTimeouts,
+        ModelErrorClass, ModelEventStream, ModelProvider, ModelRecovery, ModelRequest,
+        ModelTimeouts,
     };
     pub use crate::observability::{ObservabilityProvider, Span};
     pub use crate::protocol::{

@@ -1,6 +1,10 @@
 mod configured;
 mod control;
+mod failure;
 mod metrics;
+#[cfg(test)]
+mod policy_tests;
+pub(crate) mod retry;
 pub use configured::ConfiguredModel;
 pub use control::RequestPolicy;
 use futures_util::StreamExt;
@@ -86,6 +90,9 @@ impl GenaiModel {
     }
 }
 impl ModelProvider for GenaiModel {
+    fn classify_error(&self, error: &YourAiError) -> ModelErrorClass {
+        failure::classify(error)
+    }
     fn timeouts(&self) -> ModelTimeouts {
         self.timeouts
     }
@@ -93,7 +100,7 @@ impl ModelProvider for GenaiModel {
         true
     }
     fn retry_after(&self, error: &YourAiError) -> Option<std::time::Duration> {
-        control::retry_after(error)
+        retry::retry_after(error)
     }
     /// Media token estimation for the context pre-flight budget.
     ///
@@ -286,9 +293,23 @@ impl ModelBudget {
         starts.push_back(std::time::Instant::now());
     }
 }
+#[derive(Clone)]
 pub struct MeteredModel {
     pub inner: Arc<dyn ModelProvider>,
     pub budget: Arc<ModelBudget>,
+}
+impl MeteredModel {
+    fn fail(&self, attempt: &mut Attempt, error: &YourAiError) {
+        if attempt.fail(Some(error)) {
+            let class = self.inner.classify_error(error);
+            let hint = if class == ModelErrorClass::RateLimited {
+                self.inner.retry_after(error)
+            } else {
+                None
+            };
+            self.budget.control.on_failure(class, hint);
+        }
+    }
 }
 impl ModelProvider for MeteredModel {
     fn timeouts(&self) -> ModelTimeouts {
@@ -311,7 +332,7 @@ impl ModelProvider for MeteredModel {
                     Ok(result)
                 }
                 Err(error) => {
-                    attempt.fail(Some(&error));
+                    self.fail(&mut attempt, &error);
                     Err(error)
                 }
             }
@@ -328,23 +349,23 @@ impl ModelProvider for MeteredModel {
             let stream = match self.inner.stream_events(r).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    attempt.fail(Some(&error));
+                    self.fail(&mut attempt, &error);
                     return Err(error);
                 }
             };
             Ok(Box::pin(futures_util::stream::unfold(
-                (stream, attempt),
-                |(mut stream, mut attempt)| async move {
+                (stream, attempt, self.clone()),
+                |(mut stream, mut attempt, model)| async move {
                     match stream.next().await {
                         Some(event) => {
                             match &event {
                                 Ok(ChatStreamEvent::End(end)) => {
                                     attempt.finish(end.captured_usage.as_ref())
                                 }
-                                Err(error) => attempt.fail(Some(error)),
+                                Err(error) => model.fail(&mut attempt, error),
                                 _ => {}
                             }
-                            Some((event, (stream, attempt)))
+                            Some((event, (stream, attempt, model)))
                         }
                         None => {
                             attempt.fail(None);
@@ -363,6 +384,9 @@ impl ModelProvider for MeteredModel {
         } else {
             Some(remaining.max(hint.unwrap_or_default()))
         }
+    }
+    fn classify_error(&self, error: &YourAiError) -> ModelErrorClass {
+        self.inner.classify_error(error)
     }
     fn recovery(&self, e: &YourAiError) -> ModelRecovery {
         self.inner.recovery(e)
@@ -400,6 +424,9 @@ impl ModelProvider for SourceModel {
     }
     fn model_iden(&self) -> &str {
         self.inner.model_iden()
+    }
+    fn classify_error(&self, error: &YourAiError) -> ModelErrorClass {
+        self.inner.classify_error(error)
     }
     fn recovery(&self, e: &YourAiError) -> ModelRecovery {
         self.inner.recovery(e)

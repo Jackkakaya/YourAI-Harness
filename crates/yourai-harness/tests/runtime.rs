@@ -1185,6 +1185,9 @@ async fn context_usage_estimates_active_request_without_calling_model() {
 async fn rate_limit_attempts_stop_at_retry_limit() {
     struct Limited(std::sync::atomic::AtomicUsize);
     impl ModelProvider for Limited {
+        fn classify_error(&self, _: &YourAiError) -> ModelErrorClass {
+            ModelErrorClass::RateLimited
+        }
         fn model_iden(&self) -> &str {
             "limited"
         }

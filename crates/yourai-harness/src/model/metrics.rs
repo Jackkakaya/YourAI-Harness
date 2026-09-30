@@ -102,29 +102,22 @@ impl Attempt {
             }
         }
     }
-    pub fn fail(&mut self, error: Option<&YourAiError>) {
+    pub fn fail(&mut self, error: Option<&YourAiError>) -> bool {
         if self.done {
-            return;
+            return false;
         }
         self.done = true;
         let status = error
             .and_then(YourAiError::model_http_error)
             .map(|(status, _)| status);
         self.record("failed", status);
-        if status == Some(429) && error.is_some_and(super::control::transient_limit) {
-            self.budget
-                .control
-                .cool_down(error.and_then(super::control::retry_after));
-        }
         let mut state = self.budget.state.lock().unwrap();
         state.requests.active = state.requests.active.saturating_sub(1);
         state.requests.failed += 1;
-        if error
-            .and_then(YourAiError::model_http_error)
-            .is_some_and(|(status, _)| status == 429)
-        {
+        if status == Some(429) {
             state.requests.rate_limited += 1;
         }
+        true
     }
 }
 impl Drop for Attempt {
@@ -142,8 +135,11 @@ impl Drop for Attempt {
 mod tests {
     use super::*;
     fn http_error(body: &str) -> YourAiError {
+        http_error_with_status(429, body)
+    }
+    fn http_error_with_status(status: u16, body: &str) -> YourAiError {
         let error = genai::Error::HttpError {
-            status: "429".parse().unwrap(),
+            status: status.to_string().parse().unwrap(),
             canonical_reason: "Too Many Requests".into(),
             body: body.into(),
         };
@@ -221,9 +217,17 @@ mod tests {
         )
         .unwrap();
         budget.reserve();
-        Attempt::new(budget.clone()).fail(Some(&http_error(
-            r#"{"error":{"code":"rate_limit_exceeded"}}"#,
-        )));
+        let model = super::super::MeteredModel {
+            inner: Arc::new(super::super::GenaiModel::new(
+                genai::Client::default(),
+                "test",
+            )),
+            budget: budget.clone(),
+        };
+        model.fail(
+            &mut Attempt::new(budget.clone()),
+            &http_error(r#"{"error":{"code":"rate_limit_exceeded"}}"#),
+        );
         assert_eq!(
             budget.control.remaining(),
             std::time::Duration::from_secs(7)
@@ -232,34 +236,81 @@ mod tests {
         assert!(budget.control.remaining().is_zero());
     }
 
-    #[test]
-    fn quota_429_is_not_treated_as_transient_rate_limit() {
-        struct Provider;
-        impl ModelProvider for Provider {
-            fn model_iden(&self) -> &str {
-                "test"
-            }
-            fn complete<'a>(
-                &'a self,
-                _: ModelRequest,
-            ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
-                Box::pin(async { unreachable!() })
-            }
-            fn stream_events<'a>(
-                &'a self,
-                _: ModelRequest,
-            ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
-                Box::pin(async { unreachable!() })
-            }
+    #[tokio::test(start_paused = true)]
+    async fn recovery_and_cooldown_agree_on_structured_error_classification() {
+        let provider = Arc::new(super::super::GenaiModel::new(
+            genai::Client::default(),
+            "test",
+        ));
+        for (status, body, recovery, cooldown) in [
+            (
+                429,
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+                ModelRecovery::Fatal,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"code":"billing_hard_limit_reached"}}"#,
+                ModelRecovery::Fatal,
+                false,
+            ),
+            (
+                503,
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+                ModelRecovery::Fatal,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"code":"context_length_exceeded"}}"#,
+                ModelRecovery::Compact,
+                false,
+            ),
+            (
+                400,
+                r#"{"error":{"code":"context_length_exceeded"}}"#,
+                ModelRecovery::Compact,
+                false,
+            ),
+            (
+                429,
+                r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+                ModelRecovery::Retry,
+                true,
+            ),
+            (429, "not JSON", ModelRecovery::Retry, true),
+            (503, "not JSON", ModelRecovery::Retry, false),
+            (401, "{}", ModelRecovery::Fatal, false),
+        ] {
+            let error = http_error_with_status(status, body);
+            assert_eq!(provider.recovery(&error), recovery, "{status}: {body}");
+            let budget = ModelBudget::configured(
+                super::super::RequestPolicy {
+                    rpm: None,
+                    cooldown_seconds: 7,
+                },
+                crate::SqliteStore::open(std::path::Path::new(":memory:")).unwrap(),
+            )
+            .unwrap();
+            budget.reserve();
+            let model = super::super::MeteredModel {
+                inner: provider.clone(),
+                budget: budget.clone(),
+            };
+            model.fail(&mut Attempt::new(budget.clone()), &error);
+            assert_eq!(
+                !budget.control.remaining().is_zero(),
+                cooldown,
+                "{status}: {body}"
+            );
+            // This metric counts HTTP 429 responses, including permanent quota errors.
+            assert_eq!(
+                budget.snapshot().requests.rate_limited,
+                u64::from(status == 429)
+            );
+            assert_eq!(budget.snapshot().requests.failed, 1);
         }
-        assert_eq!(
-            Provider.recovery(&http_error(r#"{"error":{"code":"insufficient_quota"}}"#)),
-            ModelRecovery::Fatal
-        );
-        assert_eq!(
-            Provider.recovery(&http_error(r#"{"error":{"code":"rate_limit_exceeded"}}"#)),
-            ModelRecovery::Retry
-        );
     }
 }
 

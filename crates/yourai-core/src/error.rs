@@ -27,7 +27,10 @@ impl YourAiError {
         for _ in 0..16 {
             match current.downcast_ref::<genai::Error>() {
                 Some(genai::Error::WebStream { error, .. }) => current = error.as_ref(),
-                Some(genai::Error::WebModelCall { webc_error, .. }) => return Some(webc_error),
+                Some(
+                    genai::Error::WebModelCall { webc_error, .. }
+                    | genai::Error::WebAdapterCall { webc_error, .. },
+                ) => return Some(webc_error),
                 _ => return Some(current),
             }
         }
@@ -143,6 +146,28 @@ mod tests {
         assert_eq!(status, 429);
         assert!(body.contains("rpm exceeded"));
     }
+    #[test]
+    fn adapter_http_errors_share_status_headers_and_classification() {
+        let source = genai::Error::WebAdapterCall {
+            adapter_kind: genai::adapter::AdapterKind::OpenAI,
+            webc_error: genai::webc::Error::ResponseFailedStatus {
+                status: "429".parse().unwrap(),
+                body: "{}".into(),
+                headers: Box::new(
+                    [("retry-after".parse().unwrap(), "2".parse().unwrap())]
+                        .into_iter()
+                        .collect(),
+                ),
+            },
+        };
+        let error = YourAiError::from(ErrorKind::Model {
+            source: wrap(wrap(source)),
+        });
+        assert_eq!(error.model_http_error(), Some((429, "{}")));
+        assert!(error.model_has_http_headers());
+        assert_eq!(error.model_http_header("retry-after"), Some("2"));
+    }
+
     #[test]
     fn display_text_is_not_a_structured_http_status() {
         let error = YourAiError::from(ErrorKind::Model {

@@ -6,7 +6,6 @@ mod control;
 mod hooks;
 mod interaction;
 mod model;
-mod retry;
 mod tools;
 
 use std::{
@@ -293,8 +292,11 @@ impl State<'_> {
                             }
                             ModelRecovery::Retry if retries < self.config.max_model_retries => {
                                 new_step = false;
-                                let delay = retry::delay(
-                                    self.config,
+                                let delay = crate::model::retry::Backoff {
+                                    initial: self.config.retry_delay,
+                                    max_without_headers: self.config.retry_max_delay,
+                                }
+                                .delay(
                                     retries,
                                     &error,
                                     self.model.retry_after(&error),
