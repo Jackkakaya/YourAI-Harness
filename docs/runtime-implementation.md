@@ -1,5 +1,7 @@
 # Runtime 实现与验收
 
+> 后续架构决定：默认由统一用户级 Server 持有和驱动会话，所有前端连接该服务，按 `session_id` 复用宿主并同步状态。尚未实现；当前 TUI 仍在进程内创建宿主。详见 [默认共享 Server 决定](./architecture.md#已确定的后续方向默认共享-server2026-10-01)。
+
 > 会话记录使用 SQLite；ContextManager 内部完成消息提交、工具清理、摘要 Hook 和模型视图更新。详见 [存储设计](./session-storage-design.md) 与 [ContextManager 设计](./context-manager-design.md)。
 
 `default-loop-flow.md` 的五张图现在统一实现在 `yourai-harness` 中，入口为 `yourai_harness::Harness::open`；`yourai-core` 仅保留协议、Provider 接口和 turn 运输机制，不反向依赖具体实现。
@@ -49,8 +51,11 @@ cargo run -p yourai-harness --example run -- <model-id> <prompt>
 
 session_dir/sessions.sqlite3 保存元数据、消息/摘要和用量。宿主队列、配置、权限、任务、记忆、技能仍保存在会话目录；宿主持有 host.lock。MemoryContext 内部先提交数据库再更新活跃视图。
 
+Harness 恢复及 `SessionHost::restore` 在初始化系统提示、写会话元数据和装配 provider 前取得执行 lease。lease 持有 `host.lock`，随后直接转交给 Host，途中不释放或重复获取；锁拒绝的恢复不会改写活动会话，装配失败会释放 lease。
+
 - follow-up 在接纳前落盘；运行中 steer 记入 active。Turn 返回的 pending 转移回宿主队列；失效 Reply 不得进入后续 Turn。
 - 恢复时保留未开始的输入，将上次 active 标记为 interrupted。缺少结果的工具调用补中断结果，不自动重放工具或整次失败 Turn。调用方可读取 last_error / interrupted_inputs 后决定继续。
+- Core 返回 `LoopTerminated`（watchdog 强制丢弃或 panic）时，Host 进入 Closing，将全部 active 输入保留到 interrupted。未读 steer 已在 active 中，不再从 Turn.pending 重复入队；独立排队的 follow-up 由 close 归还。
 - compact 调用模型生成摘要，成功且候选来源仍 active 才事务提交。模型视图使用系统指令、摘要和后续消息；完整 transcript 保留。工具调用及内部事件身份查询覆盖归档，压缩不会让已完成调用重新执行。
 - 手动 compact 与 Turn 互斥，有取消和总截止时间。系统指令保留；显式加载或重载指令才触发 InstructionsLoaded。
 - close 取消执行、停止监听、关闭子会话、执行有界 SessionEnd、回收后台 Hook、释放宿主锁。并发关闭不重复交还输入或触发 SessionEnd。应用应显式 close；Drop 只是取消兜底。

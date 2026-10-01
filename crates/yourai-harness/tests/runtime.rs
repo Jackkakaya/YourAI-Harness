@@ -409,7 +409,8 @@ async fn child_agent_runs_its_own_session_and_reports_lifecycle() {
     };
     let result = tool.execute(tc, json!({"prompt":"do work"})).await.unwrap();
     assert_eq!(result["text"], "child result");
-    assert_eq!(tool.child_ids().len(), 1);
+    // Completed children are released, not retained.
+    assert_eq!(tool.child_ids().len(), 0);
     let seen = hooks.seen.lock().unwrap();
     assert!(seen.contains(&HookEventKind::SubagentStart));
     assert!(seen.contains(&HookEventKind::SubagentStop));
@@ -1045,7 +1046,10 @@ async fn basic_harness_has_todos_without_optional_extensions() {
         .unwrap()
         .result
         .unwrap();
-    let session = dir.path().join("sessions").join(h.host.context().id.0);
+    let session = dir
+        .path()
+        .join("sessions")
+        .join(h.host.context().id.as_str());
     assert!(
         !session.join("memory.json").exists()
             && !session.join("skills.json").exists()

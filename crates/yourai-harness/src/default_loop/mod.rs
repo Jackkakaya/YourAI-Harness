@@ -331,15 +331,17 @@ impl State<'_> {
                             _ => {}
                         }
                     }
-                    if matches!(
-                        &error,
-                        YourAiError::Error(
-                            ErrorKind::Model { .. } | ErrorKind::Provider { name: "model", .. }
-                        )
-                    ) {
+                    let is_model_error =
+                        matches!(&error, YourAiError::Error(ErrorKind::Model { .. }))
+                            || matches!(
+                                &error,
+                                YourAiError::Error(ErrorKind::Provider { name, .. })
+                                    if *name == crate::model::MODEL_NAME
+                            );
+                    if is_model_error {
                         self.stop_failure(&error).await;
                     }
-                    if let Some((status, _)) = error.model_http_error() {
+                    if let Some((status, _)) = crate::model::failure::http_error(&error) {
                         self.notice(Level::Warning, format!("HTTP {status}: stopped after {} attempt(s) for this model step; {} model call(s) in this turn", retries + 1, self.model_calls))?;
                     }
                     return Err(error);

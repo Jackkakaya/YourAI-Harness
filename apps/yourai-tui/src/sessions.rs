@@ -54,7 +54,7 @@ pub fn filter_sessions(rows: &[SessionRow], query: &str) -> Vec<usize> {
         .enumerate()
         .filter(|(_, r)| {
             r.title.to_lowercase().contains(&q)
-                || r.id.0.to_lowercase().contains(&q)
+                || r.id.as_str().to_lowercase().contains(&q)
                 || r.model.to_lowercase().contains(&q)
         })
         .map(|(i, _)| i)
@@ -68,7 +68,7 @@ pub fn filter_sessions(rows: &[SessionRow], query: &str) -> Vec<usize> {
 pub fn row_body(row: &SessionRow, title_w: usize, now: i64) -> String {
     let title = crate::text::elide(&row.title, title_w);
     let pad = title_w.saturating_sub(unicode_width::UnicodeWidthStr::width(title.as_str()));
-    let id8: String = row.id.0.chars().take(8).collect();
+    let id8: String = row.id.as_str().chars().take(8).collect();
     let model = if row.model.is_empty() {
         "—".to_string()
     } else {
@@ -137,7 +137,7 @@ mod tests {
     fn meta(id: &str, title: Option<&str>, model: Option<&str>, updated: i64) -> SessionMeta {
         SessionMeta {
             system_prompt: None,
-            id: SessionId(id.into()),
+            id: SessionId::from(id),
             title: title.map(str::to_owned),
             parent_session_id: None,
             provider: None,
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn rows_hide_subagent_children_and_sort_newest_first() {
         let mut child = meta("child", Some("subagent"), None, 2000);
-        child.parent_session_id = Some(SessionId("parent".into()));
+        child.parent_session_id = Some(SessionId::from("parent"));
         let metas = vec![
             meta("old", Some("Old session"), Some("kimi"), 1000),
             child,
@@ -158,8 +158,8 @@ mod tests {
         ];
         let rows = rows_from(metas, None);
         assert_eq!(rows.len(), 2); // child filtered out
-        assert_eq!(rows[0].id.0, "new"); // newest first
-        assert_eq!(rows[1].id.0, "old");
+        assert_eq!(rows[0].id.as_str(), "new"); // newest first
+        assert_eq!(rows[1].id.as_str(), "old");
         assert_eq!(rows[0].title, "New session");
     }
 
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn row_body_elides_cjk_titles_by_display_width_and_aligns_columns() {
         let row = SessionRow {
-            id: SessionId("d3f40178abcdef".into()),
+            id: SessionId::from("d3f40178abcdef"),
             title: "修复中文解析器的边界问题".into(),
             model: "kimi-k3".into(),
             updated_at: 0,

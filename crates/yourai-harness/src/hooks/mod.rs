@@ -79,6 +79,9 @@ pub mod matcher;
 pub mod runtime;
 pub mod wire_output;
 
+/// Cap on hook command/HTTP output so a misbehaving hook cannot exhaust memory.
+pub(crate) const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
 // ── Re-exports：实现层类型 ──────────────────────────────────────────
 
 pub use command::{BackgroundHookEvent, CommandHandler};

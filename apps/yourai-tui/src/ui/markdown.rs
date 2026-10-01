@@ -389,18 +389,24 @@ fn wrap_spans_with_prefixes(
     let mut used = 0;
     for span in spans {
         for g in span.content.graphemes(true) {
-            if used + g.width() > available && used > 0 {
+            let gw = g.width();
+            if used + gw > available && used > 0 {
                 lines.push(Line::from(std::mem::take(&mut current)));
                 current.push(Span::styled(continuation.to_owned(), prefix_style));
                 available = width.saturating_sub(continuation.width()).max(1);
                 used = 0;
+            }
+            // A grapheme wider than a whole line cannot be placed without
+            // exceeding the width budget; drop it instead of overflowing.
+            if gw > available {
+                continue;
             }
             if let Some(last) = current.last_mut().filter(|s| s.style == span.style) {
                 last.content.to_mut().push_str(g);
             } else {
                 current.push(Span::styled(g.to_owned(), span.style));
             }
-            used += g.width();
+            used += gw;
         }
     }
     lines.push(Line::from(current));
@@ -422,6 +428,22 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+    #[test]
+    fn wide_graphemes_never_exceed_line_width() {
+        for width in 2..8usize {
+            let lines = wrap_spans_with_prefixes(
+                vec![Span::raw("汉字测试")],
+                width,
+                "- ",
+                "  ",
+                Style::default(),
+            );
+            assert!(
+                lines.iter().all(|line| line.width() <= width),
+                "width {width}: {lines:?}"
+            );
+        }
     }
     #[test]
     fn wrapped_list_items_keep_hanging_indent() {

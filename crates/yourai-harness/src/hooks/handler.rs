@@ -217,21 +217,21 @@ impl HookHandler for UnsupportedHandler {
     }
 }
 
-/// 对 handler 执行应用超时。
+/// 对 handler 执行应用超时；未配置时使用默认上限，防止 hook 无限期挂起会话。
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub async fn execute_with_timeout(
     handler: &dyn HookHandler,
     invocation: &HookInvocation,
     timeout: Option<Duration>,
 ) -> Result<HookOutput, yourai_core::YourAiError> {
-    match timeout {
-        Some(d) => match tokio::time::timeout(d, handler.execute(invocation)).await {
-            Ok(result) => result,
-            Err(_) => Err(yourai_core::ErrorKind::Provider {
-                name: "hook",
-                message: format!("hook timed out after {d:?}"),
-            }
-            .into()),
-        },
-        None => handler.execute(invocation).await,
+    let d = timeout.unwrap_or(DEFAULT_HOOK_TIMEOUT);
+    match tokio::time::timeout(d, handler.execute(invocation)).await {
+        Ok(result) => result,
+        Err(_) => Err(yourai_core::ErrorKind::Provider {
+            name: "hook",
+            message: format!("hook timed out after {d:?}"),
+        }
+        .into()),
     }
 }

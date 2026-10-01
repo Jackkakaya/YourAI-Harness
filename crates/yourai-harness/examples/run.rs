@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pending = harness.close().await?;
     eprintln!(
         "Session: {}; pending inputs: {}",
-        harness.host.context().id.0,
+        harness.host.context().id.as_str(),
         pending.len()
     );
     for report in result? {

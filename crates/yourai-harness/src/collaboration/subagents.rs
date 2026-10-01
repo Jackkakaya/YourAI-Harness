@@ -2,7 +2,7 @@ use crate::{error, SessionHost};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
 };
 use yourai_core::prelude::*;
@@ -11,7 +11,9 @@ pub struct SubagentTool {
     host: Weak<SessionHost>,
     model: Arc<dyn ModelProvider>,
     tools: Option<Arc<dyn ToolRegistry>>,
-    children: Mutex<HashMap<String, Arc<SessionHost>>>,
+    children: Arc<Mutex<HashMap<String, Arc<SessionHost>>>>,
+    // Opening a catalog scans the directory and opens SQLite; reuse it across runs.
+    catalog: Mutex<Option<(PathBuf, Arc<crate::SessionCatalog>)>>,
 }
 impl SubagentTool {
     pub fn new(
@@ -23,7 +25,8 @@ impl SubagentTool {
             host: Arc::downgrade(host),
             model,
             tools,
-            children: Mutex::new(HashMap::new()),
+            children: Arc::new(Mutex::new(HashMap::new())),
+            catalog: Mutex::new(None),
         })
     }
     pub fn child_ids(&self) -> Vec<String> {
@@ -48,13 +51,23 @@ impl SubagentTool {
             .and_then(|p| p.parent())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| parent.dir.join("children"));
-        let catalog = crate::SessionCatalog::new(&root)?;
+        let catalog = {
+            let mut cached = self.catalog.lock().unwrap();
+            match &*cached {
+                Some((cached_root, catalog)) if cached_root == &root => catalog.clone(),
+                _ => {
+                    let catalog = Arc::new(crate::SessionCatalog::new(&root)?);
+                    *cached = Some((root.clone(), catalog.clone()));
+                    catalog
+                }
+            }
+        };
         let mut meta = catalog
             .create_session(&parent.agent.ctx().context_manager()?.system_prompt())
             .await?;
         meta.parent_session_id = Some(parent.context().id);
         catalog.save_session(&meta).await?;
-        let id = meta.id.0.clone();
+        let id = meta.id.as_str().to_owned();
         let start = parent
             .dispatch(HookEvent::SubagentStart {
                 agent_id: id.clone(),
@@ -81,7 +94,11 @@ impl SubagentTool {
             .lock()
             .unwrap()
             .insert(id.clone(), child.clone());
-        let _cleanup = ChildCleanup(child.clone());
+        let _cleanup = ChildCleanup {
+            children: self.children.clone(),
+            id: id.clone(),
+            child: child.clone(),
+        };
         child
             .submit_async(In::user_text(prompt))
             .await
@@ -140,15 +157,21 @@ impl SubagentTool {
         Err(error("subagent", "unreachable continuation state"))
     }
 }
-struct ChildCleanup(Arc<SessionHost>);
+struct ChildCleanup {
+    children: Arc<Mutex<HashMap<String, Arc<SessionHost>>>>,
+    id: String,
+    child: Arc<SessionHost>,
+}
 impl Drop for ChildCleanup {
     fn drop(&mut self) {
-        if self.0.status() == SessionStatus::Closed {
+        // Release the entry on every exit path: completion, error, or future cancellation.
+        self.children.lock().unwrap().remove(&self.id);
+        if self.child.status() == SessionStatus::Closed {
             return;
         }
-        self.0.interrupt();
+        self.child.interrupt();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let child = self.0.clone();
+            let child = self.child.clone();
             runtime.spawn(async move {
                 let _ = child.close(None).await;
             });

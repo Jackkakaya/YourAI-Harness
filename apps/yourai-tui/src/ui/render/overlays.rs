@@ -1,6 +1,7 @@
 //! Dashboard and pickers, constrained to the current terminal.
+use super::footer::{ctx_bar, ctx_color, label, tokens};
 use super::Canvas;
-use super::{ctx_bar, ctx_color, label, tokens, Metadata};
+use super::Metadata;
 use crate::ui::markdown::wrap_text;
 use crate::ui::overlay::Overlay;
 use crate::ui::state::View;
@@ -335,7 +336,7 @@ pub(super) fn sessions_overlay(f: &mut Canvas, area: Rect, v: &View, now: i64) {
     if let Some(row) = &picker.pending_delete {
         let rect = crate::picker::centered(area, 64, 9);
         f.render_widget(Clear, rect);
-        let text = format!("Delete this session permanently?\n{}\n{}\nThis cannot be undone.\nY delete · N / Esc keep", row.title, row.id.0);
+        let text = format!("Delete this session permanently?\n{}\n{}\nThis cannot be undone.\nY delete · N / Esc keep", row.title, row.id.as_str());
         f.render_widget(
             Paragraph::new(text)
                 .wrap(ratatui::widgets::Wrap { trim: false })
@@ -525,7 +526,7 @@ mod tests {
             pending_delete: None,
             rows: (0..100)
                 .map(|i| crate::sessions::SessionRow {
-                    id: yourai_core::prelude::SessionId(format!("session-{i:03}")),
+                    id: yourai_core::prelude::SessionId::from(format!("session-{i:03}")),
                     title: format!("row-{i:03}"),
                     model: String::new(),
                     updated_at: 0,
@@ -600,14 +601,14 @@ mod tests {
             pending_delete: None,
             rows: vec![
                 SessionRow {
-                    id: SessionId("d3f40178deadbeef".into()),
+                    id: SessionId::from("d3f40178deadbeef"),
                     title: "Fix parser off-by-one".into(),
                     model: "kimi-k3".into(),
                     updated_at: now - 2 * 3600,
                     is_current: true,
                 },
                 SessionRow {
-                    id: SessionId("9a1b2c3ddeadd00d".into()),
+                    id: SessionId::from("9a1b2c3ddeadd00d"),
                     title: "Fix TUI sidebar".into(),
                     model: "glm-4.6".into(),
                     updated_at: now - 3 * 86_400,

@@ -107,10 +107,15 @@ impl SessionCatalog {
         })
     }
     pub fn directory(&self, id: &SessionId) -> Result<PathBuf, YourAiError> {
-        if id.0.is_empty() || !id.0.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        if id.as_str().is_empty()
+            || !id
+                .as_str()
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
             return Err(error("storage", "invalid session id"));
         }
-        let path = self.root.join(&id.0);
+        let path = self.root.join(id.as_str());
         fs::create_dir_all(&path).map_err(|e| error("storage", e))?;
         Ok(path)
     }

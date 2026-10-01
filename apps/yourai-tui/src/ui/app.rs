@@ -66,7 +66,7 @@ impl App {
     pub(super) async fn poll(&mut self, first: Option<Out>) {
         if self.controller.poll(&mut self.view, first).await {
             let context = self.controller.harness().host.context();
-            self.meta.session = context.id.0;
+            self.meta.session = context.id.as_str().to_owned();
             self.meta.cwd = context.cwd.to_string_lossy().into();
             self.view.draft.set_cwd(&context.cwd);
             self.renderer = Renderer::default();
@@ -613,6 +613,7 @@ pub(super) fn click_dispatch(renderer: &mut Renderer, view: &mut View, x: u16, y
                 view.draft.insert(" ");
             }
         }
+        Some(Hit::Mention(index)) => view.draft.accept_mention(index),
         Some(Hit::TodoToggle) => view.session.todos.panel = !view.session.todos.panel,
         Some(Hit::Block(id)) => {
             renderer.anchor(view, id, y);
@@ -878,7 +879,7 @@ mod tests {
         finish(&mut app).await;
         assert_ne!(app.controller.harness().host.context().id, old);
         assert_eq!(app.view.draft.text(), "draft typed while opening");
-        assert_ne!(app.meta.session, old.0);
+        assert_ne!(app.meta.session, old.as_str());
         app.close().await.unwrap();
     }
 

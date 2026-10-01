@@ -73,18 +73,8 @@ impl HttpHandler {
         let headers = self.interpolate_headers();
         let (url, resolved) = self.validate_target().await?;
 
-        let mut client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-        if let (Some(host), Some(addresses)) = (url.host_str(), resolved.as_deref()) {
-            client = client.resolve_to_addrs(host, addresses);
-        }
-        let client = client
-            .build()
-            .map_err(|e| yourai_core::ErrorKind::Provider {
-                name: "hook",
-                message: format!("failed to build HTTP client: {e}"),
-            })?;
-
-        let response = client
+        let client = shared_client(url.host_str(), resolved.as_deref())?;
+        let mut response = client
             .post(url)
             .headers(headers_to_reqwest(headers))
             .body(json_body)
@@ -104,15 +94,21 @@ impl HttpHandler {
             .into());
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| yourai_core::ErrorKind::Provider {
-                name: "hook",
-                message: format!("failed to read HTTP body: {e}"),
-            })?;
+        let mut body = Vec::new();
+        while let Some(chunk) =
+            response
+                .chunk()
+                .await
+                .map_err(|e| yourai_core::ErrorKind::Provider {
+                    name: "hook",
+                    message: format!("failed to read HTTP body: {e}"),
+                })?
+        {
+            let room = crate::hooks::MAX_OUTPUT_BYTES.saturating_sub(body.len());
+            body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
 
-        Ok((body, status))
+        Ok((String::from_utf8_lossy(&body).into_owned(), status))
     }
 
     async fn validate_target(
@@ -186,8 +182,54 @@ impl HookHandler for HttpHandler {
     }
 }
 
+/// Reuse clients per (host, pinned addresses): building a client per call wastes TLS setup,
+/// while keying on the resolved addresses keeps DNS-pinning semantics intact.
+fn shared_client(
+    host: Option<&str>,
+    addresses: Option<&[SocketAddr]>,
+) -> Result<reqwest::Client, yourai_core::YourAiError> {
+    static CLIENTS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, reqwest::Client>>> =
+        std::sync::OnceLock::new();
+    let (host, addresses) = match (host, addresses) {
+        (Some(host), addresses) => (host, addresses),
+        (None, _) => {
+            return Err(yourai_core::ErrorKind::Config("HTTP hook URL has no host".into()).into())
+        }
+    };
+    let key = match addresses {
+        Some(addrs) => format!(
+            "{host}|{}",
+            addrs
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        None => host.to_string(),
+    };
+    let cache = CLIENTS.get_or_init(Default::default);
+    if let Some(client) = cache.lock().unwrap().get(&key) {
+        return Ok(client.clone());
+    }
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if let Some(addrs) = addresses {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+    let client = builder
+        .build()
+        .map_err(|e| yourai_core::ErrorKind::Provider {
+            name: "hook",
+            message: format!("failed to build HTTP client: {e}"),
+        })?;
+    cache.lock().unwrap().insert(key, client.clone());
+    Ok(client)
+}
+
 fn interpolate_env_vars(value: &str, allowed: &std::collections::HashSet<&str>) -> String {
-    let re = regex::Regex::new(r"\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)").unwrap();
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)").unwrap()
+    });
     re.replace_all(value, |caps: &regex::Captures| {
         let var_name = caps
             .get(1)
@@ -247,9 +289,7 @@ fn wildcard_url_match(pattern: &str, url: &str) -> bool {
         }
     }
     expression.push('$');
-    regex::Regex::new(&expression)
-        .map(|compiled| compiled.is_match(url))
-        .unwrap_or(false)
+    crate::hooks::matcher::cached_regex(&expression).is_some_and(|re| re.is_match(url))
 }
 
 fn ensure_safe_ip(ip: IpAddr) -> Result<(), yourai_core::YourAiError> {

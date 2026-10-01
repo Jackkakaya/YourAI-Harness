@@ -1,5 +1,6 @@
 use super::{frame_time::FrameTime, presentation::Canvas};
 mod cards;
+mod footer;
 mod overlays;
 mod timeline;
 use super::overlay::Overlay;
@@ -8,11 +9,12 @@ use super::{
     state::{Item, ToolStatus, View},
     theme::{
         lerp_color, Theme, ACCENT, BG, BLUE, BORDER, CODE_SURFACE, FOCUS_SURFACE, GREEN, MUTED,
-        PANEL, RED, TEXT, YELLOW,
+        PANEL, TEXT,
     },
 };
-use crate::text::{elide, elide_tail};
+use crate::text::elide;
 use cards::tool_title_row;
+use footer::footer_lines;
 use overlays::{
     ask_overlay, model_picker_overlay, sessions_overlay, stats_overlay, theme_picker_overlay,
 };
@@ -62,6 +64,8 @@ struct Layout {
     hits: Vec<(Rect, u64)>,
     command_hits: Vec<(Rect, super::commands::Command)>,
     command_area: Option<Rect>,
+    mention_hits: Vec<(Rect, usize)>,
+    mention_area: Option<Rect>,
     follow_hit: Option<Rect>,
     todo_hit: Option<Rect>,
     todo_area: Option<Rect>,
@@ -74,6 +78,8 @@ pub(crate) enum Hit<'a> {
     FollowLatest,
     /// A row of the slash-command menu.
     Command(&'a super::commands::Command),
+    /// A row of the @-mention autocomplete popup (index into its entries).
+    Mention(usize),
     /// The Todo panel title (same as ^T).
     TodoToggle,
     /// The header line of a foldable block (tool card or thinking).
@@ -113,6 +119,14 @@ impl Renderer {
                 .iter()
                 .find(|(r, _)| r.contains(point))
                 .map(|(_, c)| Hit::Command(c));
+        }
+        if self.layout.mention_area.is_some_and(|r| r.contains(point)) {
+            return self
+                .layout
+                .mention_hits
+                .iter()
+                .find(|(r, _)| r.contains(point))
+                .map(|(_, i)| Hit::Mention(*i));
         }
         if self.layout.todo_hit.is_some_and(|r| r.contains(point)) {
             return Some(Hit::TodoToggle);
@@ -214,6 +228,8 @@ impl Renderer {
         self.layout.hits.clear();
         self.layout.command_hits.clear();
         self.layout.command_area = None;
+        self.layout.mention_hits.clear();
+        self.layout.mention_area = None;
         self.layout.follow_hit = None;
         self.layout.todo_hit = None;
         self.layout.todo_area = None;
@@ -525,13 +541,31 @@ impl Renderer {
                 inner.width.min(62),
                 height,
             );
-            f.render_widget(Clear, rect);
+            layout.mention_area = Some(rect);
             let visible = height.saturating_sub(2) as usize;
             let start = v
                 .draft
                 .mention()
                 .selected
                 .saturating_sub(visible.saturating_sub(1));
+            for (row, (index, _)) in entries
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible)
+                .enumerate()
+            {
+                layout.mention_hits.push((
+                    Rect::new(
+                        rect.x + 1,
+                        rect.y + 1 + row as u16,
+                        rect.width.saturating_sub(2),
+                        1,
+                    ),
+                    index,
+                ));
+            }
+            f.render_widget(Clear, rect);
             let lines = entries
                 .iter()
                 .enumerate()
@@ -690,36 +724,6 @@ fn elapsed_str(v: &View, now: std::time::Instant) -> String {
         .unwrap_or_default()
 }
 /// Context pressure ratio for color thresholds.
-fn ctx_pressure(v: &View) -> Option<f64> {
-    let usage = v.session.context_usage.as_ref()?;
-    let used = usage.estimated_tokens;
-    usage
-        .context_window
-        .filter(|w| *w > 0)
-        .map(|w| used as f64 / w as f64)
-}
-fn ctx_color(ratio: f64) -> Color {
-    if ratio >= 0.85 {
-        RED
-    } else if ratio >= 0.70 {
-        YELLOW
-    } else {
-        GREEN
-    }
-}
-fn ctx_bar(ratio: f64) -> String {
-    let filled = (ratio.clamp(0.0, 1.0) * 10.0).round() as usize;
-    format!("{}{}", "▓".repeat(filled), "░".repeat(10 - filled))
-}
-fn permission_label(yolo: bool, trusted: bool) -> &'static str {
-    if yolo {
-        "YOLO"
-    } else if trusted {
-        "trusted"
-    } else {
-        "ask"
-    }
-}
 fn welcome(f: &mut Canvas, area: Rect) {
     // A task-oriented empty state; no terminal banner or persistent title bar.
     let wide = area.width >= 60 && area.height >= 10;
@@ -931,6 +935,10 @@ fn wrap_todo_text(text: &str, width: usize) -> Vec<String> {
                 continue;
             }
         }
+        // Wider than a whole line: drop instead of overflowing the width.
+        if gw > width {
+            continue;
+        }
         line.push_str(g);
         used += gw;
     }
@@ -988,121 +996,6 @@ fn draw_activity_bar(
 
 /// One full-width row. Drop optional metrics before clipping a value or its unit.
 /// Truncated labels and the overflow mark point to the full details in Ctrl-B.
-fn footer_lines(width: usize, v: &View, m: &Metadata, queued: usize) -> Vec<Line<'static>> {
-    let muted = Style::default().fg(MUTED);
-    let permission = permission_label(m.yolo, m.trusted_shell);
-    let context = ctx_pressure(v)
-        .map(|n| {
-            if n * 100.0 > 999.0 {
-                ">999%".into()
-            } else {
-                format!("{:.0}%", n * 100.0)
-            }
-        })
-        .unwrap_or_else(|| "—".into());
-    let rate = v
-        .session
-        .model_metrics
-        .requests
-        .last_output_tokens_per_second
-        .filter(|n| n.is_finite() && *n >= 0.0)
-        .map(compact_number)
-        .unwrap_or_else(|| "—".into());
-    let mut fields = vec![(1, format!("ctx {context}"))];
-    let label_reserve = if width >= 60 { 16 } else { 8 };
-    let metrics_budget = width.saturating_sub(label_reserve + permission.width() + 6);
-    let mut omitted = false;
-    let mut optional = vec![
-        (0, format!("tok {}", tokens(v.usage().total_tokens))),
-        (2, format!("{rate} tok/s")),
-    ];
-    if queued > 0 {
-        optional.push((
-            3,
-            format!(
-                "{} queued",
-                if queued < 1000 {
-                    queued.to_string()
-                } else {
-                    compact_number(queued as f64)
-                }
-            ),
-        ));
-    }
-    for field in optional {
-        let used: usize = fields.iter().map(|(_, text)| text.width() + 3).sum();
-        if used + field.1.width() <= metrics_budget {
-            fields.push(field);
-        } else {
-            omitted = true;
-        }
-    }
-    fields.sort_by_key(|(order, _)| *order);
-    let metrics = fields
-        .into_iter()
-        .map(|(_, text)| text)
-        .collect::<Vec<_>>()
-        .join(" · ");
-    let overflow = if omitted { " …" } else { "" };
-    let right_width = metrics.width() + overflow.width() + 3 + permission.width();
-    let left_width = width.saturating_sub(right_width + 2);
-    let title = v.session.title.as_deref().unwrap_or("New session");
-    // A partial title competes with the path and conveys little: show it whole or omit it.
-    let show_title = !omitted && title.width() + 3 + m.cwd.width() <= left_width;
-    let title_label = if show_title {
-        format!("{title} · ")
-    } else {
-        String::new()
-    };
-    let path = elide_tail(&m.cwd, left_width.saturating_sub(title_label.width()));
-    let gap = width.saturating_sub(title_label.width() + path.width() + right_width);
-    vec![Line::from(vec![
-        Span::styled(title_label, Style::default().fg(TEXT).bold()),
-        Span::styled(path, muted),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(metrics, Style::default().fg(TEXT)),
-        Span::styled(overflow, muted),
-        Span::styled(" · ", Style::default().fg(BORDER)),
-        Span::styled(
-            permission,
-            if m.yolo {
-                Style::default().fg(YELLOW).bold()
-            } else {
-                muted
-            },
-        ),
-    ])]
-}
-
-fn compact_number(value: f64) -> String {
-    if value >= 1e21 {
-        return format!("{value:.1e}");
-    }
-    for (scale, suffix) in [
-        (1e18, "E"),
-        (1e15, "P"),
-        (1e12, "T"),
-        (1e9, "B"),
-        (1e6, "M"),
-        (1e3, "K"),
-    ] {
-        if value >= scale {
-            return format!("{:.1}{suffix}", value / scale);
-        }
-    }
-    format!("{value:.1}")
-}
-fn tokens(value: u64) -> String {
-    if value < 1_000_000 {
-        format!("{:.1}K", value as f64 / 1000.0)
-    } else {
-        compact_number(value as f64)
-    }
-}
-
-fn label(s: &str, color: Color) -> Line<'static> {
-    Line::from(Span::styled(format!("  {s}"), Style::default().fg(color)))
-}
 fn help(f: &mut Canvas, area: Rect, scroll: u16) {
     let rect = crate::picker::centered(area, 78, area.height.saturating_sub(2) as usize);
     let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nCtrl-V          Paste image from clipboard (Esc clears)\n@               Reference a file (text inlined; images/PDF attached)\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/continue       Retry pending execution failures\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y/n + Enter (YOLO skips approvals).";

@@ -10,6 +10,19 @@
 > 最新 Rust 接口及迁移以 [Core 组件接口契约](./core-contracts.md) 和源码为准；
 > 下文早期签名示例尚未全部迁移，包括 TurnResult、compact 和工具交互等接口。
 
+## 已确定的后续方向：默认共享 Server（2026-10-01）
+
+后续对齐 OpenCode 的默认共享后台模式：所有本地 TUI 及其他前端默认连接同一用户级 Server；客户端自动发现已有 Server，未运行时启动它。会话运行与生命周期由 Server 全局统一管理。
+
+- Server 以全局唯一 `session_id` 查找会话，并复用已打开的 `SessionHost`。不同项目的会话由同一个 Server 管理，各会话可以独立并发执行。
+- 多个客户端可以同时打开同一个会话，共享历史、输入队列、执行状态、输出和交互审批；同一会话的执行由 Server 串行协调，不能因重复打开或恢复而创建第二份执行实例。
+- 前端通过统一协议提交输入、回复审批、请求中断并订阅事件。客户端连接生命周期与会话运行生命周期分离；关闭一个窗口不应自动关闭共享会话或中断其他客户端正在使用的执行。
+- `host.lock` 保留为 Server 对会话执行所有权的跨进程保护，不再通过拒绝第二个前端来实现互斥。共享存储本身不能替代统一的执行所有权。
+
+当前状态：尚未实现独立共享 Server；TUI 仍在本进程内通过 `Harness::open` 创建并驱动 `SessionHost`。下文早期关于 TUI 直接拥有执行、恢复时重建宿主及断连即取消的描述属于当前或历史模式，后续默认客户端模式以本决定为准。独立服务模式和远程连接选项在实现时另行设计。
+
+参考：[OpenCode 当前默认后台服务](https://opencode.ai/v2/docs/cli/#background-service)。
+
 ## 1. 设计理念
 
 **Everything is a Plugin.** 
@@ -201,6 +214,11 @@ YourAI 是一个"乐高积木"式的 agent 框架。`yourai-core` 定义接口�
 | `yourai-cli` | 装配策略 | toml → 类型化直调 → builder；core 不读文件、impl crate 不读文件 | §5.8 |
 
 ### 3.4 Crate 结构
+
+> **现状（v0.1 漂移说明）**：下表是目标形态。当前 workspace 实际为 3 个
+> crate——`yourai-core`（trait + 运输机制）、`yourai-harness`（全部默认实现：
+> DefaultLoop / GenaiModel / MemoryContext / SqliteStore / 内置工具 / hooks /
+> SessionHost 宿主）、`apps/yourai-tui`（前端）。目标拆分等外部使用者出现再做。
 
 ```
 yourai/                              # workspace root
@@ -1244,26 +1262,27 @@ impl AgentLoop for MyLoop {
 
 ### 8.1 快速开始（用默认实现）
 
+当前默认实现都在 `yourai-harness`；`Harness::open` 完成装配，`SessionHost`
+管理会话（可执行示例见 `crates/yourai-harness/examples/run.rs`）：
+
 ```rust
 use std::sync::Arc;
 use yourai_core::prelude::*;
-use yourai_loop_default::DefaultLoop;
-use yourai_model_genai::GenaiModel;
-use yourai_context_inmemory::InMemoryContextManager;
-use yourai_session_sqlite::SqliteSessionManager;
-use yourai_tools_builtin::BuiltinToolRegistry;
-use yourai_sandbox_seatbelt::SeatbeltSandbox;
+use yourai_harness::{GenaiModel, Harness, HarnessConfig};
 
-let agent = Agent::builder()
-    .agent_loop(Arc::new(DefaultLoop::new()))
-    .model(Arc::new(GenaiModel::new("deepseek-chat")))
-    .context_manager(Arc::new(InMemoryContextManager::new()))
-    .session(Arc::new(SqliteSessionManager::open("sessions.db")?))
-    .tools(Arc::new(BuiltinToolRegistry::new()))
-    .sandbox(Arc::new(SeatbeltSandbox::new(SandboxPolicy::workspace_write())))
-    .build();
-
-let output = agent.run(In::user_text("hello")).await?;  // 非交互：无工具审批 Ask 时安全
+let cwd = std::env::current_dir()?;
+let harness = Harness::open(
+    HarnessConfig::new(cwd.join(".yourai/sessions"), cwd),
+    Arc::new(GenaiModel::new(genai::Client::default(), "deepseek-chat")),
+).await?;
+harness.host.submit(In::user_text("hello"))?;   // 输入走 inbox，fire-and-forget
+let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+let result = harness
+    .host
+    .run_until_idle(TurnLimits::default(), &tx, &CancellationToken::new())
+    .await;
+// 消费 rx 中的 Out 事件（Chunk/Message/ToolStarted/Ask...），
+// outbox 关闭即 turn 结束；交互审批通过 submit(In::Reply{..}) 应答。
 ```
 
 ### 8.2 自定义 AgentLoop

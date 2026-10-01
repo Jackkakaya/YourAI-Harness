@@ -10,7 +10,7 @@ yourai-harness = { path = "../../crates/yourai-harness" }
 serde.workspace = true
 serde_json.workspace = true
 genai.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 tokio-util.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"

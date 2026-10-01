@@ -4,6 +4,23 @@ use std::collections::HashSet;
 use yourai_core::prelude::*;
 
 impl State<'_> {
+    /// Save what streamed so far so cancellation cleanup can persist it, then return the error.
+    fn fail_with_partial(
+        &mut self,
+        error: YourAiError,
+        text: &str,
+        reasoning: &str,
+    ) -> YourAiError {
+        self.output.text = text.to_owned();
+        if !text.is_empty() || !reasoning.is_empty() {
+            self.partial_message = Some(
+                ChatMessage::assistant(text.to_owned())
+                    .with_reasoning_content((!reasoning.is_empty()).then(|| reasoning.to_owned())),
+            );
+        }
+        error
+    }
+
     pub(crate) async fn model_step(
         &mut self,
         attempt: u32,
@@ -89,7 +106,7 @@ impl State<'_> {
             .unwrap_or(model.timeouts().read);
         self.model_calls += 1;
         let mut request = ModelRequest::new(request, options);
-        request.session_id = Some(self.history.session_id().0.clone());
+        request.session_id = Some(self.history.session_id().as_str().to_owned());
         request.turn_id = Some(self.tc.info.id.to_string());
         request.attempt = attempt;
         let transport = model.uses_transport_timeouts();
@@ -115,46 +132,46 @@ impl State<'_> {
             } else {
                 self.deadline(Some(chunk_timeout))
             };
-            let next = self
+            let next = match self
                 .wait_until(async { stream.next().await.transpose() }, deadline, "model")
-                .await?;
+                .await
+            {
+                Ok(next) => next,
+                Err(e) => return Err(self.fail_with_partial(e, &text, &reasoning)),
+            };
             let Some(event) = next else {
-                return Err(ErrorKind::Provider {
-                    name: "model",
-                    message: "stream ended without terminal event".into(),
-                }
-                .into());
+                return Err(self.fail_with_partial(
+                    ErrorKind::Provider {
+                        name: crate::model::MODEL_NAME,
+                        message: "stream ended without terminal event".into(),
+                    }
+                    .into(),
+                    &text,
+                    &reasoning,
+                ));
             };
             match event {
                 ChatStreamEvent::Start => {}
                 ChatStreamEvent::Chunk(chunk) => {
                     if !chunk.content.is_empty() {
-                        if text.is_empty() {
-                            self.output.text.clear();
-                        }
                         text.push_str(&chunk.content);
-                        self.output.text = text.clone();
-                        self.partial_message =
-                            Some(ChatMessage::assistant(text.clone()).with_reasoning_content(
-                                (!reasoning.is_empty()).then(|| reasoning.clone()),
-                            ));
                         *visible = true;
-                        self.send(Out::Chunk {
+                        if let Err(e) = self.send(Out::Chunk {
                             text: chunk.content,
-                        })?;
+                        }) {
+                            return Err(self.fail_with_partial(e, &text, &reasoning));
+                        }
                     }
                 }
                 ChatStreamEvent::ReasoningChunk(chunk) => {
                     if !chunk.content.is_empty() {
                         *visible = true;
                         reasoning.push_str(&chunk.content);
-                        self.partial_message = Some(
-                            ChatMessage::assistant(text.clone())
-                                .with_reasoning_content(Some(reasoning.clone())),
-                        );
-                        self.send(Out::Reasoning {
+                        if let Err(e) = self.send(Out::Reasoning {
                             text: chunk.content,
-                        })?;
+                        }) {
+                            return Err(self.fail_with_partial(e, &text, &reasoning));
+                        }
                     }
                 }
                 ChatStreamEvent::ToolCallChunk(_) => {
@@ -197,24 +214,14 @@ impl State<'_> {
                                 input_tokens: input_tokens as u64,
                             });
                         }
-                        let input = u.prompt_tokens.unwrap_or(0).max(0) as u64;
-                        let output = u.completion_tokens.unwrap_or(0).max(0) as u64;
-                        self.record_usage(Usage {
-                            input_tokens: input,
-                            output_tokens: output,
-                            total_tokens: u
-                                .total_tokens
-                                .map(|n| n.max(0) as u64)
-                                .unwrap_or(input + output),
-                        })
-                        .await?;
+                        self.record_usage(crate::model::usage(u)).await?;
                     }
                     if matches!(
                         end.captured_stop_reason,
                         Some(StopReason::MaxTokens(_) | StopReason::ContentFilter(_))
                     ) {
                         return Err(ErrorKind::Provider {
-                            name: "model",
+                            name: crate::model::MODEL_NAME,
                             message: "model response truncated or filtered; tools will not execute"
                                 .into(),
                         }
@@ -263,7 +270,7 @@ impl State<'_> {
 
 /// Safe, structured error context for retry notices; never print request payloads.
 pub(crate) fn retry_cause(error: &YourAiError) -> String {
-    let Some((status, body)) = error.model_http_error() else {
+    let Some((status, body)) = crate::model::failure::http_error(error) else {
         return "model provider error".into();
     };
     let mut reason = format!("HTTP {status}");

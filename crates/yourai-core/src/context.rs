@@ -36,233 +36,148 @@ use crate::usage::UsageTracker;
 
 // region:    --- Context ---
 
-/// 所有 provider 的容器——纯粹的 provider 容器，交互管道不在这里
-///（每次 turn 由 [`Agent::start`] 装配进 [`TurnContext`]，决策 5.5）。
-pub struct Context {
-    agent_loop: RwLock<Option<Arc<dyn AgentLoop>>>,
-    model: RwLock<Option<Arc<dyn ModelProvider>>>,
-    context_manager: RwLock<Option<Arc<dyn ContextManager>>>,
-    session: RwLock<Option<Arc<dyn SessionManager>>>,
-    memory: RwLock<Option<Arc<dyn MemoryProvider>>>,
-    tools: RwLock<Option<Arc<dyn ToolRegistry>>>,
-    skills: RwLock<Option<Arc<dyn SkillProvider>>>,
-    sandbox: RwLock<Option<Arc<dyn SandboxProvider>>>,
-    security: RwLock<Option<Arc<dyn SecurityProvider>>>,
-    usage: RwLock<Option<Arc<dyn UsageTracker>>>,
-    observability: RwLock<Option<Arc<dyn ObservabilityProvider>>>,
-    hooks: RwLock<Option<Arc<dyn HookRuntime>>>,
-}
+/// 单一处声明全部 provider 插槽，生成 Context / ProviderSnapshot / AgentBuilder
+/// 与三组访问器（读取/可选读取/热替换）——新增插槽只改这份清单。
+/// 第一行是必需槽（ProviderSnapshot 中非 Option），其余为可选槽。
+macro_rules! provider_slots {
+    (
+        required $req:ident : $req_try:ident : $req_set:ident : $req_trait:ident
+        $(, optional $field:ident : $try:ident : $setter:ident : $trait:ident)*
+        $(,)?
+    ) => {
+        /// 所有 provider 的容器——纯粹的 provider 容器，交互管道不在这里
+        ///（每次 turn 由 [`Agent::start`] 装配进 [`TurnContext`]，决策 5.5）。
+        pub struct Context {
+            $req: RwLock<Option<Arc<dyn $req_trait>>>,
+            $( $field: RwLock<Option<Arc<dyn $trait>>> ),*
+        }
 
-// 必需读取器：缺失报 Config 错——缺什么在使用点报（决策 5.8）
-macro_rules! getters {
-    ($($name:ident : $trait:ident),* $(,)?) => {
-        $(
-            #[doc = concat!("读取 provider；未装配时返回 `Config` 错误（决策 5.8）")]
-            pub fn $name(&self) -> Result<Arc<dyn $trait>, YourAiError> {
-                self.$name
+        // 必需读取器：缺失报 Config 错——缺什么在使用点报（决策 5.8）。
+        // 锁中毒视为可恢复：provider slot 的数据仍然一致。
+        impl Context {
+            $(
+                #[doc = concat!("读取 provider `", stringify!($field), "`；未装配时返回 `Config` 错误（决策 5.8）")]
+                pub fn $field(&self) -> Result<Arc<dyn $trait>, YourAiError> {
+                    self.$field
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                        .ok_or_else(|| {
+                            YourAiError::Error(ErrorKind::Config(format!(
+                                "provider not configured: {}",
+                                stringify!($field)
+                            )))
+                        })
+                }
+                #[doc = concat!("可选读取 `", stringify!($field), "`；未装配返回 `None`（决策 5.8 依赖矩阵的可选侧）")]
+                pub fn $try(&self) -> Option<Arc<dyn $trait>> {
+                    self.$field
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                }
+                #[doc = concat!("运行时热替换 `", stringify!($field), "`（决策 5.2）：正在跑的 turn 用旧快照跑完，下一 turn 生效")]
+                pub fn $setter(&self, v: Arc<dyn $trait>) {
+                    *self.$field.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(v);
+                }
+            )*
+            // 必需槽的访问器形式与可选槽一致；snapshot 是它唯一不同的地方。
+            #[doc = concat!("读取 provider `", stringify!($req), "`；未装配时返回 `Config` 错误（决策 5.8）")]
+            pub fn $req(&self) -> Result<Arc<dyn $req_trait>, YourAiError> {
+                self.$req
                     .read()
-                    .unwrap()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone()
                     .ok_or_else(|| {
                         YourAiError::Error(ErrorKind::Config(format!(
                             "provider not configured: {}",
-                            stringify!($name)
+                            stringify!($req)
                         )))
                     })
             }
-        )*
-    };
-}
-
-// 可选读取器：缺失返回 None（DefaultLoop 依赖矩阵用：memory/skills/
-// sandbox/security/usage/observability/hooks/session 缺失均有合理缺省）
-macro_rules! try_getters {
-    ($($name:ident : $field:ident, $trait:ident),* $(,)?) => {
-        $(
-            #[doc = concat!("可选读取：未装配返回 `None`（决策 5.8 依赖矩阵的可选侧）")]
-            pub fn $name(&self) -> Option<Arc<dyn $trait>> {
-                self.$field.read().unwrap().clone()
+            #[doc = concat!("可选读取 `", stringify!($req), "`；未装配返回 `None`")]
+            pub fn $req_try(&self) -> Option<Arc<dyn $req_trait>> {
+                self.$req
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
             }
-        )*
-    };
-}
-
-// 写入器：运行时热替换（决策 5.2，turn 级语义）
-macro_rules! setters {
-    ($($setter:ident : $field:ident, $trait:ident),* $(,)?) => {
-        $(
-            #[doc = concat!("运行时热替换（决策 5.2）：正在跑的 turn 用旧快照跑完，下一 turn 生效")]
-            pub fn $setter(&self, v: Arc<dyn $trait>) {
-                *self.$field.write().unwrap() = Some(v);
+            #[doc = concat!("运行时热替换 `", stringify!($req), "`（决策 5.2）")]
+            pub fn $req_set(&self, v: Arc<dyn $req_trait>) {
+                *self.$req.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(v);
             }
-        )*
-    };
-}
 
-impl Context {
-    getters! {
-        agent_loop: AgentLoop,
-        model: ModelProvider,
-        context_manager: ContextManager,
-        session: SessionManager,
-        memory: MemoryProvider,
-        tools: ToolRegistry,
-        skills: SkillProvider,
-        sandbox: SandboxProvider,
-        security: SecurityProvider,
-        usage: UsageTracker,
-        observability: ObservabilityProvider,
-        hooks: HookRuntime,
-    }
+            /// turn 开始时的 provider 快照（决策 5.2：一个 turn 内实现恒定）。
+            /// 缺少必需槽时返回 Config 错误，不通过公开 API 暴露 panic 路径。
+            pub fn snapshot(&self) -> Result<ProviderSnapshot, YourAiError> {
+                Ok(ProviderSnapshot {
+                    $req: self.$req()?,
+                    $( $field: self.$try(), )*
+                })
+            }
+        }
 
-    try_getters! {
-        try_agent_loop: agent_loop, AgentLoop,
-        try_model: model, ModelProvider,
-        try_context_manager: context_manager, ContextManager,
-        try_session: session, SessionManager,
-        try_memory: memory, MemoryProvider,
-        try_tools: tools, ToolRegistry,
-        try_skills: skills, SkillProvider,
-        try_sandbox: sandbox, SandboxProvider,
-        try_security: security, SecurityProvider,
-        try_usage: usage, UsageTracker,
-        try_observability: observability, ObservabilityProvider,
-        try_hooks: hooks, HookRuntime,
-    }
+        /// turn 作用域的 provider 快照：在 `start()/run()` 时刻取一次，
+        /// turn 内全部读取走这里——热替换只影响下一 turn（决策 5.2）。
+        ///
+        /// DefaultLoop 依赖矩阵（决策 5.8）：
+        /// - 必需：`agent_loop`（start 已查）、`model`、`context_manager`（用点报 Config）
+        /// - 工具循环需要：`tools`（无则视作空工具集）
+        /// - 可选：`session` / `memory` / `skills` / `sandbox` / `security`
+        ///   （缺省 = 不拦截）/ `usage` / `observability` / `hooks`（缺省 = 不发）
+        #[derive(Clone)]
+        pub struct ProviderSnapshot {
+            pub $req: Arc<dyn $req_trait>,
+            $( pub $field: Option<Arc<dyn $trait>>, )*
+        }
 
-    setters! {
-        set_agent_loop: agent_loop, AgentLoop,
-        set_model: model, ModelProvider,
-        set_context_manager: context_manager, ContextManager,
-        set_session: session, SessionManager,
-        set_memory: memory, MemoryProvider,
-        set_tools: tools, ToolRegistry,
-        set_skills: skills, SkillProvider,
-        set_sandbox: sandbox, SandboxProvider,
-        set_security: security, SecurityProvider,
-        set_usage: usage, UsageTracker,
-        set_observability: observability, ObservabilityProvider,
-        set_hooks: hooks, HookRuntime,
-    }
+        /// 装配器：全部字段 Option，`build()` **不做完整性检查**（决策 5.8）——
+        /// 缺什么在使用点报 `Config` 错。机制（builder）与策略（CLI 读配置）分离。
+        #[derive(Default)]
+        pub struct AgentBuilder {
+            $req: Option<Arc<dyn $req_trait>>,
+            $( $field: Option<Arc<dyn $trait>>, )*
+        }
 
-    /// turn 开始时的 provider 快照（决策 5.2：一个 turn 内实现恒定）。
-    /// 缺少 `agent_loop` 时返回 Config 错误，不通过公开 API 暴露 panic 路径。
-    pub fn snapshot(&self) -> Result<ProviderSnapshot, YourAiError> {
-        Ok(ProviderSnapshot {
-            agent_loop: self.agent_loop()?,
-            model: self.try_model(),
-            context_manager: self.try_context_manager(),
-            session: self.try_session(),
-            memory: self.try_memory(),
-            tools: self.try_tools(),
-            skills: self.try_skills(),
-            sandbox: self.try_sandbox(),
-            security: self.try_security(),
-            usage: self.try_usage(),
-            observability: self.try_observability(),
-            hooks: self.try_hooks(),
-        })
-    }
-}
-
-// endregion: --- Context ---
-
-// region:    --- ProviderSnapshot ---
-
-/// turn 作用域的 provider 快照：在 `start()/run()` 时刻取一次，
-/// turn 内全部读取走这里——热替换只影响下一 turn（决策 5.2）。
-///
-/// DefaultLoop 依赖矩阵（决策 5.8）：
-/// - 必需：`agent_loop`（start 已查）、`model`、`context_manager`（用点报 Config）
-/// - 工具循环需要：`tools`（无则视作空工具集）
-/// - 可选：`session` / `memory` / `skills` / `sandbox` / `security`
-///   （缺省 = 不拦截）/ `usage` / `observability` / `hooks`（缺省 = 不发）
-#[derive(Clone)]
-pub struct ProviderSnapshot {
-    pub agent_loop: Arc<dyn AgentLoop>,
-    pub model: Option<Arc<dyn ModelProvider>>,
-    pub context_manager: Option<Arc<dyn ContextManager>>,
-    pub session: Option<Arc<dyn SessionManager>>,
-    pub memory: Option<Arc<dyn MemoryProvider>>,
-    pub tools: Option<Arc<dyn ToolRegistry>>,
-    pub skills: Option<Arc<dyn SkillProvider>>,
-    pub sandbox: Option<Arc<dyn SandboxProvider>>,
-    pub security: Option<Arc<dyn SecurityProvider>>,
-    pub usage: Option<Arc<dyn UsageTracker>>,
-    pub observability: Option<Arc<dyn ObservabilityProvider>>,
-    pub hooks: Option<Arc<dyn HookRuntime>>,
-}
-
-// endregion: --- ProviderSnapshot ---
-
-// region:    --- Builder ---
-
-/// 装配器：全部字段 Option，`build()` **不做完整性检查**（决策 5.8）——
-/// 缺什么在使用点报 `Config` 错。机制（builder）与策略（CLI 读配置）分离。
-#[derive(Default)]
-pub struct AgentBuilder {
-    agent_loop: Option<Arc<dyn AgentLoop>>,
-    model: Option<Arc<dyn ModelProvider>>,
-    context_manager: Option<Arc<dyn ContextManager>>,
-    session: Option<Arc<dyn SessionManager>>,
-    memory: Option<Arc<dyn MemoryProvider>>,
-    tools: Option<Arc<dyn ToolRegistry>>,
-    skills: Option<Arc<dyn SkillProvider>>,
-    sandbox: Option<Arc<dyn SandboxProvider>>,
-    security: Option<Arc<dyn SecurityProvider>>,
-    usage: Option<Arc<dyn UsageTracker>>,
-    observability: Option<Arc<dyn ObservabilityProvider>>,
-    hooks: Option<Arc<dyn HookRuntime>>,
-}
-
-macro_rules! builder_methods {
-    ($($method:ident : $field:ident, $trait:ident),* $(,)?) => {
-        $(
-            pub fn $method(mut self, v: Arc<dyn $trait>) -> Self {
-                self.$field = Some(v);
+        impl AgentBuilder {
+            pub fn $req(mut self, v: Arc<dyn $req_trait>) -> Self {
+                self.$req = Some(v);
                 self
             }
-        )*
+            $(
+                pub fn $field(mut self, v: Arc<dyn $trait>) -> Self {
+                    self.$field = Some(v);
+                    self
+                }
+            )*
+
+            /// 组装 Agent（不做完整性检查，决策 5.8）
+            pub fn build(self) -> Arc<Agent> {
+                let ctx = Context {
+                    $req: RwLock::new(self.$req),
+                    $( $field: RwLock::new(self.$field), )*
+                };
+                Arc::new(Agent { ctx: Arc::new(ctx) })
+            }
+        }
     };
 }
 
-impl AgentBuilder {
-    builder_methods! {
-        agent_loop: agent_loop, AgentLoop,
-        model: model, ModelProvider,
-        context_manager: context_manager, ContextManager,
-        session: session, SessionManager,
-        memory: memory, MemoryProvider,
-        tools: tools, ToolRegistry,
-        skills: skills, SkillProvider,
-        sandbox: sandbox, SandboxProvider,
-        security: security, SecurityProvider,
-        usage: usage, UsageTracker,
-        observability: observability, ObservabilityProvider,
-        hooks: hooks, HookRuntime,
-    }
-
-    /// 组装 Agent（不做完整性检查，决策 5.8）
-    pub fn build(self) -> Arc<Agent> {
-        let ctx = Context {
-            agent_loop: RwLock::new(self.agent_loop),
-            model: RwLock::new(self.model),
-            context_manager: RwLock::new(self.context_manager),
-            session: RwLock::new(self.session),
-            memory: RwLock::new(self.memory),
-            tools: RwLock::new(self.tools),
-            skills: RwLock::new(self.skills),
-            sandbox: RwLock::new(self.sandbox),
-            security: RwLock::new(self.security),
-            usage: RwLock::new(self.usage),
-            observability: RwLock::new(self.observability),
-            hooks: RwLock::new(self.hooks),
-        };
-        Arc::new(Agent { ctx: Arc::new(ctx) })
-    }
+provider_slots! {
+    //      字段            可选读取            热替换             trait
+    required   agent_loop:        try_agent_loop:        set_agent_loop:        AgentLoop,
+    optional   model:             try_model:             set_model:             ModelProvider,
+    optional   context_manager:   try_context_manager:   set_context_manager:   ContextManager,
+    optional   session:           try_session:           set_session:           SessionManager,
+    optional   memory:            try_memory:            set_memory:            MemoryProvider,
+    optional   tools:             try_tools:             set_tools:             ToolRegistry,
+    optional   skills:            try_skills:            set_skills:            SkillProvider,
+    optional   sandbox:           try_sandbox:           set_sandbox:           SandboxProvider,
+    optional   security:          try_security:          set_security:          SecurityProvider,
+    optional   usage:             try_usage:             set_usage:             UsageTracker,
+    optional   observability:     try_observability:     set_observability:     ObservabilityProvider,
+    optional   hooks:             try_hooks:             set_hooks:             HookRuntime,
 }
-
-// endregion: --- Builder ---
 
 // region:    --- Agent ---
 
@@ -321,7 +236,7 @@ impl Agent {
                 outbox: &sink,
                 cancel: &task_cancel,
             };
-            let mut result = loop_.run_turn(tc).await;
+            let mut result = run_loop(loop_.as_ref(), tc).await;
             collect_pending(&mut result, &mut inbox_rx);
             result
             // tc drop 后 sink drop → outbox 关闭 = turn 结束信号
@@ -375,7 +290,7 @@ impl Agent {
             outbox: &sink,
             cancel: &cancel,
         };
-        let mut result = loop_.run_turn(tc).await;
+        let mut result = run_loop(loop_.as_ref(), tc).await;
         collect_pending(&mut result, &mut inbox_rx);
         if sink.asked.load(Ordering::Acquire) {
             let output = match result {
@@ -424,6 +339,60 @@ fn collect_pending(result: &mut TurnResult, inbox: &mut UnboundedReceiver<In>) {
     }
 }
 
+/// Grace the loop gets past its deadline to run cooperative cleanup before
+/// the mechanism-level watchdog drops it.
+const WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Drive one turn with mechanism-level defense: the deadline backstops loops
+/// that ignore it, and a panicking loop still yields a typed failure instead
+/// of losing every pending input.
+async fn run_loop(loop_: &dyn AgentLoop, tc: TurnContext<'_>) -> TurnResult {
+    use futures_util::FutureExt;
+    let deadline = tc.info.options.limits.deadline;
+    let cancel = tc.cancel.clone();
+    // Construct the provider's future inside the unwind guard too: a plugin
+    // may panic before returning its future, not only while it is polled.
+    let future = std::panic::AssertUnwindSafe(async { loop_.run_turn(tc).await }).catch_unwind();
+    let result = match deadline {
+        Some(deadline) => {
+            let watchdog = tokio::time::Instant::from_std(deadline + WATCHDOG_GRACE);
+            match tokio::time::timeout_at(watchdog, future).await {
+                Ok(result) => result,
+                Err(_) => {
+                    cancel.cancel();
+                    return Err(TurnFailure::new(
+                        ErrorKind::LoopTerminated(
+                            "deadline exceeded; watchdog forcibly dropped the loop".into(),
+                        ),
+                        TurnOutput::new(""),
+                    ));
+                }
+            }
+        }
+        None => future.await,
+    };
+    result.unwrap_or_else(|panic| {
+        cancel.cancel();
+        Err(TurnFailure::new(
+            YourAiError::Error(ErrorKind::LoopTerminated(format!(
+                "agent loop panicked: {}",
+                panic_message(panic.as_ref())
+            ))),
+            TurnOutput::new(""),
+        ))
+    })
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = panic.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else {
+        "unknown panic payload".into()
+    }
+}
+
 // endregion: --- Agent ---
 
 // region:    --- TurnHandle / TurnContext ---
@@ -458,9 +427,11 @@ impl TurnHandle {
         match self.result.take() {
             Some(h) => match h.await {
                 Ok(r) => r,
-                Err(e) => Err(ErrorKind::Other(format!("turn task join failed: {e}")).into()),
+                Err(e) => {
+                    Err(ErrorKind::LoopTerminated(format!("turn task join failed: {e}")).into())
+                }
             },
-            None => Err(ErrorKind::Loop("turn already joined".into()).into()),
+            None => Err(ErrorKind::Loop("TurnHandle::join called twice".into()).into()),
         }
     }
 
@@ -907,6 +878,18 @@ mod tests {
             matches!(*err.error, YourAiError::Aborted(AbortReason::Cancelled)),
             "非 Ask 的取消必须保留原始语义，实际: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn unexpectedly_aborted_turn_task_reports_uncertain_execution() {
+        let agent = Agent::builder().agent_loop(Arc::new(EchoLoop)).build();
+        let handle = agent.start(In::user_text("hi")).unwrap();
+        handle.result.as_ref().unwrap().abort();
+        let failure = handle.join().await.unwrap_err();
+        assert!(matches!(
+            *failure.error,
+            YourAiError::Error(ErrorKind::LoopTerminated(_))
+        ));
     }
 }
 

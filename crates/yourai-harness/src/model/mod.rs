@@ -1,6 +1,6 @@
 mod configured;
 mod control;
-mod failure;
+pub mod failure;
 mod metrics;
 #[cfg(test)]
 mod policy_tests;
@@ -13,6 +13,10 @@ pub use metrics::RequestMetrics;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use yourai_core::prelude::*;
+
+/// Provider label for model-step errors; matched as a contract by the loop.
+pub(crate) const MODEL_NAME: &str = "model";
+
 pub fn usage(u: &GenaiUsage) -> Usage {
     let input = u.prompt_tokens.unwrap_or(0).max(0) as u64;
     let output = u.completion_tokens.unwrap_or(0).max(0) as u64;

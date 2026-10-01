@@ -104,7 +104,7 @@ with tempfile.TemporaryDirectory() as tmp:
         command = bin_dir / program
         command.write_text('#!' + sys.executable + '\nimport os,sys\nfrom pathlib import Path\nPath(os.environ["SMOKE_CLIPBOARD"]).write_text(sys.stdin.read())\n')
         command.chmod(0o755)
-    child_env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH'], SMOKE_CLIPBOARD=str(clipboard_file))
+    child_env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH'], SMOKE_CLIPBOARD=str(clipboard_file), XDG_DATA_HOME=str(Path(tmp) / 'xdg-data'))
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
     original = termios.tcgetattr(slave)
@@ -147,7 +147,7 @@ with tempfile.TemporaryDirectory() as tmp:
             wait_exit(child, master)
             assert child.returncode == 0
             assert termios.tcgetattr(slave) == original
-            db = sqlite3.connect(Path(tmp) / '.yourai/sessions/sessions.sqlite3')
+            db = sqlite3.connect(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3')
             logs = db.execute('SELECT source, outcome, http_status, attempt, session_id, turn_id FROM model_requests ORDER BY started_at').fetchall()
             assert len(logs) == expected, logs
             assert all(row[0] == 'main' and row[4] and row[5] for row in logs), logs
@@ -203,7 +203,7 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'SMOKE_SECOND_OK')
         # /compact is guarded by the idle check; the streamed marker appears
         # before the turn's finalization completes, so wait for it.
-        wait_completed(Path(tmp) / '.yourai/sessions/sessions.sqlite3', 'main', 3)
+        wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 3)
         os.write(master, b'/compact\r')
         wait_for(b'Summarized')
         os.write(master, b'\x11')
@@ -222,7 +222,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert all(path == '/v1/chat/completions' and auth == 'Bearer smoke-only'
                    and body['model'] == 'smoke-model' for path, auth, body in requests)
         assert any(m['role'] == 'tool' for m in requests[1][2]['messages'])
-        db = sqlite3.connect(Path(tmp) / '.yourai/sessions/sessions.sqlite3')
+        db = sqlite3.connect(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3')
         session = db.execute('SELECT session_id FROM sessions').fetchone()[0]
         assert db.execute("SELECT source, COUNT(*) FROM model_requests GROUP BY source ORDER BY source").fetchall() == [('compact', 1), ('main', 3)]
         assert db.execute("SELECT COUNT(*) FROM model_requests WHERE outcome='completed'").fetchone()[0] == 4

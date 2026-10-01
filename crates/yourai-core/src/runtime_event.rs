@@ -19,7 +19,10 @@ pub struct RuntimeEvents {
 }
 impl RuntimeEvents {
     pub fn push(&self, event: RuntimeEvent) -> bool {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !s.1.insert(event.id.clone()) {
             return false;
         }
@@ -28,16 +31,30 @@ impl RuntimeEvents {
         true
     }
     pub fn front(&self) -> Option<RuntimeEvent> {
-        self.state.lock().unwrap().0.front().cloned()
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+            .front()
+            .cloned()
     }
     pub fn ack(&self, id: &str) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if s.0.front().is_some_and(|e| e.id == id) {
             s.0.pop_front();
         }
     }
     pub fn pending(&self) -> Vec<RuntimeEvent> {
-        self.state.lock().unwrap().0.iter().cloned().collect()
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+            .iter()
+            .cloned()
+            .collect()
     }
     pub fn has_context(&self) -> bool {
         self.state

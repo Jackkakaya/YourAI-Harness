@@ -86,7 +86,7 @@ impl HookHandler for MemoryHookAdapter {
     ) -> BoxFuture<'a, Result<HookOutput, YourAiError>> {
         Box::pin(async move {
             // Child agents can share a HookRuntime; never mirror another session.
-            if invocation.base.session_id != self.session_id.0 {
+            if invocation.base.session_id != self.session_id.as_str() {
                 return Ok(HookOutput::Parsed(serde_json::json!({})));
             }
             let cancel = CancellationToken::new();

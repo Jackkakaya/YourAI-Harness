@@ -108,7 +108,7 @@ impl Attempt {
         }
         self.done = true;
         let status = error
-            .and_then(YourAiError::model_http_error)
+            .and_then(super::failure::http_error)
             .map(|(status, _)| status);
         self.record("failed", status);
         let mut state = self.budget.state.lock().unwrap();

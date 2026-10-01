@@ -174,12 +174,12 @@ const MESSAGE_COLUMNS: &str =
     "message_id,seq,content_json,kind,status,format_version,tool_output_pruned_at";
 fn meta_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
     Ok(SessionMeta {
-        id: SessionId(r.get(0)?),
+        id: SessionId::from(r.get::<_, String>(0)?),
         title: r.get(1)?,
         created_at: r.get(2)?,
         updated_at: r.get(3)?,
         model: r.get(4)?,
-        parent_session_id: r.get::<_, Option<String>>(5)?.map(SessionId),
+        parent_session_id: r.get::<_, Option<String>>(5)?.map(SessionId::from),
         provider: r.get(6)?,
         system_prompt: r.get(7)?,
     })
@@ -214,7 +214,7 @@ fn insert(
         .map_err(sql)?;
     let kind = if m.summary { "summary" } else { "message" };
     if let Some((sid, content, previous_kind, seq, status, pruned)) = previous {
-        if sid != session.0 || content != raw || kind != previous_kind {
+        if sid != session.as_str() || content != raw || kind != previous_kind {
             return Err(sql("message identity conflict"));
         }
         m.seq = seq;
@@ -229,7 +229,7 @@ fn insert(
     m.seq = c
         .query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?1",
-            [&session.0],
+            [session.as_str()],
             |r| r.get(0),
         )
         .map_err(sql)?;
@@ -239,10 +239,10 @@ fn insert(
     }
     let tool_id = results.first().map(|r| r.call_id.as_str());
     let role = format!("{:?}", m.message.role).to_lowercase();
-    c.execute("INSERT INTO messages(message_id,session_id,seq,kind,role,content_json,tool_call_id,token_count,status,created_at,format_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'active',?9,?10)", params![m.id,session.0,m.seq,kind,role,raw,tool_id,raw.len().div_ceil(4) as i64,now(),if m.api_content.is_some() {2} else {1}]).map_err(sql)?;
+    c.execute("INSERT INTO messages(message_id,session_id,seq,kind,role,content_json,tool_call_id,token_count,status,created_at,format_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'active',?9,?10)", params![m.id,session.as_str(),m.seq,kind,role,raw,tool_id,raw.len().div_ceil(4) as i64,now(),if m.api_content.is_some() {2} else {1}]).map_err(sql)?;
     c.execute(
         "UPDATE sessions SET updated_at=?2 WHERE session_id=?1",
-        params![session.0, now()],
+        params![session.as_str(), now()],
     )
     .map_err(sql)?;
     Ok(m)
@@ -257,8 +257,8 @@ impl SessionManager for SqliteStore {
         let system = system.to_owned();
         Box::pin(self.run(move |c| {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
-            tx.execute("UPDATE sessions SET system_prompt=?2 WHERE session_id=?1 AND system_prompt IS NULL", params![id.0,system]).map_err(sql)?;
-            let saved = tx.query_row("SELECT system_prompt FROM sessions WHERE session_id=?1", [&id.0], |r| r.get(0)).map_err(sql)?;
+            tx.execute("UPDATE sessions SET system_prompt=?2 WHERE session_id=?1 AND system_prompt IS NULL", params![id.as_str(),system]).map_err(sql)?;
+            let saved = tx.query_row("SELECT system_prompt FROM sessions WHERE session_id=?1", [id.as_str()], |r| r.get(0)).map_err(sql)?;
             tx.commit().map_err(sql)?; Ok(saved)
         }))
     }
@@ -274,7 +274,7 @@ impl SessionManager for SqliteStore {
             self.run(move |c| {
                 c.execute(
                     "INSERT INTO sessions(session_id,created_at,updated_at,system_prompt) VALUES(?1,?2,?2,?3)",
-                    params![sid.0, now(), system],
+                    params![sid.as_str(), now(), system],
                 )
                 .map_err(sql)?;
                 Ok(())
@@ -288,11 +288,11 @@ impl SessionManager for SqliteStore {
         id: &'a SessionId,
     ) -> BoxFuture<'a, Result<SessionMeta, YourAiError>> {
         let id = id.clone();
-        Box::pin(self.run(move |c| c.query_row("SELECT session_id,title,created_at,updated_at,model,parent_session_id,provider,system_prompt FROM sessions WHERE session_id=?1",[id.0],meta_row).map_err(sql)))
+        Box::pin(self.run(move |c| c.query_row("SELECT session_id,title,created_at,updated_at,model,parent_session_id,provider,system_prompt FROM sessions WHERE session_id=?1",[id.as_str()],meta_row).map_err(sql)))
     }
     fn save_session<'a>(&'a self, m: &'a SessionMeta) -> BoxFuture<'a, Result<(), YourAiError>> {
         let m = m.clone();
-        Box::pin(self.run(move |c| { let n=c.execute("UPDATE sessions SET title=?2,model=?3,updated_at=?4,parent_session_id=?5,provider=?6 WHERE session_id=?1",params![m.id.0,m.title,m.model,now(),m.parent_session_id.map(|id|id.0),m.provider]).map_err(sql)?; if n==0 {return Err(sql("unknown session"));} Ok(()) }))
+        Box::pin(self.run(move |c| { let n=c.execute("UPDATE sessions SET title=?2,model=?3,updated_at=?4,parent_session_id=?5,provider=?6 WHERE session_id=?1",params![m.id.as_str(),m.title,m.model,now(),m.parent_session_id.as_ref().map(|id|id.as_str()),m.provider]).map_err(sql)?; if n==0 {return Err(sql("unknown session"));} Ok(()) }))
     }
     fn list_sessions<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SessionMeta>, YourAiError>> {
         Box::pin(self.run(|c| { let mut q=c.prepare("SELECT session_id,title,created_at,updated_at,model,parent_session_id,provider,system_prompt FROM sessions ORDER BY updated_at DESC,session_id").map_err(sql)?; let rows=q.query_map([],meta_row).map_err(sql)?.collect::<Result<Vec<_>,_>>().map_err(sql)?; Ok(rows) }))
@@ -300,7 +300,7 @@ impl SessionManager for SqliteStore {
     fn delete_session<'a>(&'a self, id: &'a SessionId) -> BoxFuture<'a, Result<(), YourAiError>> {
         let id = id.clone();
         Box::pin(self.run(move |c| {
-            c.execute("DELETE FROM sessions WHERE session_id=?1", [id.0])
+            c.execute("DELETE FROM sessions WHERE session_id=?1", [id.as_str()])
                 .map_err(sql)?;
             Ok(())
         }))
@@ -313,9 +313,9 @@ impl SessionManager for SqliteStore {
         Box::pin(self.run(move |c| {
             let tx=c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
             let child=SessionId::new();
-            let n=tx.execute("INSERT INTO sessions(session_id,parent_session_id,title,model,provider,created_at,updated_at,system_prompt) SELECT ?2,session_id,title,model,provider,?3,?3,system_prompt FROM sessions WHERE session_id=?1",params![id.0,child.0,now()]).map_err(sql)?;
+            let n=tx.execute("INSERT INTO sessions(session_id,parent_session_id,title,model,provider,created_at,updated_at,system_prompt) SELECT ?2,session_id,title,model,provider,?3,?3,system_prompt FROM sessions WHERE session_id=?1",params![id.as_str(),child.as_str(),now()]).map_err(sql)?;
             if n==0 { return Err(sql("unknown parent session")); }
-            tx.execute("INSERT INTO messages SELECT lower(hex(randomblob(16))),?2,seq,kind,role,content_json,format_version,tool_call_id,token_count,status,created_at,tool_output_pruned_at FROM messages WHERE session_id=?1",params![id.0,child.0]).map_err(sql)?;
+            tx.execute("INSERT INTO messages SELECT lower(hex(randomblob(16))),?2,seq,kind,role,content_json,format_version,tool_call_id,token_count,status,created_at,tool_output_pruned_at FROM messages WHERE session_id=?1",params![id.as_str(),child.as_str()]).map_err(sql)?;
             tx.commit().map_err(sql)?; Ok(child)
         }))
     }
@@ -328,7 +328,7 @@ impl SessionManager for SqliteStore {
         Box::pin(self.run(move |c| {
             if query.limit==0 || query.limit>10000 {return Err(sql("page limit must be 1..=10000"));}
             let mut q=c.prepare(&format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE session_id=?1 AND seq>?2 AND (?3=0 OR status='active') ORDER BY seq LIMIT ?4")).map_err(sql)?;
-            let mut messages=q.query_map(params![id.0,query.after,query.active_only,query.limit as i64+1],message_row).map_err(sql)?.collect::<Result<Vec<_>,_>>().map_err(sql)?;
+            let mut messages=q.query_map(params![id.as_str(),query.after,query.active_only,query.limit as i64+1],message_row).map_err(sql)?.collect::<Result<Vec<_>,_>>().map_err(sql)?;
             let next=if messages.len()>query.limit {messages.pop();messages.last().map(|m|m.seq)}else{None};
             Ok(MessagePage{messages,next})
         }))
@@ -363,13 +363,13 @@ impl SessionManager for SqliteStore {
         Box::pin(self.run(move |c| {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
             let is_retry = if let Some(summary) = &change.compaction {
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE message_id=?1 AND session_id=?2)",params![summary.summary.id,id.0],|r|r.get::<_,bool>(0)).map_err(sql)?
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE message_id=?1 AND session_id=?2)",params![summary.summary.id,id.as_str()],|r|r.get::<_,bool>(0)).map_err(sql)?
             } else { false };
             for source in &change.pruned {
-                let n = tx.execute("UPDATE messages SET tool_output_pruned_at=COALESCE(tool_output_pruned_at,?3) WHERE session_id=?1 AND message_id=?2 AND (status='active' OR (?4 AND status='compacted')) AND role='tool'", params![id.0,source,now(),is_retry]).map_err(sql)?;
+                let n = tx.execute("UPDATE messages SET tool_output_pruned_at=COALESCE(tool_output_pruned_at,?3) WHERE session_id=?1 AND message_id=?2 AND (status='active' OR (?4 AND status='compacted')) AND role='tool'", params![id.as_str(),source,now(),is_retry]).map_err(sql)?;
                 if n != 1 { return Err(sql("stale pruning source")); }
             }
-            tx.execute("UPDATE sessions SET updated_at=?2 WHERE session_id=?1",params![id.0,now()]).map_err(sql)?;
+            tx.execute("UPDATE sessions SET updated_at=?2 WHERE session_id=?1",params![id.as_str(),now()]).map_err(sql)?;
             let Some(change) = change.compaction else {
                 tx.commit().map_err(sql)?;
                 return Ok(());
@@ -388,7 +388,7 @@ impl SessionManager for SqliteStore {
                 .map_err(sql)?;
             let retry = existing.is_some();
             if let Some((sid, raw, kind)) = existing {
-                if sid != id.0
+                if sid != id.as_str()
                     || kind != "summary"
                     || raw != stored_json(&change.summary)?
                 {
@@ -399,7 +399,7 @@ impl SessionManager for SqliteStore {
                 let status: Option<String> = tx
                     .query_row(
                         "SELECT status FROM messages WHERE session_id=?1 AND message_id=?2",
-                        params![id.0, source],
+                        params![id.as_str(), source],
                         |r| r.get(0),
                     )
                     .optional()
@@ -489,8 +489,8 @@ pub fn import_json_sessions(root: &Path) -> Result<usize, YourAiError> {
     store.with(move |c| {
         let tx=c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
         for (meta,history) in sessions {
-            let id=SessionId(meta.id);
-            tx.execute("INSERT INTO sessions(session_id,title,model,created_at,updated_at) VALUES(?1,?2,?3,?4,?5)",params![id.0,meta.title,meta.model,meta.created.checked_mul(1000).ok_or_else(||sql("timestamp overflow"))?,meta.updated.checked_mul(1000).ok_or_else(||sql("timestamp overflow"))?]).map_err(sql)?;
+            let id=SessionId::from(meta.id);
+            tx.execute("INSERT INTO sessions(session_id,title,model,created_at,updated_at) VALUES(?1,?2,?3,?4,?5)",params![id.as_str(),meta.title,meta.model,meta.created.checked_mul(1000).ok_or_else(||sql("timestamp overflow"))?,meta.updated.checked_mul(1000).ok_or_else(||sql("timestamp overflow"))?]).map_err(sql)?;
             for (index,message) in history.messages.into_iter().enumerate() {
                 // Instructions are reloaded from host configuration, never imported as chat facts.
                 if message.role==ChatRole::System {continue;}
@@ -502,10 +502,10 @@ pub fn import_json_sessions(root: &Path) -> Result<usize, YourAiError> {
             }
             for (index,u) in history.usage.into_iter().enumerate() {
                 let cv=|v:u64|i64::try_from(v).map_err(sql);
-                tx.execute("INSERT INTO usage_events(usage_id,session_id,model,source,input_tokens,output_tokens,total_tokens,usage_json,created_at) VALUES(?1,?2,?3,'legacy',?4,?5,?6,?7,?8)",params![format!("legacy:{}:{index}",id.0),id.0,meta.model,cv(u.input_tokens)?,cv(u.output_tokens)?,cv(u.total_tokens)?,serde_json::to_string(&u).map_err(sql)?,meta.updated*1000]).map_err(sql)?;
+                tx.execute("INSERT INTO usage_events(usage_id,session_id,model,source,input_tokens,output_tokens,total_tokens,usage_json,created_at) VALUES(?1,?2,?3,'legacy',?4,?5,?6,?7,?8)",params![format!("legacy:{}:{index}",id.as_str()),id.as_str(),meta.model,cv(u.input_tokens)?,cv(u.output_tokens)?,cv(u.total_tokens)?,serde_json::to_string(&u).map_err(sql)?,meta.updated*1000]).map_err(sql)?;
             }
             // Do not import usage.json as well: it aggregates the same calls.
-            tx.execute("UPDATE sessions SET updated_at=?2 WHERE session_id=?1",params![id.0,meta.updated*1000]).map_err(sql)?;
+            tx.execute("UPDATE sessions SET updated_at=?2 WHERE session_id=?1",params![id.as_str(),meta.updated*1000]).map_err(sql)?;
         }
         tx.commit().map_err(sql)?;Ok(())
     })?;

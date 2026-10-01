@@ -28,7 +28,7 @@ impl Backoff {
             .saturating_mul(1u32 << retries.min(31))
             .min(MAX_DELAY);
         let delay = base.saturating_add(base / 4 * jitter_percent.min(100) / 100);
-        if error.model_has_http_headers() {
+        if super::failure::has_http_headers(error) {
             delay.min(MAX_DELAY)
         } else {
             delay.min(self.max_without_headers).min(MAX_DELAY)
@@ -48,13 +48,12 @@ pub(super) fn retry_after(error: &YourAiError) -> Option<Duration> {
             (value * scale).ceil().min(MAX_DELAY.as_millis() as f64) as u64,
         ))
     }
-    if let Some(ms) = error
-        .model_http_header("retry-after-ms")
-        .and_then(|v| duration(v, 1.0))
+    if let Some(ms) =
+        super::failure::http_header(error, "retry-after-ms").and_then(|v| duration(v, 1.0))
     {
         return Some(ms);
     }
-    let value = error.model_http_header("retry-after")?.trim();
+    let value = crate::model::failure::http_header(error, "retry-after")?.trim();
     if let Some(seconds) = duration(value, 1000.0) {
         return Some(seconds);
     }
@@ -93,7 +92,7 @@ mod tests {
     #[test]
     fn nonstream_status_and_retry_after_headers_survive_sdk_errors() {
         let error = http_error("retry-after-ms", "1500");
-        assert_eq!(error.model_http_error(), Some((429, "{}")));
+        assert_eq!(crate::model::failure::http_error(&error), Some((429, "{}")));
         assert_eq!(retry_after(&error), Some(Duration::from_millis(1500)));
         assert_eq!(
             retry_after(&http_error("retry-after", "120")),

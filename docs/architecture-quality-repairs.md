@@ -18,14 +18,14 @@ MemoryContext / SQLite 的分工。整理的单位是职责和不变量，不按
 ## 错误与 Hook 契约
 
 流式失败保留 HTTP status、body、headers，沿 SDK 的结构化错误链传递。
-`YourAiError` 只在一个位置解开 SDK 嵌套；重试提示、错误分类和日志共用该解释。
+harness 的 `model/failure.rs` 只在一个位置解开 `YourAiError` 中的 SDK 嵌套；重试提示、错误分类和日志共用该解释。
 不从显示字符串猜测状态码。流式与 collected 请求都覆盖真实 HTTP 429 / Retry-After 测试。
 
 `ModelProvider::classify_error()` 是分类的插件接口，返回 core 定义的中立 `ModelErrorClass`。
 core 不解释厂商错误码，默认返回 Unclassified；默认 recovery 只映射模型提供的分类。
 GenaiModel 在私有 `model/failure.rs` 中集中解释 OpenAI 兼容错误码和 HTTP 状态，
 已知额度/上下文错误优先于状态码。其他 provider 可按自己的协议分类，甚至完全不使用 HTTP。
-SDK 的 WebStream、WebModelCall、WebAdapterCall 仍经过 core 的统一原始数据提取路径，
+SDK 的 WebStream、WebModelCall、WebAdapterCall 经过 harness 的统一原始数据提取路径，
 提取状态/body/headers 不等于决定恢复策略。
 
 | 位置 | 管理内容 |
@@ -103,6 +103,10 @@ Attempt::Drop 只入队，不写数据库、不等待锁。不同 provider budge
 会话输入 journal 继续保留每次操作的持久化确认，不与诊断日志混用。
 
 ## 验证重点
+
+文件 write/edit 的实际 blocking 任务持有 owned 文件锁，直到读改写和原子替换结束。异步等待者超时或取消不会提前释放锁；取消检查保留在提交前。
+
+命令 Hook 的首行探测与后续前台 stdout 共用 1 MiB 字节预算，stderr 独立限制为 1 MiB。超限返回失败，按既有 failure policy 处理，不解析截断后的结构化回复；读取后续输出时仍排空管道，避免子进程被满管道卡住。
 
 - 主循环、子 Agent、collected 调用继承同一模型时限；显式 turn override 仍生效。
 - 实际流式 HTTP 错误保留 Retry-After，不能只测试人工构造错误。

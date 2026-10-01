@@ -403,7 +403,7 @@ pub(super) fn aggregate_pre_tool_use(
 
     for c in &contributions {
         if let Some(p) = &c.permission {
-            permission = permission.merge(p);
+            permission = permission.merge(p.clone());
         }
         if let Some(ui) = &c.updated_input {
             if !matches!(&c.permission, Some(HookPermission::Deny { .. })) {

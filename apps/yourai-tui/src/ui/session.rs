@@ -353,7 +353,7 @@ impl Controller {
         if let Some(task) = self.retired.take() {
             let _ = task.await;
         }
-        let id = self.runtime.h.host.context().id.0;
+        let id = self.runtime.h.host.context().id.as_str().to_owned();
         Ok((id, self.runtime.close().await?))
     }
 }
@@ -528,7 +528,7 @@ mod tests {
         let (release, waiting) = oneshot::channel();
         controller.operation = Some(tokio::spawn(async move {
             waiting.await.unwrap();
-            Effect::Deleted(SessionId("x".into()), Ok(()))
+            Effect::Deleted(SessionId::from("x"), Ok(()))
         }));
         // A pending session operation defers the reply; the guard notices and
         // the ask survives for retry.
@@ -605,7 +605,7 @@ mod tests {
     async fn failed_async_submission_preserves_new_draft_and_blocks_session_switch_until_settled() {
         let (_dir, mut controller, mut view) = fixture().await;
         let id = controller.harness().host.context().id;
-        let journal = controller.template.root.join(&id.0).join("host.json");
+        let journal = controller.template.root.join(id.as_str()).join("host.json");
         let backup = journal.with_extension("backup");
         std::fs::rename(&journal, &backup).unwrap();
         std::fs::create_dir(&journal).unwrap();

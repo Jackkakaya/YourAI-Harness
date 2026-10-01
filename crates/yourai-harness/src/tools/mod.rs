@@ -22,6 +22,10 @@ pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const SHELL_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
+/// Names of the built-in coding tools; inherited registries skip these to
+/// avoid duplicates with the session's own set.
+pub const BUILTIN_TOOL_NAMES: &[&str] =
+    &["read", "write", "edit", "shell", "webfetch", "websearch"];
 
 pub fn coding_tools(cwd: &Path) -> Result<Vec<Arc<dyn ToolHandler>>, YourAiError> {
     coding_tools_with_output(cwd, None)

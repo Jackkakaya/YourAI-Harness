@@ -85,6 +85,10 @@ pub struct CompactionRequest {
     pub usage: Arc<std::sync::Mutex<Vec<GenaiUsage>>>,
 }
 impl CompactionRequest {
+    /// Compaction may itself need multiple model calls (chunked summarizing);
+    /// the cap keeps a pathological loop from summarizing forever.
+    pub const DEFAULT_MAX_MODEL_CALLS: u32 = 8;
+
     pub fn new(trigger: CompactionTrigger) -> Self {
         Self {
             trigger,
@@ -93,7 +97,7 @@ impl CompactionRequest {
             deadline: None,
             tools: vec![],
             calls: Arc::new(AtomicU32::new(0)),
-            max_model_calls: 8,
+            max_model_calls: Self::DEFAULT_MAX_MODEL_CALLS,
             usage: Arc::new(std::sync::Mutex::new(vec![])),
         }
     }

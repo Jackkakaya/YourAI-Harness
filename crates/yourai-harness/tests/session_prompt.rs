@@ -292,7 +292,7 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
         model: model.clone(),
         hooks: None,
         usage: None,
-        hook_base: BaseInput::new(&id.0, ""),
+        hook_base: BaseInput::new(id.as_str(), ""),
     };
     let before = c.build_request(&[], &execution).unwrap();
     assert!(before.estimated_tokens > 2000);

@@ -286,7 +286,7 @@ impl HandlerConfig {
 #[derive(Debug, Clone)]
 pub struct HookRegistration {
     pub id: String,
-    pub event_name: String,
+    pub event: yourai_core::hooks::HookEventKind,
     pub matcher: CompiledMatcher,
     pub handler: HandlerConfig,
     pub timeout: Option<Duration>,
@@ -302,9 +302,9 @@ pub fn build_registrations(
 ) -> Result<Vec<HookRegistration>, String> {
     let mut regs = Vec::new();
     for (event_name, groups) in &config.hooks {
-        if yourai_core::hooks::HookEventKind::from_name(event_name).is_none() {
+        let Some(event) = yourai_core::hooks::HookEventKind::from_name(event_name) else {
             return Err(format!("unknown hook event: {event_name}"));
-        }
+        };
         for (gi, group) in groups.iter().enumerate() {
             let matcher = match group.matcher.as_deref() {
                 Some(pattern) => CompiledMatcher::try_compile(pattern)?,
@@ -318,7 +318,7 @@ pub fn build_registrations(
                 let once = handler.once();
                 regs.push(HookRegistration {
                     id,
-                    event_name: event_name.clone(),
+                    event,
                     matcher: matcher.clone(),
                     handler: handler.clone(),
                     timeout,
@@ -366,7 +366,7 @@ mod tests {
         let config: HooksConfig = serde_json::from_str(json).unwrap();
         let regs = build_registrations(&config, HookSource::User).unwrap();
         assert_eq!(regs.len(), 1);
-        assert_eq!(regs[0].event_name, "PreToolUse");
+        assert_eq!(regs[0].event, yourai_core::hooks::HookEventKind::PreToolUse);
         assert_eq!(regs[0].id, "user:PreToolUse:0:0");
         assert!(regs[0].matcher.matches("Bash"));
         assert!(!regs[0].matcher.matches("Read"));

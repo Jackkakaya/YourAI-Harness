@@ -196,31 +196,10 @@ impl Draft {
                     // While loading, Enter cannot accidentally submit an incomplete
                     // reference. An empty settled result does not trap submission.
                     if let Some(entry) = self.mention.current().cloned() {
-                        let anchor = self.mention.anchor;
-                        let end = anchor + 1 + self.mention.query.len();
-                        self.cancel_scan();
-                        self.mention.deactivate();
                         if key.code == KeyCode::Tab && entry.is_dir {
-                            self.current
-                                .editor
-                                .replace_range(anchor..end, &format!("@{}/", entry.display));
-                            self.changed();
+                            self.expand_mention_dir(&entry.display);
                         } else {
-                            let marker = format!("@{}", entry.display);
-                            self.current
-                                .editor
-                                .replace_range(anchor..end, &format!("{marker} "));
-                            self.current
-                                .attachments
-                                .retain(|a| a.marker.as_ref() != Some(&marker));
-                            self.current.attachments.push(PendingAttachment {
-                                marker: Some(marker),
-                                attachment: UserAttachment::file(
-                                    entry.path.to_string_lossy(),
-                                    None,
-                                ),
-                            });
-                            self.changed();
+                            self.accept_mention(self.mention.selected);
                         }
                     } else if self.scan.is_none() && key.code == KeyCode::Enter {
                         self.mention.deactivate();
@@ -238,6 +217,40 @@ impl Draft {
             return true;
         }
         false
+    }
+    /// Accept the mention entry at `index`: replace the `@query` with the file
+    /// reference and stage its attachment. Shared by Enter and mouse clicks.
+    pub fn accept_mention(&mut self, index: usize) {
+        let Some(entry) = self.mention.entries.get(index).cloned() else {
+            return;
+        };
+        let anchor = self.mention.anchor;
+        let end = anchor + 1 + self.mention.query.len();
+        self.cancel_scan();
+        self.mention.deactivate();
+        let marker = format!("@{}", entry.display);
+        self.current
+            .editor
+            .replace_range(anchor..end, &format!("{marker} "));
+        self.current
+            .attachments
+            .retain(|a| a.marker.as_ref() != Some(&marker));
+        self.current.attachments.push(PendingAttachment {
+            marker: Some(marker),
+            attachment: UserAttachment::file(entry.path.to_string_lossy(), None),
+        });
+        self.changed();
+    }
+    /// Tab on a directory: extend the reference instead of completing it.
+    fn expand_mention_dir(&mut self, display: &str) {
+        let anchor = self.mention.anchor;
+        let end = anchor + 1 + self.mention.query.len();
+        self.cancel_scan();
+        self.mention.deactivate();
+        self.current
+            .editor
+            .replace_range(anchor..end, &format!("@{display}/"));
+        self.changed();
     }
     pub fn read_image(&mut self) {
         self.current.cancel_image();

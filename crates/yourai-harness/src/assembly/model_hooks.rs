@@ -28,7 +28,7 @@ impl HookModelExecutor for DefaultHookModelExecutor {
             let work = async {
                 let text = if request.agentic {
                     let history = MemoryContext::new(
-                        SessionId(request.invocation.base.session_id.clone()),
+                        SessionId::from(request.invocation.base.session_id.clone()),
                         crate::context::ContextServices {
                             system_prompt: instructions.into(),
                             ..Default::default()
@@ -69,7 +69,7 @@ impl HookModelExecutor for DefaultHookModelExecutor {
                     if let Some(usage) = &self.usage {
                         usage
                             .record_event(
-                                &SessionId(request.invocation.base.session_id.clone()),
+                                &SessionId::from(request.invocation.base.session_id.clone()),
                                 &UsageEvent::new(
                                     Some(self.model.model_iden().into()),
                                     "hook",

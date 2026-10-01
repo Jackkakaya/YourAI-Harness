@@ -353,9 +353,17 @@ async fn real_stream_errors_preserve_status_headers_and_retry_hint() {
                 }
             }
         };
-        assert_eq!(error.model_http_error().unwrap().0, 429);
-        assert!(error.model_has_http_headers());
-        assert_eq!(error.model_http_header("retry-after"), Some("0.25"));
+        assert_eq!(
+            yourai_harness::model::failure::http_error(&error)
+                .unwrap()
+                .0,
+            429
+        );
+        assert!(yourai_harness::model::failure::has_http_headers(&error));
+        assert_eq!(
+            yourai_harness::model::failure::http_header(&error, "retry-after"),
+            Some("0.25")
+        );
         assert_eq!(model.retry_after(&error), Some(Duration::from_millis(250)));
         assert_eq!(model.recovery(&error), ModelRecovery::Retry);
         task.await.unwrap();

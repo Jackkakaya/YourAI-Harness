@@ -49,6 +49,21 @@ pub struct Config {
 fn sessions() -> PathBuf {
     ".yourai/sessions".into()
 }
+fn data_session_dir(legacy_base: &Path) -> PathBuf {
+    let data = match std::env::var_os("XDG_DATA_HOME") {
+        Some(v) if !v.is_empty() && Path::new(&v).is_absolute() => PathBuf::from(v),
+        _ => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(".local/share"),
+            None => return legacy_base.join(".yourai/sessions"),
+        },
+    };
+    let fresh = data.join("yourai/sessions");
+    let legacy = legacy_base.join(".yourai/sessions");
+    if !fresh.exists() && legacy.exists() {
+        return legacy;
+    }
+    fresh
+}
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
@@ -132,9 +147,15 @@ impl Config {
                 path.display()
             )
         })?;
-        // Never include source or serde values in errors: configuration can contain credentials.
-        let raw: Value = serde_json::from_str(&text)
-            .map_err(|_| "Invalid JSON config; see yourai.example.json")?;
+        // Never include config values in errors: configuration can contain credentials.
+        // Field names and positions are not secrets, so they are safe to surface.
+        let raw: Value = serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "Invalid JSON config at line {}, column {}; see yourai.example.json",
+                e.line(),
+                e.column()
+            )
+        })?;
         if let Some(context) = raw.get("context") {
             for key in ["context_window", "input_limit", "output_reserve"] {
                 if context.get(key).is_some() {
@@ -142,9 +163,20 @@ impl Config {
                 }
             }
         }
-        let mut config: Self = serde_json::from_value(raw)
-            .map_err(|_| "Invalid config fields; see yourai.example.json")?;
+        let mut config: Self = serde_json::from_value(raw).map_err(|e| {
+            let message = e.to_string();
+            if message.starts_with("unknown field") || message.starts_with("missing field") {
+                format!("Invalid config: {message}; see yourai.example.json")
+            } else {
+                "Invalid config value type; see yourai.example.json".into()
+            }
+        })?;
         let base = path.canonicalize()?.parent().unwrap().to_owned();
+        // Default session storage belongs in the XDG data dir, not next to
+        // the config; keep the legacy location when it already has data.
+        if config.session_dir == sessions() {
+            config.session_dir = data_session_dir(&base);
+        }
         if config.session_dir.is_relative() {
             config.session_dir = base.join(&config.session_dir);
         }

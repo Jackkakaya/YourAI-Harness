@@ -302,7 +302,7 @@ async fn cancelling_hook_dispatch_cancels_provider_callback_token() {
         .await
         .unwrap();
     let event = HookInvocation::new(
-        BaseInput::new(h.host.context().id.0, ""),
+        BaseInput::new(h.host.context().id.as_str(), ""),
         HookEvent::SessionStart {
             source: "test-timeout".into(),
             model: None,

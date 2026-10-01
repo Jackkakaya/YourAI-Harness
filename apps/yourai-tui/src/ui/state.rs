@@ -175,48 +175,6 @@ pub struct SessionPickerState {
     pub selected: usize,
 }
 
-pub fn clean(text: &str) -> String {
-    // Strip terminal controls, including ANSI CSI/OSC sequences, from untrusted output.
-    let mut result = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => match chars.next() {
-                Some('[') => {
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    while let Some(c) = chars.next() {
-                        if c == '\u{7}' {
-                            break;
-                        }
-                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                result.push('\n');
-            }
-            '\t' => result.push_str("    "),
-            '\n' => result.push(c),
-            _ if !c.is_control() => result.push(c),
-            _ => {}
-        }
-    }
-    result
-}
-
 #[derive(Default)]
 pub struct View {
     pub session: SessionView,
@@ -791,6 +749,16 @@ impl View {
                 continue;
             }
             let m = row.message;
+            // Reasoning arrives before the answer text in live streaming; keep
+            // restored history in the same order.
+            for part in m.content.parts() {
+                if let ContentPart::ReasoningContent(reasoning) = part {
+                    self.push(Item::Text {
+                        role: Role::Thinking,
+                        text: bounded(reasoning),
+                    });
+                }
+            }
             let text = m.content.texts().join("\n");
             if !text.is_empty() {
                 let role = match m.role {
@@ -805,14 +773,6 @@ impl View {
                     role,
                     text: bounded(&text),
                 });
-            }
-            for part in m.content.parts() {
-                if let ContentPart::ReasoningContent(reasoning) = part {
-                    self.push(Item::Text {
-                        role: Role::Thinking,
-                        text: bounded(reasoning),
-                    });
-                }
             }
             for c in m.content.tool_calls() {
                 self.event(Out::ToolStarted {

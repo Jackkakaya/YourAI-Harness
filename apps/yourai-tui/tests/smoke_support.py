@@ -289,6 +289,7 @@ class Probe:
                     struct.pack('HHHH', self.rows, self.cols, 0, 0))
         env = _strip_env(self.env)
         env['TERM'] = self.term
+        env['XDG_DATA_HOME'] = str(Path(tmp) / 'xdg-data')
         self.child = subprocess.Popen(
             [str(self.binary), '--config', str(self.config)],
             cwd=self.cwd or tmp, stdin=slave, stdout=slave, stderr=slave, env=env)
@@ -374,6 +375,7 @@ class MuxProbe:
                     struct.pack('HHHH', self.rows, self.cols, 0, 0))
         env = _strip_env(self.env)
         env['TERM'] = 'xterm-256color'
+        env['XDG_DATA_HOME'] = str(Path(tmp) / 'xdg-data')
         # pane(tmp, port) -> command list, or (command list, extra client env)
         # that also reaches the pane via tmux's inherited environment.
         built = self.pane(tmp, self.server.server_port)

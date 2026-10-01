@@ -68,7 +68,7 @@ enum RegisteredHandler {
 #[derive(Clone)]
 struct RegisteredHook {
     id: String,
-    event_name: String,
+    event: yourai_core::hooks::HookEventKind,
     matcher: crate::hooks::matcher::CompiledMatcher,
     handler: RegisteredHandler,
     timeout: Option<Duration>,
@@ -85,7 +85,7 @@ impl From<HookRegistration> for RegisteredHook {
         let status_message = value.handler.status_message().map(ToOwned::to_owned);
         Self {
             id: value.id,
-            event_name: value.event_name,
+            event: value.event,
             matcher: value.matcher,
             handler: RegisteredHandler::Config(value.handler),
             timeout: value.timeout,
@@ -151,10 +151,7 @@ impl ConcreteHookRuntime {
         config: &HooksConfig,
         source: HookSource,
     ) -> Result<(), YourAiError> {
-        for (event_name, groups) in &config.hooks {
-            if yourai_core::hooks::HookEventKind::from_name(event_name).is_none() {
-                return Err(ErrorKind::Config(format!("unknown hook event: {event_name}")).into());
-            }
+        for groups in config.hooks.values() {
             for group in groups {
                 for handler in &group.hooks {
                     handler.validate().map_err(ErrorKind::Config)?;
@@ -203,11 +200,14 @@ impl ConcreteHookRuntime {
 
         let matched: Vec<RegisteredHook> = {
             let guard = self.registrations.read().await;
-            let mut seen_config_handlers: Vec<(HookSource, HandlerConfig)> = Vec::new();
+            // Config-sourced handlers dedup by (source, serialized config);
+            // the first occurrence wins, matching registration semantics.
+            let mut seen_config_handlers: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
             guard
                 .iter()
                 .filter(|reg| {
-                    reg.event_name == event_name
+                    reg.event == event
                         && condition_matches(reg.if_condition.as_deref(), invocation)
                         && match match_query {
                             Some(q) => reg.matcher.matches(q),
@@ -215,17 +215,10 @@ impl ConcreteHookRuntime {
                         }
                 })
                 .filter(|reg| match &reg.handler {
-                    RegisteredHandler::Config(config) => {
-                        if seen_config_handlers
-                            .iter()
-                            .any(|(source, seen)| source == &reg.source && seen == config)
-                        {
-                            false
-                        } else {
-                            seen_config_handlers.push((reg.source.clone(), config.clone()));
-                            true
-                        }
-                    }
+                    RegisteredHandler::Config(config) => seen_config_handlers.insert((
+                        reg.source.as_str().to_string(),
+                        serde_json::to_string(config).unwrap_or_default(),
+                    )),
                     RegisteredHandler::Native(_) => true,
                 })
                 .cloned()
@@ -431,7 +424,7 @@ impl HookRegistry for ConcreteHookRuntime {
         Box::pin(async move {
             let reg = RegisteredHook {
                 id: registration.id,
-                event_name: registration.event.as_str().to_string(),
+                event: registration.event,
                 matcher: match registration.matcher.as_deref() {
                     Some(pattern) => crate::hooks::matcher::CompiledMatcher::try_compile(pattern)
                         .map_err(ErrorKind::Config)?,
@@ -558,9 +551,7 @@ fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
         }
     }
     regex.push('$');
-    regex::Regex::new(&regex)
-        .map(|compiled| compiled.is_match(candidate))
-        .unwrap_or(false)
+    crate::hooks::matcher::cached_regex(&regex).is_some_and(|re| re.is_match(candidate))
 }
 
 // ── Parallel execution ──────────────────────────────────────────────
@@ -611,7 +602,7 @@ async fn run_handlers_parallel(
                             session_id: invocation.base.session_id.clone(),
                             tasks: background_tasks.clone(),
                             hook_id: reg.id.clone(),
-                            event_name: reg.event_name.clone(),
+                            event_name: reg.event.as_str().to_string(),
                             rewake: config.async_rewake(),
                             timeout: reg.timeout,
                             force_background: config.is_async(),
@@ -731,7 +722,7 @@ mod tests {
     ) -> HookRegistration {
         HookRegistration {
             id: id.to_string(),
-            event_name: event_name.to_string(),
+            event: yourai_core::hooks::HookEventKind::from_name(event_name).unwrap(),
             matcher,
             handler: crate::hooks::config::HandlerConfig::Command {
                 command: command.to_string(),

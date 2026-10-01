@@ -13,9 +13,49 @@ use yourai_harness::{Harness, HarnessConfig, SessionCatalog};
 
 #[tokio::main]
 async fn main() {
+    // Both hooks must precede any terminal state change: a panic or an
+    // external signal would otherwise leave the terminal in raw mode on the
+    // alternate screen.
+    install_panic_hook();
+    watch_termination_signals();
     if let Err(e) = run().await {
         eprintln!("YourAI: {e}");
         std::process::exit(1);
+    }
+}
+
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        terminal::restore();
+        previous(info);
+    }));
+}
+
+/// SIGTERM/SIGHUP/SIGQUIT (SSH drop, tmux kill-pane, logout) terminate the
+/// process without running `Drop`, so restore the terminal explicitly first.
+fn watch_termination_signals() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+            return;
+        };
+        let Ok(mut hangup) = signal(SignalKind::hangup()) else {
+            return;
+        };
+        let Ok(mut quit) = signal(SignalKind::quit()) else {
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = hangup.recv() => {}
+                _ = quit.recv() => {}
+            }
+            terminal::restore();
+            std::process::exit(0);
+        });
     }
 }
 async fn run() -> Result<(), Error> {
@@ -41,12 +81,12 @@ async fn run() -> Result<(), Error> {
                 // token if it looks like an ID.
                 let next_is_flag = args.peek().is_some_and(|v| v.starts_with("--"));
                 if next_is_flag {
-                    resume = Some(SessionId(String::new()));
+                    resume = Some(SessionId::from(String::new()));
                 } else {
                     // Either no more args (bare --resume at the end) or a real ID.
                     resume = match args.next() {
-                        Some(v) => Some(SessionId(v)),
-                        None => Some(SessionId(String::new())),
+                        Some(v) => Some(SessionId::from(v)),
+                        None => Some(SessionId::from(String::new())),
                     };
                 }
             }
@@ -101,7 +141,7 @@ async fn run() -> Result<(), Error> {
     }
     let choices = crate::models::model_choices(&config);
     // Bare `--resume` opens the launcher; Esc there falls through to a fresh session.
-    if resume.as_ref().is_some_and(|SessionId(id)| id.is_empty()) {
+    if resume.as_ref().is_some_and(|id| id.as_str().is_empty()) {
         let catalog = SessionCatalog::new(&config.session_dir)?;
         match launcher::pick(&catalog).await? {
             launcher::Choice::Resume(picked) => resume = Some(picked),

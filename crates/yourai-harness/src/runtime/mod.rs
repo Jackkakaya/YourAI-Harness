@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
     fs::{File, OpenOptions},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -39,6 +39,32 @@ impl Default for HostConfig {
             instruction_paths: vec![],
             workspace_enabled: false,
         }
+    }
+}
+
+/// Workspace file-watcher poll interval.
+const WATCH_INTERVAL: Duration = Duration::from_millis(250);
+/// Follow-up injected to make an idle host consume a pending runtime event.
+const RUNTIME_EVENT_PROMPT: &str = "Process the pending runtime event.";
+
+/// Acquire execution ownership before assembly can mutate session state.
+/// The lease is transferred into the host without releasing or reacquiring it.
+pub(crate) struct SessionLease {
+    pub(crate) dir: PathBuf,
+    lock: File,
+}
+impl SessionLease {
+    pub(crate) fn acquire(dir: PathBuf) -> Result<Self, YourAiError> {
+        std::fs::create_dir_all(&dir).map_err(|e| error("host", e))?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("host.lock"))
+            .map_err(|e| error("host", e))?;
+        lock.try_lock_exclusive().map_err(|e| error("host", e))?;
+        Ok(Self { dir, lock })
     }
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -142,16 +168,18 @@ impl SessionHost {
         config: HostConfig,
         source: &str,
     ) -> Result<Arc<Self>, YourAiError> {
-        let dir = dir.into();
-        std::fs::create_dir_all(&dir).map_err(|e| error("host", e))?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(dir.join("host.lock"))
-            .map_err(|e| error("host", e))?;
-        lock.try_lock_exclusive().map_err(|e| error("host", e))?;
+        let lease = SessionLease::acquire(dir.into())?;
+        Self::open_owned(lease, context, agent, config, source).await
+    }
+
+    pub(crate) async fn open_owned(
+        lease: SessionLease,
+        context: SessionContext,
+        agent: Arc<Agent>,
+        config: HostConfig,
+        source: &str,
+    ) -> Result<Arc<Self>, YourAiError> {
+        let SessionLease { dir, lock } = lease;
         let history = agent.ctx().context_manager()?;
         if history.session_id() != &context.id {
             return Err(error("host", "history/session identity mismatch"));
@@ -240,8 +268,7 @@ impl SessionHost {
             }
         }
         if !host.watch_paths().is_empty() {
-            host.workspace()?
-                .start_watching(Duration::from_millis(250))?;
+            host.workspace()?.start_watching(WATCH_INTERVAL)?;
         }
         Ok(host)
     }
@@ -282,8 +309,7 @@ impl SessionHost {
         journal.commit()?;
         drop(journal);
         if let Some(host) = self.self_ref.get().and_then(std::sync::Weak::upgrade) {
-            host.workspace()?
-                .start_watching(Duration::from_millis(250))?;
+            host.workspace()?.start_watching(WATCH_INTERVAL)?;
         }
         Ok(())
     }
@@ -300,9 +326,7 @@ impl SessionHost {
             && self.status() == SessionStatus::Idle
             && journal.queue.is_empty()
         {
-            journal
-                .queue
-                .push_back(In::follow_up("Process the pending runtime event."));
+            journal.queue.push_back(In::follow_up(RUNTIME_EVENT_PROMPT));
         }
         journal.commit()?;
         self.events.push(event);
@@ -317,7 +341,7 @@ impl SessionHost {
             return Ok(HookDispatchResult::empty(event.kind()));
         };
         let c = self.context();
-        let mut base = BaseInput::new(&c.id.0, c.cwd.to_string_lossy());
+        let mut base = BaseInput::new(c.id.as_str(), c.cwd.to_string_lossy());
         base.transcript_path = c
             .transcript_path
             .map(|p| p.to_string_lossy().into_owned())
@@ -379,7 +403,7 @@ impl SessionHost {
                 let event = tokio::select! {_=cancel.cancelled()=>break,e=rx.recv()=>e};
                 let Some(host) = weak.upgrade() else { break };
                 match event {
-                    Ok(e) if e.session_id == host.context().id.0 => {
+                    Ok(e) if e.session_id == host.context().id.as_str() => {
                         let wake = e.rewake && e.exit_code == 2;
                         let text = if e.stderr.is_empty() {
                             e.stdout
@@ -705,6 +729,8 @@ impl SessionRuntime for SessionHost {
                 } else {
                     handle.join().await
                 };
+                let uncertain = timed_out
+                    || matches!(&result, Err(failure) if matches!(failure.error.as_ref(), YourAiError::Error(ErrorKind::LoopTerminated(_))));
                 let settled = host
                     .blocking(move |host| {
                         let mut journal = host.journal();
@@ -712,27 +738,31 @@ impl SessionRuntime for SessionHost {
                             Ok(o) => o,
                             Err(e) => &mut e.output,
                         };
-                        for input in std::mem::take(&mut output.pending).into_iter().rev() {
-                            if matches!(input, In::UserText { .. }) {
-                                journal.queue.push_front(input);
+                        let pending = std::mem::take(&mut output.pending);
+                        if !uncertain {
+                            for input in pending.into_iter().rev() {
+                                if matches!(input, In::UserText { .. }) {
+                                    journal.queue.push_front(input);
+                                }
                             }
                         }
-                        if timed_out {
+                        // On force-drop every submitted active input is already
+                        // in the durable ledger, including unread inbox entries.
+                        // Keep it once for inspection; never replay uncertain work.
+                        if uncertain {
                             let uncertain = std::mem::take(&mut journal.active);
                             journal.interrupted.extend(uncertain);
                         }
                         journal.active.clear();
                         journal.last_error = result.as_ref().err().map(ToString::to_string);
-                        if timed_out {
+                        if uncertain {
                             host.closing.cancel();
                         }
                         if host.events.pending().iter().any(|e| e.wake)
                             && journal.queue.is_empty()
                             && host.config.allow_background_wake
                         {
-                            journal
-                                .queue
-                                .push_back(In::follow_up("Process the pending runtime event."));
+                            journal.queue.push_back(In::follow_up(RUNTIME_EVENT_PROMPT));
                         }
                         if let Err(e) = journal.commit() {
                             journal.retain_for_recovery(&e);
@@ -929,7 +959,7 @@ impl SessionHost {
             .map_err(|_| error("hook", "SessionEnd cleanup deadline exceeded"))
             .and_then(|r| r);
             if let Some(hooks) = self.agent.ctx().try_hooks() {
-                hooks.shutdown_session(&self.context().id.0).await?;
+                hooks.shutdown_session(self.context().id.as_str()).await?;
             }
             self.blocking(move |host| {
                 let _gate = gate;
@@ -982,5 +1012,88 @@ impl Drop for SessionHost {
         for task in self.background.get_mut().unwrap().drain(..) {
             task.abort();
         }
+    }
+}
+
+// Public convenience entry points share the same concrete assembly code.
+impl SessionHost {
+    pub async fn create(
+        root: &Path,
+        cwd: PathBuf,
+        model: Arc<dyn ModelProvider>,
+        hooks: Option<Arc<dyn HookRuntime>>,
+        tools: Option<Arc<dyn ToolRegistry>>,
+    ) -> Result<Arc<Self>, YourAiError> {
+        let catalog = Arc::new(crate::SessionCatalog::new(root)?);
+        let prompt = crate::context::prompt::prepare(
+            &crate::PromptConfig::default(),
+            &cwd,
+            None,
+            &[],
+            None,
+            None,
+            &ContextPolicy::default(),
+            &CancellationToken::new(),
+        )
+        .await?;
+        let meta = catalog.create_session(&prompt.system).await?;
+        Self::restore(
+            root,
+            meta.id,
+            cwd,
+            model,
+            hooks,
+            tools,
+            ContextPolicy::default(),
+            "startup",
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn restore(
+        root: &Path,
+        id: SessionId,
+        cwd: PathBuf,
+        model: Arc<dyn ModelProvider>,
+        hooks: Option<Arc<dyn HookRuntime>>,
+        tools: Option<Arc<dyn ToolRegistry>>,
+        policy: ContextPolicy,
+        source: &str,
+    ) -> Result<Arc<Self>, YourAiError> {
+        let catalog = Arc::new(crate::SessionCatalog::new(root)?);
+        let lease = SessionLease::acquire(catalog.directory(&id)?)?;
+        let mut meta = catalog.load_session(&id).await?;
+        if meta.system_prompt.is_none() {
+            let prompt = crate::context::prompt::prepare(
+                &crate::PromptConfig::default(),
+                &cwd,
+                None,
+                &[],
+                None,
+                None,
+                &policy,
+                &CancellationToken::new(),
+            )
+            .await?;
+            meta.system_prompt = Some(catalog.initialize_system(&id, &prompt.system).await?);
+        }
+        meta.model = Some(model.model_iden().into());
+        catalog.save_session(&meta).await?;
+        let usage = Arc::new(crate::storage::LocalUsage((*catalog.store).clone()));
+        let (agent, _) = crate::assembly::assemble(
+            &catalog,
+            &id,
+            &cwd,
+            false,
+            model,
+            hooks,
+            Some(usage),
+            tools,
+            policy,
+        )
+        .await?;
+        let mut context = SessionContext::new(id, cwd);
+        context.transcript_path = Some(crate::SqliteStore::path(root));
+        Self::open_owned(lease, context, agent, HostConfig::default(), source).await
     }
 }

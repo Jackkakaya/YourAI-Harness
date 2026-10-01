@@ -198,143 +198,50 @@ pub enum HookEvent {
 }
 
 /// Claude Hook 事件判别器。与 wire 字段 `hook_event_name` 一一对应。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum HookEventKind {
-    PreToolUse,
-    PostToolUse,
-    PostToolUseFailure,
-    PermissionRequest,
-    PermissionDenied,
-    Notification,
-    UserPromptSubmit,
-    SessionStart,
-    SessionEnd,
-    TurnCompleted,
-    Stop,
-    StopFailure,
-    SubagentStart,
-    SubagentStop,
-    PreCompact,
-    PostCompact,
-    Setup,
-    TeammateIdle,
-    TaskCreated,
-    TaskCompleted,
-    Elicitation,
-    ElicitationResult,
-    ConfigChange,
-    InstructionsLoaded,
-    WorktreeCreate,
-    WorktreeRemove,
-    CwdChanged,
+/// 全部事件一处声明：variant 名即 wire 字符串，ALL / as_str / from_name /
+/// `HookEvent::kind` 都从这里生成——新增事件只改这份清单。
+macro_rules! hook_event_kinds {
+    ( $( $variant:ident ),* $(,)? ) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[non_exhaustive]
+        pub enum HookEventKind {
+            $( $variant, )*
+        }
+
+        impl HookEventKind {
+            pub const ALL: &'static [Self] = &[ $( Self::$variant, )* ];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => stringify!($variant), )*
+                }
+            }
+
+            pub fn from_name(name: &str) -> Option<Self> {
+                Self::ALL.iter().copied().find(|event| event.as_str() == name)
+            }
+        }
+
+        impl HookEvent {
+            pub fn kind(&self) -> HookEventKind {
+                match self {
+                    $( HookEvent::$variant { .. } => HookEventKind::$variant, )*
+                }
+            }
+        }
+    };
+}
+
+hook_event_kinds! {
+    PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, PermissionDenied,
+    Notification, UserPromptSubmit, SessionStart, SessionEnd, TurnCompleted, Stop,
+    StopFailure, SubagentStart, SubagentStop, PreCompact, PostCompact, Setup,
+    TeammateIdle, TaskCreated, TaskCompleted, Elicitation, ElicitationResult,
+    ConfigChange, InstructionsLoaded, WorktreeCreate, WorktreeRemove, CwdChanged,
     FileChanged,
 }
 
-impl HookEventKind {
-    pub const ALL: [Self; 28] = [
-        Self::PreToolUse,
-        Self::PostToolUse,
-        Self::PostToolUseFailure,
-        Self::PermissionRequest,
-        Self::PermissionDenied,
-        Self::Notification,
-        Self::UserPromptSubmit,
-        Self::SessionStart,
-        Self::SessionEnd,
-        Self::TurnCompleted,
-        Self::Stop,
-        Self::StopFailure,
-        Self::SubagentStart,
-        Self::SubagentStop,
-        Self::PreCompact,
-        Self::PostCompact,
-        Self::Setup,
-        Self::TeammateIdle,
-        Self::TaskCreated,
-        Self::TaskCompleted,
-        Self::Elicitation,
-        Self::ElicitationResult,
-        Self::ConfigChange,
-        Self::InstructionsLoaded,
-        Self::WorktreeCreate,
-        Self::WorktreeRemove,
-        Self::CwdChanged,
-        Self::FileChanged,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::PreToolUse => "PreToolUse",
-            Self::PostToolUse => "PostToolUse",
-            Self::PostToolUseFailure => "PostToolUseFailure",
-            Self::PermissionRequest => "PermissionRequest",
-            Self::PermissionDenied => "PermissionDenied",
-            Self::Notification => "Notification",
-            Self::UserPromptSubmit => "UserPromptSubmit",
-            Self::SessionStart => "SessionStart",
-            Self::SessionEnd => "SessionEnd",
-            Self::TurnCompleted => "TurnCompleted",
-            Self::Stop => "Stop",
-            Self::StopFailure => "StopFailure",
-            Self::SubagentStart => "SubagentStart",
-            Self::SubagentStop => "SubagentStop",
-            Self::PreCompact => "PreCompact",
-            Self::PostCompact => "PostCompact",
-            Self::Setup => "Setup",
-            Self::TeammateIdle => "TeammateIdle",
-            Self::TaskCreated => "TaskCreated",
-            Self::TaskCompleted => "TaskCompleted",
-            Self::Elicitation => "Elicitation",
-            Self::ElicitationResult => "ElicitationResult",
-            Self::ConfigChange => "ConfigChange",
-            Self::InstructionsLoaded => "InstructionsLoaded",
-            Self::WorktreeCreate => "WorktreeCreate",
-            Self::WorktreeRemove => "WorktreeRemove",
-            Self::CwdChanged => "CwdChanged",
-            Self::FileChanged => "FileChanged",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|event| event.as_str() == name)
-    }
-}
-
 impl HookEvent {
-    pub fn kind(&self) -> HookEventKind {
-        match self {
-            HookEvent::PreToolUse { .. } => HookEventKind::PreToolUse,
-            HookEvent::PostToolUse { .. } => HookEventKind::PostToolUse,
-            HookEvent::PostToolUseFailure { .. } => HookEventKind::PostToolUseFailure,
-            HookEvent::PermissionRequest { .. } => HookEventKind::PermissionRequest,
-            HookEvent::PermissionDenied { .. } => HookEventKind::PermissionDenied,
-            HookEvent::Notification { .. } => HookEventKind::Notification,
-            HookEvent::UserPromptSubmit { .. } => HookEventKind::UserPromptSubmit,
-            HookEvent::SessionStart { .. } => HookEventKind::SessionStart,
-            HookEvent::SessionEnd { .. } => HookEventKind::SessionEnd,
-            HookEvent::TurnCompleted { .. } => HookEventKind::TurnCompleted,
-            HookEvent::Stop { .. } => HookEventKind::Stop,
-            HookEvent::StopFailure { .. } => HookEventKind::StopFailure,
-            HookEvent::SubagentStart { .. } => HookEventKind::SubagentStart,
-            HookEvent::SubagentStop { .. } => HookEventKind::SubagentStop,
-            HookEvent::PreCompact { .. } => HookEventKind::PreCompact,
-            HookEvent::PostCompact { .. } => HookEventKind::PostCompact,
-            HookEvent::Setup { .. } => HookEventKind::Setup,
-            HookEvent::TeammateIdle { .. } => HookEventKind::TeammateIdle,
-            HookEvent::TaskCreated { .. } => HookEventKind::TaskCreated,
-            HookEvent::TaskCompleted { .. } => HookEventKind::TaskCompleted,
-            HookEvent::Elicitation { .. } => HookEventKind::Elicitation,
-            HookEvent::ElicitationResult { .. } => HookEventKind::ElicitationResult,
-            HookEvent::ConfigChange { .. } => HookEventKind::ConfigChange,
-            HookEvent::InstructionsLoaded { .. } => HookEventKind::InstructionsLoaded,
-            HookEvent::WorktreeCreate { .. } => HookEventKind::WorktreeCreate,
-            HookEvent::WorktreeRemove { .. } => HookEventKind::WorktreeRemove,
-            HookEvent::CwdChanged { .. } => HookEventKind::CwdChanged,
-            HookEvent::FileChanged { .. } => HookEventKind::FileChanged,
-        }
-    }
-
     /// 返回 Claude 协议中的事件名字符串（`hook_event_name` 字段值）。
     pub fn event_name(&self) -> &'static str {
         self.kind().as_str()
@@ -466,19 +373,20 @@ pub enum HookPermission {
 }
 
 impl HookPermission {
-    /// 聚合优先级：`deny > ask > allow`。
-    pub fn merge(self, other: &HookPermission) -> HookPermission {
-        match (&self, other) {
-            (HookPermission::Deny { .. }, HookPermission::Deny { .. }) => other.clone(),
-            (HookPermission::Deny { .. }, _) => self.clone(),
-            (_, HookPermission::Deny { .. }) => other.clone(),
-            (HookPermission::Ask { .. }, HookPermission::Ask { .. }) => other.clone(),
-            (HookPermission::Ask { .. }, _) => self.clone(),
-            (_, HookPermission::Ask { .. }) => other.clone(),
-            (HookPermission::Allow { .. }, HookPermission::Allow { .. }) => other.clone(),
-            (HookPermission::Allow { .. }, _) => self.clone(),
-            (_, HookPermission::Allow { .. }) => other.clone(),
-            (HookPermission::Pass, HookPermission::Pass) => HookPermission::Pass,
+    /// 聚合优先级：`deny > ask > allow`。Later hooks win within a level.
+    pub fn merge(self, other: HookPermission) -> HookPermission {
+        use HookPermission::*;
+        match (self, other) {
+            (Deny { .. }, other @ Deny { .. }) => other,
+            (deny @ Deny { .. }, _) => deny,
+            (_, other @ Deny { .. }) => other,
+            (Ask { .. }, other @ Ask { .. }) => other,
+            (ask @ Ask { .. }, _) => ask,
+            (_, other @ Ask { .. }) => other,
+            (Allow { .. }, other @ Allow { .. }) => other,
+            (allow @ Allow { .. }, _) => allow,
+            (_, other @ Allow { .. }) => other,
+            (Pass, Pass) => Pass,
         }
     }
 }
@@ -868,7 +776,8 @@ mod tests {
     fn claude_event_discriminators_are_complete_and_unique() {
         assert_eq!(HookEventKind::ALL.len(), 28);
         let names: std::collections::HashSet<_> = HookEventKind::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .map(HookEventKind::as_str)
             .collect();
         assert_eq!(names.len(), 28);
@@ -882,7 +791,7 @@ mod result_contract_tests {
     use super::*;
     #[test]
     fn every_event_checks_both_discriminator_and_outcome() {
-        for event in HookEventKind::ALL {
+        for &event in HookEventKind::ALL {
             let mut result = HookDispatchResult::empty(event);
             result.validate_for(event).unwrap();
             result.outcome = if event == HookEventKind::PreToolUse {

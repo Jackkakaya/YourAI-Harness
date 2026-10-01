@@ -7,6 +7,7 @@ use std::{
     sync::{Mutex, OnceLock, Weak},
 };
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 
 type FileLocks = Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>;
 fn file_lock(path: &Path) -> Arc<AsyncMutex<()>> {
@@ -20,6 +21,48 @@ fn file_lock(path: &Path) -> Arc<AsyncMutex<()>> {
     locks.insert(path.into(), Arc::downgrade(&lock));
     lock
 }
+
+/// File I/O and per-line processing must not block the async executor
+/// (multi-session starvation); run them on the blocking pool.
+async fn blocking<T>(
+    work: impl FnOnce() -> Result<T, YourAiError> + Send + 'static,
+) -> Result<T, YourAiError>
+where
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(e) => Err(ErrorKind::Provider {
+            name: "files",
+            message: format!("blocking task failed: {e}"),
+        }
+        .into()),
+    }
+}
+
+/// The blocking mutation owns its lock until the actual I/O finishes, even
+/// when a timeout or cancellation drops the async waiter.
+async fn mutate<T: Send + 'static>(
+    path: PathBuf,
+    cancel: CancellationToken,
+    work: impl FnOnce() -> Result<T, YourAiError> + Send + 'static,
+) -> Result<T, YourAiError> {
+    let lock = file_lock(&path);
+    let guard = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(AbortReason::Cancelled.into()),
+        guard = lock.lock_owned() => guard,
+    };
+    blocking(move || {
+        let _guard = guard;
+        if cancel.is_cancelled() {
+            return Err(AbortReason::Cancelled.into());
+        }
+        work()
+    })
+    .await
+}
+
 fn text(path: &Path, name: &str) -> Result<String, YourAiError> {
     let meta = fs::metadata(path).map_err(|e| error(name, e))?;
     if !meta.is_file() {
@@ -59,11 +102,18 @@ fn target(cwd: &Path, raw: &str, name: &str) -> Result<PathBuf, YourAiError> {
     }
     resolve_path(cwd, &raw).map_err(|e| error(name, e))
 }
-fn save(path: &Path, content: &str, tc: &ToolContext<'_>, name: &str) -> Result<bool, YourAiError> {
+fn save(
+    path: &Path,
+    content: &str,
+    cancel: &CancellationToken,
+    name: &str,
+) -> Result<bool, YourAiError> {
     if content.len() > MAX_FILE_BYTES {
         return Err(error(name, "content exceeds 16 MiB"));
     }
-    check_cancel(tc)?;
+    if cancel.is_cancelled() {
+        return Err(AbortReason::Cancelled.into());
+    }
     let previous = match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() || !m.is_file() => {
             return Err(error(name, "target changed or is not a regular file"))
@@ -85,7 +135,9 @@ fn save(path: &Path, content: &str, tc: &ToolContext<'_>, name: &str) -> Result<
             .map_err(|e| error(name, e))?;
     }
     tmp.as_file().sync_all().map_err(|e| error(name, e))?;
-    check_cancel(tc)?;
+    if cancel.is_cancelled() {
+        return Err(AbortReason::Cancelled.into());
+    }
     tmp.persist(path).map_err(|e| error(name, e))?;
     Ok(previous.is_none())
 }
@@ -160,40 +212,54 @@ impl ToolHandler for Read {
             if i.path.is_empty() || i.offset == 0 || !(1..=2000).contains(&i.limit) {
                 return Err(error(self.name(), "invalid path, offset or limit"));
             }
+            let cwd = self.cwd.clone();
+            let raw = i.path.clone();
+            let tool = self.name().to_owned();
             let path =
-                resolve_path(&self.cwd, Path::new(&i.path)).map_err(|e| error(self.name(), e))?;
-            let path_str = utf8_path(&path, self.name())?;
+                blocking(move || resolve_path(&cwd, Path::new(&raw)).map_err(|e| error(&tool, e)))
+                    .await?;
+            let path_str = utf8_path(&path, self.name())?.to_owned();
             file_permission(&tc, &path, false, self.name()).await?;
-            let content = text(&path, self.name())?;
-            let lines: Vec<_> = content.split_inclusive('\n').collect();
-            if i.offset > lines.len() && !(lines.is_empty() && i.offset == 1) {
-                return Err(error(self.name(), "offset is past end of file"));
-            }
-            let start = i.offset - 1;
-            let mut end = start;
-            let mut body = String::new();
-            let mut clipped = false;
-            for line in lines.iter().skip(start).take(i.limit) {
-                let (text, newline) = line
-                    .strip_suffix('\n')
-                    .map_or((*line, ""), |text| (text, "\n"));
-                let cut = text.char_indices().nth(2000).map(|(index, _)| index);
-                let text = match cut {
-                    Some(index) => format!("{}... (line truncated to 2000 chars)", &text[..index]),
-                    None => text.to_owned(),
-                };
-                let numbered = format!("{}|{}{}", end + 1, text, newline);
-                if body.len() + numbered.len() > super::output::MAX_BYTES {
-                    break;
+            let tool = self.name().to_owned();
+            let path = path.clone();
+            let cancel = tc.cancel.clone();
+            let offset = i.offset;
+            let limit = i.limit;
+            blocking(move || {
+                let content = text(&path, &tool)?;
+                let lines: Vec<_> = content.split_inclusive('\n').collect();
+                if offset > lines.len() && !(lines.is_empty() && offset == 1) {
+                    return Err(error(&tool, "offset is past end of file"));
                 }
-                clipped |= cut.is_some();
-                body.push_str(&numbered);
-                end += 1;
-            }
-            check_cancel(&tc)?;
-            Ok(
-                json!({"ok":true,"path":path_str,"offset":i.offset,"next_offset":(end<lines.len()).then_some(end+1),"content":body,"lines_clipped":clipped}),
-            )
+                let start = offset - 1;
+                let mut end = start;
+                let mut body = String::new();
+                let mut clipped = false;
+                for line in lines.iter().skip(start).take(limit) {
+                    let (text, newline) = line
+                        .strip_suffix('\n')
+                        .map_or((*line, ""), |text| (text, "\n"));
+                    let cut = text.char_indices().nth(2000).map(|(index, _)| index);
+                    let text = match cut {
+                        Some(index) => {
+                            format!("{}... (line truncated to 2000 chars)", &text[..index])
+                        }
+                        None => text.to_owned(),
+                    };
+                    let numbered = format!("{}|{}{}", end + 1, text, newline);
+                    if body.len() + numbered.len() > super::output::MAX_BYTES {
+                        break;
+                    }
+                    clipped |= cut.is_some();
+                    body.push_str(&numbered);
+                    end += 1;
+                }
+                if cancel.is_cancelled() {
+                    return Err(AbortReason::Cancelled.into());
+                }
+                Ok(json!({"ok":true,"path":path_str,"offset":offset,"next_offset":(end<lines.len()).then_some(end+1),"content":body,"lines_clipped":clipped}))
+            })
+            .await
         })
     }
 }
@@ -214,13 +280,21 @@ impl ToolHandler for Write {
     ) -> BoxFuture<'a, Result<Value, YourAiError>> {
         Box::pin(async move {
             let i: WriteInput = serde_json::from_value(input).map_err(|e| error(self.name(), e))?;
-            let path = target(&self.cwd, &i.path, self.name())?;
-            let path_str = utf8_path(&path, self.name())?;
+            let cwd = self.cwd.clone();
+            let raw = i.path.clone();
+            let tool = self.name().to_owned();
+            let path = blocking(move || target(&cwd, &raw, &tool)).await?;
+            let path_str = utf8_path(&path, self.name())?.to_owned();
             file_permission(&tc, &path, true, self.name()).await?;
-            let lock = file_lock(&path);
-            let _guard = tokio::select! {biased;_=tc.cancel.cancelled()=>return Err(AbortReason::Cancelled.into()),g=lock.lock()=>g};
-            let created = save(&path, &i.content, &tc, self.name())?;
-            Ok(json!({"ok":true,"path":path_str,"created":created,"bytes_written":i.content.len()}))
+            let tool = self.name().to_owned();
+            let content = i.content.clone();
+            let cancel = tc.cancel.clone();
+            let bytes = content.len();
+            let created = mutate(path.clone(), cancel.clone(), move || {
+                save(&path, &content, &cancel, &tool)
+            })
+            .await?;
+            Ok(json!({"ok":true,"path":path_str,"created":created,"bytes_written":bytes}))
         })
     }
 }
@@ -244,44 +318,85 @@ impl ToolHandler for Edit {
             if i.old_text.is_empty() {
                 return Err(error(self.name(), "old_text must be nonempty"));
             }
-            let path = target(&self.cwd, &i.path, self.name())?;
-            let path_str = utf8_path(&path, self.name())?;
+            let cwd = self.cwd.clone();
+            let raw = i.path.clone();
+            let tool = self.name().to_owned();
+            let path = blocking(move || target(&cwd, &raw, &tool)).await?;
+            let path_str = utf8_path(&path, self.name())?.to_owned();
             file_permission(&tc, &path, true, self.name()).await?;
-            let lock = file_lock(&path);
-            let _guard = tokio::select! {biased;_=tc.cancel.cancelled()=>return Err(AbortReason::Cancelled.into()),g=lock.lock()=>g};
-            let before = text(&path, self.name())?;
-            let Some(start) = before.find(&i.old_text) else {
-                return Err(error(
-                    self.name(),
-                    "old_text not found; read the file again",
-                ));
-            };
-            let next = start + before[start..].chars().next().unwrap().len_utf8();
-            if before[next..].contains(&i.old_text) {
-                return Err(error(
-                    self.name(),
-                    "old_text matches more than once; include more context",
-                ));
-            }
-            let new_len = before.len() - i.old_text.len() + i.new_text.len();
-            if new_len > MAX_FILE_BYTES {
-                return Err(error(self.name(), "edited file exceeds 16 MiB"));
-            }
-            let after = before.replacen(&i.old_text, &i.new_text, 1);
-            let changed = before != after;
-            let label = path_str;
-            let diff = similar::TextDiff::configure()
-                .timeout(std::time::Duration::from_millis(200))
-                .diff_lines(&before, &after)
-                .unified_diff()
-                .header(label, label)
-                .to_string();
-            if changed {
-                save(&path, &after, &tc, self.name())?;
-            } else {
-                check_cancel(&tc)?;
-            }
-            Ok(json!({"ok":true,"path":path_str,"changed":changed,"diff":diff}))
+            let tool = self.name().to_owned();
+            let old_text = i.old_text.clone();
+            let new_text = i.new_text.clone();
+            let cancel = tc.cancel.clone();
+            mutate(path.clone(), cancel.clone(), move || {
+                let before = text(&path, &tool)?;
+                let Some(start) = before.find(&old_text) else {
+                    return Err(error(&tool, "old_text not found; read the file again"));
+                };
+                let next = start + before[start..].chars().next().unwrap().len_utf8();
+                if before[next..].contains(&old_text) {
+                    return Err(error(
+                        &tool,
+                        "old_text matches more than once; include more context",
+                    ));
+                }
+                let new_len = before.len() - old_text.len() + new_text.len();
+                if new_len > MAX_FILE_BYTES {
+                    return Err(error(&tool, "edited file exceeds 16 MiB"));
+                }
+                let after = before.replacen(&old_text, &new_text, 1);
+                let changed = before != after;
+                let diff = similar::TextDiff::configure()
+                    .timeout(std::time::Duration::from_millis(200))
+                    .diff_lines(&before, &after)
+                    .unified_diff()
+                    .header(&path_str, &path_str)
+                    .to_string();
+                if changed {
+                    save(&path, &after, &cancel, &tool)?;
+                } else if cancel.is_cancelled() {
+                    return Err(AbortReason::Cancelled.into());
+                }
+                Ok(json!({"ok":true,"path":path_str,"changed":changed,"diff":diff}))
+            })
+            .await
         })
+    }
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropped_waiter_keeps_lock_until_blocking_write_finishes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("shared.txt");
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let first_path = path.clone();
+        let first = tokio::spawn(mutate(path.clone(), CancellationToken::new(), move || {
+            let _ = started.send(());
+            wait.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            fs::write(first_path, "first").map_err(|error| super::error("write", error))
+        }));
+        ready.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        // Capture the assertion before releasing the worker, so even a failure
+        // does not strand a blocking thread or make the test hang at shutdown.
+        let still_locked = file_lock(&path).try_lock().is_err();
+        let next_path = path.clone();
+        let second = tokio::spawn(mutate(path.clone(), CancellationToken::new(), move || {
+            fs::write(next_path, "second").map_err(|error| super::error("write", error))
+        }));
+        release.send(()).unwrap();
+        second.await.unwrap().unwrap();
+        assert!(
+            still_locked,
+            "lock released while detached write was still running"
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), "second");
     }
 }

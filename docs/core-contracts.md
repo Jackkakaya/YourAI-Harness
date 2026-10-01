@@ -3,6 +3,8 @@
 
 运行时补充接口：`TurnOptions.events` 绑定内部事件队列；ContextManager 内部协调持久化并维护归档身份索引；`SecurityProvider::update_permissions` 消费权限变更；`HookRuntime::subscribe_background / shutdown_session` 提供按会话订阅和后台回收。`TurnHandle::abort` 用于协作取消超时后的任务回收，宿主必须记录被强制中止执行的不确定状态。
 
+Core 的 deadline watchdog（截止时间后 60 秒宽限）强制丢弃 Loop，或 Loop 在构造/执行 future 时 panic，统一返回 `ErrorKind::LoopTerminated` 并取消 turn token。它表示执行状态未知，与正常协作收尾的 `Aborted(DeadlineExceeded)` 区分。宿主必须隔离会话并保留活动输入供检查；不得自动重放。Core 仍回收 inbox 中未消费的输入，但无法恢复 Loop 已消费的局部状态。
+
 对应 [完整流程图](./default-loop-flow.md)。本文定义公共边界和运输机制。DefaultLoop、会话宿主、compact 摘要和业务扩展现已统一实现在 `yourai-harness`，见 [实现文档](./default-loop-implementation.md) 与 [Runtime 文档](./runtime-implementation.md)。下文出现的 `yourai-loop` / `yourai-runtime` 是合并前的历史包名。
 
 ## 图与代码的对应

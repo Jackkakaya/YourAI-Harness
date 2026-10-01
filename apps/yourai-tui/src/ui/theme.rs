@@ -342,13 +342,20 @@ impl Theme {
         if self.effective() == Self::Dark {
             return;
         }
-        let palette = self.palette().slots();
+        // Build the slot→palette table once per frame instead of scanning the
+        // 26-slot array for every cell's foreground and background.
+        let slots = self.palette().slots();
+        let remap: std::collections::HashMap<Color, Color> = SLOTS
+            .iter()
+            .zip(slots.iter())
+            .map(|(a, b)| (*a, *b))
+            .collect();
         for cell in &mut buffer.content {
-            if let Some(index) = SLOTS.iter().position(|c| *c == cell.fg) {
-                cell.fg = palette[index];
+            if let Some(fg) = remap.get(&cell.fg) {
+                cell.fg = *fg;
             }
-            if let Some(index) = SLOTS.iter().position(|c| *c == cell.bg) {
-                cell.bg = palette[index];
+            if let Some(bg) = remap.get(&cell.bg) {
+                cell.bg = *bg;
             }
         }
     }

@@ -1,4 +1,8 @@
 //! Optional modules own their effects and invoke hooks at actual lifecycle boundaries.
+//!
+//! `Workspace` intentionally holds a `Weak<SessionHost>` back-reference: every
+//! mutation is a host operation (hook dispatch + journal gate + watch-set
+//! update), so the dependency is real, not incidental.
 use crate::{
     error,
     storage::{atomic_write, read_json},
@@ -35,7 +39,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use yourai_core::{prelude::*, runtime_event::RuntimeEvent};
 
-type WatchSnapshots = HashMap<PathBuf, HashMap<PathBuf, Vec<u8>>>;
+type WatchSnapshots = HashMap<PathBuf, HashMap<PathBuf, (u64, std::time::SystemTime)>>;
 
 pub struct Workspace {
     host: Weak<SessionHost>,
@@ -286,20 +290,25 @@ impl Workspace {
                     break;
                 }
                 for root in host.watch_paths() {
-                    let current = match file_snapshot(&root) {
-                        Ok(snapshot) => snapshot,
-                        Err(e) => {
-                            let _ = host
-                                .post_event_async(RuntimeEvent {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    context: None,
-                                    notice: Some(format!("File watcher: {e}")),
-                                    wake: false,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
+                    let snapshot_root = root.clone();
+                    let current =
+                        match tokio::task::spawn_blocking(move || file_snapshot(&snapshot_root))
+                            .await
+                            .unwrap_or_else(|e| Err(error("watcher", e)))
+                        {
+                            Ok(snapshot) => snapshot,
+                            Err(e) => {
+                                let _ = host
+                                    .post_event_async(RuntimeEvent {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        context: None,
+                                        notice: Some(format!("File watcher: {e}")),
+                                        wake: false,
+                                    })
+                                    .await;
+                                continue;
+                            }
+                        };
                     let old = ws.snapshots.lock().unwrap().insert(root, current.clone());
                     if let Some(old) = old {
                         let paths: std::collections::HashSet<_> =
@@ -362,7 +371,11 @@ impl Drop for Workspace {
     }
 }
 // Do not follow directory symlinks: a watched tree must not recursively escape its root.
-fn file_snapshot(root: &Path) -> Result<HashMap<PathBuf, Vec<u8>>, YourAiError> {
+// Change detection uses metadata only: rereading watched file contents every
+// tick would multiply IO and memory by tree size.
+fn file_snapshot(
+    root: &Path,
+) -> Result<HashMap<PathBuf, (u64, std::time::SystemTime)>, YourAiError> {
     let mut files = HashMap::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
@@ -376,10 +389,8 @@ fn file_snapshot(root: &Path) -> Result<HashMap<PathBuf, Vec<u8>>, YourAiError> 
                 pending.push(entry.map_err(|e| error("watcher", e))?.path());
             }
         } else if meta.is_file() {
-            files.insert(
-                path.clone(),
-                std::fs::read(path).map_err(|e| error("watcher", e))?,
-            );
+            let modified = meta.modified().map_err(|e| error("watcher", e))?;
+            files.insert(path, (meta.len(), modified));
         }
     }
     Ok(files)

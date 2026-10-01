@@ -63,7 +63,7 @@ with tempfile.TemporaryDirectory() as tmp:
     bin_path = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
-    child = subprocess.Popen([str(bin_path), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=os.environ)
+    child = subprocess.Popen([str(bin_path), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, XDG_DATA_HOME=str(Path(tmp) / 'xdg-data')))
     captured = bytearray()
 
     def wait_for(needle, timeout=10):
@@ -94,7 +94,7 @@ with tempfile.TemporaryDirectory() as tmp:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
     original = termios.tcgetattr(slave)
-    child = subprocess.Popen([str(bin_path), '--config', str(config), '--resume'], stdin=slave, stdout=slave, stderr=slave, env=os.environ)
+    child = subprocess.Popen([str(bin_path), '--config', str(config), '--resume'], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, XDG_DATA_HOME=str(Path(tmp) / 'xdg-data')))
     captured = bytearray()
     try:
         wait_for(b'Sessions')

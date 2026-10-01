@@ -20,7 +20,7 @@ pub(crate) fn additional(result: &HookDispatchResult) -> Vec<String> {
 }
 impl State<'_> {
     pub(crate) fn invocation(&self, event: HookEvent) -> HookInvocation {
-        let mut base = BaseInput::new(self.history.session_id().0.as_str(), "");
+        let mut base = BaseInput::new(self.history.session_id().as_str(), "");
         if let Some(session) = &self.tc.info.options.session {
             base.cwd = session.cwd.to_string_lossy().into_owned();
             base.transcript_path = session

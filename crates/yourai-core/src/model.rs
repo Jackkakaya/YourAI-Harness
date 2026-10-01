@@ -40,11 +40,13 @@ pub struct ModelTimeouts {
     pub headers: std::time::Duration,
     pub read: std::time::Duration,
 }
+/// 5 minutes matches long-thinking models' worst case before first byte.
+const DEFAULT_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 impl Default for ModelTimeouts {
     fn default() -> Self {
         Self {
-            headers: std::time::Duration::from_secs(300),
-            read: std::time::Duration::from_secs(300),
+            headers: DEFAULT_MODEL_TIMEOUT,
+            read: DEFAULT_MODEL_TIMEOUT,
         }
     }
 }

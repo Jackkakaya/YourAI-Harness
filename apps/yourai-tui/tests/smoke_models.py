@@ -69,7 +69,7 @@ with tempfile.TemporaryDirectory() as tmp:
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
     original = termios.tcgetattr(slave)
     binary = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
-    child = subprocess.Popen([str(binary), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=os.environ)
+    child = subprocess.Popen([str(binary), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, XDG_DATA_HOME=str(Path(tmp) / 'xdg-data')))
     captured = bytearray()
 
     def wait_for(needle, timeout=10):
@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert requests[0][1]['model'] == 'smoke-model', f'expected smoke-model, got {requests[0][1]["model"]}'
         # Switch to alt model via direct command; it is idle-guarded, so the
         # first turn must be fully settled first.
-        wait_completed(Path(tmp) / '.yourai/sessions/sessions.sqlite3', 'main', 1)
+        wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 1)
         os.write(master, b'/models mock/alt\r')
         time.sleep(0.5)
         # Verify the footer shows the new model label.

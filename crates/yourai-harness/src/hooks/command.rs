@@ -9,7 +9,7 @@
 
 use crate::hooks::event::to_wire_json;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use yourai_core::hooks::{HookHandler, HookInvocation, HookOutput};
 
@@ -47,8 +47,75 @@ impl std::ops::DerefMut for OwnedChild {
     }
 }
 impl OwnedChild {
-    async fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
-        self.child.take().unwrap().wait_with_output().await
+    /// Read both pipes concurrently (each capped) and reap the child.
+    async fn read_output(&mut self) -> std::io::Result<(String, String, std::process::ExitStatus)> {
+        let mut stdout = self.stdout.take().ok_or_else(|| pipe_error("stdout"))?;
+        let mut stderr = self.stderr.take().ok_or_else(|| pipe_error("stderr"))?;
+        let (stdout, stderr) = tokio::join!(read_capped(&mut stdout), read_capped(&mut stderr));
+        let status = self.wait().await?;
+        Ok((stdout?, stderr?, status))
+    }
+}
+fn pipe_error(which: &str) -> std::io::Error {
+    std::io::Error::other(format!("hook {which} pipe unavailable"))
+}
+
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<String> {
+    read_with_budget(reader, crate::hooks::MAX_OUTPUT_BYTES).await
+}
+
+fn output_limit_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "hook output exceeds 1 MiB")
+}
+
+fn decode_output(bytes: Vec<u8>) -> std::io::Result<String> {
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Keep draining both pipes so a full pipe cannot block the child, but reject
+/// oversized output instead of interpreting a truncated protocol response.
+async fn read_with_budget<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    budget: usize,
+) -> std::io::Result<String> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut overflow = false;
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return if overflow {
+                Err(output_limit_error())
+            } else {
+                decode_output(out)
+            };
+        }
+        let room = budget.saturating_sub(out.len());
+        overflow |= n > room;
+        out.extend_from_slice(&chunk[..n.min(room)]);
+    }
+}
+
+/// The async handshake shares stdout's cap. Never allocate an unbounded first
+/// line while waiting to decide whether the process should run in background.
+async fn read_first_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<String> {
+    let mut line = Vec::new();
+    loop {
+        let buffer = reader.fill_buf().await?;
+        if buffer.is_empty() {
+            return decode_output(line);
+        }
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(buffer.len(), |index| index + 1);
+        if take > crate::hooks::MAX_OUTPUT_BYTES.saturating_sub(line.len()) {
+            return Err(output_limit_error());
+        }
+        line.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return decode_output(line);
+        }
     }
 }
 impl Drop for OwnedChild {
@@ -107,8 +174,8 @@ impl CommandHandler {
                 command
             }
             None => {
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-                let mut command = Command::new(shell);
+                // Fixed fallback: $SHELL is user-controlled and can point anywhere.
+                let mut command = Command::new("/bin/sh");
                 command.arg("-c").arg(&self.command);
                 command
             }
@@ -162,21 +229,16 @@ impl CommandHandler {
         &self,
         invocation: &HookInvocation,
     ) -> Result<(String, String, i32), yourai_core::YourAiError> {
-        let child = self.spawn(invocation).await?;
-        let output =
+        let mut child = self.spawn(invocation).await?;
+        let (stdout, stderr, status) =
             child
-                .wait_with_output()
+                .read_output()
                 .await
                 .map_err(|e| yourai_core::ErrorKind::Provider {
                     name: "hook",
                     message: format!("wait output: {e}"),
                 })?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        Ok((stdout, stderr, exit_code))
+        Ok((stdout, stderr, status.code().unwrap_or(-1)))
     }
 
     async fn run_with_async_detection(
@@ -204,14 +266,11 @@ impl CommandHandler {
         })?;
 
         let mut stdout = BufReader::new(stdout);
-        let mut first_line = String::new();
         let stderr_task = tokio::spawn(async move {
-            let mut stderr = BufReader::new(stderr);
-            let mut value = String::new();
-            let result = stderr.read_to_string(&mut value).await;
-            (result, value)
+            let mut stderr = stderr;
+            read_capped(&mut stderr).await
         });
-        stdout.read_line(&mut first_line).await.map_err(|error| {
+        let mut first_line = read_first_line(&mut stdout).await.map_err(|error| {
             yourai_core::ErrorKind::Provider {
                 name: "hook",
                 message: format!("failed reading hook stdout: {error}"),
@@ -232,9 +291,8 @@ impl CommandHandler {
             let tasks = background.tasks.clone();
             let task = tokio::spawn(async move {
                 let stdout_task = tokio::spawn(async move {
-                    let mut remaining = String::new();
-                    let result = stdout.read_to_string(&mut remaining).await;
-                    (result, remaining)
+                    let mut stdout = stdout;
+                    read_capped(&mut stdout).await
                 });
                 let wait_result = match async_timeout.or(background.timeout) {
                     Some(timeout) => match tokio::time::timeout(timeout, child.wait()).await {
@@ -248,21 +306,24 @@ impl CommandHandler {
                     None => child.wait().await.map(Some),
                 };
                 drop(child); // End the owned process group before joining pipe readers.
-                let (read_result, remaining) = stdout_task.await.unwrap_or_else(|error| {
-                    (Ok(0), format!("failed joining stdout reader: {error}"))
-                });
-                let (_, stderr) = stderr_task
-                    .await
-                    .unwrap_or_else(|error| (Ok(0), format!("failed reading stderr: {error}")));
+                let (read_result, remaining) = match stdout_task.await {
+                    Ok(Ok(text)) => (Ok(()), text),
+                    Ok(Err(error)) => (Err(error), String::new()),
+                    Err(error) => (Ok(()), format!("failed joining stdout reader: {error}")),
+                };
+                let mut stderr = match stderr_task.await {
+                    Ok(Ok(text)) => text,
+                    Ok(Err(error)) => format!("failed reading stderr: {error}"),
+                    Err(error) => format!("failed reading stderr: {error}"),
+                };
+                if let Err(error) = read_result {
+                    stderr.push_str(&format!("\nfailed reading stdout: {error}"));
+                }
                 let (exit_code, timed_out, extra_error) = match wait_result {
                     Ok(Some(status)) => (status.code().unwrap_or(-1), false, None),
                     Ok(None) => (-1, true, Some("background hook timed out".to_string())),
                     Err(error) => (-1, false, Some(error.to_string())),
                 };
-                let mut stderr = stderr;
-                if let Err(error) = read_result {
-                    stderr.push_str(&format!("\nfailed reading stdout: {error}"));
-                }
                 if let Some(error) = extra_error {
                     stderr.push_str(&format!("\n{error}"));
                 }
@@ -287,14 +348,15 @@ impl CommandHandler {
             return Ok(HookOutput::Backgrounded { task_id });
         }
 
-        let mut remaining = String::new();
-        stdout
-            .read_to_string(&mut remaining)
-            .await
-            .map_err(|error| yourai_core::ErrorKind::Provider {
-                name: "hook",
-                message: format!("failed reading hook stdout: {error}"),
-            })?;
+        let remaining = read_with_budget(
+            &mut stdout,
+            crate::hooks::MAX_OUTPUT_BYTES - first_line.len(),
+        )
+        .await
+        .map_err(|error| yourai_core::ErrorKind::Provider {
+            name: "hook",
+            message: format!("failed reading hook stdout: {error}"),
+        })?;
         let status = child
             .wait()
             .await
@@ -302,17 +364,16 @@ impl CommandHandler {
                 name: "hook",
                 message: format!("failed waiting for hook: {error}"),
             })?;
-        let (stderr_result, stderr) =
-            stderr_task
-                .await
-                .map_err(|error| yourai_core::ErrorKind::Provider {
-                    name: "hook",
-                    message: format!("failed joining stderr reader: {error}"),
-                })?;
-        stderr_result.map_err(|error| yourai_core::ErrorKind::Provider {
-            name: "hook",
-            message: format!("failed reading hook stderr: {error}"),
-        })?;
+        let stderr = stderr_task
+            .await
+            .map_err(|error| yourai_core::ErrorKind::Provider {
+                name: "hook",
+                message: format!("failed joining stderr reader: {error}"),
+            })?
+            .map_err(|error| yourai_core::ErrorKind::Provider {
+                name: "hook",
+                message: format!("failed reading hook stderr: {error}"),
+            })?;
         first_line.push_str(&remaining);
         Ok(HookOutput::Command {
             stdout: first_line,
@@ -332,23 +393,24 @@ fn background_child(
     let owner = background.session_id.clone();
     let tasks = background.tasks.clone();
     let task = tokio::spawn(async move {
-        let wait = child.wait_with_output();
+        let mut child = child;
+        let read = child.read_output();
         let result = match timeout_override.or(background.timeout) {
-            Some(timeout) => match tokio::time::timeout(timeout, wait).await {
+            Some(timeout) => match tokio::time::timeout(timeout, read).await {
                 Ok(result) => result.map(Some),
                 Err(_) => Ok(None),
             },
-            None => wait.await.map(Some),
+            None => read.await.map(Some),
         };
         let event = match result {
-            Ok(Some(output)) => BackgroundHookEvent {
+            Ok(Some((stdout, stderr, status))) => BackgroundHookEvent {
                 session_id: background.session_id.clone(),
                 task_id: event_task_id,
                 hook_id: background.hook_id,
                 event_name: background.event_name,
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
+                stdout,
+                stderr,
+                exit_code: status.code().unwrap_or(-1),
                 timed_out: false,
                 rewake: background.rewake,
             },

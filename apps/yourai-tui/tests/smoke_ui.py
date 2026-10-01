@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory() as tmp:
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
     original = termios.tcgetattr(slave)
     binary = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
-    child = subprocess.Popen([str(binary), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=os.environ)
+    child = subprocess.Popen([str(binary), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, XDG_DATA_HOME=str(Path(tmp) / 'xdg-data')))
     captured = bytearray()
 
     def wait_for(needle, timeout=10):
@@ -100,8 +100,8 @@ with tempfile.TemporaryDirectory() as tmp:
         assert len(requests) == 1
         assert 'after stats' in json.dumps(requests[0][1])
         assert 'LEAK' not in json.dumps(requests[0][1])
-        db = sqlite3.connect(Path(tmp) / '.yourai/sessions/sessions.sqlite3')
-        db_path = Path(tmp) / '.yourai/sessions/sessions.sqlite3'
+        db = sqlite3.connect(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3')
+        db_path = Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3'
         # Local commands must reset the actual model context, retain old sessions,
         # and preserve the process permission selection across a session switch.
         time.sleep(0.2)
@@ -174,7 +174,7 @@ with tempfile.TemporaryDirectory() as tmp:
         before = db.execute('SELECT count(*) FROM sessions').fetchone()[0]
         captured.clear()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
-        child = subprocess.Popen([str(binary), '--config', str(config), '--resume'], stdin=slave, stdout=slave, stderr=slave, env=os.environ)
+        child = subprocess.Popen([str(binary), '--config', str(config), '--resume'], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, XDG_DATA_HOME=str(Path(tmp) / 'xdg-data')))
         wait_for(b'Sessions')
         os.write(master, b'\x11')
         assert wait_exit(child, master) == 0

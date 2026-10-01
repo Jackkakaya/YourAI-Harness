@@ -41,7 +41,7 @@ impl MemoryContext {
                 model,
                 hooks: s.hooks,
                 usage: s.usage,
-                hook_base: BaseInput::new(&id.0, ""),
+                hook_base: BaseInput::new(id.as_str(), ""),
             },
             inner: yourai_harness::MemoryContext::new(id, services),
         })

@@ -8,6 +8,10 @@ use crate::protocol::Out;
 /// 返回值告知接收端是否仍然存活：
 /// - `true`：已投递（或实现方选择了丢弃策略）
 /// - `false`：消费端已关闭——loop 应尽快以 `Aborted(Disconnected)` 中止
+///
+/// 刻意设计：底层队列**无界**（同步 send 无法等待容量），fire-and-forget 语义
+/// 依赖消费方持续排空。慢/停消费会让事件在内存中累积——消费方必须与 turn
+/// 生命周期绑定排空 outbox，不得长期搁置。
 pub trait OutSink: Send + Sync {
     fn send(&self, m: Out) -> bool;
 

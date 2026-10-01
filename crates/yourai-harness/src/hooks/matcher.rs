@@ -71,6 +71,27 @@ pub(crate) fn normalize_legacy_tool_name(name: &str) -> &str {
     }
 }
 
+/// Compile-once cache for regex strings built from config-sourced patterns
+/// (a bounded set) that dispatch paths would otherwise rebuild every call.
+pub(crate) fn cached_regex(expression: &str) -> Option<Regex> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static COMPILED: OnceLock<Mutex<HashMap<String, Regex>>> = OnceLock::new();
+    let cache = COMPILED.get_or_init(Default::default);
+    let compiled = {
+        let mut guard = cache.lock().unwrap();
+        match guard.get(expression) {
+            Some(re) => re.clone(),
+            None => {
+                let re = Regex::new(expression).ok()?;
+                guard.insert(expression.to_string(), re.clone());
+                re
+            }
+        }
+    };
+    Some(compiled)
+}
+
 fn legacy_tool_names(canonical: &str) -> &'static [&'static str] {
     match canonical {
         "Agent" => &["Task"],

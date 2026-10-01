@@ -17,60 +17,6 @@ pub enum YourAiError {
     Error(#[from] ErrorKind),
 }
 
-impl YourAiError {
-    /// One place understands the SDK's nested streaming/non-streaming errors.
-    fn model_error_leaf(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        let Self::Error(ErrorKind::Model { source }) = self else {
-            return None;
-        };
-        let mut current: &(dyn std::error::Error + 'static) = source;
-        for _ in 0..16 {
-            match current.downcast_ref::<genai::Error>() {
-                Some(genai::Error::WebStream { error, .. }) => current = error.as_ref(),
-                Some(
-                    genai::Error::WebModelCall { webc_error, .. }
-                    | genai::Error::WebAdapterCall { webc_error, .. },
-                ) => return Some(webc_error),
-                _ => return Some(current),
-            }
-        }
-        None
-    }
-    pub fn model_has_http_headers(&self) -> bool {
-        matches!(
-            self.model_error_leaf()
-                .and_then(|e| e.downcast_ref::<genai::webc::Error>()),
-            Some(genai::webc::Error::ResponseFailedStatus { .. })
-        )
-    }
-    pub fn model_http_header(&self, name: &str) -> Option<&str> {
-        match self
-            .model_error_leaf()?
-            .downcast_ref::<genai::webc::Error>()?
-        {
-            genai::webc::Error::ResponseFailedStatus { headers, .. } => {
-                headers.get(name)?.to_str().ok()
-            }
-            _ => None,
-        }
-    }
-    /// Typed status/body; never classify errors by their display text.
-    pub fn model_http_error(&self) -> Option<(u16, &str)> {
-        let error = self.model_error_leaf()?;
-        if let Some(genai::Error::HttpError { status, body, .. }) =
-            error.downcast_ref::<genai::Error>()
-        {
-            return Some((status.as_u16(), body));
-        }
-        match error.downcast_ref::<genai::webc::Error>()? {
-            genai::webc::Error::ResponseFailedStatus { status, body, .. } => {
-                Some((status.as_u16(), body))
-            }
-            _ => None,
-        }
-    }
-}
-
 /// 终止的原因。
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -117,66 +63,13 @@ pub enum ErrorKind {
     #[error("loop error: {0}")]
     Loop(String),
 
+    /// The loop was dropped before cooperative cleanup (watchdog or panic).
+    /// Side effects and consumed inputs are uncertain; hosts must quarantine
+    /// the session instead of treating this as a normally settled failure.
+    #[error("agent loop terminated; execution state unknown: {0}")]
+    LoopTerminated(String),
+
     /// 兜底
     #[error("{0}")]
     Other(String),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn wrap(error: genai::Error) -> genai::Error {
-        genai::Error::WebStream {
-            model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "glm"),
-            cause: error.to_string(),
-            error: Box::new(error),
-        }
-    }
-    #[test]
-    fn http_status_survives_nested_stream_wrappers() {
-        let source = genai::Error::HttpError {
-            status: "429".parse().unwrap(),
-            canonical_reason: "Too Many Requests".into(),
-            body: r#"{"error":{"message":"rpm exceeded","dimension":"rpm"}}"#.into(),
-        };
-        let error = YourAiError::from(ErrorKind::Model {
-            source: wrap(wrap(source)),
-        });
-        let (status, body) = error.model_http_error().unwrap();
-        assert_eq!(status, 429);
-        assert!(body.contains("rpm exceeded"));
-    }
-    #[test]
-    fn adapter_http_errors_share_status_headers_and_classification() {
-        let source = genai::Error::WebAdapterCall {
-            adapter_kind: genai::adapter::AdapterKind::OpenAI,
-            webc_error: genai::webc::Error::ResponseFailedStatus {
-                status: "429".parse().unwrap(),
-                body: "{}".into(),
-                headers: Box::new(
-                    [("retry-after".parse().unwrap(), "2".parse().unwrap())]
-                        .into_iter()
-                        .collect(),
-                ),
-            },
-        };
-        let error = YourAiError::from(ErrorKind::Model {
-            source: wrap(wrap(source)),
-        });
-        assert_eq!(error.model_http_error(), Some((429, "{}")));
-        assert!(error.model_has_http_headers());
-        assert_eq!(error.model_http_header("retry-after"), Some("2"));
-    }
-
-    #[test]
-    fn display_text_is_not_a_structured_http_status() {
-        let error = YourAiError::from(ErrorKind::Model {
-            source: genai::Error::WebStream {
-                model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "glm"),
-                cause: "HTTP 429".into(),
-                error: Box::new(std::io::Error::other("HTTP 429")),
-            },
-        });
-        assert!(error.model_http_error().is_none());
-    }
 }

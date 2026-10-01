@@ -47,7 +47,7 @@ impl Editor {
         assert!(range.start <= range.end && range.end <= self.text.len());
         assert!(self.text.is_char_boundary(range.start));
         assert!(self.text.is_char_boundary(range.end));
-        let replacement = super::state::clean(replacement);
+        let replacement = crate::text::clean(replacement);
         let start = range.start;
         self.text.replace_range(range, &replacement);
         self.cursor = start + replacement.len();

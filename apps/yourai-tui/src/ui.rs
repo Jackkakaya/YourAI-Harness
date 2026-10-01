@@ -30,10 +30,10 @@ use yourai_harness::{Harness, HarnessConfig};
 use crate::terminal::SyncWriter;
 
 struct Screen {
-    /// Shared alternate-screen guard; dropped after the terminal so the
-    /// terminal state is restored first.
-    _guard: crate::terminal::Screen,
     terminal: Terminal<crate::terminal::SizedBackend<crate::terminal::ScrollBackend<SyncWriter>>>,
+    /// Shared alternate-screen guard; dropped after the terminal so the
+    /// terminal state is restored once rendering is fully finished.
+    _guard: crate::terminal::Screen,
 }
 impl Screen {
     fn open(scroll_region: crate::terminal::SharedRegion) -> Result<Self, Error> {
@@ -78,16 +78,11 @@ pub async fn run(
         },
     };
     session::restore_history(&harness, &mut view).await?;
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        crate::terminal::restore();
-        previous(info);
-    }));
     let scroll_region: crate::terminal::SharedRegion = Arc::new(std::sync::Mutex::new(None));
     let mut screen = Screen::open(scroll_region.clone())?;
     let context = harness.host.context();
     let meta = Metadata {
-        session: context.id.0,
+        session: context.id.as_str().to_owned(),
         cwd: context.cwd.to_string_lossy().into(),
         trusted_shell,
         yolo,

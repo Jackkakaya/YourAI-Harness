@@ -310,7 +310,7 @@ async fn legacy_import_preserves_sources_and_is_transactional() {
         history
     );
     let catalog = yourai_harness::SessionCatalog::new(dir.path()).unwrap();
-    let id = SessionId("legacy".into());
+    let id = SessionId::from("legacy");
     assert_eq!(catalog.load_session(&id).await.unwrap().created_at, 1000);
     let active = catalog
         .read_messages(

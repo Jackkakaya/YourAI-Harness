@@ -153,7 +153,7 @@ mod tests {
     fn launcher_fits_small_terminals_and_scrolls() {
         let rows: Vec<_> = (0..100)
             .map(|i| SessionRow {
-                id: SessionId(format!("session-{i:03}")),
+                id: SessionId::from(format!("session-{i:03}")),
                 title: format!("row-{i:03}"),
                 model: String::new(),
                 updated_at: 0,
@@ -187,7 +187,7 @@ mod tests {
         // (2 columns per glyph) overflowed their column. The shared row
         // body must elide by display width and keep the id column stable.
         let rows = vec![SessionRow {
-            id: SessionId("d3f40178deadbeef".into()),
+            id: SessionId::from("d3f40178deadbeef"),
             title: "修复中文解析器的边界问题与回归测试".into(),
             model: String::new(),
             updated_at: 0,

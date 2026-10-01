@@ -108,6 +108,9 @@ impl In {
         }
     }
 
+    /// 便捷构造：FollowUp 模式输入。与 Steer 的区别：FollowUp 不打断当前
+    /// 正在进行的模型步骤/工具调用，而是排队到当前步骤完成后作为下一条
+    /// 用户输入消费；Steer 会在下一个决策点立即生效并改写当前步骤走向。
     pub fn follow_up(text: impl Into<String>) -> Self {
         In::UserText {
             text: text.into(),
@@ -160,13 +163,15 @@ pub enum Out {
     /// rejection is retained in TurnOutput for non-streaming consumers.
     InputRejected { rejection: InputRejected },
 
-    /// 正文流式增量
+    /// 正文流式增量。语义：`text` 是**追加**到当前流式正文末尾的新片段，
+    /// 不是全量替换；消费方按到达顺序拼接。终态以 [`Out::Message`] 为准
+    /// （捕获内容/重试可能使最终全文与增量拼接不同）。
     Chunk { text: String },
 
-    /// 思考流式增量（thinking / R1 类模型的 reasoning）
+    /// 思考流式增量（thinking / R1 类模型的 reasoning）。同为追加语义。
     Reasoning { text: String },
 
-    /// 完整消息
+    /// 完整消息：该轮正文的最终定稿，替代此前 Chunk 拼接结果。
     Message { text: String },
 
     /// 工具调用开始

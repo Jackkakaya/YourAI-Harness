@@ -139,7 +139,7 @@ mod tests {
     fn picker() -> Overlay {
         Overlay::Sessions(SessionPickerState {
             rows: vec![crate::sessions::SessionRow {
-                id: SessionId("old".into()),
+                id: SessionId::from("old"),
                 title: "Previous task".into(),
                 model: String::new(),
                 updated_at: 0,
@@ -186,7 +186,7 @@ mod tests {
         assert!(modal.sessions_mut().unwrap().pending_delete.is_none());
         modal.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), 0);
         assert!(
-            matches!(modal.key(key(KeyCode::Char('y')),0),Some(Action::Delete(SessionId(id))) if id=="old")
+            matches!(modal.key(key(KeyCode::Char('y')),0),Some(Action::Delete(id)) if id.as_str()=="old")
         );
         modal.sessions_mut().unwrap().rows[0].is_current = true;
         modal.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), 0);

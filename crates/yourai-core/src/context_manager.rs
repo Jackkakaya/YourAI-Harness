@@ -20,7 +20,7 @@ impl ContextExecution {
         id: &SessionId,
         session: Option<&SessionContext>,
     ) -> Result<Self, YourAiError> {
-        let mut hook_base = BaseInput::new(&id.0, "");
+        let mut hook_base = BaseInput::new(id.as_str(), "");
         if let Some(session) = session {
             hook_base.cwd = session.cwd.to_string_lossy().into_owned();
             hook_base.transcript_path = session

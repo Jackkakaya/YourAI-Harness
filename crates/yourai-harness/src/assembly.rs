@@ -8,11 +8,10 @@ use crate::{
 use model_hooks::DefaultHookModelExecutor;
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
 
 #[derive(Clone)]
@@ -110,6 +109,14 @@ impl Harness {
             Some(id) => Some(catalog.load_session(id).await?),
             None => None,
         };
+        // A refused resume must not initialize prompts, rewrite metadata or
+        // assemble providers for a session owned by another host.
+        let lease = match &existing {
+            Some(meta) => Some(crate::runtime::SessionLease::acquire(
+                catalog.directory(&meta.id)?,
+            )?),
+            None => None,
+        };
         let mut prompt_notices = vec![];
         let prepared = if existing.as_ref().is_none_or(|m| m.system_prompt.is_none()) {
             let prepared = crate::context::prompt::prepare(
@@ -142,10 +149,14 @@ impl Harness {
                     .id
             }
         };
+        let lease = match lease {
+            Some(lease) => lease,
+            None => crate::runtime::SessionLease::acquire(catalog.directory(&id)?)?,
+        };
+        let dir = lease.dir.clone();
         let mut meta = catalog.load_session(&id).await?;
         meta.model = Some(model.model_iden().into());
         catalog.save_session(&meta).await?;
-        let dir = catalog.directory(&id)?;
         let budget =
             ModelBudget::configured(config.request_policy.clone(), (*catalog.store).clone())?;
         let model: Arc<dyn ModelProvider> = Arc::new(MeteredModel {
@@ -220,8 +231,8 @@ impl Harness {
         }
         let mut context = SessionContext::new(id, config.cwd);
         context.transcript_path = Some(crate::SqliteStore::path(&config.root));
-        let host = SessionHost::open(
-            dir,
+        let host = SessionHost::open_owned(
+            lease,
             context,
             agent,
             HostConfig {
@@ -416,10 +427,7 @@ pub(crate) async fn assemble(
     let registry = Arc::new(ToolSet::default());
     if let Some(tools) = inherited {
         for definition in tools.definitions() {
-            if !matches!(
-                definition.name.as_str(),
-                "read" | "write" | "edit" | "shell" | "webfetch" | "websearch"
-            ) {
+            if !crate::tools::BUILTIN_TOOL_NAMES.contains(&definition.name.as_str()) {
                 registry.register(tools.resolve(definition.name.as_str())?);
             }
         }
@@ -458,87 +466,4 @@ pub(crate) async fn assemble(
         builder = builder.usage(usage);
     }
     Ok((builder.build(), registry))
-}
-
-// Public convenience entry points share the same concrete assembly code.
-impl SessionHost {
-    pub async fn create(
-        root: &Path,
-        cwd: PathBuf,
-        model: Arc<dyn ModelProvider>,
-        hooks: Option<Arc<dyn HookRuntime>>,
-        tools: Option<Arc<dyn ToolRegistry>>,
-    ) -> Result<Arc<Self>, YourAiError> {
-        let catalog = Arc::new(crate::SessionCatalog::new(root)?);
-        let prompt = crate::context::prompt::prepare(
-            &crate::PromptConfig::default(),
-            &cwd,
-            None,
-            &[],
-            None,
-            None,
-            &ContextPolicy::default(),
-            &CancellationToken::new(),
-        )
-        .await?;
-        let meta = catalog.create_session(&prompt.system).await?;
-        Self::restore(
-            root,
-            meta.id,
-            cwd,
-            model,
-            hooks,
-            tools,
-            ContextPolicy::default(),
-            "startup",
-        )
-        .await
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub async fn restore(
-        root: &Path,
-        id: SessionId,
-        cwd: PathBuf,
-        model: Arc<dyn ModelProvider>,
-        hooks: Option<Arc<dyn HookRuntime>>,
-        tools: Option<Arc<dyn ToolRegistry>>,
-        policy: ContextPolicy,
-        source: &str,
-    ) -> Result<Arc<Self>, YourAiError> {
-        let catalog = Arc::new(crate::SessionCatalog::new(root)?);
-        let mut meta = catalog.load_session(&id).await?;
-        if meta.system_prompt.is_none() {
-            let prompt = crate::context::prompt::prepare(
-                &crate::PromptConfig::default(),
-                &cwd,
-                None,
-                &[],
-                None,
-                None,
-                &policy,
-                &CancellationToken::new(),
-            )
-            .await?;
-            meta.system_prompt = Some(catalog.initialize_system(&id, &prompt.system).await?);
-        }
-        meta.model = Some(model.model_iden().into());
-        catalog.save_session(&meta).await?;
-        let dir = catalog.directory(&id)?;
-        let usage = Arc::new(crate::storage::LocalUsage((*catalog.store).clone()));
-        let (agent, _) = crate::assembly::assemble(
-            &catalog,
-            &id,
-            &cwd,
-            false,
-            model,
-            hooks,
-            Some(usage),
-            tools,
-            policy,
-        )
-        .await?;
-        let mut context = SessionContext::new(id, cwd);
-        context.transcript_path = Some(crate::SqliteStore::path(root));
-        Self::open(dir, context, agent, HostConfig::default(), source).await
-    }
 }
