@@ -147,6 +147,46 @@ impl AgentLoop for OperationsLoop {
     }
 }
 
+pub struct GuardLoop;
+impl AgentLoop for GuardLoop {
+    fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
+        Box::pin(async move {
+            let mut cx = TurnExecution::open(tc, ExecutionConfig::default()).await?;
+            let result = async {
+                if !cx.input_accepted() {
+                    return Ok(());
+                }
+                let response = cx.model().exec().await?;
+                assert_eq!(response.calls.len(), 1);
+                // Documented invariants: unresolved calls block every
+                // dependent operation, without consuming the model script.
+                let err = cx.model().exec().await.unwrap_err();
+                assert!(err.to_string().contains("resolve pending tool calls"));
+                let err = cx.complete("premature").await.unwrap_err();
+                assert!(err.to_string().contains("unresolved tool calls"));
+                let err = cx
+                    .tools()
+                    .call("tool", serde_json::json!({"value":1}))
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("resolve pending calls"));
+                // Settling clears the ledger; dependent operations resume.
+                cx.tools().exec_pending().await?;
+                loop {
+                    let response = cx.model().exec().await?;
+                    if response.calls.is_empty()
+                        && cx.complete(response.text).await? == Completion::Completed
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            .await;
+            cx.finish(result).await
+        })
+    }
+}
+
 pub struct BoundLoop {
     pub replacement: Arc<dyn ToolHandler>,
 }

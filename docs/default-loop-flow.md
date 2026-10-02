@@ -266,10 +266,10 @@ DefaultLoop
                      +-- 是                      |        |
                           |                      |        |
                           v                      |        |
-                   ContextManager.compact()      |        |
+                   ContextManager.prepare_compaction()
                           |                      |        |
-                          +-- 内部清理            |        |
-                          +-- 需要摘要时：        |        |
+                          +-- Complete: 内部清理  |        |
+                          +-- Summary: 需要摘要时 │        |
                           |    PreCompact         |        |
                           |    选区 → 分批摘要    |        |
                           +-- 单事务保存 → 内存更新       |

@@ -29,14 +29,17 @@ impl ExecutionState<'_> {
             .as_ref()
             .err()
             .is_some_and(|e| matches!(e, YourAiError::Aborted(_)));
-        let (mut output, is_error) = self
-            .tool_completion
-            .take()
-            .map(|(_, output, is_error)| (output, is_error))
-            .unwrap_or_else(|| match &result {
+        let (mut output, is_error) = match self.tool_completion.take() {
+            // Reuse only a settle of this very call (cancellation grace
+            // period); a leftover from an earlier failed execution is stale.
+            Some((settled, output, is_error)) if settled.call_id == call.call_id => {
+                (output, is_error)
+            }
+            _ => match &result {
                 Ok(value) => (value.clone(), false),
                 Err(error) => (json!({"error":error.to_string()}), true),
-            });
+            },
+        };
         self.tool_completion = Some((call.clone(), output.clone(), is_error));
         let event = match &result {
             Ok(value) => HookEvent::PostToolUse {
@@ -332,7 +335,28 @@ impl ExecutionState<'_> {
                     let decision = match decision {
                         Some(decision) => decision,
                         None => {
-                            let reply = self.ask(uuid::Uuid::new_v4().to_string(), json!({"kind":"permission", "reason":if doom_loop { "Repeated identical tool call (doom_loop)" } else { "Tool permission" }, "call_id":call.call_id, "tool_name":call.fn_name, "input":call.fn_arguments}), self.tc.info.options.limits.approval_timeout.or(self.config.approval_timeout)).await;
+                            let reason = if doom_loop {
+                                "Repeated identical tool call (doom_loop)"
+                            } else {
+                                "Tool permission"
+                            };
+                            let payload = json!({
+                                "kind": "permission",
+                                "reason": reason,
+                                "call_id": call.call_id,
+                                "tool_name": call.fn_name,
+                                "input": call.fn_arguments,
+                            });
+                            let timeout = self
+                                .tc
+                                .info
+                                .options
+                                .limits
+                                .approval_timeout
+                                .or(self.config.approval_timeout);
+                            let reply = self
+                                .ask(uuid::Uuid::new_v4().to_string(), payload, timeout)
+                                .await;
                             match reply {
                                 Ok(reply) => parse_decision(reply)?,
                                 Err(e @ YourAiError::Aborted(_)) => return Err(e),

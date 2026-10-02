@@ -607,3 +607,17 @@ async fn public_registry_binding_exec_uses_framework_lifecycle_and_rejects_repla
         ]
     );
 }
+
+#[tokio::test]
+async fn unresolved_tool_calls_block_dependent_operations() {
+    let registry = Arc::new(Registry::default());
+    registry.register(Arc::new(Handler::new("tool", Mode::Return)));
+    let agent = Agent::builder()
+        .agent_loop(Arc::new(custom::GuardLoop))
+        .context_manager(Arc::new(History::default()))
+        .tools(registry)
+        .hooks(Arc::new(Hooks::new(|_, _| {})))
+        .model(Arc::new(Model::new(vec![calls(&["tool"]), answer("done")])))
+        .build();
+    assert_eq!(agent.run(In::user_text("go")).await.unwrap().text, "done");
+}

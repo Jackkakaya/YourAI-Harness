@@ -9,7 +9,13 @@ pub struct LoopConfig {
     /// Managed output storage; assembled harnesses share their catalog store.
     pub tool_output: Option<Arc<crate::tools::ToolOutputStore>>,
     /// Explicitly selected skills; listing a skill does not activate it.
+    ///
+    /// Host-driven turns (`SessionHost::run_next`) always inject per-turn
+    /// [`InputOptions`](yourai_core::InputOptions), which overrides these
+    /// values — treat them as defaults for directly constructed turns only.
     pub skill_ids: Vec<String>,
+    /// Recall limit for the initial input; see `skill_ids` for the host
+    /// override behavior.
     pub memory_search_limit: usize,
     pub memory_max_chars: usize,
     /// OpenCode-compatible attachment image normalization policy.

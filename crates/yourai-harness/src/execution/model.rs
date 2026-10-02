@@ -38,7 +38,14 @@ impl ExecutionState<'_> {
     ) -> Result<(ChatMessage, Vec<ToolCall>), YourAiError> {
         self.bound_tools.clear();
         let mut tools = vec![];
-        if let (false, Some(registry)) = (!model_options.tools_enabled, &self.tc.snap.tools) {
+        // Bind every registered tool when this step allows tool use.
+        if let Some(registry) = self
+            .tc
+            .snap
+            .tools
+            .as_ref()
+            .filter(|_| model_options.tools_enabled)
+        {
             let mut definitions = registry.definitions();
             definitions.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
             for definition in definitions {

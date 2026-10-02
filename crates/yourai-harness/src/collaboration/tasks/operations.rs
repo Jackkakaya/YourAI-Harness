@@ -21,7 +21,7 @@ impl TaskBoard {
             completed: false,
             seq: self
                 .seq
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .map_err(|_| error("tasks", "task creation sequence exhausted"))?
                 + 1,
         };

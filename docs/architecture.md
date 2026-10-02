@@ -500,12 +500,13 @@ pub trait ToolHandler: Send + Sync {
 }
 
 pub trait ToolRegistry: Send + Sync {
-    fn register(&self, handler: Arc<dyn ToolHandler>);
+    fn register(&self, handler: Arc<dyn ToolHandler>);          // 委托 register_binding
+    fn register_binding(&self, binding: ToolBinding);            // 注册侧协议入口
     fn unregister(&self, name: &str);
     fn has(&self, name: &str) -> bool;
     fn definitions(&self) -> Vec<Tool>;              // 所有工具的 schema
     fn security_context(&self, name: &str, input: &Value) -> Result<SecurityContext>;
-    fn resolve(&self, name: &str) -> Result<Arc<dyn ToolHandler>, YourAiError>; // 管理/绑定侧接口
+    fn resolve(&self, name: &str) -> Result<ToolBinding, YourAiError>; // 返回私有持有 backend 的执行绑定
     fn count(&self) -> usize;
 }
 ```
@@ -1156,7 +1157,7 @@ run_turn(tc)
       │       └─ Ask   → outbox.send(Out::Ask)   │
       │                  select! 等 In::Reply     │
       │     • ToolContext{call_id, security,     │
-      │       sandbox} → tools.execute(tc, ...)  │
+      │       sandbox} → binding.exec(op, call) │
       │       （第二层 check_command/文件检查、   │
       │        sandbox.apply(Command) 由具体工具 │
       │        用 tc 注入的能力自调）             │

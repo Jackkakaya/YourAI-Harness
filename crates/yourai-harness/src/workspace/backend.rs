@@ -58,10 +58,7 @@ impl Workspace {
                 .canonicalize()
                 .map_err(|e| error("workspace", e))?;
             if !p.is_dir() {
-                return Err(error(
-                    "workspace",
-                    "provided worktree path is not a directory",
-                ));
+                return Err(error("workspace", "hook worktree path is not a directory"));
             }
             p
         } else {

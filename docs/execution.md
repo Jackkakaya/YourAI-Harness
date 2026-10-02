@@ -104,7 +104,7 @@ impl AgentLoop for MyLoop {
 | StopFailure | model.exec：最终模型故障报告，不用于普通工具错误或取消 |
 | SessionStart | SessionHost.open/restore：初始化后应用初始输入、上下文与监视路径 |
 | SessionEnd | SessionHost.close：停止资源后执行结束 Hook，完成关闭提交 |
-| TurnCompleted | SessionHost.run_next：成功且历史/宿主提交后通知，不撤销结果 |
+| TurnCompleted | SessionHost.run_next：成功且历史/宿主提交后通知（仅当 `through_seq > after_seq`，即本 turn 确有新提交行），不撤销结果 |
 | SubagentStart | Subagents.exec_child：准备后、启动子会话前检查 |
 | SubagentStop | 子代理包装：候选结束时检查；反馈进入同一子会话继续执行 |
 | PreCompact | context.compact：仅摘要阶段执行，可阻断或补充指令 |

@@ -206,7 +206,7 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
 ① 前端把请求交给 SessionHost
 ② 宿主尝试取得会话执行互斥
     ├─ 正在执行 Turn / 另一次压缩 → 返回 Busy
-    └─ 空闲 → 调 ContextManager.compact(Manual)
+    └─ 空闲 → 走公共 compact 包装（ContextManager.prepare_compaction）
 ③ 内部忽略自动阈值与自动冷却，执行摘要流程
 ④ 宿主展示 Summarized / Unchanged / 错误，释放互斥
 ```

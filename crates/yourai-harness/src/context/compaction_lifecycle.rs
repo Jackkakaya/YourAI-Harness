@@ -95,6 +95,14 @@ pub async fn compact(
             summary,
         } = job.run(run_options, execution, cancel, &committed).await?;
         committed.store(true, Ordering::Release);
+        if result.action != CompactAction::Summarized {
+            return Err(ErrorKind::Config(
+                "CompactionJob must report a Summarized commit; the summary is durable, \
+                 but its reported action breaks overflow accounting"
+                    .into(),
+            )
+            .into());
+        }
         result.notices.extend(pre.notices().map(str::to_owned));
         match hook(
             execution,
