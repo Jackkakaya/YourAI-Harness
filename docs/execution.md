@@ -86,7 +86,7 @@ impl AgentLoop for MyLoop {
 - `Complete`：未变更或只剪枝，已经完成相应业务操作。
 - `Summary`：持有业务锁/事务的 `CompactionJob`，只实现摘要生成与提交。
 
-公共 `context::compact` 对所有 ContextManager 使用相同包装：准备 → PreCompact → job.run → PostCompact。PreCompact 上下文合入摘要指令，PostCompact 上下文通过标准 append 保存。MemoryContext 的便捷 compact、SessionHost 的手动 compact 和 turn 内 compact 均调用此入口。
+公共入口 `yourai_core::context_manager::compact` 位于 core（`yourai_harness::context::compact` 为其再导出），对所有 ContextManager 使用相同包装：准备 → PreCompact → job.run → PostCompact。PreCompact 上下文合入摘要指令，PostCompact 上下文通过标准 append 保存。MemoryContext 的便捷 compact、SessionHost 的手动 compact 和 turn 内 compact 均调用此入口。
 
 摘要任务报告提交标记，以区分提交前取消与提交后收尾失败；这是持久化契约，不是 Hook 协议。只剪枝不会触发摘要 Hook。提交后的 post 故障或阻断不会撤回摘要，CompactionResult 携带 stop_reason。直接调用低层业务 provider/backend 属于实现协议，不会自动获得公共操作的执行契约。
 

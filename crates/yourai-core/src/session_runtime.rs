@@ -98,7 +98,10 @@ pub trait SessionRuntime: Send + Sync {
     /// 请求取消当前运行；不清空尚未运行的输入，不等价于完成清理。
     fn interrupt(&self);
 
-    /// 手动压缩，与 Turn 历史写入互斥；公共压缩包装处理 Hook，ContextManager 的业务计划完成提交和内存更新。
+    /// 手动压缩，与 Turn 历史写入互斥。实现必须经由公共入口
+    /// [`crate::context_manager::compact`] 执行——它固定持有 Hook 生命周期、
+    /// 阻断与取消/提交竞态语义；内部调用 ContextManager 的业务计划与摘要提交。
+    /// 直接调用 `prepare_compaction` / `CompactionJob::run` 属于实现协议，不获得该契约。
     fn compact<'a>(
         &'a self,
         request: CompactionRequest,

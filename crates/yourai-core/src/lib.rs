@@ -99,7 +99,7 @@ pub mod prelude {
         Agent, AgentBuilder, Context, ProviderSnapshot, TurnContext, TurnHandle,
     };
     pub use crate::context_manager::{
-        CompactionCommit, CompactionJob, CompactionPlan, ContextExecution, ContextManager,
+        compact, CompactionCommit, CompactionJob, CompactionPlan, ContextExecution, ContextManager,
         ContextRequest,
     };
     pub use crate::error::{AbortReason, ErrorKind, YourAiError};
