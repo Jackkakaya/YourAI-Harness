@@ -1,6 +1,23 @@
 //! Session lifecycle wrappers. Business initialization and cleanup are private host actions.
 use super::*;
 
+/// 宿主回调实现：core 公共操作模板（任务/工作区等）经由这里派发与消费 hook。
+impl yourai_core::hooks::HookHost for SessionHost {
+    fn dispatch_hook(
+        &self,
+        event: HookEvent,
+    ) -> BoxFuture<'_, Result<HookDispatchResult, YourAiError>> {
+        Box::pin(SessionHost::dispatch(self, event))
+    }
+    fn consume_hook_result<'a>(
+        &'a self,
+        result: &'a HookDispatchResult,
+        deny_block: bool,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(SessionHost::consume_hook_async(self, result, deny_block))
+    }
+}
+
 impl SessionHost {
     pub(crate) async fn open_owned(
         lease: SessionLease,

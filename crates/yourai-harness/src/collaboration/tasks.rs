@@ -5,30 +5,23 @@ use crate::{
     storage::{atomic_write, read_json},
     SessionHost,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, Weak,
     },
 };
 use yourai_core::prelude::*;
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Task {
-    pub id: String,
-    pub subject: String,
-    pub description: Option<String>,
-    pub owner: Option<String>,
-    pub completed: bool,
-    /// Monotonic creation order. Files written before this field existed
-    /// load with 0; they sort first and keep their id order as tie-break.
-    #[serde(default)]
-    pub seq: u64,
-}
+
+/// Task 条目与固定公共任务操作住在 core；此处仅保留业务实现。
+pub use yourai_core::tasks::{Task, TaskBoardProvider};
+
 pub struct TaskBoard {
     host: Weak<SessionHost>,
+    dir: PathBuf,
     tasks: Mutex<HashMap<String, Task>>,
     gate: tokio::sync::Mutex<()>,
     seq: AtomicU64,
@@ -50,6 +43,7 @@ impl TaskBoard {
         let seq = tasks.values().map(|t: &Task| t.seq).max().unwrap_or(0);
         Ok(Arc::new(Self {
             host: Arc::downgrade(host),
+            dir: host.dir.clone(),
             tasks: Mutex::new(tasks),
             gate: tokio::sync::Mutex::new(()),
             seq: AtomicU64::new(seq),

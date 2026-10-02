@@ -68,6 +68,8 @@ pub mod security;
 pub mod session;
 pub mod session_runtime;
 pub mod skill;
+pub mod subagent;
+pub mod tasks;
 pub mod tool;
 pub mod turn;
 pub mod ui;
@@ -106,9 +108,9 @@ pub mod prelude {
     pub use crate::future::BoxFuture;
     pub use crate::hooks::{
         BaseInput, FailurePolicy, HookBlockingError, HookCommonOutcome, HookDispatchResult,
-        HookEvent, HookEventKind, HookHandler, HookInvocation, HookMessage, HookMessageKind,
-        HookOutput, HookPermission, HookPointOutcome, HookRegistry, HookRun, HookRunStatus,
-        HookRuntime, HookSource, NativeHookRegistration,
+        HookEvent, HookEventKind, HookHandler, HookHost, HookInvocation, HookMessage,
+        HookMessageKind, HookOutput, HookPermission, HookPointOutcome, HookRegistry, HookRun,
+        HookRunStatus, HookRuntime, HookSource, NativeHookRegistration,
     };
     pub use crate::interaction::{InteractionKind, InteractionRequest, ToolInteraction};
     pub use crate::memory::{
@@ -135,6 +137,10 @@ pub mod prelude {
         InputRejected, SessionContext, SessionRuntime, SessionStatus, SessionTurn,
     };
     pub use crate::skill::{SkillContent, SkillInfo, SkillProvider};
+    pub use crate::tasks::{
+        complete_task, create_task, teammate_idle, Task, TaskBoardProvider, TaskCompletePlan,
+        TaskCreatePlan,
+    };
     pub use crate::tool::{
         ExecutedTool, ToolBinding, ToolContext, ToolHandler, ToolOperation, ToolRegistry,
     };

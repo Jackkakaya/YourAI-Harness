@@ -768,6 +768,30 @@ pub enum HookOutput {
     Backgrounded { task_id: String },
 }
 
+// region:    --- 宿主回调（core 操作模板的注入点） ---
+
+/// Host-side callbacks for core-owned operation templates.
+///
+/// 运行时宿主实现本 trait：`dispatch_hook` 用宿主的 hook runtime 派发事件；
+/// `consume_hook_result` 应用结果（阻断语义 + 通知/附加上下文进入宿主事件队列）。
+/// core 公共操作模板（任务、工作区等）通过它把 hook 结果交还宿主；
+/// 模板自身固定事件顺序与各操作的 `deny_block` 语义。
+pub trait HookHost: Send + Sync {
+    /// Dispatch one hook event with the host's hook runtime and timeout.
+    fn dispatch_hook(
+        &self,
+        event: HookEvent,
+    ) -> BoxFuture<'_, Result<HookDispatchResult, YourAiError>>;
+    /// Consume a dispatch result; `deny_block` marks operations whose
+    /// blocking errors abort the call site.
+    fn consume_hook_result<'a>(
+        &'a self,
+        result: &'a HookDispatchResult,
+        deny_block: bool,
+    ) -> BoxFuture<'a, Result<(), YourAiError>>;
+}
+// endregion: --- 宿主回调（core 操作模板的注入点） ---
+
 #[cfg(test)]
 mod tests {
     use super::HookEventKind;

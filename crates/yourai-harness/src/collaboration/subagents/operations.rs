@@ -2,6 +2,18 @@
 use super::backend::ChildCleanup;
 use super::*;
 
+/// 缝实现：SubagentStart/SubagentStop 生命周期在本实现内，
+/// 公共入口 `yourai_core::subagent::exec_child` 委托到这里。
+impl yourai_core::subagent::SubagentOperation for SubagentTool {
+    fn exec_child_bound<'a>(
+        &'a self,
+        tc: ToolContext<'a>,
+        prompt: String,
+    ) -> BoxFuture<'a, Result<Value, YourAiError>> {
+        Box::pin(SubagentTool::exec_child(self, tc, prompt))
+    }
+}
+
 impl SubagentTool {
     pub(super) async fn exec_child(
         &self,
