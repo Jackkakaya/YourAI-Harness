@@ -1,6 +1,56 @@
 //! Public operation wrappers own hooks and effect application.
 use super::*;
 
+/// 缝实现：工作区变更生命周期在本实现内（宿主 gate / 监视集 / 事件队列），
+/// 公共入口 `yourai_core::workspace::*` 委托到这里。
+impl yourai_core::workspace::WorkspaceOperation for Workspace {
+    fn setup_bound<'a>(&'a self, trigger: &'a str) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(Workspace::setup(self, trigger))
+    }
+    fn load_instructions_bound<'a>(
+        &'a self,
+        path: &'a Path,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(Workspace::load_instructions(self, path, reason))
+    }
+    fn notify_bound<'a>(
+        &'a self,
+        message: &'a str,
+        kind: &'a str,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(Workspace::notify(self, message, kind))
+    }
+    fn change_config_bound<'a>(
+        &'a self,
+        source: &'a str,
+        value: Value,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(Workspace::change_config(self, source, value))
+    }
+    fn change_cwd_bound<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(Workspace::change_cwd(self, path))
+    }
+    fn create_worktree_bound<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<PathBuf, YourAiError>> {
+        Box::pin(Workspace::create_worktree(self, name))
+    }
+    fn remove_worktree_bound<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(Workspace::remove_worktree(self, name))
+    }
+    fn file_changed_bound<'a>(&'a self, path: &'a Path, event: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Ok(host) = self.host() else { return };
+            Workspace::file_changed(self, &host, path, event).await
+        })
+    }
+}
+
 impl Workspace {
     pub async fn setup(&self, trigger: &str) -> Result<(), YourAiError> {
         let host = self.host()?;

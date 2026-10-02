@@ -74,6 +74,7 @@ pub mod tool;
 pub mod turn;
 pub mod ui;
 pub mod usage;
+pub mod workspace;
 
 /// genai 类型 re-export（决策 5.6）：下游一律写 `yourai_core::chat::Xxx`
 pub mod chat {
