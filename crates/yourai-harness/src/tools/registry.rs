@@ -1,15 +1,12 @@
 use crate::error;
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashMap, sync::RwLock};
 use yourai_core::prelude::*;
 #[derive(Default)]
 pub struct ToolSet {
-    handlers: RwLock<HashMap<String, Arc<dyn ToolHandler>>>,
+    handlers: RwLock<HashMap<String, ToolBinding>>,
 }
 impl ToolRegistry for ToolSet {
-    fn register(&self, h: Arc<dyn ToolHandler>) {
+    fn register_binding(&self, h: ToolBinding) {
         self.handlers.write().unwrap().insert(h.name().into(), h);
     }
     fn unregister(&self, n: &str) {
@@ -29,7 +26,7 @@ impl ToolRegistry for ToolSet {
         v.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         v
     }
-    fn resolve(&self, n: &str) -> Result<Arc<dyn ToolHandler>, YourAiError> {
+    fn resolve(&self, n: &str) -> Result<ToolBinding, YourAiError> {
         self.handlers
             .read()
             .unwrap()

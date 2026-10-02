@@ -57,18 +57,32 @@ pub trait ContextManager: Send + Sync {
     fn system_prompt(&self) -> String;
     fn session_id(&self) -> &SessionId;
     fn restore(&self) -> BoxFuture<'_, Result<(), YourAiError>>;
+    /// Appends stored messages to the durable history.
+    ///
+    /// Implementations must accept runtime-context rows (marker-prefixed
+    /// notes such as `[PostCompact context]`): the public compact wrapper
+    /// appends PostCompact additional contexts through this method, and a
+    /// rejection would stop continuation after an already committed summary.
     fn append(&self, messages: Vec<StoredMessage>) -> BoxFuture<'_, Result<(), YourAiError>>;
     fn build_request(
         &self,
         tools: &[Tool],
         execution: &ContextExecution,
     ) -> Result<ContextRequest, YourAiError>;
-    fn compact<'a>(
+    /// Implementation-side planning. Public context operations own the hook lifecycle.
+    ///
+    /// Hard invariants: `prepare_compaction` must not commit summary changes,
+    /// and on the Summary path it must not mutate the active view — a
+    /// PreCompact hook may still block afterwards. Summary commits happen
+    /// only inside [`CompactionJob::run`]. Complete plans include only
+    /// no-op/prune-only commits; Summary jobs hold any transaction/lock
+    /// needed until their business commit finishes.
+    fn prepare_compaction<'a>(
         &'a self,
-        options: CompactionRequest,
+        options: &'a CompactionRequest,
         execution: &'a ContextExecution,
         cancel: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>>;
+    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>>;
     /// Read-only active view and archival identity checks used by recovery/deduplication.
     fn records(&self) -> Vec<StoredMessage>;
     /// Committed high-water mark, including messages removed from active context.
@@ -101,4 +115,49 @@ pub trait ContextManager: Send + Sync {
     fn default_options(&self) -> ChatOptions {
         ChatOptions::default()
     }
+}
+
+/// A prepared business operation; no hook protocol is required from implementations.
+pub enum CompactionPlan<'a> {
+    Complete(CompactionResult),
+    Summary(Box<dyn CompactionJob + 'a>),
+}
+
+impl std::fmt::Debug for CompactionPlan<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Complete(result) => f.debug_tuple("Complete").field(result).finish(),
+            Self::Summary(_) => f.debug_tuple("Summary").field(&"<compaction job>").finish(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct CompactionCommit {
+    pub result: CompactionResult,
+    pub summary: String,
+}
+
+/// Implementation-side summary and durable commit.
+pub trait CompactionJob: Send {
+    /// Runs the summary and commits it durably.
+    ///
+    /// `committed` must be set to `true` as soon as the business commit is
+    /// durable — before post-commit bookkeeping or returning (see
+    /// `MemoryContext::run_summary`). The wrapper reads it only after a
+    /// cancellation/deadline drop: a set flag means the summary landed even
+    /// though this future was abandoned, so the caller reports the commit
+    /// instead of a plain cancellation. Implementations must tolerate the
+    /// future being dropped between the durable write and resolution; the
+    /// `MemoryContext` recovery protocol (dirty-flag reload) is one way to
+    /// make a misreported cancellation recoverable.
+    fn run<'a>(
+        self: Box<Self>,
+        options: CompactionRequest,
+        execution: &'a ContextExecution,
+        cancel: &'a CancellationToken,
+        committed: &'a std::sync::atomic::AtomicBool,
+    ) -> BoxFuture<'a, Result<CompactionCommit, YourAiError>>
+    where
+        Self: 'a;
 }

@@ -95,12 +95,12 @@ impl ContextManager for MemoryContext {
     ) -> Result<ContextRequest, YourAiError> {
         self.inner.build_request(t, e)
     }
-    fn compact<'a>(
+    fn prepare_compaction<'a>(
         &'a self,
-        r: CompactionRequest,
+        r: &'a CompactionRequest,
         e: &'a ContextExecution,
         c: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>> {
-        self.inner.compact(r, e, c)
+    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
+        self.inner.prepare_compaction(r, e, c)
     }
 }

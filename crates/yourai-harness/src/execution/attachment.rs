@@ -82,7 +82,7 @@ fn encode_error(error: image::ImageError) -> ResolveError {
 pub(super) fn message(
     text: &str,
     attachments: &[UserAttachment],
-    config: &super::LoopConfig,
+    config: &super::ExecutionConfig,
     cwd: Option<&Path>,
 ) -> Result<ChatMessage, ResolveError> {
     if attachments.is_empty() {
@@ -106,7 +106,7 @@ pub(super) fn message(
 /// Resolve one attachment into a model-visible content part.
 pub(super) fn resolve_attachment(
     att: &UserAttachment,
-    config: &super::LoopConfig,
+    config: &super::ExecutionConfig,
 ) -> Result<ContentPart, ResolveError> {
     match &att.data {
         AttachmentData::Base64(data) => {
@@ -354,7 +354,10 @@ fn classify_path(path: &Path) -> FileKind {
     }
 }
 
-fn resolve_file(file: &FileRef, config: &super::LoopConfig) -> Result<ContentPart, ResolveError> {
+fn resolve_file(
+    file: &FileRef,
+    config: &super::ExecutionConfig,
+) -> Result<ContentPart, ResolveError> {
     let path = PathBuf::from(&file.path);
     std::fs::metadata(&path).map_err(|e| io_error("file", &file.path, e))?;
     let ext = path
@@ -499,8 +502,8 @@ fn directory_listing(
 mod tests {
     use super::*;
 
-    fn config() -> super::super::LoopConfig {
-        super::super::LoopConfig::default()
+    fn config() -> super::super::ExecutionConfig {
+        super::super::ExecutionConfig::default()
     }
 
     fn att(content_type: &str, data: &str) -> UserAttachment {

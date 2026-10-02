@@ -407,7 +407,7 @@ async fn child_agent_runs_its_own_session_and_reports_lifecycle() {
         sandbox: None,
         interaction: None,
     };
-    let result = tool.execute(tc, json!({"prompt":"do work"})).await.unwrap();
+    let result = tool.run(tc, json!({"prompt":"do work"})).await.unwrap();
     assert_eq!(result["text"], "child result");
     // Completed children are released, not retained.
     assert_eq!(tool.child_ids().len(), 0);

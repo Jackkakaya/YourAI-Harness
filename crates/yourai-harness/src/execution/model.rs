@@ -1,9 +1,9 @@
-use super::State;
+use super::{ExecutionState, ModelOptions};
 use futures_util::StreamExt;
 use std::collections::HashSet;
 use yourai_core::prelude::*;
 
-impl State<'_> {
+impl ExecutionState<'_> {
     /// Save what streamed so far so cancellation cleanup can persist it, then return the error.
     fn fail_with_partial(
         &mut self,
@@ -24,19 +24,28 @@ impl State<'_> {
     pub(crate) async fn model_step(
         &mut self,
         attempt: u32,
+        model_options: &ModelOptions,
     ) -> Result<(ChatMessage, Vec<ToolCall>), (YourAiError, bool)> {
         let mut visible = false;
-        let result = self.read_model(&mut visible, attempt).await;
+        let result = self.read_model(&mut visible, attempt, model_options).await;
         result.map_err(|e| (e, visible))
     }
     async fn read_model(
         &mut self,
         visible: &mut bool,
         attempt: u32,
+        model_options: &ModelOptions,
     ) -> Result<(ChatMessage, Vec<ToolCall>), YourAiError> {
         self.bound_tools.clear();
         let mut tools = vec![];
-        if let (false, Some(registry)) = (self.forced_final, &self.tc.snap.tools) {
+        // Bind every registered tool when this step allows tool use.
+        if let Some(registry) = self
+            .tc
+            .snap
+            .tools
+            .as_ref()
+            .filter(|_| model_options.tools_enabled)
+        {
             let mut definitions = registry.definitions();
             definitions.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
             for definition in definitions {
@@ -75,14 +84,14 @@ impl State<'_> {
             )
             .into());
         }
-        if self.forced_final {
+        if let Some(prefill) = &model_options.prefill {
             // opencode runner (llm.ts "isLastStep"): append an assistant-role
             // MAX_STEPS_PROMPT prefill to the outgoing request only — never to
             // persisted history — and forbid tool calls at the API level.
             prepared
                 .request
                 .messages
-                .push(ChatMessage::assistant(super::MAX_STEPS_PROMPT));
+                .push(ChatMessage::assistant(prefill.clone()));
         }
         let request = prepared.request;
         let observed_request = request.clone();
@@ -93,10 +102,13 @@ impl State<'_> {
             .with_capture_tool_calls(true)
             .with_capture_usage(true)
             .with_capture_reasoning_content(true);
-        if self.forced_final {
+        if !model_options.tools_enabled {
             options = options.with_tool_choice(ToolChoice::None);
         }
-        let model = self.model.clone();
+        let model = self
+            .model
+            .clone()
+            .ok_or_else(|| ErrorKind::Config("model not configured".into()))?;
         let model_timeout = self.tc.info.options.limits.model_timeout;
         let header_timeout = model_timeout
             .or(options.stream_header_timeout)
@@ -199,7 +211,7 @@ impl State<'_> {
                             .record_event(
                                 self.history.session_id(),
                                 &UsageEvent::new(
-                                    Some(self.model.model_iden().into()),
+                                    Some(model.model_iden().into()),
                                     "main",
                                     end.captured_usage.clone().unwrap_or_default(),
                                 ),
@@ -209,7 +221,7 @@ impl State<'_> {
                     if let Some(u) = &end.captured_usage {
                         if let Some(input_tokens) = u.prompt_tokens.filter(|n| *n >= 0) {
                             self.request_observation = Some(RequestObservation {
-                                model: self.model.model_iden().into(),
+                                model: model.model_iden().into(),
                                 request: observed_request.clone(),
                                 input_tokens: input_tokens as u64,
                             });
