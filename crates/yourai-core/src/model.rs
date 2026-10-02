@@ -5,7 +5,7 @@
 //! 选项由 ContextManager 组装请求时带出，不再断链。
 
 use crate::chat::ChatStreamEvent;
-use crate::chat::{ChatOptions, ChatRequest, ChatResponse};
+use crate::chat::{ChatOptions, ChatRequest, ChatResponse, ToolCall};
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
 use std::pin::Pin;
@@ -142,3 +142,48 @@ pub trait ModelProvider: Send + Sync {
 
     fn model_iden(&self) -> &str;
 }
+
+// region:    --- 公共模型执行入口（固定缝） ---
+
+/// Options for one model execution step.
+#[derive(Debug, Clone)]
+pub struct ModelOptions {
+    pub tools_enabled: bool,
+    pub prefill: Option<String>,
+}
+impl Default for ModelOptions {
+    fn default() -> Self {
+        Self {
+            tools_enabled: true,
+            prefill: None,
+        }
+    }
+}
+
+/// Result of one model execution step.
+#[derive(Debug, Clone)]
+pub struct ModelOutput {
+    pub text: String,
+    pub calls: Vec<ToolCall>,
+}
+
+/// Infrastructure bridge between the Core entry and a runtime's execution.
+/// Model providers implement [`ModelProvider`]; ordinary callers use [`exec`].
+#[doc(hidden)]
+pub trait ModelOperation: Send {
+    fn exec_bound<'a>(
+        &'a mut self,
+        options: ModelOptions,
+    ) -> BoxFuture<'a, Result<ModelOutput, YourAiError>>;
+}
+
+/// Fixed public model execution entry; always delegates to the supplied
+/// framework operation, which owns the step lifecycle (request build,
+/// streaming, timeouts, retry and StopFailure reporting).
+pub fn exec<'a>(
+    operation: &'a mut dyn ModelOperation,
+    options: ModelOptions,
+) -> BoxFuture<'a, Result<ModelOutput, YourAiError>> {
+    operation.exec_bound(options)
+}
+// endregion: --- 公共模型执行入口（固定缝） ---
