@@ -3,6 +3,7 @@ pub mod assembly;
 pub mod collaboration;
 pub mod context;
 pub mod default_loop;
+pub mod execution;
 pub mod hooks;
 pub mod memory;
 pub mod model;

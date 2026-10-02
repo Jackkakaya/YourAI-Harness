@@ -1,6 +1,8 @@
 #[path = "support/context.rs"]
 mod context_fixture;
 use context_fixture::{ContextServices, MemoryContext};
+#[path = "support/execution.rs"]
+mod custom;
 #[path = "support/loop.rs"]
 mod support;
 use serde_json::json;
@@ -133,6 +135,62 @@ async fn seed_tools(c: &MemoryContext) {
     ])
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn custom_loop_compaction_uses_summary_lifecycle_and_retains_current_input() {
+    let hooks = Arc::new(support::Hooks::new(|_, result| {
+        if let HookPointOutcome::Generic(outcome) = &mut result.outcome {
+            outcome
+                .additional_contexts
+                .push("compaction context".into());
+        }
+    }));
+    let model = Summarizer::new();
+    let (_dir, _store, history) = setup(policy(), model.clone(), None).await;
+    append(
+        &history,
+        vec![
+            ChatMessage::user("old task ".repeat(300)),
+            ChatMessage::assistant("old answer ".repeat(300)),
+        ],
+    )
+    .await;
+    let agent = Agent::builder()
+        .agent_loop(Arc::new(custom::CompactLoop))
+        .model(model.clone())
+        .context_manager(history.clone())
+        .hooks(hooks.clone())
+        .build();
+    let output = agent.run(In::user_text("current input")).await.unwrap();
+    assert_eq!(output.text, "compacted");
+    assert_eq!(
+        *hooks.seen.lock().unwrap(),
+        [
+            HookEventKind::UserPromptSubmit,
+            HookEventKind::PreCompact,
+            HookEventKind::PostCompact,
+            HookEventKind::Stop,
+        ]
+    );
+    let records = history.records();
+    assert!(records.iter().any(|r| r.summary));
+    assert!(records.iter().any(|r| r.runtime_context
+        && r.message
+            .content
+            .texts()
+            .join("")
+            .contains("compaction context")));
+    assert!(records.iter().any(|r| r.message.role == ChatRole::User
+        && r.message.content.texts().join("") == "current input"));
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .request
+        .system
+        .as_deref()
+        .unwrap()
+        .contains("compaction context"));
 }
 #[tokio::test]
 async fn projection_is_bounded_valid_json_and_original_is_preserved() {

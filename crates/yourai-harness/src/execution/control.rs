@@ -1,11 +1,11 @@
-use super::State;
+use super::ExecutionState;
 use std::{
     future::Future,
     time::{Duration, Instant},
 };
 use yourai_core::prelude::*;
 
-impl State<'_> {
+impl ExecutionState<'_> {
     pub(crate) fn op_timeout(&self) -> Option<Duration> {
         self.config.operation_timeout
     }

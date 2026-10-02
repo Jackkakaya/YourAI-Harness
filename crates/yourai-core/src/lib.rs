@@ -98,7 +98,10 @@ pub mod prelude {
     pub use crate::context::{
         Agent, AgentBuilder, Context, ProviderSnapshot, TurnContext, TurnHandle,
     };
-    pub use crate::context_manager::{ContextExecution, ContextManager, ContextRequest};
+    pub use crate::context_manager::{
+        CompactionCommit, CompactionJob, CompactionPlan, ContextExecution, ContextManager,
+        ContextRequest,
+    };
     pub use crate::error::{AbortReason, ErrorKind, YourAiError};
     pub use crate::future::BoxFuture;
     pub use crate::hooks::{
@@ -132,8 +135,10 @@ pub mod prelude {
         InputRejected, SessionContext, SessionRuntime, SessionStatus, SessionTurn,
     };
     pub use crate::skill::{SkillContent, SkillInfo, SkillProvider};
-    pub use crate::tool::{ToolContext, ToolHandler, ToolRegistry};
-    pub use crate::turn::{TurnId, TurnInfo, TurnLimits, TurnOptions};
+    pub use crate::tool::{
+        ExecutedTool, ToolBinding, ToolContext, ToolHandler, ToolOperation, ToolRegistry,
+    };
+    pub use crate::turn::{InputOptions, TurnId, TurnInfo, TurnLimits, TurnOptions};
     pub use crate::ui::OutSink;
     pub use crate::usage::{UsageEvent, UsageStats, UsageTracker};
 }

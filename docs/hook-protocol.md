@@ -156,7 +156,7 @@ pub struct BaseInput {
 | `CwdChanged` | `old_cwd: string`、`new_cwd: string` |
 | `FileChanged` | `file_path: string`、`event: "change" \| "add" \| "unlink"` |
 
-共 27 种事件。YourAI 的 `HookEvent` enum 有对应变体（`#[non_exhaustive]`）。
+上述兼容基线共 27 种事件。YourAI 另外提供 `TurnCompleted`，当前 `HookEvent` 共 28 种（`#[non_exhaustive]`）。
 
 ### 1.4 枚举类型
 
@@ -671,11 +671,11 @@ pub struct HookRun {
 }
 ```
 
-### 9.3 Loop 消费规则
+### 9.3 公共业务入口消费规则
 
-HookRuntime 只返回数据，不产生业务副作用。Loop 负责消费：
+HookRuntime 返回类型化数据。Harness 的公共 execution 和生命周期入口负责消费；AgentLoop 只调度业务操作：
 
-| 事件 | Loop 消费动作 |
+| 事件 | 公共入口消费动作 |
 |---|---|
 | `UserPromptSubmit` | blocking feedback → 拒绝本次输入；`preventContinuation` → 停止；`additionalContexts` → 写入 `ContextManager` |
 | `PreToolUse` | `permission` 与 `SecurityProvider` 合并；deny 只拒绝工具；`preventContinuation` 才停止；`Ask` → 发 `Out::Ask` 等 `In::Reply` |
@@ -683,10 +683,9 @@ HookRuntime 只返回数据，不产生业务副作用。Loop 负责消费：
 | `SessionStart` | `additionalContexts` 注入；`watchPaths` 注册文件监听 |
 | 其他 | Block → 阻断；`additionalContexts` 收集 |
 
-关键边界：**HookRuntime 负责把外部程序变成可信的类型化结果；Loop 负责让这个结果在 Agent 流程中真正生效。**
+关键边界：**HookRuntime 负责解析、校验和聚合；公共业务执行入口负责应用结果，调度程序无需接触 Hook 协议。**
 
-当前仓库尚无生产 `DefaultLoop`，所以上表是 Loop 的规范性消费契约，而不是“已经接线”的
-声明。`ProviderSnapshot.hooks` 已提供 turn 级 Runtime 快照，实际触发点与副作用应用留在下一阶段。
+生产 DefaultLoop 和自定义 AgentLoop 已共用 execution 模块。`ProviderSnapshot.hooks` 仍是底层 turn 快照的运行时依赖；普通自定义调度通过 [公共业务入口](./execution.md) 使用它，不自行 dispatch。
 
 ---
 
@@ -818,7 +817,7 @@ permission: HookPermission::Deny { reason: "no rm -rf" }
 | Command stdout | JSON / plain text | JSON / plain text message | 已对齐 |
 | Command 双向 prompt request | 部分调用路径支持 | 依赖未来 Loop Ask/Reply capability | 未对齐 |
 | Exit code 0 | 成功 | 成功 | 已对齐 |
-| Exit code 2 | blocking feedback | blocking feedback | 待 Loop 验收 |
+| Exit code 2 | blocking feedback | blocking feedback | 执行包装已接入并测试 |
 | Exit code other | non-blocking error | non-blocking error | 已对齐 |
 | HTTP method | POST | POST | 已对齐 |
 | HTTP success | 2xx | 2xx | 已对齐 |
@@ -829,25 +828,25 @@ permission: HookPermission::Deny { reason: "no rm -rf" }
 | 权限聚合 | deny > ask > allow | deny > ask > allow | 已对齐 |
 | 并行执行 | 是，按完成顺序产生结果 | 相同，保留 registration 身份 | 已对齐 |
 | 同来源重复 Handler | 执行前去重 | 相同 | 已对齐 |
-| async/asyncRewake | 后台执行 + 完成事件 | 后台执行 + 完成事件；Loop rewake 待接入 | 部分对齐 |
+| async/asyncRewake | 后台执行 + 完成事件 | 后台执行 + 完成事件；宿主按会话路由并唤醒 | 已接入并测试 |
 | prompt/agent handler | 内置模型能力 | 宿主注入 `HookModelExecutor`；缺失时注册失败 | 部分对齐 |
 | Workspace trust | 未信任项目 Hook 不执行 | 注册前由宿主策略层检查 | 待宿主验收 |
-| 事件数量 | 27 | 27 | 已对齐 |
+| 事件数量 | 27 | 27 个兼容事件 + TurnCompleted 扩展 | 共 28 个 |
 | hookSpecificOutput 变体 | 15 | 15 | 已对齐 |
 
 ### 11.1 下一阶段必须补齐的运行边界
 
 以下项目尚未完成，不属于当前“已对齐”范围：
 
-1. 生产 Loop 在所有 hook point 的触发与 outcome 消费，以及 `asyncRewake` 唤醒。
+1. Command 同进程双向 prompt request 的执行层接线；普通工具 Ask/Reply 已实现。
 2. Loop 丢弃 `dispatch` future 的取消集成测试；core trait 已明确 drop-based 取消契约。
 3. Command/HTTP 的默认 timeout（兼容基线为 60 秒）及 stdout、stderr、HTTP body
    的最大字节数。
-4. Command 超时/取消时终止整个进程组，而不仅是直接 shell 子进程。
+4. Command 进程组清理的跨平台一致性；当前 Unix 已终止 shell 及同组子进程。
 5. Command 环境变量继承和默认 shell 策略；需要兼顾最小暴露原则、跨平台行为与
    Claude 脚本兼容性。
 6. Managed/User/Project/Plugin/Session 的 source precedence、显式 `order` 和稳定装配顺序。
-7. Command 同进程双向 prompt request、workspace trust 的宿主接线。
+7. workspace trust 的宿主接线。
 
 “无需修改即可运行”是最终验收结论，不是设计前提；只有本表全部通过自动化
 conformance 测试后才可启用该表述。

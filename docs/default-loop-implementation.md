@@ -2,13 +2,14 @@
 
 > 会话存储与统一提交路径已经落地，当前行为以 [会话存储设计](./session-storage-design.md) 和源码为准。
 
-`yourai_harness::DefaultLoop` 对应流程图 2、3，并复用同一包中的 HookRuntime。实现依赖 `yourai-core`，core 不反向依赖 Loop。图 1、4 及具体 Provider 也统一位于 `yourai-harness`，见 [Runtime 实现与验收](./runtime-implementation.md)。
+`yourai_harness::DefaultLoop` 只实现默认调度。流程图 2、3 的执行契约现归独立 `execution` 模块，默认与自定义 Loop 共用。自定义接口和迁移说明见 [公共执行层](./execution.md)。实现依赖 `yourai-core`，core 不反向依赖 Loop。图 1、4 及具体 Provider 也统一位于 `yourai-harness`，见 [Runtime 实现与验收](./runtime-implementation.md)。
 
 ## 入口和模块
 
 ```text
 Agent.start / run
     -> DefaultLoop.run_turn
+       -> TurnExecution 公共操作
        -> 首条输入 + UserPromptSubmit
        -> checkpoint：取消、steer、延迟上下文
        -> compact（需要时）
@@ -22,14 +23,17 @@ Agent.start / run
 
 | 文件 | 职责 |
 |---|---|
-| `crates/yourai-harness/src/default_loop/mod.rs` | DefaultLoop、LoopConfig、TurnState、主流程、compact、技能与记忆准备 |
-| `default_loop/control.rs` | 可取消等待、超时、输入队列、历史、用量与失败收尾 |
-| `default_loop/model.rs` | 请求装配、工具绑定、流式事件、完整消息、截断与工具 ID 校验 |
-| `default_loop/tools.rs` | 参数校验、Hook、安全审批、串行执行、结果提交 |
-| `default_loop/interaction.rs` | 工具请求通道、oneshot 回复、Ask/Reply 路由、MCP 回复校验 |
-| `default_loop/hooks.rs` | Hook 调用、通用效果、展示与可观测性 |
+| `default_loop/mod.rs` | DefaultLoop：调用公共模型和工具入口，提交候选完成 |
+| `execution/mod.rs` | TurnExecution、共享操作状态、业务能力与完成操作 |
+| `execution/config.rs` | ExecutionConfig 业务操作策略；default_loop/config.rs 保留原 LoopConfig 字段和 steps |
+| `execution/control.rs` | 可取消等待、唯一 inbox 消费、历史、用量与清理 |
+| `execution/admission.rs` | 输入 Hook、附件准备、拒绝与提交 |
+| `execution/model.rs` | 请求装配、工具绑定、流式事件、完整消息与工具 ID 校验 |
+| `execution/tools.rs` | 工具 Hook、校验、审批、执行与结果提交 |
+| `execution/interaction.rs` | 工具提问、回复路由、MCP Hook 与回复校验 |
+| `execution/hooks.rs` | 私有 Hook 调用和结果应用 |
 
-这些是内部模块，没有再增加 ToolExecutor、队列或调度器 Provider。
+公共 ToolExecutor/ModelExecutor/ContextExecutor/InputExecutor/PermissionExecutor/InteractionExecutor 隐藏内部状态和 Hook 协议。DefaultLoop 不再直接 dispatch Hook。
 
 ## 装配
 
@@ -40,9 +44,7 @@ use yourai_harness::default_loop::{DefaultLoop, LoopConfig};
 
 fn assemble(model: Arc<dyn ModelProvider>, history: Arc<dyn ContextManager>) -> Arc<Agent> {
     let config = LoopConfig {
-        system_prompt: Some("你是一个编程助手。".into()),
-        compact_threshold: Some(80_000), // 按所选模型容量设置；默认不启用阈值压缩
-        compact_target: Some(40_000),
+        steps: Some(20),
         ..Default::default()
     };
     Agent::builder()
@@ -73,13 +75,13 @@ fn assemble(model: Arc<dyn ModelProvider>, history: Arc<dyn ContextManager>) -> 
 
 ## 超时、预算和收尾
 
-模型调用额度默认不限（None）；配置限额时达到限额的第 N 次调用为强制收尾步——注入提示词要求仅文本总结、不再提供工具，随后正常结束 Turn，而不是硬中止。显式 0 仍表示不允许调用，在首次调用前硬中止。工具执行默认 256 次、2 次请求重试、1 次连续溢出恢复、3 次 Stop 继续、1 次权限重审。配置可以调整；TurnLimits 的次数与配置取较小值。重试时间由 `model/retry.rs` 集中管理：初始 2 秒逐次倍增，附加至多 25% 抖动；无响应头时默认封顶 30 秒，有响应头时使用全局安全上限（`i32::MAX` 毫秒）。provider 返回的重试提示优先且不追加抖动；GenaiModel 从 Retry-After 解析提示，MeteredModel 与剩余共享冷却取较长者。
+agentic iteration 默认不限（steps=None）；达到第 N 步时要求模型仅文本总结、不再提供工具。steps=0 是配置错误。默认 5 次请求重试、1 次连续溢出恢复、3 次 Stop 继续、1 次权限重审。重试时间由 `model/retry.rs` 集中管理：初始 2 秒逐次倍增，附加至多 25% 抖动；无响应头时默认封顶 30 秒，有响应头时使用全局安全上限（`i32::MAX` 毫秒）。provider 返回的重试提示优先且不追加抖动；GenaiModel 从 Retry-After 解析提示，MeteredModel 与剩余共享冷却取较长者。
 
 总截止时间不因重试、审批或压缩重置。模型默认响应头等待与原始数据读取时限各 300 秒，不含整段响应总时长；心跳和未完整事件的原始数据会重置读取等待。GenaiModel 在传输层执行这两个时限，Loop 不重复添加事件空闲计时。普通操作、工具、审批、Hook 和收尾时限默认 None，可显式配置；工具单次时限覆盖执行及内部提问。
 
 模型请求前按完整请求预算触发 compact；provider 明确报告 overflow 时有界重试。ContextManager 内部清理/摘要和提交，Loop 只重建请求。分批摘要按实际尝试调用计数，包括失败和取消；只清理不消耗模型额度。ContextManager 记账，Loop 汇总 Turn 用量。Harness 的共享 MeteredModel 另统一限制主模型、摘要、Hook 模型及子 Agent。
 
-取消时，Loop 请求工具子 token 取消、丢弃操作 future。Provider 必须 cancellation-safe，用 RAII 或自身有界清理释放进程和任务。Loop 随后以独立时限记录部分 assistant、已完成工具的实际结果以及剩余调用的 `interrupted_or_not_executed` 结果。它不能强杀实现方私自脱离的任务。
+取消时，共享执行包装请求工具子 token 取消，给有界宽限保存真实结果，再丢弃未完成 future。Provider 必须 cancellation-safe，用 RAII 或自身有界清理释放进程和任务。执行层随后以独立时限记录部分 assistant、已完成工具的实际结果以及剩余调用的 `interrupted_or_not_executed` 结果。它不能强杀实现方私自脱离的任务。
 
 ContextManager 的工具结果提交必须按 call_id 幂等，以处理提交时中断后的收尾重试。持久化失败或清理超时会输出明确错误 Notice，并记录指标；宿主不能自动重放副作用。进程崩溃后的事务恢复仍属于宿主和存储实现。
 
@@ -87,13 +89,13 @@ OutSink 新增默认 `closed()` 等待接口；core 的 channel sink 实现关�
 
 ## 工具交互
 
-工具调用 `ToolContext.ask`，内部桥将请求交给 Loop。Loop 等待工具时同时服务交互通道，使用独立 request_id 关联 In::Reply。过期/错误 ID 的回复不保存、不转给后续提问；工具取消等待时关闭 oneshot，Loop 注销当前请求。
+工具调用 `ToolContext.ask`，内部桥将请求交给公共执行层。公共工具执行入口等待工具时同时服务交互通道，使用独立 request_id 关联 In::Reply。过期/错误 ID 的回复不保存、不转给后续提问；工具取消等待时关闭 oneshot，执行层注销当前请求。
 
 MCP 请求依次经过 Elicitation、用户回复（或 Hook 答复）、ElicitationResult。最终回复只允许 accept/decline/cancel；accept 的 content 按 requested_schema 校验。普通提问不触发 MCP Hook。非交互 Agent.run 遇 Ask 立即取消并返回 Config。
 
 ## Hook 职责划分
 
-本 crate 接入 10 个 Loop 所属 Hook：UserPromptSubmit、Stop、StopFailure、PreToolUse、PostToolUse、PostToolUseFailure、PermissionRequest、PermissionDenied、Elicitation、ElicitationResult。
+公共 execution 模块接入 10 个操作 Hook，DefaultLoop 和自定义 AgentLoop 无需触发或消费：UserPromptSubmit、Stop、StopFailure、PreToolUse、PostToolUse、PostToolUseFailure、PermissionRequest、PermissionDenied、Elicitation、ElicitationResult。
 
 SessionStart/SessionEnd、工作区、配置、指令文件、子 Agent、协作任务等事件仍归会话宿主或对应扩展。ConcreteHookRuntime 自主管理后台 Hook；宿主订阅其完成事件与唤醒策略不属于 DefaultLoop。Loop 的内部 Notice 不递归触发 Notification。
 
