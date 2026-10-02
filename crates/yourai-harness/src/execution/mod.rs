@@ -25,11 +25,7 @@ pub struct TurnExecution<'a> {
     span: Option<Arc<dyn yourai_core::observability::Span>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Completion {
-    Completed,
-    NeedsMoreWork,
-}
+pub use yourai_core::completion::Completion;
 
 /// Model step options/output live in core next to the public execution entry.
 pub use yourai_core::model::{ModelOptions, ModelOutput};
@@ -54,14 +50,48 @@ pub struct PermissionExecutor<'a, 'turn> {
 pub struct InteractionExecutor<'a, 'turn> {
     state: &'a mut ExecutionState<'turn>,
 }
+impl yourai_core::inputs::InputOperation for InputExecutor<'_, '_> {
+    fn accept_bound<'a>(&'a mut self, input: In) -> BoxFuture<'a, Result<bool, YourAiError>> {
+        Box::pin(async move {
+            if !matches!(input, In::UserText { .. }) {
+                return Err(ErrorKind::Config("input admission requires UserText".into()).into());
+            }
+            let index = self.state.queued.len();
+            self.state.queued.push_back(input);
+            self.state.accept_input(index, false).await
+        })
+    }
+}
 impl InputExecutor<'_, '_> {
     pub async fn accept(&mut self, input: In) -> Result<bool, YourAiError> {
-        if !matches!(input, In::UserText { .. }) {
-            return Err(ErrorKind::Config("input admission requires UserText".into()).into());
-        }
-        let index = self.state.queued.len();
-        self.state.queued.push_back(input);
-        self.state.accept_input(index, false).await
+        yourai_core::inputs::accept(self, input).await
+    }
+}
+/// Stop 生命周期的框架操作持有整个 TurnExecution（完成状态与可观测性）。
+pub struct CompletionExecutor<'a, 'turn> {
+    turn: &'a mut TurnExecution<'turn>,
+}
+impl yourai_core::completion::CompletionOperation for CompletionExecutor<'_, '_> {
+    fn complete_bound<'a>(
+        &'a mut self,
+        text: String,
+    ) -> BoxFuture<'a, Result<Completion, YourAiError>> {
+        Box::pin(async move {
+            self.turn.state.tc.check_control()?;
+            if !self.turn.state.unresolved.is_empty() {
+                return Err(
+                    ErrorKind::Loop("cannot complete with unresolved tool calls".into()).into(),
+                );
+            }
+            self.turn.state.complete_candidate(text).await?;
+            let completion = if self.turn.state.finish().await? {
+                Completion::Completed
+            } else {
+                Completion::NeedsMoreWork
+            };
+            self.turn.completed = completion == Completion::Completed;
+            Ok(completion)
+        })
     }
 }
 impl yourai_core::security::SecurityOperation for PermissionExecutor<'_, '_> {
@@ -187,20 +217,7 @@ impl<'turn> TurnExecution<'turn> {
     }
     /// Accept a business answer. Completion may request more work; hooks stay internal.
     pub async fn complete(&mut self, text: impl Into<String>) -> Result<Completion, YourAiError> {
-        self.state.tc.check_control()?;
-        if !self.state.unresolved.is_empty() {
-            return Err(
-                ErrorKind::Loop("cannot complete with unresolved tool calls".into()).into(),
-            );
-        }
-        self.state.complete_candidate(text.into()).await?;
-        let completion = if self.state.finish().await? {
-            Completion::Completed
-        } else {
-            Completion::NeedsMoreWork
-        };
-        self.completed = completion == Completion::Completed;
-        Ok(completion)
+        yourai_core::completion::complete(&mut CompletionExecutor { turn: self }, text.into()).await
     }
     /// Retain committed tool results, partial output and pending input on all exit paths.
     pub async fn finish(mut self, mut result: Result<(), YourAiError>) -> TurnResult {

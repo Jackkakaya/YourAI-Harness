@@ -52,11 +52,13 @@
 
 pub mod agent_loop;
 pub mod compaction;
+pub mod completion;
 pub mod context;
 pub mod context_manager;
 pub mod error;
 pub mod future;
 pub mod hooks;
+pub mod inputs;
 pub mod interaction;
 pub mod memory;
 pub mod model;
@@ -66,6 +68,7 @@ pub mod runtime_event;
 pub mod sandbox;
 pub mod security;
 pub mod session;
+pub mod session_ops;
 pub mod session_runtime;
 pub mod skill;
 pub mod subagent;
@@ -98,6 +101,7 @@ pub mod prelude {
     pub use crate::compaction::{
         CompactAction, CompactionRequest, CompactionResult, CompactionTrigger, ContextPolicy,
     };
+    pub use crate::completion::{complete, Completion, CompletionOperation};
     pub use crate::context::{
         Agent, AgentBuilder, Context, ProviderSnapshot, TurnContext, TurnHandle,
     };
@@ -113,6 +117,7 @@ pub mod prelude {
         HookMessageKind, HookOutput, HookPermission, HookPointOutcome, HookRegistry, HookRun,
         HookRunStatus, HookRuntime, HookSource, NativeHookRegistration,
     };
+    pub use crate::inputs::{accept, InputOperation};
     pub use crate::interaction::{InteractionKind, InteractionRequest, ToolInteraction};
     pub use crate::memory::{
         CompletedMemoryTurn, MemoryEntry, MemoryManager, MemoryProvider, MemorySession,
@@ -134,6 +139,7 @@ pub mod prelude {
         CompactionChange, ContextChange, MessagePage, MessageQuery, MessageStatus,
         RequestObservation, SessionId, SessionManager, SessionMeta, StoredMessage,
     };
+    pub use crate::session_ops::{session_end, session_start, turn_completed, SessionStartSink};
     pub use crate::session_runtime::{
         InputRejected, SessionContext, SessionRuntime, SessionStatus, SessionTurn,
     };

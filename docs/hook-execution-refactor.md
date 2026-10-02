@@ -38,6 +38,10 @@
 | 工作区操作 / 变化检测 | 8 | Setup、Notification、ConfigChange、InstructionsLoaded、WorktreeCreate、WorktreeRemove、CwdChanged、FileChanged |
 | 总计 | 28 | |
 
+## Core 固定入口
+
+后续 core 化轮次把上表全部 Hook 生命周期固定到 core 入口：`ToolBinding::exec`（tool）、`ToolBinding::authorize`（security）、`interaction::elicit`、`model::exec`、`context_manager::compact`、`inputs::accept`、`completion::complete`、`session_ops::session_start`/`session_end`/`turn_completed`、`subagent::exec_child`、`tasks::*`、`workspace::*`。Harness 执行器实现对应的 `*Operation` 基础设施缝；`ExecutionState` 的控制底座（wait/route/期限）保留在运行时，作为缝背后的调度细节。入口语义与调用方式以 [公共执行文档](./execution.md) 为准。
+
 ## 关键验收
 
 1. 自定义 AgentLoop 使用公共操作，无需引用 Hook 事件或消费 HookDispatchResult；Stop 继续时不重建调度器，也不重放工具。

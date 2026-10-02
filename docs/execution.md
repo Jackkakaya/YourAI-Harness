@@ -71,6 +71,8 @@ impl AgentLoop for MyLoop {
 
 正常成功必须先通过 `complete`；输入被拒绝可以直接结束。未结工具存在时不能完成或开始下一次模型请求。`finish` 不负责调度，也不再次触发 Stop。
 
+上述操作的固定入口位于 core：`model::exec`、`ToolBinding::exec`（tool）、`ToolBinding::authorize`（security）、`interaction::elicit`、`context_manager::compact`、`inputs::accept`、`completion::complete`、`subagent::exec_child`、`session_ops::session_start`/`session_end`/`turn_completed`、`tasks::*` 与 `workspace::*`。Harness 执行器实现对应的 `*Operation` 基础设施缝；Loop 侧调用与 `cx.*` 方法均经由这些固定入口，Hook 生命周期（阻断、反馈、附加上下文、超时与错误聚合）随入口固定在 core。
+
 ## 工具实现与注册
 
 `ToolHandler::run` 是实现侧业务方法。框架正常调用通过 `ToolExecutor::exec/call`；`ToolRegistry::resolve` 返回 `ToolBinding`，其 backend 字段私有，不提供裸 run。继承已有绑定使用 `register_binding`，新工具仍使用 `register`。
@@ -99,12 +101,12 @@ impl AgentLoop for MyLoop {
 | PostToolUseFailure | tools.exec/call：失败或取消时报告，保留实际完成的结果 |
 | PermissionRequest | permissions.authorize / 工具内部授权：先尝试 Hook 决定，必要时请求用户 |
 | PermissionDenied | 授权拒绝路径：报告原因，执行有界重新检查 |
-| UserPromptSubmit | open、inputs.accept、steer 接纳：通过后准备并提交输入 |
-| Stop | complete：补充反馈/上下文，返回继续或完成，保持当前 Loop 局部状态 |
+| UserPromptSubmit | inputs.accept（core 入口）：通过后准备并提交输入 |
+| Stop | complete（core 入口）：补充反馈/上下文，返回继续或完成，保持当前 Loop 局部状态 |
 | StopFailure | model.exec：最终模型故障报告，不用于普通工具错误或取消 |
-| SessionStart | SessionHost.open/restore：初始化后应用初始输入、上下文与监视路径 |
-| SessionEnd | SessionHost.close：停止资源后执行结束 Hook，完成关闭提交 |
-| TurnCompleted | SessionHost.run_next：成功且历史/宿主提交后通知（仅当 `through_seq > after_seq`，即本 turn 确有新提交行），不撤销结果 |
+| SessionStart | SessionHost.open/restore（core 模板 session_ops::session_start）：初始化后应用初始输入、上下文与监视路径 |
+| SessionEnd | SessionHost.close（core 模板 session_ops::session_end）：停止资源后执行结束 Hook，完成关闭提交 |
+| TurnCompleted | SessionHost.run_next（core 模板 session_ops::turn_completed）：成功且历史/宿主提交后通知（仅当 `through_seq > after_seq`，即本 turn 确有新提交行），不撤销结果 |
 | SubagentStart | Subagents.exec_child：准备后、启动子会话前检查 |
 | SubagentStop | 子代理包装：候选结束时检查；反馈进入同一子会话继续执行 |
 | PreCompact | context.compact：仅摘要阶段执行，可阻断或补充指令 |
