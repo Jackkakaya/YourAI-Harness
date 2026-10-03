@@ -8,6 +8,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import signal
 import sqlite3
 import struct
 import sys
@@ -242,7 +243,15 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'Todo')
         wait_for(b'Review parser')
         os.write(master, b'resume question\r')
+        wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 4)
+        # The resumed answer shares cells with the previous answer. Sparse
+        # updates may omit their common characters from the raw byte stream;
+        # repaint the completed turn before matching its full visible text.
+        captured.clear()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 100, 0, 0))
+        os.kill(child.pid, signal.SIGWINCH)
         wait_for(b'SMOKE_RESUME_OK')
+        assert len(requests) == 5, 'resumed turn must issue exactly one request'
         assert any('Prior task list is complete.' in str(m.get('content')) for m in requests[-1][2]['messages'])
         os.write(master, b'\x11')
         wait_exit(child, master)
