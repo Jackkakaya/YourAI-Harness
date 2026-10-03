@@ -84,7 +84,7 @@ with tempfile.TemporaryDirectory() as tmp:
                 if b'\x1b[6n' in data:
                     os.write(master, b'\x1b[1;1R')
 
-    def wait_for_switch(needle):
+    def wait_for_repaint(needle):
         # Wait for the local operation, then force a complete repaint:
         # sparse cell updates do not contain the whole notice as raw text.
         time.sleep(0.5)
@@ -104,7 +104,7 @@ with tempfile.TemporaryDirectory() as tmp:
         os.write(master, b'\r')
         wait_for(b'config default')
         os.write(master, b'\r')
-        wait_for_switch(b'Model switched to mock/smoke')
+        wait_for_repaint(b'Model switched to mock/smoke')
         # Effort also works for the valid implicit model (models is empty).
         captured.clear()
         os.write(master, b'/models\r')
@@ -112,7 +112,7 @@ with tempfile.TemporaryDirectory() as tmp:
         os.write(master, b'\r')
         wait_for(b'config default')
         os.write(master, b'\x1b[B' * 5 + b'\r')  # config default -> high
-        wait_for_switch('Model switched to mock/smoke · thinking high'.encode())
+        wait_for_repaint('Model switched to mock/smoke · thinking high'.encode())
         captured.clear()
         # Open a dashboard while work is in flight. Text and Esc belong to it.
         os.write(master, b'after stats\r\x02')
@@ -141,10 +141,10 @@ with tempfile.TemporaryDirectory() as tmp:
         os.write(master, b'\r')
         wait_for(b'config default')
         os.write(master, b'\x1b[A' * 5 + b'\r')  # high -> config default
-        wait_for_switch(b'Model switched to mock/smoke')
+        wait_for_repaint(b'Model switched to mock/smoke')
         captured.clear()
         os.write(master, b'/new\r')
-        wait_for(b'Session ready')
+        wait_for_repaint(b'Session ready')
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before_new + 1
         captured.clear()
         os.write(master, b'\x07')
@@ -163,7 +163,7 @@ with tempfile.TemporaryDirectory() as tmp:
         # Titles follow committed history on background refresh; a quick turn
         # can finish while the footer still says New session. Wait for the
         # new host's notice, not a footer that need not emit different pixels.
-        wait_for(b'Session ready')
+        wait_for_repaint(b'Session ready')
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before_new + 2
         captured.clear()
         os.write(master, b'after reset\r')

@@ -131,7 +131,7 @@ with tempfile.TemporaryDirectory() as tmp:
             os.write(master, b'\x1b[B')
             time.sleep(0.05)
         os.write(master, b'\r')
-        wait_for(b'thinking high')
+        wait_for_switch('Model switched to mock/alt · thinking high'.encode())
         # The override rides on the next request as reasoning_effort.
         captured.clear()
         os.write(master, b'third message\r')
@@ -151,7 +151,7 @@ with tempfile.TemporaryDirectory() as tmp:
             os.write(master, b'\x1b[A')
             time.sleep(0.05)
         os.write(master, b'\r')
-        wait_for(b'thinking low')
+        wait_for_switch('Model switched to mock/alt · thinking low'.encode())
         captured.clear()
         os.write(master, b'fourth message\r')
         wait_for(b'MODELS_OK', request_count=4)
