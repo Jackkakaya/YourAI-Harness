@@ -14,6 +14,8 @@ use std::{
 };
 use yourai_harness::GenaiModel;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
+/// Borrowed option maps for one picker entry: (model options, variant options).
+type EntryOptions<'a> = (&'a Map<String, Value>, Option<&'a Map<String, Value>>);
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -212,6 +214,75 @@ impl Config {
         };
         let model = provider.models.get(model_key);
         model.map(|m| m.pricing.clone()).unwrap_or_default()
+    }
+    fn model_entry(&self, id: &str, variant: Option<&str>) -> Result<EntryOptions<'_>, Error> {
+        let (provider_id, model_key) = id.split_once('/').ok_or("model must be provider/model")?;
+        let provider = self.provider.get(provider_id).ok_or("Unknown provider")?;
+        let model = provider.models.get(model_key).ok_or("Unknown model")?;
+        let variant_options = match variant {
+            Some(name) => Some(model.variants.get(name).ok_or("Unknown model variant")?),
+            None => None,
+        };
+        Ok((&model.options, variant_options))
+    }
+    /// Effective reasoning effort for one picker entry: the variant's
+    /// `reasoningEffort` when set, else the model's. None = no hint.
+    pub fn effective_effort(&self, id: &str, variant: Option<&str>) -> Option<String> {
+        let (model_options, variant_options) = self.model_entry(id, variant).ok()?;
+        let read = |map: &Map<String, Value>| {
+            map.get("reasoningEffort")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        variant_options
+            .and_then(read)
+            .or_else(|| read(model_options))
+    }
+    /// Write or clear a runtime `reasoningEffort` override for one picker
+    /// entry. Variant entries edit that variant (it wins over model options
+    /// during the merge in `resolve`); no-variant entries edit the model.
+    /// In-memory only: the config file on disk is never rewritten.
+    pub fn set_entry_effort(
+        &mut self,
+        id: &str,
+        variant: Option<&str>,
+        choice: &crate::models::EffortChoice,
+    ) -> Result<(), Error> {
+        let keyword = match choice {
+            crate::models::EffortChoice::Config => None,
+            crate::models::EffortChoice::Set(keyword) => Some(keyword.as_str()),
+        };
+        if let Some(keyword) = keyword {
+            let valid = crate::models::EFFORT_CHOICES
+                .iter()
+                .flatten()
+                .any(|valid| *valid == keyword);
+            if !valid {
+                return Err(format!("Invalid reasoningEffort: {keyword}").into());
+            }
+        }
+        let (provider_id, model_key) = id.split_once('/').ok_or("model must be provider/model")?;
+        let provider = self
+            .provider
+            .get_mut(provider_id)
+            .ok_or("Unknown provider")?;
+        let model = provider.models.get_mut(model_key).ok_or("Unknown model")?;
+        let options = match variant {
+            Some(name) => model
+                .variants
+                .get_mut(name)
+                .ok_or("Unknown model variant")?,
+            None => &mut model.options,
+        };
+        match keyword {
+            Some(keyword) => {
+                options.insert("reasoningEffort".into(), Value::String(keyword.into()));
+            }
+            None => {
+                options.remove("reasoningEffort");
+            }
+        }
+        Ok(())
     }
     pub fn request_policy(&self) -> Result<yourai_harness::model::RequestPolicy, Error> {
         let policy = self.selected_provider()?.options.requests.clone();

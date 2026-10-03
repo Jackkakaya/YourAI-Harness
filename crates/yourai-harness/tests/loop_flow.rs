@@ -352,7 +352,7 @@ async fn compaction_and_retry_are_bounded_and_do_not_repeat_user_history() {
             .iter()
             .filter(|k| **k == HookEventKind::PostCompact)
             .count(),
-        0
+        2 // Replacement ContextManager summaries use the common hook wrapper too.
     );
 }
 #[tokio::test]
@@ -577,6 +577,73 @@ async fn model_call_limit_never_executes_calls_from_the_final_step() {
     assert!(response
         .content
         .contains("Tools are disabled after the maximum agent steps"));
+}
+#[tokio::test]
+async fn forced_final_bound_notifies_and_completes_instead_of_looping() {
+    let h = Arc::new(Handler::new("tool", Mode::Return));
+    let registry = Arc::new(Registry::default());
+    registry.register(h.clone());
+    // A misbehaving provider keeps requesting tools after the step cap:
+    // every refusal warns the user, and once the defensive bound is
+    // exhausted the turn completes with the text it has instead of asking
+    // the model again (Stop hooks still run through complete). Call ids
+    // must differ per iteration: identities already seen this turn are
+    // refused as duplicates.
+    let refused = |id: &str| events(vec![end("", vec![call(id, "tool")])]);
+    let model = Arc::new(Model::new(vec![
+        refused("c0"),
+        refused("c1"),
+        refused("c2"),
+        refused("c3"),
+    ]));
+    let agent = builder(
+        model.clone(),
+        Arc::new(History::default()),
+        LoopConfig::default(),
+    )
+    .tools(registry)
+    .build();
+    let mut options = TurnOptions::default();
+    options.limits.steps = Some(1);
+    let (events, result) = collect(agent.start_with(In::user_text("go"), options).unwrap()).await;
+    result.expect("bounded forced-final turn completes");
+    assert!(
+        h.inputs.lock().unwrap().is_empty(),
+        "refused calls never execute"
+    );
+    let notices: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            Out::Notice {
+                level: Level::Warning,
+                message,
+            } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    // One batch warning per refused iteration (the bound iteration included),
+    // plus the one-time bound-exhausted explanation.
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|m| **m == "Tools are disabled after the maximum agent steps")
+            .count(),
+        4
+    );
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|m| **m
+                == "Model requested tools after maximum agent steps; they were not executed.")
+            .count(),
+        1
+    );
+    // The bound stops the model polling: initial call plus three continuations.
+    assert_eq!(model.requests.lock().unwrap().len(), 4);
+    // Every request after the cap disables tools at the API level.
+    for request in model.requests.lock().unwrap().iter() {
+        assert_eq!(request.options.tool_choice, Some(ToolChoice::None));
+    }
 }
 #[tokio::test]
 async fn invisible_failure_announces_structured_retry_status() {
@@ -1366,7 +1433,7 @@ async fn cancelled_tool_can_finish_within_grace_and_preserves_actual_result() {
                 is_network: false,
             }
         }
-        fn execute<'a>(
+        fn run<'a>(
             &'a self,
             tc: ToolContext<'a>,
             _: serde_json::Value,

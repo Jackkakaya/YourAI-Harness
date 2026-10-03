@@ -23,7 +23,7 @@ Core seam 后面的所有能力都可以替换。Loop 本身也是 provider，�
 - **Turn 级运输机制**——`Agent::start` 返回 `TurnHandle`，统一提供 inbox、outbox、取消与 join 语义。
 - **稳定的 provider 快照**——运行时可以热替换 provider，同时保证正在执行的 turn 继续使用启动时的实现。
 - **类型化交互词汇**——`yourai-core::protocol` 定义 Loop 与前端共享的全部 `In` / `Out` 消息。
-- **兼容 Claude 的 Hook**——支持 27 种事件、类型化 outcome、Command/HTTP transport、并行执行、确定性聚合、异步完成和运行时注册。
+- **兼容 Claude 的 Hook**——支持 28 种事件、类型化 outcome、Command/HTTP transport、并行执行、确定性聚合、异步完成和运行时注册。
 - **精简且对象安全的 interface**——使用 boxed future，让 provider trait 无需 `async_trait` 也能放入 `Arc<dyn Trait>`。
 
 ## Workspace
@@ -49,6 +49,7 @@ yourai-core  ←  yourai-harness  ←  yourai-tui
 测试真实模型：复制 `yourai.example.json` 到 `$XDG_CONFIG_HOME/yourai/yourai.json`（默认 `~/.config/yourai/yourai.json`），填写模型名、地址和密钥环境变量，然后执行 `cargo run -p yourai-tui`。可用 `--config PATH` 覆盖配置路径；操作与配置见 [TUI 使用说明](./docs/tui.md)。
 
 DefaultLoop 的装配、配置与行为约定见 [实现文档](./docs/default-loop-implementation.md)。
+自定义 loop 使用 [AgentLoop 与公共执行入口](./docs/execution.md)，业务逻辑无需手工调用 Hook。
 
 安装较新的 Rust stable toolchain，然后克隆并验证 workspace：
 

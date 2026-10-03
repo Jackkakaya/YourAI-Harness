@@ -63,12 +63,15 @@ pub trait ContextManager: Send + Sync {
         tools: &[Tool],
         execution: &ContextExecution,
     ) -> Result<ContextRequest, YourAiError>;
-    fn compact<'a>(
+    /// Implementation-side planning. Public context operations own the hook lifecycle.
+    /// Complete plans include no-op/prune-only commits; Summary jobs hold any
+    /// transaction/lock needed until their business commit finishes.
+    fn prepare_compaction<'a>(
         &'a self,
-        options: CompactionRequest,
+        options: &'a CompactionRequest,
         execution: &'a ContextExecution,
         cancel: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>>;
+    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>>;
     /// Read-only active view and archival identity checks used by recovery/deduplication.
     fn records(&self) -> Vec<StoredMessage>;
     /// Committed high-water mark, including messages removed from active context.
@@ -101,4 +104,28 @@ pub trait ContextManager: Send + Sync {
     fn default_options(&self) -> ChatOptions {
         ChatOptions::default()
     }
+}
+
+/// A prepared business operation; no hook protocol is required from implementations.
+pub enum CompactionPlan<'a> {
+    Complete(CompactionResult),
+    Summary(Box<dyn CompactionJob + 'a>),
+}
+
+pub struct CompactionCommit {
+    pub result: CompactionResult,
+    pub summary: String,
+}
+
+/// Implementation-side summary and durable commit.
+pub trait CompactionJob: Send {
+    fn run<'a>(
+        self: Box<Self>,
+        options: CompactionRequest,
+        execution: &'a ContextExecution,
+        cancel: &'a CancellationToken,
+        committed: &'a std::sync::atomic::AtomicBool,
+    ) -> BoxFuture<'a, Result<CompactionCommit, YourAiError>>
+    where
+        Self: 'a;
 }

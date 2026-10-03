@@ -1,5 +1,12 @@
 {
   "model": "gateway/YOUR_MODEL_NAME",
+  "context": {
+    "prune_enabled": true,
+    "keep_recent_turns": 2,
+    "keep_recent_tokens": 8000,
+    "summary_tokens": 2000,
+    "summary_tool_output_chars": 2000
+  },
   "provider": {
     "gateway": {
       "options": {

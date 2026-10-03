@@ -1,7 +1,7 @@
 use super::{
     hooks,
     interaction::{validate_schema, Bridge},
-    State,
+    ExecutionState, ToolExecutor, ToolOutput,
 };
 use serde_json::{json, Value};
 use std::{collections::HashSet, sync::Arc};
@@ -11,15 +11,20 @@ use yourai_core::{
     prelude::*,
 };
 
-impl State<'_> {
-    pub(crate) async fn execute_tool(&mut self, mut call: ToolCall) -> Result<(), YourAiError> {
+impl ExecutionState<'_> {
+    pub(crate) async fn execute_tool(
+        &mut self,
+        binding: &ToolBinding,
+        backend: Arc<dyn ToolHandler>,
+        mut call: ToolCall,
+    ) -> Result<ToolOutput, YourAiError> {
         self.send(Out::ToolStarted {
             id: call.call_id.clone(),
             name: call.fn_name.clone(),
             input: call.fn_arguments.clone(),
         })?;
         self.tool_cleanup_deadline = None;
-        let result = self.tool_body(&mut call).await;
+        let result = self.tool_body(&mut call, binding, backend).await;
         let aborted = result
             .as_ref()
             .err()
@@ -92,7 +97,7 @@ impl State<'_> {
         }
         self.tool_completion = Some((call.clone(), output.clone(), is_error));
         if aborted {
-            return result.map(|_| ());
+            return Err(result.expect_err("aborted tool must have an error"));
         } // cleanup commits the result with fresh time allowance
         let history = self.history.clone();
         self.wait(
@@ -101,8 +106,14 @@ impl State<'_> {
             "history",
         )
         .await?;
-        self.unresolved.pop_front();
+        self.unresolved
+            .retain(|pending| pending.call_id != call.call_id);
         self.tool_completion = None;
+        let settled = ToolOutput {
+            call: call.clone(),
+            output: output.clone(),
+            is_error,
+        };
         self.send(Out::ToolDone {
             id: call.call_id,
             name: call.fn_name,
@@ -113,18 +124,15 @@ impl State<'_> {
             return Err(error);
         }
         self.deferred_context.extend(contexts);
-        Ok(())
+        Ok(settled)
     }
 
-    async fn tool_body(&mut self, call: &mut ToolCall) -> Result<Value, YourAiError> {
-        let handler = self
-            .bound_tools
-            .get(&call.fn_name)
-            .cloned()
-            .ok_or_else(|| ErrorKind::Tool {
-                name: call.fn_name.clone(),
-                message: "tool was not offered in this model request".into(),
-            })?;
+    async fn tool_body(
+        &mut self,
+        call: &mut ToolCall,
+        handler: &ToolBinding,
+        backend: Arc<dyn ToolHandler>,
+    ) -> Result<Value, YourAiError> {
         let pre = self
             .hook(HookEvent::PreToolUse {
                 tool_name: call.fn_name.clone(),
@@ -165,7 +173,7 @@ impl State<'_> {
             });
         self.repeated_tool = Some((call.fn_name.clone(), call.fn_arguments.clone(), repeat));
         let doom_loop = repeat >= 3;
-        self.approve(call, &handler, permission, doom_loop).await?;
+        self.approve(call, handler, permission, doom_loop).await?;
         // Permission hooks may rewrite the input; count what will actually execute.
         if let Some((name, input, count)) = &mut self.repeated_tool {
             if input != &call.fn_arguments {
@@ -187,7 +195,7 @@ impl State<'_> {
             sandbox: self.tc.snap.sandbox.clone(),
             interaction: Some(&bridge),
         };
-        let future = handler.execute(tool_context, call.fn_arguments.clone());
+        let future = backend.run(tool_context, call.fn_arguments.clone());
         tokio::pin!(future);
         let deadline = self.deadline(
             self.tc
@@ -255,7 +263,7 @@ impl State<'_> {
     }
     async fn security(
         &mut self,
-        handler: &Arc<dyn ToolHandler>,
+        handler: &ToolBinding,
         input: &Value,
     ) -> Result<ApprovalDecision, YourAiError> {
         let Some(security) = self.tc.snap.security.clone() else {
@@ -269,10 +277,10 @@ impl State<'_> {
         )
         .await
     }
-    async fn approve(
+    pub(super) async fn approve(
         &mut self,
         call: &mut ToolCall,
-        handler: &Arc<dyn ToolHandler>,
+        handler: &ToolBinding,
         hook_permission: HookPermission,
         doom_loop: bool,
     ) -> Result<(), YourAiError> {
@@ -433,4 +441,34 @@ fn parse_decision(value: Value) -> Result<PermissionRequestDecision, YourAiError
 
 pub(super) fn result_record(call: &ToolCall, output: &Value, _is_error: bool) -> StoredMessage {
     StoredMessage::new(ToolResponse::from_tool_call(call, output.to_string()).into())
+}
+
+impl ToolOperation for ToolExecutor<'_, '_> {
+    fn exec_bound<'a>(
+        &'a mut self,
+        binding: &'a ToolBinding,
+        backend: Arc<dyn ToolHandler>,
+        call: ToolCall,
+    ) -> BoxFuture<'a, Result<ExecutedTool, YourAiError>> {
+        Box::pin(async move {
+            let pending = self.state.unresolved.iter().any(|c| {
+                c.call_id == call.call_id
+                    && c.fn_name == call.fn_name
+                    && c.fn_arguments == call.fn_arguments
+            });
+            let bound = self
+                .state
+                .bound_tools
+                .get(&call.fn_name)
+                .is_some_and(|b| b.same_backend(binding));
+            if !pending || !bound || !binding.owns_backend(&backend) {
+                return Err(ErrorKind::Tool {
+                    name: call.fn_name,
+                    message: "tool call is not pending or binding changed".into(),
+                }
+                .into());
+            }
+            self.state.execute_tool(binding, backend, call).await
+        })
+    }
 }

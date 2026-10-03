@@ -219,7 +219,7 @@ impl ToolHandler for WebFetch {
     fn security_context(&self, input: &Value) -> SecurityContext {
         network_context(self.name(), input)
     }
-    fn execute<'a>(
+    fn run<'a>(
         &'a self,
         tc: ToolContext<'a>,
         input: Value,
@@ -364,7 +364,7 @@ impl ToolHandler for WebSearch {
     fn security_context(&self, input: &Value) -> SecurityContext {
         network_context(self.name(), input)
     }
-    fn execute<'a>(
+    fn run<'a>(
         &'a self,
         tc: ToolContext<'a>,
         input: Value,

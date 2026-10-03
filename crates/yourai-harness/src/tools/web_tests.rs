@@ -71,7 +71,7 @@ async fn call(
     input: Value,
     cancel: &CancellationToken,
 ) -> Result<Value, YourAiError> {
-    tool.execute(
+    tool.run(
         ToolContext {
             call_id: "test".into(),
             emit: &DiscardSink,

@@ -106,6 +106,26 @@ with tempfile.TemporaryDirectory() as tmp:
         stream_reqs = [r for r in requests if r[1].get('stream')]
         assert len(stream_reqs) >= 2, f'expected 2 stream requests, got {len(stream_reqs)}'
         assert stream_reqs[1][1]['model'] == 'alt-model', f'expected alt-model, got {stream_reqs[1][1]["model"]}'
+        # Set thinking effort via the /models picker's Tab sub-picker.
+        wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 2)
+        os.write(master, b'/models\r')
+        wait_for(b'Tab effort')
+        os.write(master, b'\t')
+        wait_for(b'config default')
+        for _ in range(5):  # default -> none -> minimal -> low -> medium -> high
+            os.write(master, b'\x1b[B')
+            time.sleep(0.05)
+        os.write(master, b'\r')
+        wait_for(b'thinking high')
+        # The override rides on the next request as reasoning_effort.
+        captured.clear()
+        os.write(master, b'third message\r')
+        wait_for(b'MODELS_OK')
+        stream_reqs = [r for r in requests if r[1].get('stream')]
+        assert len(stream_reqs) >= 3, f'expected 3 stream requests, got {len(stream_reqs)}'
+        assert stream_reqs[2][1]['model'] == 'alt-model', f'expected alt-model, got {stream_reqs[2][1]["model"]}'
+        assert stream_reqs[2][1].get('reasoning_effort') == 'high', \
+            f'expected reasoning_effort high, got {stream_reqs[2][1].get("reasoning_effort")}'
         os.write(master, b'\x11')  # Ctrl-Q
         wait_exit(child, master)
         assert child.returncode == 0

@@ -1,7 +1,10 @@
 //! Active context and its durable mutation boundary. SQL lives in SessionManager.
 mod compact;
+mod compaction_lifecycle;
 mod projection;
 pub mod prompt;
+mod selection;
+mod summary;
 
 use crate::error;
 use std::{
@@ -131,7 +134,9 @@ impl MemoryContext {
             // after the adapter's transaction gate. Reads reject the uncertain view.
             self.dirty.store(true, Ordering::Release);
             store.save_context(&self.id, change).await?;
-            self.reload().await
+            self.reload().await?;
+            self.view.lock().unwrap().observation = None;
+            Ok(())
         } else {
             let mut records = self.records();
             for m in &mut records {
@@ -147,6 +152,7 @@ impl MemoryContext {
             let mut view = self.view.lock().unwrap();
             records.sort_by_key(|m| (!m.summary, m.seq));
             view.records = records;
+            view.observation = None;
             Ok(())
         }
     }
@@ -333,21 +339,31 @@ impl ContextManager for MemoryContext {
             maintenance_needed,
         })
     }
-    fn compact<'a>(
+    fn prepare_compaction<'a>(
         &'a self,
-        options: CompactionRequest,
+        options: &'a CompactionRequest,
+        execution: &'a ContextExecution,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
+        Box::pin(async move { self.prepare(options, execution, cancel).await })
+    }
+}
+
+impl MemoryContext {
+    /// Fixed public operation, shared with every replacement ContextManager.
+    pub fn compact<'a>(
+        &'a self,
+        request: CompactionRequest,
         execution: &'a ContextExecution,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>> {
-        Box::pin(async move {
-            let deadline = options.deadline;
-            let committed = AtomicBool::new(false);
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => if committed.load(Ordering::Acquire) { Err(error("compact", "summary committed; cancelled during PostCompact")) } else { Err(AbortReason::Cancelled.into()) },
-                _ = crate::time::sleep_until(deadline) => if committed.load(Ordering::Acquire) { Err(error("compact", "summary committed; deadline exceeded during PostCompact")) } else { Err(AbortReason::DeadlineExceeded.into()) },
-                result = self.maintain(options, execution, cancel, &committed) => result
-            }
-        })
+        Box::pin(compaction_lifecycle::compact(
+            self,
+            request,
+            execution,
+            cancel,
+            self.services.hook_timeout,
+        ))
     }
 }
+pub use compaction_lifecycle::{compact, compact_with_events};

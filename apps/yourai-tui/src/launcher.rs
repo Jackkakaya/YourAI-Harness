@@ -8,6 +8,7 @@
 //! fork those pieces again here.
 use crate::config::Error;
 use crate::sessions::{filter_sessions, rows_from, SessionRow};
+use crate::ui::theme::{Theme, ACCENT, BG, FOCUS_SURFACE, MUTED, PANEL, TEXT, YELLOW};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     backend::CrosstermBackend,
@@ -27,12 +28,8 @@ pub enum Choice {
     Quit,
 }
 
-pub async fn pick(catalog: &SessionCatalog) -> Result<Choice, Error> {
+pub async fn pick(catalog: &SessionCatalog, theme: Theme) -> Result<Choice, Error> {
     let metas = catalog.list_sessions().await?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
     let mut rows = rows_from(metas, None);
     // Stable secondary sort by title for ties on updated_at.
     rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.title.cmp(&b.title)));
@@ -45,9 +42,18 @@ pub async fn pick(catalog: &SessionCatalog) -> Result<Choice, Error> {
     let backend = crate::terminal::SizedBackend(CrosstermBackend::new(io::stdout()));
     let mut terminal = Terminal::new(backend)?;
     loop {
+        // Refreshed every frame (the poll below ticks at 100ms): "2m ago"
+        // labels must stay honest while the picker sits open.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         let filtered = filter_sessions(&rows, &query);
         let picked = filtered.get(selected).copied();
-        terminal.draw(|f| render(f, &rows, &filtered, &query, selected, picked, now))?;
+        terminal.draw(|f| {
+            render(f, &rows, &filtered, &query, selected, picked, now);
+            theme.apply(f.buffer_mut());
+        })?;
         if !event::poll(std::time::Duration::from_millis(100))? {
             continue;
         }
@@ -83,29 +89,45 @@ fn render(
 ) {
     let area = f.area();
     f.render_widget(
-        Block::default().style(Style::default().bg(Color::Black).fg(Color::White)),
+        Block::default().style(Style::default().bg(BG).fg(TEXT)),
         area,
     );
-    let rect = crate::picker::centered(area, 80, filtered.len().saturating_add(6).min(24));
+    let content = if area.width >= 68 && area.height >= 28 {
+        let mut brand = crate::branding::wordmark();
+        brand.push(Line::default());
+        brand.push(
+            Line::from(Span::styled(
+                "YourAI · pick up where you left off",
+                Style::default().fg(MUTED),
+            ))
+            .alignment(Alignment::Center),
+        );
+        let brand_area = Rect::new(area.x, area.y + 1, area.width, 7);
+        f.render_widget(Paragraph::new(brand), brand_area);
+        Rect::new(area.x, area.y + 9, area.width, area.height - 9)
+    } else {
+        area
+    };
+    let rect = crate::picker::centered(content, 80, filtered.len().saturating_add(6).min(24));
     let width = rect.width;
     f.render_widget(Clear, rect);
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Search line.
     let hint = if query.is_empty() {
-        "type to search · ↑↓ move · Enter resume · Esc new session · Ctrl-Q quit"
+        "by title, model, or ID…"
     } else {
         ""
     };
     lines.push(Line::from(vec![
-        Span::styled("filter ", Style::default().fg(Color::DarkGray)),
-        Span::styled(query.to_owned(), Style::default().fg(Color::White)),
-        Span::styled(hint.to_owned(), Style::default().fg(Color::DarkGray)),
+        Span::styled("Search ", Style::default().fg(MUTED)),
+        Span::styled(query.to_owned(), Style::default().fg(TEXT)),
+        Span::styled(hint.to_owned(), Style::default().fg(MUTED)),
     ]));
     lines.push(Line::default());
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "No sessions match. Esc starts a fresh session.",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(YELLOW),
         )));
     } else {
         let inner_w = (width.saturating_sub(4)) as usize;
@@ -121,24 +143,29 @@ fn render(
             let marker = if is_picked { "►" } else { " " };
             let line = format!("{marker} {}", crate::sessions::row_body(row, title_w, now));
             let style = if rank == selected {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(TEXT)
             };
-            lines.push(Line::from(Span::styled(line, style)));
+            lines.push(
+                Line::from(Span::styled(line, style)).style(Style::default().bg(if is_picked {
+                    FOCUS_SURFACE
+                } else {
+                    PANEL
+                })),
+            );
         }
     }
     f.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().bg(Color::Black).fg(Color::White))
+            .style(Style::default().bg(PANEL).fg(TEXT))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(" Sessions · resume "),
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(format!(" Sessions · resume · {} saved ", rows.len()))
+                    .title_bottom(" ↑↓ select · Enter resume · Esc new · Ctrl-Q quit "),
             ),
         rect,
     );
@@ -161,13 +188,28 @@ mod tests {
             })
             .collect();
         let filtered: Vec<_> = (0..100).collect();
-        for width in [1, 20, 30, 40, 80] {
-            for height in [1, 2, 3, 12, 24] {
+        for width in [1, 20, 30, 40, 80, 120] {
+            for height in [1, 2, 3, 12, 24, 35] {
                 let mut t =
                     Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
                 t.draw(|f| render(f, &rows, &filtered, "", 99, Some(99), 0))
                     .unwrap();
-                if width == 80 && height >= 12 {
+                if width == 120 && height == 35 {
+                    if let Ok(path) = std::env::var("YOURAI_LAUNCHER_SNAPSHOT") {
+                        let cells = t.backend().buffer().content.iter().map(|c| serde_json::json!({
+                            "text": c.symbol(), "fg": format!("{:?}", c.fg), "bg": format!("{:?}", c.bg), "bold": c.modifier.contains(Modifier::BOLD)
+                        })).collect::<Vec<_>>();
+                        std::fs::write(
+                            path,
+                            serde_json::to_vec(
+                                &serde_json::json!({"width":width,"height":height,"cells":cells}),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                }
+                if width >= 80 && height >= 12 {
                     let text: String = t
                         .backend()
                         .buffer()

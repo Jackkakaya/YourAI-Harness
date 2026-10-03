@@ -7,7 +7,7 @@ use yourai_harness::tools::*;
 
 async fn call(tool: &dyn ToolHandler, input: Value) -> Result<Value, YourAiError> {
     let cancel = CancellationToken::new();
-    tool.execute(
+    tool.run(
         ToolContext {
             call_id: "test".into(),
             emit: &DiscardSink,
@@ -116,7 +116,7 @@ async fn symlinks_permissions_line_endings_and_cancelled_write() {
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert!(write
-        .execute(
+        .run(
             ToolContext {
                 call_id: "cancel".into(),
                 emit: &DiscardSink,
@@ -193,7 +193,7 @@ async fn dropping_shell_future_kills_descendants() {
     let cancel = CancellationToken::new();
     let task = tokio::spawn(async move {
         shell
-            .execute(
+            .run(
                 ToolContext {
                     call_id: "drop".into(),
                     emit: &DiscardSink,
@@ -249,7 +249,7 @@ async fn hard_denial_prevents_side_effects() {
     let cancel = CancellationToken::new();
     let write = Write::new(d.path().into());
     assert!(write
-        .execute(
+        .run(
             ToolContext {
                 call_id: "deny".into(),
                 emit: &DiscardSink,
@@ -296,7 +296,7 @@ async fn cancellation_token_stops_shell_and_sandbox_denial_prevents_spawn() {
     let shell = Shell::new(root.clone());
     let task = tokio::spawn(async move {
         shell
-            .execute(
+            .run(
                 ToolContext {
                     call_id: "cancel".into(),
                     emit: &DiscardSink,
@@ -346,7 +346,7 @@ async fn cancellation_token_stops_shell_and_sandbox_denial_prevents_spawn() {
     let cancel = CancellationToken::new();
     let shell = Shell::new(root.clone());
     assert!(shell
-        .execute(
+        .run(
             ToolContext {
                 call_id: "sandbox".into(),
                 emit: &DiscardSink,

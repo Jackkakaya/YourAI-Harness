@@ -54,7 +54,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
-        compact = any(m.get('role') == 'system' and 'Summarize for continuation' in str(m.get('content'))
+        compact = any(m.get('role') == 'system' and 'Create a structured checkpoint' in str(m.get('content'))
                       for m in body.get('messages', []))
         if compact:
             delta = {'content': 'Prior task list is complete.'}
@@ -161,7 +161,8 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'16.0K')
         os.write(master, b'\x02')  # Close the dashboard.
         time.sleep(0.3)
-        os.write(master, b'\x1b[<0;1;35M\x1b[<32;11;35M\x1b[<0;11;35m')
+        # The centered 100-column home puts its title at x=13 (zero-based), row 0.
+        os.write(master, b'\x1b[<0;14;1M\x1b[<32;24;1M\x1b[<0;24;1m')
         wait_for(b'Copied')
         assert clipboard_file.read_text() == 'New session', repr(clipboard_file.read_text())
         os.write(master, b'/')
@@ -176,9 +177,13 @@ with tempfile.TemporaryDirectory() as tmp:
             wait_for(b'YOLO')
         else:
             wait_for(b'Allow tasks?')
-            os.write(master, b'\r')
-            wait_for(b'Enter y to allow once')
-            assert len(requests) == 1, 'empty reply approved a tool'
+            wait_for(b'y  Allow once')
+            os.write(master, b'x')  # unrelated keys never answer an approval
+            time.sleep(0.3)
+            assert len(requests) == 1, 'a stray key approved a tool'
+            os.write(master, b'a')  # allow once and for the rest of the session
+            wait_for(b'approved once and for the rest of this session')
+            assert len(requests) == 1, 'the approval itself must not hit the model'
         if yolo:
             wait_for(b'SMOKE_STREAM_OK')
         content = next(m['content'] for m in requests[0][2]['messages'] if m['role'] == 'user')
@@ -186,7 +191,6 @@ with tempfile.TemporaryDirectory() as tmp:
             content = ''.join(p.get('text', '') for p in content)
         assert content == 'list tasks\nsecond line', repr(content)
         if not yolo:
-            os.write(master, b'y\r')
             # Clear the historical approval dialog (which contains the tool input JSON)
             # before checking the folded card preview — only the current screen matters.
             captured.clear()
@@ -205,7 +209,7 @@ with tempfile.TemporaryDirectory() as tmp:
         # before the turn's finalization completes, so wait for it.
         wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 3)
         os.write(master, b'/compact\r')
-        wait_for(b'Summarized')
+        wait_for(b'Context compacted')
         os.write(master, b'\x11')
         wait_exit(child, master)
         assert child.returncode == 0
@@ -213,8 +217,9 @@ with tempfile.TemporaryDirectory() as tmp:
         assert len(requests) == 4
         assert requests[3][2].get('stream') is True, 'compaction must use a progressing stream'
         assert all(value == 'model' for value in config_headers)
-        for _, _, body in requests:
-            assert body.get('max_tokens', body.get('max_completion_tokens')) == 4096, body
+        for index, (_, _, body) in enumerate(requests):
+            expected_output = 2000 if index == 3 else 4096
+            assert body.get('max_tokens', body.get('max_completion_tokens')) == expected_output, body
             assert body['temperature'] == 0.2
             assert body['top_p'] == 0.9
             assert body['reasoning_effort'] == 'high'
@@ -222,6 +227,8 @@ with tempfile.TemporaryDirectory() as tmp:
         assert all(path == '/v1/chat/completions' and auth == 'Bearer smoke-only'
                    and body['model'] == 'smoke-model' for path, auth, body in requests)
         assert any(m['role'] == 'tool' for m in requests[1][2]['messages'])
+        assert all(m['role'] != 'tool' and not m.get('tool_calls')
+                   for m in requests[3][2]['messages']), 'summary history must be serialized data'
         db = sqlite3.connect(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3')
         session = db.execute('SELECT session_id FROM sessions').fetchone()[0]
         assert db.execute("SELECT source, COUNT(*) FROM model_requests GROUP BY source ORDER BY source").fetchall() == [('compact', 1), ('main', 3)]

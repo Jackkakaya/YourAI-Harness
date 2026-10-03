@@ -20,6 +20,8 @@ pub struct HarnessConfig {
     pub cwd: PathBuf,
     pub resume: Option<SessionId>,
     pub hooks: HooksConfig,
+    /// Optional replacement of the original AgentLoop scheduling interface.
+    pub agent_loop: Option<Arc<dyn AgentLoop>>,
     pub instructions: Vec<PathBuf>,
     pub context_policy: ContextPolicy,
     pub extensions: bool,
@@ -45,6 +47,7 @@ impl HarnessConfig {
             cwd,
             resume: None,
             hooks: HooksConfig::default(),
+            agent_loop: None,
             instructions: vec![],
             context_policy: ContextPolicy::default(),
             extensions: false,
@@ -215,15 +218,13 @@ impl Harness {
         if let Some(provider) = agent.ctx().try_memory() {
             crate::memory::register(hooks.as_ref(), provider, catalog.clone(), id.clone()).await?;
         }
-        agent
-            .ctx()
-            .set_agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
-                crate::default_loop::LoopConfig {
-                    memory_search_limit: config.memory_search_limit,
-                    tool_output: Some(catalog.tool_output.clone()),
-                    ..Default::default()
-                },
-            )));
+        let input = yourai_core::turn::InputOptions {
+            memory_search_limit: config.memory_search_limit,
+            ..Default::default()
+        };
+        if let Some(agent_loop) = config.agent_loop {
+            agent.ctx().set_agent_loop(agent_loop);
+        }
         if let Some(provider) = config.skill_provider {
             agent.ctx().set_skills(provider);
         } else if let Some(skills) = &skills {
@@ -236,6 +237,7 @@ impl Harness {
             context,
             agent,
             HostConfig {
+                input,
                 // Preserve initial instruction lifecycle hooks; reopening uses the
                 // frozen snapshot and must not require the original files.
                 instruction_paths: if source == "startup" {
@@ -428,7 +430,7 @@ pub(crate) async fn assemble(
     if let Some(tools) = inherited {
         for definition in tools.definitions() {
             if !crate::tools::BUILTIN_TOOL_NAMES.contains(&definition.name.as_str()) {
-                registry.register(tools.resolve(definition.name.as_str())?);
+                registry.register_binding(tools.resolve(definition.name.as_str())?);
             }
         }
     }
