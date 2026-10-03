@@ -691,16 +691,6 @@ impl App {
     fn overlay_action(&mut self, action: OverlayAction) {
         match action {
             OverlayAction::None => {}
-            OverlayAction::Model(index) => {
-                if let Some(choice) = self.view.model_choices.get(index) {
-                    self.controller.model(
-                        choice.id.clone(),
-                        choice.variant.clone(),
-                        None,
-                        &mut self.view,
-                    );
-                }
-            }
             OverlayAction::PickEffort(index) => {
                 // Preselect the entry's effective effort; "default" when unset.
                 let Some(choice) = self.view.model_choices.get(index) else {

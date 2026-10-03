@@ -269,7 +269,11 @@ impl Config {
             .provider
             .get_mut(provider_id)
             .ok_or("Unknown provider")?;
-        let model = provider.models.get_mut(model_key).ok_or("Unknown model")?;
+        // The current model can be named without a provider.models entry —
+        // resolve falls back to defaults for it, and the picker shows a
+        // synthetic row. Materialize the entry so an override has somewhere
+        // to live and still rides on the request.
+        let model = provider.models.entry(model_key.to_owned()).or_default();
         let options = match variant {
             Some(name) => model
                 .variants
@@ -639,6 +643,28 @@ mod tests {
             cfg.effective_effort(id, Some("short")).as_deref(),
             Some("high")
         );
+    }
+    #[test]
+    fn effort_override_materializes_an_undeclared_model_entry() {
+        use crate::models::EffortChoice;
+        let mut cfg = config();
+        // "gateway" declares concrete models; an id naming an undeclared
+        // model still shows a synthetic picker row. An override must not
+        // fail with "Unknown model"; it materializes the entry (resolve
+        // already falls back to defaults for undeclared models).
+        let id = "gateway/undeclared";
+        cfg.model = id.to_string();
+        cfg.set_entry_effort(id, None, &EffortChoice::Set("high".into()))
+            .unwrap();
+        assert_eq!(cfg.effective_effort(id, None).as_deref(), Some("high"));
+        // The materialized entry resolves like the fallback entry did.
+        // (The override riding on the HTTP request is asserted end-to-end
+        // in tests/smoke_models.py.)
+        cfg.resolve(None).unwrap();
+        // Config restores the (absent) configured value and drops the entry.
+        cfg.set_entry_effort(id, None, &EffortChoice::Config)
+            .unwrap();
+        assert_eq!(cfg.effective_effort(id, None), None);
     }
     #[tokio::test]
     async fn minimal_gateway_config_uses_model_name_and_default_prompt() {

@@ -108,11 +108,11 @@ with tempfile.TemporaryDirectory() as tmp:
         assert len(stream_reqs) >= 2, f'expected 2 stream requests, got {len(stream_reqs)}'
         assert stream_reqs[1][1]['model'] == 'alt-model', f'expected alt-model, got {stream_reqs[1][1]["model"]}'
         assert stream_reqs[1][1].get('reasoning_effort') == 'low'
-        # Set thinking effort via the /models picker's Tab sub-picker.
+        # Set thinking effort via the /models picker's Enter drill-in.
         wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 2)
         os.write(master, b'/models\r')
-        wait_for(b'Tab effort')
-        os.write(master, b'\t')
+        wait_for(b'Enter effort')
+        os.write(master, b'\r')
         wait_for(b'config default')
         for _ in range(2):  # configured low -> medium -> high
             os.write(master, b'\x1b[B')
@@ -131,8 +131,8 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 3)
         captured.clear()
         os.write(master, b'/models\r')
-        wait_for(b'Tab effort')
-        os.write(master, b'\t')
+        wait_for(b'Enter effort')
+        os.write(master, b'\r')
         wait_for(b'config default')
         for _ in range(5):  # high -> config default
             os.write(master, b'\x1b[A')

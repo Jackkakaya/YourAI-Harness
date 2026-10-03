@@ -88,6 +88,10 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'New session')
         os.write(master, b'/models\r')
         wait_for(b'Models')
+        # Enter drills into the effort picker; a second Enter confirms the
+        # preselected level and switches.
+        os.write(master, b'\r')
+        wait_for(b'config default')
         os.write(master, b'\r')
         wait_for(b'Model switched to mock/smoke')
         captured.clear()

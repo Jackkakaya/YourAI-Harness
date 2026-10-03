@@ -63,10 +63,10 @@ cargo run -p yourai-tui
 
 ### 在 `/models` 选择器中调整 thinking effort
 
-选择器中高亮任意条目后按 `Tab`（或 `→`）进入该条目的 "Thinking effort" 二级选择器：
+选择器中高亮任意条目后按 `Enter`（或 `Tab`/`→`）进入该条目的 "Thinking effort" 二级选择器：
 
 - 级别：`config default`（回到配置文件的设定）、`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`；`●` 标记当前生效级别。
-- `Enter` 应用并切换到该模型；`Esc`/`←` 返回模型列表。
+- 二级选择器中 `Enter` 应用所选强度并切换到该模型；`Esc`/`←` 返回模型列表。
 - 覆盖写入内存中的配置（与 `/models` 切换同一路径），对主对话、压缩与共享该模型的子代理一致生效；不回写 `yourai.json`，重启后回到文件配置。
 - 当前 effort 显示在三处：`/models` 行内（如 `gateway/kimi-k3 · high`）、输入框左侧模型标签、`Ctrl-B` 仪表盘首行；切换成功也会提示 `Model switched to … · thinking high`。
 
@@ -90,7 +90,7 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --check-config
 | `/continue` | 重试暂时执行失败后保留的待处理输入 |
 | `/editor` | 把当前草稿交给 `$VISUAL`/`$EDITOR` 编辑（等价 `Ctrl-X`）；非零退出视为取消，草稿保持不变 |
 | `/compact` | 手动压缩；运行中会拒绝并提示 busy；压缩期间可按 Esc / Ctrl-C 取消 |
-| `/models [provider/model [variant]]` | 打开模型选择器或直接切换；选择器内 `Tab`/`→` 进入 thinking effort 二级选择器；仅空闲时可切换，模型与上下文限制一起更新，失败保留原选择 |
+| `/models [provider/model [variant]]` | 打开模型选择器或直接切换；选择器内 `Enter`（或 `Tab`/`→`）进入 thinking effort 二级选择器，选定强度后一并切换；仅空闲时可切换，模型与上下文限制一起更新，失败保留原选择 |
 | `F2` | 按“最近使用”顺序循环切换模型（等价 /models 的快捷入口，仅空闲时生效） |
 | `/sessions` | 打开会话选择器，过滤/切换；当前 turn 进行中会拒绝；Ctrl-D 请求删除，Y 确认，N/Esc 保留 |
 | `/status` | 切换仪表盘覆盖层（等价 `^B`） |

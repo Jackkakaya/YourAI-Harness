@@ -146,7 +146,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         text: "/models",
-        description: "Switch model (picker; Tab sets thinking effort)",
+        description: "Switch model then thinking effort (picker)",
         argument: false,
     },
     Command {
