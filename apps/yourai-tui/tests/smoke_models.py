@@ -9,6 +9,7 @@ import pty
 import re
 import select
 import signal
+import sqlite3
 import struct
 import sys
 import subprocess
@@ -78,7 +79,9 @@ with tempfile.TemporaryDirectory() as tmp:
         end = time.monotonic() + timeout
         while len(requests) < request_count or needle not in re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured):
             if time.monotonic() > end:
-                raise AssertionError(f'Missing {needle!r}; requests: {len(requests)}; output: ' + re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured).decode(errors='replace')[-2000:])
+                with sqlite3.connect(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3') as db:
+                    messages = db.execute('SELECT kind, status, content_json FROM messages ORDER BY rowid DESC LIMIT 3').fetchall()
+                raise AssertionError(f'Missing {needle!r}; requests: {len(requests)}; exit: {child.poll()}; messages: {messages!r}; output: ' + re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured).decode(errors='replace')[-2000:])
             if select.select([master], [], [], 0.1)[0]:
                 data = os.read(master, 65536)
                 captured.extend(data)
