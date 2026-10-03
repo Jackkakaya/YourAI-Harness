@@ -118,7 +118,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         text: "/continue",
-        description: "Resume pending inputs",
+        description: "Resume queued inputs or continue after a failure",
         argument: false,
     },
     Command {

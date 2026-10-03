@@ -160,8 +160,20 @@ impl Controller {
         }
     }
     pub fn resume(&mut self, view: &mut View) {
-        if self.available(view) {
-            self.runtime.resume();
+        if !self.available(view) {
+            return;
+        }
+        // A consumed input is already in history and is deliberately not requeued
+        // by the host. Explicit /continue adds a follow-up only when no pending
+        // input or active operation can already resume the work.
+        if self.runtime.idle() && self.runtime.h.host.last_error().is_some() {
+            if self.submit(In::follow_up(
+                "Continue the previous task from the saved conversation after the interrupted or failed response. Check saved tool results and current state before acting; do not repeat completed operations. Regenerate any incomplete tool call, and split large file edits into smaller saved steps."
+            ), view) {
+                self.runtime.continue_execution();
+            }
+        } else {
+            self.runtime.continue_execution();
         }
     }
     pub fn compact(&mut self, view: &mut View) {
@@ -627,5 +639,149 @@ mod tests {
         std::fs::remove_dir(&journal).unwrap();
         std::fs::rename(backup, journal).unwrap();
         controller.close().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::{Config, Controller, View};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use yourai_core::prelude::*;
+    use yourai_harness::{Harness, HarnessConfig};
+
+    #[derive(Default)]
+    struct InterruptedModel {
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+    impl ModelProvider for InterruptedModel {
+        fn complete<'a>(
+            &'a self,
+            _: ModelRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
+            Box::pin(async { Err(ErrorKind::Config("unused".into()).into()) })
+        }
+        fn stream_events<'a>(
+            &'a self,
+            req: ModelRequest,
+        ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
+            Box::pin(async move {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(req.request);
+                let events = if requests.len() == 1 {
+                    vec![Ok(ChatStreamEvent::Chunk(StreamChunk {
+                        content: "partial answer".into(),
+                    }))]
+                } else {
+                    vec![Ok(ChatStreamEvent::End(StreamEnd {
+                        captured_content: Some(MessageContent::from_text("recovered")),
+                        ..Default::default()
+                    }))]
+                };
+                Ok(Box::pin(futures_util::stream::iter(events)) as ModelEventStream)
+            })
+        }
+        fn model_iden(&self) -> &str {
+            "test"
+        }
+    }
+    async fn settle(
+        controller: &mut Controller,
+        view: &mut View,
+        model: &InterruptedModel,
+        calls: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                controller.poll(view, None).await;
+                if model.requests.lock().unwrap().len() >= calls
+                    && controller.runtime.idle()
+                    && !view.session.active
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "settle calls={calls}, received={}, idle={}, active={}, queued={}, error={:?}",
+                model.requests.lock().unwrap().len(),
+                controller.runtime.idle(),
+                view.session.active,
+                controller.runtime.h.host.queued(),
+                controller.runtime.h.host.last_error()
+            )
+        });
+    }
+    #[tokio::test]
+    async fn explicit_continue_recovers_once_from_history_without_replaying_consumed_input() {
+        for queued in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let config: Config = serde_json::from_value(serde_json::json!({
+            "model":"mock/test", "extensions":false,
+            "provider":{"mock":{"options":{"baseURL":"http://127.0.0.1:1/v1","apiKey":"test"},"models":{}}}
+        })).unwrap();
+            let hc = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+            let model = Arc::new(InterruptedModel::default());
+            let h = Harness::open(hc.clone(), model.clone()).await.unwrap();
+            let mut controller = Controller::new(
+                h,
+                Arc::new(Mutex::new(config)),
+                hc,
+                TurnLimits::default(),
+                false,
+            );
+            let mut view = View::default();
+            assert!(controller.submit(In::user_text("write game.js"), &mut view));
+            settle(&mut controller, &mut view, &model, 1).await;
+            assert!(controller.runtime.h.host.last_error().is_some());
+            assert_eq!(controller.runtime.h.host.queued(), 0);
+            if queued {
+                assert!(controller.submit(
+                    In::follow_up("continue with my queued instruction"),
+                    &mut view
+                ));
+            }
+            controller.resume(&mut view);
+            // Repeated /continue while the follow-up is being submitted must not duplicate it.
+            controller.resume(&mut view);
+            settle(&mut controller, &mut view, &model, 2).await;
+            assert!(controller.runtime.h.host.last_error().is_none());
+            {
+                let requests = model.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                let messages = &requests[1].messages;
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|m| m.content.texts().join("") == "write game.js")
+                        .count(),
+                    1
+                );
+                assert!(messages
+                    .iter()
+                    .any(|m| m.content.texts().join("") == "partial answer"));
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|m| m
+                            .content
+                            .texts()
+                            .join("")
+                            .starts_with("Continue the previous task"))
+                        .count(),
+                    usize::from(!queued)
+                );
+            }
+            // Healthy idle sessions have nothing to retry.
+            controller.resume(&mut view);
+            assert!(!controller.runtime.submitting());
+            assert_eq!(controller.runtime.h.host.queued(), 0);
+            controller.close().await.unwrap();
+        }
     }
 }

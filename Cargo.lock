@@ -3634,6 +3634,7 @@ name = "yourai-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "futures-util",
  "genai",
  "libc",
  "pulldown-cmark",
