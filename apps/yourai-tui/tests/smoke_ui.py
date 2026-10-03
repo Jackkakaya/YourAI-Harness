@@ -1,4 +1,5 @@
 from smoke_support import wait_completed, wait_exit
+from pty_probe import Screen
 """UI regression flows: modal isolation, model defaults, deletion, narrow stats and launcher quit."""
 import fcntl
 import http.server
@@ -72,28 +73,39 @@ with tempfile.TemporaryDirectory() as tmp:
     binary = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
     child = subprocess.Popen([str(binary), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, XDG_DATA_HOME=str(Path(tmp) / 'xdg-data')))
     captured = bytearray()
+    screen = Screen(120, 35)
 
-    def wait_for(needle, timeout=10):
+    def read_output(timeout):
+        if select.select([master], [], [], timeout)[0]:
+            data = os.read(master, 65536)
+            captured.extend(data)
+            screen.feed(data)
+            if b'\x1b[6n' in data:
+                os.write(master, b'\x1b[1;1R')
+            return True
+        return False
+
+    def visible(needle):
+        text = screen.text()
+        if needle.startswith(b'Model switched'):
+            notices = [line.strip().lstrip('· ') for line in text.splitlines() if 'Model switched' in line]
+            return bool(notices) and notices[-1] == needle.decode()
+        return needle in text.encode()
+
+    def wait_for(needle, timeout=10, current=False):
         end = time.monotonic() + timeout
-        while needle not in re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured):
+        while not (visible(needle) if current else needle in re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured)):
             if time.monotonic() > end:
                 raise AssertionError(f'Missing {needle!r}; requests: {len(requests)}; output: ' + re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured).decode(errors='replace')[-2000:])
-            if select.select([master], [], [], 0.1)[0]:
-                data = os.read(master, 65536)
-                captured.extend(data)
-                if b'\x1b[6n' in data:
-                    os.write(master, b'\x1b[1;1R')
+            read_output(0.1)
 
     def wait_for_repaint(needle):
-        # Wait for the local operation, then force a complete repaint:
-        # sparse cell updates do not contain the whole notice as raw text.
-        time.sleep(0.5)
-        captured.clear()
-        rows, columns, _, _ = struct.unpack('HHHH', fcntl.ioctl(slave, termios.TIOCGWINSZ, bytes(8)))
-        columns = 100 if columns == 120 else 120
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
-        os.kill(child.pid, signal.SIGWINCH)
-        wait_for(needle)
+        # Drain frames while settings settle, then match the latest visible
+        # confirmation. An older identical notice cannot release this wait.
+        end = time.monotonic() + 0.5
+        while time.monotonic() < end:
+            read_output(min(0.1, max(0, end - time.monotonic())))
+        wait_for(needle, current=True)
 
     try:
         wait_for(b'New session')

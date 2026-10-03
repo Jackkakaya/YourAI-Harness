@@ -1,4 +1,5 @@
 from smoke_support import wait_completed, wait_exit
+from pty_probe import Screen
 """Offline POSIX TUI smoke test. Run cargo build -p yourai-tui first."""
 import fcntl
 import http.server
@@ -8,7 +9,6 @@ from pathlib import Path
 import pty
 import re
 import select
-import signal
 import sqlite3
 import struct
 import sys
@@ -112,15 +112,17 @@ with tempfile.TemporaryDirectory() as tmp:
     binary = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
     child = subprocess.Popen([str(binary), '--config', str(config)] + mode_args, stdin=slave, stdout=slave, stderr=slave, env=child_env)
     captured = bytearray()
+    screen = Screen(120, 35)
 
-    def wait_for(needle, timeout=10):
+    def wait_for(needle, timeout=10, current=False):
         end = time.monotonic() + timeout
-        while needle not in re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured):
+        while needle not in (screen.text().encode() if current else re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured)):
             if time.monotonic() > end:
                 raise AssertionError(f'Missing {needle!r}; requests: {len(requests)}; output: ' + re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured).decode(errors='replace')[-4000:])
             if select.select([master], [], [], 0.1)[0]:
                 data = os.read(master, 65536)
                 captured.extend(data)
+                screen.feed(data)
                 if b'\x1b[6n' in data:
                     os.write(master, b'\x1b[1;1R')
 
@@ -244,13 +246,8 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'Review parser')
         os.write(master, b'resume question\r')
         wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 4)
-        # The resumed answer shares cells with the previous answer. Sparse
-        # updates may omit their common characters from the raw byte stream;
-        # repaint the completed turn before matching its full visible text.
-        captured.clear()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 100, 0, 0))
-        os.kill(child.pid, signal.SIGWINCH)
-        wait_for(b'SMOKE_RESUME_OK')
+        # Reconstruct sparse updates before matching the current reply.
+        wait_for(b'SMOKE_RESUME_OK', current=True)
         assert len(requests) == 5, 'resumed turn must issue exactly one request'
         assert any('Prior task list is complete.' in str(m.get('content')) for m in requests[-1][2]['messages'])
         os.write(master, b'\x11')
