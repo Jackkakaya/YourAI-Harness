@@ -68,7 +68,7 @@ impl InputExecutor<'_, '_> {
     }
 }
 /// Stop 生命周期的框架操作持有整个 TurnExecution（完成状态与可观测性）。
-pub struct CompletionExecutor<'a, 'turn> {
+pub(crate) struct CompletionExecutor<'a, 'turn> {
     turn: &'a mut TurnExecution<'turn>,
 }
 impl yourai_core::completion::CompletionOperation for CompletionExecutor<'_, '_> {

@@ -101,7 +101,7 @@ pub mod prelude {
     pub use crate::compaction::{
         CompactAction, CompactionRequest, CompactionResult, CompactionTrigger, ContextPolicy,
     };
-    pub use crate::completion::{complete, Completion, CompletionOperation};
+    pub use crate::completion::{Completion, CompletionOperation};
     pub use crate::context::{
         Agent, AgentBuilder, Context, ProviderSnapshot, TurnContext, TurnHandle,
     };
@@ -117,7 +117,7 @@ pub mod prelude {
         HookMessageKind, HookOutput, HookPermission, HookPointOutcome, HookRegistry, HookRun,
         HookRunStatus, HookRuntime, HookSource, NativeHookRegistration,
     };
-    pub use crate::inputs::{accept, InputOperation};
+    pub use crate::inputs::InputOperation;
     pub use crate::interaction::{InteractionKind, InteractionRequest, ToolInteraction};
     pub use crate::memory::{
         CompletedMemoryTurn, MemoryEntry, MemoryManager, MemoryProvider, MemorySession,

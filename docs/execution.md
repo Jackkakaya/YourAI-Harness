@@ -71,7 +71,7 @@ impl AgentLoop for MyLoop {
 
 正常成功必须先通过 `complete`；输入被拒绝可以直接结束。未结工具存在时不能完成或开始下一次模型请求。`finish` 不负责调度，也不再次触发 Stop。
 
-上述操作的固定入口位于 core：`model::exec`、`ToolBinding::exec`（tool）、`ToolBinding::authorize`（security）、`interaction::elicit`、`context_manager::compact`、`inputs::accept`、`completion::complete`、`subagent::exec_child`、`session_ops::session_start`/`session_end`/`turn_completed`、`tasks::*` 与 `workspace::*`。Harness 执行器实现对应的 `*Operation` 基础设施缝；Loop 侧调用与 `cx.*` 方法均经由这些固定入口，Hook 生命周期（阻断、反馈、附加上下文、超时与错误聚合）随入口固定在 core。
+上述操作的固定入口位于 core：`model::exec`、`ToolBinding::exec`（tool）、`ToolBinding::authorize`（security）、`interaction::elicit`、`context_manager::compact`、`inputs::accept`、`completion::complete`、`subagent::exec_child`、`session_ops::session_start`/`session_end`/`turn_completed`、`tasks::*` 与 `workspace::*`。入口分两类：`context_manager::compact`、`tasks::*`、`workspace::*` 与 `session_ops::*` 是 core 模板，Hook 派发、消费与效果应用固定在 core；其余为 `*Operation` 缝，core 固定入口签名与契约，Hook 生命周期由运行时执行器实现（与 `ExecutionState` 的 wait/route 控制底座协作）。Loop 侧调用与 `cx.*` 方法均经由这些固定入口。
 
 ## 工具实现与注册
 
@@ -101,7 +101,7 @@ impl AgentLoop for MyLoop {
 | PostToolUseFailure | tools.exec/call：失败或取消时报告，保留实际完成的结果 |
 | PermissionRequest | permissions.authorize / 工具内部授权：先尝试 Hook 决定，必要时请求用户 |
 | PermissionDenied | 授权拒绝路径：报告原因，执行有界重新检查 |
-| UserPromptSubmit | inputs.accept（core 入口）：通过后准备并提交输入 |
+| UserPromptSubmit | open、inputs.accept、steer 接纳（共用同一接纳实现，cx 入口经 core 缝）：通过后准备并提交输入 |
 | Stop | complete（core 入口）：补充反馈/上下文，返回继续或完成，保持当前 Loop 局部状态 |
 | StopFailure | model.exec：最终模型故障报告，不用于普通工具错误或取消 |
 | SessionStart | SessionHost.open/restore（core 模板 session_ops::session_start）：初始化后应用初始输入、上下文与监视路径 |
