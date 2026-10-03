@@ -1,6 +1,5 @@
 //! Active context and its durable mutation boundary. SQL lives in SessionManager.
 mod compact;
-mod compaction_lifecycle;
 mod projection;
 pub mod prompt;
 
@@ -345,14 +344,16 @@ impl ContextManager for MemoryContext {
 }
 
 impl MemoryContext {
-    /// Fixed public operation, shared with every replacement ContextManager.
+    /// Convenience forwarding to the fixed public operation in
+    /// [`yourai_core::context_manager::compact`], shared with every
+    /// replacement ContextManager.
     pub fn compact<'a>(
         &'a self,
         request: CompactionRequest,
         execution: &'a ContextExecution,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>> {
-        Box::pin(compaction_lifecycle::compact(
+        Box::pin(crate::context::compact(
             self,
             request,
             execution,
@@ -361,4 +362,5 @@ impl MemoryContext {
         ))
     }
 }
-pub use compaction_lifecycle::compact;
+/// Fixed public compaction operation; the hook lifecycle lives in core.
+pub use yourai_core::context_manager::compact;

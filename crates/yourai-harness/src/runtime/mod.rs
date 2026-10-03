@@ -249,15 +249,18 @@ impl SessionHost {
         }
         if host.config.workspace_enabled || !host.config.instruction_paths.is_empty() {
             let workspace = host.workspace()?;
-            workspace
-                .setup(if source == "startup" {
+            // 固定公共入口：Setup / InstructionsLoaded 生命周期在框架操作内。
+            yourai_core::workspace::setup(
+                workspace.as_ref(),
+                if source == "startup" {
                     "init"
                 } else {
                     "maintenance"
-                })
-                .await?;
+                },
+            )
+            .await?;
             for path in &host.config.instruction_paths {
-                workspace.load_instructions(path, source).await?;
+                yourai_core::workspace::load_instructions(workspace.as_ref(), path, source).await?;
             }
         }
         if was_interrupted {

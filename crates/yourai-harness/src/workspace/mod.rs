@@ -136,7 +136,8 @@ impl Workspace {
                             } else {
                                 "modified"
                             };
-                            ws.file_changed(&host, &path, event).await;
+                            // 固定公共入口：FileChanged 生命周期在框架操作内。
+                            yourai_core::workspace::file_changed(ws.as_ref(), &path, event).await;
                         }
                     }
                 }

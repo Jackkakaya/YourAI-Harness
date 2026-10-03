@@ -25,31 +25,10 @@ pub struct TurnExecution<'a> {
     span: Option<Arc<dyn yourai_core::observability::Span>>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ModelOptions {
-    pub tools_enabled: bool,
-    pub prefill: Option<String>,
-}
-impl Default for ModelOptions {
-    fn default() -> Self {
-        Self {
-            tools_enabled: true,
-            prefill: None,
-        }
-    }
-}
+pub use yourai_core::completion::Completion;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Completion {
-    Completed,
-    NeedsMoreWork,
-}
-
-#[derive(Debug, Clone)]
-pub struct ModelOutput {
-    pub text: String,
-    pub calls: Vec<ToolCall>,
-}
+/// Model step options/output live in core next to the public execution entry.
+pub use yourai_core::model::{ModelOptions, ModelOutput};
 
 pub use yourai_core::tool::ExecutedTool as ToolOutput;
 
@@ -71,14 +50,62 @@ pub struct PermissionExecutor<'a, 'turn> {
 pub struct InteractionExecutor<'a, 'turn> {
     state: &'a mut ExecutionState<'turn>,
 }
+impl yourai_core::inputs::InputOperation for InputExecutor<'_, '_> {
+    fn accept_bound<'a>(&'a mut self, input: In) -> BoxFuture<'a, Result<bool, YourAiError>> {
+        Box::pin(async move {
+            if !matches!(input, In::UserText { .. }) {
+                return Err(ErrorKind::Config("input admission requires UserText".into()).into());
+            }
+            let index = self.state.queued.len();
+            self.state.queued.push_back(input);
+            self.state.accept_input(index, false).await
+        })
+    }
+}
 impl InputExecutor<'_, '_> {
     pub async fn accept(&mut self, input: In) -> Result<bool, YourAiError> {
-        if !matches!(input, In::UserText { .. }) {
-            return Err(ErrorKind::Config("input admission requires UserText".into()).into());
-        }
-        let index = self.state.queued.len();
-        self.state.queued.push_back(input);
-        self.state.accept_input(index, false).await
+        yourai_core::inputs::accept(self, input).await
+    }
+}
+/// Stop 生命周期的框架操作持有整个 TurnExecution（完成状态与可观测性）。
+pub(crate) struct CompletionExecutor<'a, 'turn> {
+    turn: &'a mut TurnExecution<'turn>,
+}
+impl yourai_core::completion::CompletionOperation for CompletionExecutor<'_, '_> {
+    fn complete_bound<'a>(
+        &'a mut self,
+        text: String,
+    ) -> BoxFuture<'a, Result<Completion, YourAiError>> {
+        Box::pin(async move {
+            self.turn.state.tc.check_control()?;
+            if !self.turn.state.unresolved.is_empty() {
+                return Err(
+                    ErrorKind::Loop("cannot complete with unresolved tool calls".into()).into(),
+                );
+            }
+            self.turn.state.complete_candidate(text).await?;
+            let completion = if self.turn.state.finish().await? {
+                Completion::Completed
+            } else {
+                Completion::NeedsMoreWork
+            };
+            self.turn.completed = completion == Completion::Completed;
+            Ok(completion)
+        })
+    }
+}
+impl yourai_core::security::SecurityOperation for PermissionExecutor<'_, '_> {
+    fn authorize_bound<'a>(
+        &'a mut self,
+        call: &'a mut ToolCall,
+        binding: &'a yourai_core::tool::ToolBinding,
+        hook_permission: HookPermission,
+        doom_loop: bool,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(
+            self.state
+                .approve(call, binding, hook_permission, doom_loop),
+        )
     }
 }
 impl PermissionExecutor<'_, '_> {
@@ -104,10 +131,20 @@ impl PermissionExecutor<'_, '_> {
         if let Some(schema) = &binding.definition().schema {
             interaction::validate_schema(schema, &call.fn_arguments)?;
         }
-        self.state
-            .approve(&mut call, &binding, HookPermission::default(), false)
+        // Fixed public entry: the PermissionRequest/Denied lifecycle lives in
+        // the framework operation, never in the caller.
+        binding
+            .authorize(self, &mut call, HookPermission::default(), false)
             .await?;
         Ok(call.fn_arguments)
+    }
+}
+impl yourai_core::interaction::InteractionOperation for InteractionExecutor<'_, '_> {
+    fn elicit_bound<'a>(
+        &'a mut self,
+        request: InteractionRequest,
+    ) -> BoxFuture<'a, Result<serde_json::Value, YourAiError>> {
+        Box::pin(self.state.service_interaction(request))
     }
 }
 impl InteractionExecutor<'_, '_> {
@@ -115,7 +152,9 @@ impl InteractionExecutor<'_, '_> {
         &mut self,
         request: InteractionRequest,
     ) -> Result<serde_json::Value, YourAiError> {
-        self.state.service_interaction(request).await
+        // Fixed public entry: Elicitation/ElicitationResult lifecycle lives in
+        // the framework operation.
+        yourai_core::interaction::elicit(self, request).await
     }
 }
 
@@ -178,20 +217,7 @@ impl<'turn> TurnExecution<'turn> {
     }
     /// Accept a business answer. Completion may request more work; hooks stay internal.
     pub async fn complete(&mut self, text: impl Into<String>) -> Result<Completion, YourAiError> {
-        self.state.tc.check_control()?;
-        if !self.state.unresolved.is_empty() {
-            return Err(
-                ErrorKind::Loop("cannot complete with unresolved tool calls".into()).into(),
-            );
-        }
-        self.state.complete_candidate(text.into()).await?;
-        let completion = if self.state.finish().await? {
-            Completion::Completed
-        } else {
-            Completion::NeedsMoreWork
-        };
-        self.completed = completion == Completion::Completed;
-        Ok(completion)
+        yourai_core::completion::complete(&mut CompletionExecutor { turn: self }, text.into()).await
     }
     /// Retain committed tool results, partial output and pending input on all exit paths.
     pub async fn finish(mut self, mut result: Result<(), YourAiError>) -> TurnResult {
@@ -317,18 +343,31 @@ impl ToolExecutor<'_, '_> {
         self.state.unresolved.iter().cloned().collect()
     }
 }
+impl yourai_core::model::ModelOperation for ModelExecutor<'_, '_> {
+    fn exec_bound<'a>(
+        &'a mut self,
+        options: ModelOptions,
+    ) -> BoxFuture<'a, Result<ModelOutput, YourAiError>> {
+        Box::pin(async move {
+            if !self.state.unresolved.is_empty() {
+                return Err(ErrorKind::Loop(
+                    "resolve pending tool calls before requesting another model response".into(),
+                )
+                .into());
+            }
+            self.state.next_model(&options).await
+        })
+    }
+}
 impl ModelExecutor<'_, '_> {
     pub async fn exec(&mut self) -> Result<ModelOutput, YourAiError> {
         self.exec_with(ModelOptions::default()).await
     }
     pub async fn exec_with(&mut self, options: ModelOptions) -> Result<ModelOutput, YourAiError> {
-        if !self.state.unresolved.is_empty() {
-            return Err(ErrorKind::Loop(
-                "resolve pending tool calls before requesting another model response".into(),
-            )
-            .into());
-        }
-        self.state.next_model(&options).await
+        // Fixed public entry: the step lifecycle (request build, streaming,
+        // timeouts, retry accounting, StopFailure reporting) lives in the
+        // framework operation, never in the caller.
+        yourai_core::model::exec(self, options).await
     }
 }
 impl ContextExecutor<'_, '_> {

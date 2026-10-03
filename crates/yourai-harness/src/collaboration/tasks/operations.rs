@@ -1,4 +1,4 @@
-//! Public transition wrappers own hooks; mutations are private business methods.
+//! Public transitions forward to the fixed core templates.
 use super::*;
 
 impl TaskBoard {
@@ -8,81 +8,35 @@ impl TaskBoard {
         description: Option<String>,
         owner: Option<String>,
     ) -> Result<Task, YourAiError> {
-        let _gate = self.gate.lock().await;
         let host = self
             .host
             .upgrade()
             .ok_or_else(|| error("tasks", "host gone"))?;
-        let task = Task {
-            id: uuid::Uuid::new_v4().to_string(),
+        // 固定公共入口：TaskCreated 生命周期在 core 模板。
+        yourai_core::tasks::create_task(
+            self,
+            host.as_ref(),
+            &self.team,
             subject,
             description,
             owner,
-            completed: false,
-            seq: self
-                .seq
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-                .map_err(|_| error("tasks", "task creation sequence exhausted"))?
-                + 1,
-        };
-        let result = host
-            .dispatch(HookEvent::TaskCreated {
-                task_id: task.id.clone(),
-                task_subject: task.subject.clone(),
-                task_description: task.description.clone(),
-                teammate_name: task.owner.clone(),
-                team_name: Some(self.team.clone()),
-            })
-            .await?;
-        host.consume_hook_async(&result, true).await?;
-        self.run_create(&host.dir, task)
+        )
+        .await
     }
     pub async fn complete(&self, id: &str) -> Result<(), YourAiError> {
-        let _gate = self.gate.lock().await;
         let host = self
             .host
             .upgrade()
             .ok_or_else(|| error("tasks", "host gone"))?;
-        let task = self
-            .tasks
-            .lock()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| error("tasks", "unknown task"))?;
-        if task.completed {
-            return Ok(());
-        }
-        let result = host
-            .dispatch(HookEvent::TaskCompleted {
-                task_id: task.id,
-                task_subject: task.subject,
-                task_description: task.description,
-                teammate_name: task.owner,
-                team_name: Some(self.team.clone()),
-            })
-            .await?;
-        host.consume_hook_async(&result, true).await?;
-        self.run_complete(&host.dir, id)
+        // 固定公共入口：TaskCompleted 生命周期在 core 模板（已完成快路径不触发）。
+        yourai_core::tasks::complete_task(self, host.as_ref(), &self.team, id).await
     }
     pub async fn idle(&self, teammate: &str) -> Result<(), YourAiError> {
         let host = self
             .host
             .upgrade()
             .ok_or_else(|| error("tasks", "host gone"))?;
-        if self
-            .list()
-            .iter()
-            .any(|t| t.owner.as_deref() == Some(teammate) && !t.completed)
-        {
-            return Err(error("tasks", "teammate has unfinished tasks"));
-        }
-        let result = host
-            .dispatch(HookEvent::TeammateIdle {
-                teammate_name: teammate.into(),
-                team_name: self.team.clone(),
-            })
-            .await?;
-        host.consume_hook_async(&result, true).await
+        // 固定公共入口：TeammateIdle 生命周期在 core 模板。
+        yourai_core::tasks::teammate_idle(self, host.as_ref(), &self.team, teammate).await
     }
 }

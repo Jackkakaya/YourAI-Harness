@@ -1,9 +1,16 @@
 //! Context mutations are committed before the active in-memory view changes.
+//!
+//! 本模块同时持有 [`ContextManager`] 的公共压缩操作 [`compact`]：
+//! hook 生命周期、阻断、取消/提交竞态语义对全部实现固定，属于机制层。
 use crate::prelude::{
-    BaseInput, HookRuntime, ModelProvider, ProviderSnapshot, SessionContext, UsageTracker,
+    AbortReason, BaseInput, ErrorKind, HookDispatchResult, HookEvent, HookInvocation,
+    HookPointOutcome, HookRuntime, ModelProvider, ProviderSnapshot, SessionContext, UsageTracker,
 };
 use crate::{chat::*, compaction::*, error::YourAiError, future::BoxFuture, session::*};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Dependencies selected once for this execution; context storage does not retain providers.
@@ -161,3 +168,191 @@ pub trait CompactionJob: Send {
     where
         Self: 'a;
 }
+
+// region:    --- 公共压缩操作（固定模板） ---
+
+/// Optional policy bounds: absence of a timer never disables caller cancellation.
+async fn bounded_timeout<T>(
+    duration: Option<Duration>,
+    future: impl Future<Output = T>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    match duration {
+        Some(duration) => tokio::time::timeout(duration, future).await,
+        None => Ok(future.await),
+    }
+}
+
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn op_error(message: impl std::fmt::Display) -> YourAiError {
+    ErrorKind::Provider {
+        name: "compact",
+        message: message.to_string(),
+    }
+    .into()
+}
+
+async fn dispatch_hook(
+    execution: &ContextExecution,
+    event: HookEvent,
+    timeout: Option<Duration>,
+) -> Result<HookDispatchResult, YourAiError> {
+    let kind = event.kind();
+    let result = match &execution.hooks {
+        Some(hooks) => bounded_timeout(
+            timeout,
+            hooks.dispatch(&HookInvocation::new(execution.hook_base.clone(), event)),
+        )
+        .await
+        .map_err(|_| op_error("hook deadline exceeded"))??,
+        None => HookDispatchResult::empty(kind),
+    };
+    result.validate_for(kind)?;
+    Ok(result)
+}
+
+fn additional_contexts(r: &HookDispatchResult) -> Vec<String> {
+    match &r.outcome {
+        HookPointOutcome::Generic(o) => o.additional_contexts.clone(),
+        _ => vec![],
+    }
+}
+
+/// Fixed public compaction operation shared by every [`ContextManager`] implementation.
+///
+/// 编排顺序：业务准备 → PreCompact（仅摘要路径，可阻断）→ 摘要提交 → PostCompact。
+///
+/// - 未变更与只剪枝的操作不触发摘要 hook（`CompactionPlan::Complete` 快路径）。
+/// - PreCompact 阻断发生在任何 active view 变更之前（prepare 的硬性不变量）。
+/// - PostCompact 阻断或失败只设置 `stop_reason`，不撤销已提交摘要。
+/// - 取消/超时与业务提交竞态时，通过 `committed` 标志区分"已提交但中断"与纯取消。
+///
+/// 直接调用 `prepare_compaction` / [`CompactionJob::run`] 属于实现协议，
+/// 不会获得本入口的 hook 与竞态契约。
+pub async fn compact(
+    context: &dyn ContextManager,
+    options: CompactionRequest,
+    execution: &ContextExecution,
+    cancel: &CancellationToken,
+    hook_timeout: Option<Duration>,
+) -> Result<CompactionResult, YourAiError> {
+    let committed = AtomicBool::new(false);
+    let deadline = options.deadline;
+    let operation = async {
+        let plan = context
+            .prepare_compaction(&options, execution, cancel)
+            .await?;
+        let job = match plan {
+            CompactionPlan::Complete(result) => {
+                if result.action == CompactAction::Summarized {
+                    return Err(ErrorKind::Config(
+                        "summary commits must use a CompactionJob".into(),
+                    )
+                    .into());
+                }
+                return Ok(result);
+            }
+            CompactionPlan::Summary(job) => job,
+        };
+        let trigger = match options.trigger {
+            CompactionTrigger::Manual => "manual",
+            CompactionTrigger::Threshold => "auto",
+            CompactionTrigger::Overflow => "overflow",
+        };
+        let pre = dispatch_hook(
+            execution,
+            HookEvent::PreCompact {
+                trigger: trigger.into(),
+                custom_instructions: options.custom_instructions.clone(),
+            },
+            hook_timeout,
+        )
+        .await?;
+        if pre.common.prevent_continuation {
+            return Err(AbortReason::HookStopped(
+                pre.common
+                    .stop_reason
+                    .clone()
+                    .unwrap_or_else(|| "PreCompact stopped".into()),
+            )
+            .into());
+        }
+        if !pre.common.blocking_errors.is_empty() {
+            return Err(op_error("PreCompact blocked summary"));
+        }
+        let mut run_options = options.clone();
+        let extra = additional_contexts(&pre);
+        if !extra.is_empty() {
+            run_options.custom_instructions = Some(
+                [
+                    run_options.custom_instructions.unwrap_or_default(),
+                    extra.join("\n"),
+                ]
+                .join("\n"),
+            );
+        }
+        let CompactionCommit {
+            mut result,
+            summary,
+        } = job.run(run_options, execution, cancel, &committed).await?;
+        committed.store(true, Ordering::Release);
+        if result.action != CompactAction::Summarized {
+            return Err(ErrorKind::Config(
+                "CompactionJob must report a Summarized commit; the summary is durable, \
+                 but its reported action breaks overflow accounting"
+                    .into(),
+            )
+            .into());
+        }
+        result.notices.extend(pre.notices().map(str::to_owned));
+        match dispatch_hook(
+            execution,
+            HookEvent::PostCompact {
+                trigger: trigger.into(),
+                compact_summary: summary,
+            },
+            hook_timeout,
+        )
+        .await
+        {
+            Ok(post) => {
+                result.notices.extend(post.notices().map(str::to_owned));
+                let additional = additional_contexts(&post);
+                if !additional.is_empty() {
+                    if let Err(e) = context
+                        .append(vec![StoredMessage::runtime_context(format!(
+                            "[PostCompact context]\n{}",
+                            additional.join("\n")
+                        ))])
+                        .await
+                    {
+                        result.stop_reason = Some(format!(
+                            "summary committed; PostCompact context save failed: {e}"
+                        ));
+                    }
+                }
+                if post.common.prevent_continuation || !post.common.blocking_errors.is_empty() {
+                    result.stop_reason = Some(post.common.stop_reason.unwrap_or_else(|| {
+                        "summary committed; PostCompact stopped continuation".into()
+                    }));
+                }
+            }
+            Err(e) => {
+                result.stop_reason = Some(format!("summary committed; PostCompact failed: {e}"))
+            }
+        }
+        Ok(result)
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => if committed.load(Ordering::Acquire) { Err(op_error("summary committed; cancelled during PostCompact")) } else { Err(AbortReason::Cancelled.into()) },
+        _ = sleep_until(deadline) => if committed.load(Ordering::Acquire) { Err(op_error("summary committed; deadline exceeded during PostCompact")) } else { Err(AbortReason::DeadlineExceeded.into()) },
+        result = operation => result,
+    }
+}
+// endregion: --- 公共压缩操作（固定模板） ---

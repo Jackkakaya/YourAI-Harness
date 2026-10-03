@@ -61,3 +61,27 @@ pub trait ToolInteraction: Send + Sync {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Value, YourAiError>>;
 }
+
+// region:    --- 公共交互入口（固定缝） ---
+
+/// Infrastructure bridge between the Core entry and a runtime's execution.
+/// Interaction UIs implement [`ToolInteraction`]; ordinary callers use
+/// [`elicit`], which owns the Elicitation/ElicitationResult lifecycle
+/// (hook answers first, schema validation of hook-modified results).
+#[doc(hidden)]
+pub trait InteractionOperation: Send {
+    fn elicit_bound<'a>(
+        &'a mut self,
+        request: InteractionRequest,
+    ) -> BoxFuture<'a, Result<Value, YourAiError>>;
+}
+
+/// Fixed public interaction entry; always delegates to the supplied
+/// framework operation.
+pub fn elicit<'a>(
+    operation: &'a mut dyn InteractionOperation,
+    request: InteractionRequest,
+) -> BoxFuture<'a, Result<Value, YourAiError>> {
+    operation.elicit_bound(request)
+}
+// endregion: --- 公共交互入口（固定缝） ---

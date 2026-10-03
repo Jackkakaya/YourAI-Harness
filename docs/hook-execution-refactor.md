@@ -38,6 +38,10 @@
 | 工作区操作 / 变化检测 | 8 | Setup、Notification、ConfigChange、InstructionsLoaded、WorktreeCreate、WorktreeRemove、CwdChanged、FileChanged |
 | 总计 | 28 | |
 
+## Core 固定入口
+
+后续 core 化轮次为上表全部事件提供 core 固定入口：`ToolBinding::exec`（tool）、`ToolBinding::authorize`（security）、`interaction::elicit`、`model::exec`、`context_manager::compact`、`inputs::accept`、`completion::complete`、`session_ops::session_start`/`session_end`/`turn_completed`、`subagent::exec_child`、`tasks::*`、`workspace::*`。其中 `context_manager::compact`、`tasks::*`、`workspace::*`、`session_ops::*` 为 core 模板（派发、消费与效果应用固定在 core）；其余为 `*Operation` 缝（core 固定入口签名与契约，Hook 生命周期由运行时执行器实现）。`ExecutionState` 的控制底座（wait/route/期限）保留在运行时，作为缝背后的调度细节。入口语义与调用方式以 [公共执行文档](./execution.md) 为准。
+
 ## 关键验收
 
 1. 自定义 AgentLoop 使用公共操作，无需引用 Hook 事件或消费 HookDispatchResult；Stop 继续时不重建调度器，也不重放工具。

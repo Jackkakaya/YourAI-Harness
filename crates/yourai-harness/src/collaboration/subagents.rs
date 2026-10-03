@@ -66,7 +66,8 @@ impl ToolHandler for SubagentTool {
             let prompt = input["prompt"]
                 .as_str()
                 .ok_or_else(|| error("subagent", "prompt required"))?;
-            self.exec_child(tc, prompt.into()).await
+            // 固定公共入口：SubagentStart/Stop 生命周期由框架操作持有。
+            yourai_core::subagent::exec_child(self, tc, prompt.into()).await
         })
     }
 }

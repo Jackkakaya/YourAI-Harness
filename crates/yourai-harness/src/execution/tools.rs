@@ -1,7 +1,7 @@
 use super::{
     hooks,
     interaction::{validate_schema, Bridge},
-    ExecutionState, ToolExecutor, ToolOutput,
+    ExecutionState, PermissionExecutor, ToolExecutor, ToolOutput,
 };
 use serde_json::{json, Value};
 use std::{collections::HashSet, sync::Arc};
@@ -176,7 +176,16 @@ impl ExecutionState<'_> {
             });
         self.repeated_tool = Some((call.fn_name.clone(), call.fn_arguments.clone(), repeat));
         let doom_loop = repeat >= 3;
-        self.approve(call, handler, permission, doom_loop).await?;
+        // Fixed public entry: the PermissionRequest/Denied lifecycle lives in
+        // the framework operation, never in the tool wrapper itself.
+        handler
+            .authorize(
+                &mut PermissionExecutor { state: self },
+                call,
+                permission,
+                doom_loop,
+            )
+            .await?;
         // Permission hooks may rewrite the input; count what will actually execute.
         if let Some((name, input, count)) = &mut self.repeated_tool {
             if input != &call.fn_arguments {
