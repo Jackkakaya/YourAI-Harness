@@ -1,4 +1,5 @@
 """Interactive PTY driver for probing CLI TUI apps; dumps screen as plain text."""
+import codecs
 import fcntl
 import os
 import pty
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import termios
 import time
+import unicodedata
 
 
 def run_pty(cmd, env=None, cwd=None, cols=160, rows=48):
@@ -21,46 +23,94 @@ def run_pty(cmd, env=None, cwd=None, cols=160, rows=48):
 
 
 class Screen:
-    """Very small VT100-ish grid to see what the app paints."""
+    """Small VT grid for current-screen assertions, including sparse updates."""
 
     def __init__(self, cols, rows):
         self.grid = [[' '] * cols for _ in range(rows)]
         self.x = self.y = 0
         self.cols, self.rows = cols, rows
+        self.top, self.bottom = 0, rows - 1
+        self.decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        self.pending = ''
 
     def feed(self, data):
+        text = self.pending + self.decoder.decode(data)
         i = 0
-        while i < len(data):
-            b = data[i]
-            if b == 0x1b:
-                if i + 1 < len(data) and data[i + 1] == ord('['):
+        while i < len(text):
+            ch = text[i]
+            if ch == '\x1b':
+                if i + 1 == len(text):
+                    break
+                if text[i + 1] == '[':
                     j = i + 2
-                    while j < len(data) and (chr(data[j]).isdigit() or data[j] in (ord(';'), ord('?'))):
+                    while j < len(text) and not ('@' <= text[j] <= '~'):
                         j += 1
-                    if j < len(data):
-                        params = data[i + 2:j].decode(errors='ignore')
-                        final = chr(data[j])
-                        if final == 'H':
-                            p = [int(x) if x else 1 for x in params.split(';')] if params else [1, 1]
-                            self.y, self.x = p[0] - 1, p[-1] - 1
-                        elif final == 'J' and params in ('2', ''):
-                            self.grid = [[' '] * self.cols for _ in range(self.rows)]
-                        i = j + 1
-                        continue
+                    if j == len(text):
+                        break
+                    params, final = text[i + 2:j], text[j]
+                    values = [int(v) if v.isdigit() else 0 for v in params.lstrip('?').split(';')]
+                    amount = values[0] or 1
+                    if final in ('H', 'f'):
+                        self.y = amount - 1
+                        self.x = (values[1] or 1) - 1 if len(values) > 1 else 0
+                    elif final == 'G':
+                        self.x = amount - 1
+                    elif final == 'd':
+                        self.y = amount - 1
+                    elif final in ('A', 'B', 'C', 'D'):
+                        if final == 'A':
+                            self.y = max(0, self.y - amount)
+                        elif final == 'B':
+                            self.y = min(self.rows - 1, self.y + amount)
+                        elif final == 'C':
+                            self.x = min(self.cols - 1, self.x + amount)
+                        else:
+                            self.x = max(0, self.x - amount)
+                    elif final == 'J':
+                        mode = values[0]
+                        for y in range(self.rows):
+                            for x in range(self.cols):
+                                if mode == 2 or (mode == 0 and (y, x) >= (self.y, self.x)) or (mode == 1 and (y, x) <= (self.y, self.x)):
+                                    self.grid[y][x] = ' '
+                    elif final == 'K' and 0 <= self.y < self.rows:
+                        lo = 0 if values[0] in (1, 2) else self.x
+                        hi = self.cols if values[0] in (0, 2) else min(self.cols, self.x + 1)
+                        self.grid[self.y][max(0, lo):hi] = [' '] * (hi - max(0, lo))
+                    elif final == 'r':
+                        self.top = max(0, amount - 1)
+                        self.bottom = min(self.rows - 1, (values[1] or self.rows) - 1) if len(values) > 1 else self.rows - 1
+                        self.x = self.y = 0
+                    elif final in ('S', 'T'):
+                        for _ in range(min(amount, self.bottom - self.top + 1)):
+                            at = self.top if final == 'S' else self.bottom
+                            self.grid.pop(at)
+                            self.grid.insert(self.bottom if final == 'S' else self.top, [' '] * self.cols)
+                    i = j + 1
+                    continue
+                if text[i + 1] == ']':
+                    # OSC title/link sequences can span read chunks too.
+                    end = re.search('\x07|\x1b\\\\', text[i + 2:])
+                    if end is None:
+                        break
+                    i += 2 + end.end()
+                    continue
                 i += 2
                 continue
-            if b == 0x0a:
+            if ch == '\n':
                 self.y = min(self.y + 1, self.rows - 1)
-                i += 1
-                continue
-            if b == 0x0d:
+            elif ch == '\r':
                 self.x = 0
-                i += 1
-                continue
-            if 0x20 <= b < 0x7f and self.y < self.rows and self.x < self.cols:
-                self.grid[self.y][self.x] = chr(b)
-                self.x += 1
+            elif ch == '\b':
+                self.x = max(0, self.x - 1)
+            elif ch >= ' ' and ch != '\x7f':
+                width = 0 if unicodedata.combining(ch) else 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+                if 0 <= self.y < self.rows and 0 <= self.x < self.cols and width:
+                    self.grid[self.y][self.x] = ch
+                    if width == 2 and self.x + 1 < self.cols:
+                        self.grid[self.y][self.x + 1] = ''
+                self.x += width
             i += 1
+        self.pending = text[i:]
 
     def text(self):
         return '\n'.join(''.join(row).rstrip() for row in self.grid).rstrip('\n')

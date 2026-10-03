@@ -1,4 +1,5 @@
 from smoke_support import wait_completed, wait_exit
+from pty_probe import Screen
 """Smoke test for /models switching: verify the second request hits the switched model."""
 import fcntl
 import http.server
@@ -8,6 +9,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import sqlite3
 import struct
 import sys
 import subprocess
@@ -61,7 +63,7 @@ with tempfile.TemporaryDirectory() as tmp:
             "models": {
                 "smoke": {"id": "smoke-model", "limit": {"context": 16000, "output": 4096}},
                 "alt": {"id": "alt-model", "limit": {"context": 16000, "output": 4096},
-                        "options": {"reasoningEffort": "low"}}
+                        "options": {"reasoningEffort": "low"}, "variants": {"inherit": {}}}
             }
         }},
         "context": {"keep_recent_tokens": 0, "summary_min_savings": 1}
@@ -72,23 +74,47 @@ with tempfile.TemporaryDirectory() as tmp:
     binary = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
     child = subprocess.Popen([str(binary), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, XDG_DATA_HOME=str(Path(tmp) / 'xdg-data')))
     captured = bytearray()
+    screen = Screen(120, 35)
 
-    def wait_for(needle, timeout=10):
+    def read_output(timeout):
+        if select.select([master], [], [], timeout)[0]:
+            data = os.read(master, 65536)
+            captured.extend(data)
+            screen.feed(data)
+            if b'\x1b[6n' in data:
+                os.write(master, b'\x1b[1;1R')
+            return True
+        return False
+
+    def visible(needle):
+        text = screen.text()
+        if needle.startswith(b'Model switched'):
+            notices = [line.strip().lstrip('· ') for line in text.splitlines() if 'Model switched' in line]
+            return bool(notices) and notices[-1] == needle.decode()
+        return needle in text.encode()
+
+    def wait_for(needle, timeout=10, request_count=0, current=False):
         end = time.monotonic() + timeout
-        while needle not in re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured):
+        while len(requests) < request_count or not (visible(needle) if current else needle in re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured)):
             if time.monotonic() > end:
-                raise AssertionError(f'Missing {needle!r}; requests: {len(requests)}; output: ' + re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured).decode(errors='replace')[-2000:])
-            if select.select([master], [], [], 0.1)[0]:
-                data = os.read(master, 65536)
-                captured.extend(data)
-                if b'\x1b[6n' in data:
-                    os.write(master, b'\x1b[1;1R')
+                with sqlite3.connect(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3') as db:
+                    messages = db.execute('SELECT kind, status, content_json FROM messages ORDER BY rowid DESC LIMIT 3').fetchall()
+                raise AssertionError(f'Missing {needle!r}; requests: {len(requests)}; exit: {child.poll()}; messages: {messages!r}; output: ' + re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured).decode(errors='replace')[-2000:])
+            read_output(0.1)
+
+    def wait_for_switch(needle):
+        # Drain frames while settings settle, then match the latest visible
+        # confirmation. An older identical notice cannot release this wait.
+        end = time.monotonic() + 0.5
+        while time.monotonic() < end:
+            read_output(min(0.1, max(0, end - time.monotonic())))
+        wait_for(needle, current=True)
 
     try:
         wait_for(b'New session')
         # Send first message with default model (smoke-model).
         os.write(master, b'first message\r')
-        wait_for(b'MODELS_OK')
+        wait_for(b'MODELS_OK', request_count=1)
         assert len(requests) >= 1, 'first request missing'
         assert requests[0][1]['model'] == 'smoke-model', f'expected smoke-model, got {requests[0][1]["model"]}'
         # Switch to alt model via direct command; it is idle-guarded, so the
@@ -102,27 +128,27 @@ with tempfile.TemporaryDirectory() as tmp:
         captured.clear()
         # Send second message; should use alt-model.
         os.write(master, b'second message\r')
-        wait_for(b'MODELS_OK')
+        wait_for(b'MODELS_OK', request_count=2)
         # Find the second streaming request (skip any non-streaming ones).
         stream_reqs = [r for r in requests if r[1].get('stream')]
         assert len(stream_reqs) >= 2, f'expected 2 stream requests, got {len(stream_reqs)}'
         assert stream_reqs[1][1]['model'] == 'alt-model', f'expected alt-model, got {stream_reqs[1][1]["model"]}'
         assert stream_reqs[1][1].get('reasoning_effort') == 'low'
-        # Set thinking effort via the /models picker's Tab sub-picker.
+        # Set thinking effort via the /models picker's Enter drill-in.
         wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 2)
         os.write(master, b'/models\r')
-        wait_for(b'Tab effort')
-        os.write(master, b'\t')
+        wait_for(b'Enter effort')
+        os.write(master, b'\r')
         wait_for(b'config default')
         for _ in range(2):  # configured low -> medium -> high
             os.write(master, b'\x1b[B')
             time.sleep(0.05)
         os.write(master, b'\r')
-        wait_for(b'thinking high')
+        wait_for_switch('Model switched to mock/alt · thinking high'.encode())
         # The override rides on the next request as reasoning_effort.
         captured.clear()
         os.write(master, b'third message\r')
-        wait_for(b'MODELS_OK')
+        wait_for(b'MODELS_OK', request_count=3)
         stream_reqs = [r for r in requests if r[1].get('stream')]
         assert len(stream_reqs) >= 3, f'expected 3 stream requests, got {len(stream_reqs)}'
         assert stream_reqs[2][1]['model'] == 'alt-model', f'expected alt-model, got {stream_reqs[2][1]["model"]}'
@@ -131,25 +157,108 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 3)
         captured.clear()
         os.write(master, b'/models\r')
-        wait_for(b'Tab effort')
-        os.write(master, b'\t')
+        wait_for(b'Enter effort')
+        os.write(master, b'\r')
         wait_for(b'config default')
         for _ in range(5):  # high -> config default
             os.write(master, b'\x1b[A')
             time.sleep(0.05)
         os.write(master, b'\r')
-        wait_for(b'thinking low')
+        wait_for_switch('Model switched to mock/alt · thinking low'.encode())
         captured.clear()
         os.write(master, b'fourth message\r')
-        wait_for(b'MODELS_OK')
+        wait_for(b'MODELS_OK', request_count=4)
         stream_reqs = [r for r in requests if r[1].get('stream')]
         assert stream_reqs[3][1].get('reasoning_effort') == 'low', \
             'config default must restore the original configured effort'
+        # Visiting and confirming an inherited level must not pin it to the
+        # variant. Cancelling the sub-picker must not change either entry.
+        wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 4)
+        captured.clear()
+        os.write(master, b'/models\r')
+        wait_for(b'Enter effort')
+        os.write(master, b'\x1b[B\r')  # alt default -> inherited variant
+        wait_for(b'config default')
+        os.write(master, b'\x1b[B')  # navigate, then cancel without applying
+        captured.clear()
+        os.write(master, b'\x1b')
+        wait_for(b'Models')
+        assert len(requests) == 4, 'opening/cancelling a picker must not call the model'
+        os.write(master, b'\r')
+        wait_for(b'config default')
+        os.write(master, b'\r')
+        wait_for_switch('Model switched to mock/alt · inherit · thinking low'.encode())
+
+        # Change only the base model, then confirm the inherited variant again.
+        captured.clear()
+        os.write(master, b'/models\r')
+        wait_for(b'Enter effort')
+        os.write(master, b'\r')
+        wait_for(b'config default')
+        os.write(master, b'\x1b[B\x1b[B\r')  # low -> high
+        wait_for_switch('Model switched to mock/alt · thinking high'.encode())
+        captured.clear()
+        os.write(master, b'/models\r')
+        wait_for(b'Enter effort')
+        os.write(master, b'\x1b[B\r')
+        wait_for(b'config default')
+        os.write(master, b'\r')
+        wait_for_switch('Model switched to mock/alt · inherit · thinking high'.encode())
+        captured.clear()
+        os.write(master, b'fifth message\r')
+        wait_for(b'MODELS_OK', request_count=5)
+        assert requests[4][1].get('reasoning_effort') == 'high', \
+            'an unchanged confirmation must preserve variant inheritance'
+
+        # An intentional variant override remains independent of base changes.
+        wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 5)
+        captured.clear()
+        os.write(master, b'/models\r')
+        wait_for(b'Enter effort')
+        os.write(master, b'\x1b[B\r')
+        wait_for(b'config default')
+        os.write(master, b'\x1b[A\x1b[A\r')  # high -> low
+        wait_for_switch('Model switched to mock/alt · inherit · thinking low'.encode())
+        captured.clear()
+        os.write(master, b'/models\r')
+        wait_for(b'Enter effort')
+        os.write(master, b'\r')
+        wait_for(b'config default')
+        os.write(master, b'\x1b[A\r')  # base high -> medium
+        wait_for_switch('Model switched to mock/alt · thinking medium'.encode())
+        captured.clear()
+        os.write(master, b'/models\r')
+        wait_for(b'Enter effort')
+        os.write(master, b'\x1b[B\r')
+        wait_for(b'config default')
+        os.write(master, b'\r')
+        wait_for_switch('Model switched to mock/alt · inherit · thinking low'.encode())
+        captured.clear()
+        os.write(master, b'sixth message\r')
+        wait_for(b'MODELS_OK', request_count=6)
+        assert requests[5][1].get('reasoning_effort') == 'low', \
+            'an unchanged confirmation must preserve an explicit variant override'
+
+        # Config default removes the variant override and resumes inheritance.
+        wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 6)
+        captured.clear()
+        os.write(master, b'/models\r')
+        wait_for(b'Enter effort')
+        os.write(master, b'\x1b[B\r')
+        wait_for(b'config default')
+        os.write(master, b'\x1b[A\x1b[A\x1b[A\r')  # low -> config default
+        wait_for_switch('Model switched to mock/alt · inherit · thinking medium'.encode())
+        captured.clear()
+        os.write(master, b'seventh message\r')
+        wait_for(b'MODELS_OK', request_count=7)
+        assert requests[6][1].get('reasoning_effort') == 'medium', \
+            'config default must restore inheritance after a variant override'
+        wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 7)
         os.write(master, b'\x11')  # Ctrl-Q
         wait_exit(child, master)
         assert child.returncode == 0
         assert termios.tcgetattr(slave) == original, 'terminal mode was not restored'
-        print('PASS: /models switch -> effort override -> restore configured effort on HTTP request')
+        print('PASS: /models two-step confirmation -> cancelled selection -> inherited/explicit effort -> configured defaults on HTTP requests')
     finally:
         if child.poll() is None:
             child.kill()

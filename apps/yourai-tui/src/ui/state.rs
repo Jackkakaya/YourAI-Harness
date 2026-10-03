@@ -326,6 +326,40 @@ impl View {
         }
         self.recent_models = order;
     }
+    /// Refresh candidates, retaining recent order and open pickers by identity.
+    /// Creating an implicit model's override can reorder the configured list.
+    pub fn replace_model_choices(&mut self, choices: Vec<crate::models::ModelChoice>) {
+        let mut order: Vec<_> = self
+            .recent_models
+            .iter()
+            .filter_map(|&index| self.model_choices.get(index))
+            .filter_map(|old| {
+                choices
+                    .iter()
+                    .position(|new| new.id == old.id && new.variant == old.variant)
+            })
+            .collect();
+        for index in 0..choices.len() {
+            if !order.contains(&index) {
+                order.push(index);
+            }
+        }
+        if let super::overlay::Overlay::Models(index)
+        | super::overlay::Overlay::Effort { model: index, .. } = &mut self.overlay
+        {
+            let replacement = self.model_choices.get(*index).and_then(|old| {
+                choices
+                    .iter()
+                    .position(|new| new.id == old.id && new.variant == old.variant)
+            });
+            match replacement {
+                Some(replacement) => *index = replacement,
+                None => self.overlay = super::overlay::Overlay::None,
+            }
+        }
+        self.model_choices = choices;
+        self.recent_models = order;
+    }
     /// A model switch landed: move its choice to the front of the MRU order.
     pub fn touch_model(&mut self, label: &str) {
         if let Some(at) = self
@@ -918,6 +952,63 @@ mod tests {
         v.seed_recent_models();
         assert_eq!(v.next_recent_model(), None);
     }
+    #[test]
+    fn recent_models_keep_identities_when_candidates_reorder_or_disappear() {
+        let choice =
+            |id: &str, variant: Option<&str>, effort: Option<&str>| crate::models::ModelChoice {
+                id: id.into(),
+                variant: variant.map(str::to_string),
+                label: variant.map_or_else(|| id.into(), |name| format!("{id} · {name}")),
+                effort: effort.map(str::to_string),
+            };
+        let mut view = View::default();
+        view.model.label = "mock/z".into();
+        view.model_choices = vec![
+            choice("mock/z", None, None),
+            choice("mock/a", None, None),
+            choice("mock/a", Some("fast"), None),
+        ];
+        view.seed_recent_models();
+        view.touch_model("mock/a · fast");
+        view.touch_model("mock/z");
+        view.overlay = super::super::overlay::Overlay::Effort {
+            model: 2,
+            selected: 5,
+        };
+        // The former implicit entry now sorts after the configured entries.
+        view.replace_model_choices(vec![
+            choice("mock/a", None, Some("high")),
+            choice("mock/a", Some("fast"), Some("high")),
+            choice("mock/z", None, Some("high")),
+            choice("mock/b", None, None),
+        ]);
+        view.touch_model("mock/z");
+        assert_eq!(view.recent_models, vec![2, 1, 0, 3]);
+        assert!(matches!(
+            view.overlay,
+            super::super::overlay::Overlay::Effort {
+                model: 1,
+                selected: 5
+            }
+        ));
+        assert_eq!(
+            view.next_recent_model(),
+            Some(1),
+            "F2 must still choose the recent variant"
+        );
+        view.overlay = super::super::overlay::Overlay::Models(1);
+        view.replace_model_choices(vec![
+            choice("mock/a", None, None),
+            choice("mock/z", None, Some("high")),
+        ]);
+        assert_eq!(view.recent_models, vec![1, 0]);
+        assert_eq!(view.next_recent_model(), Some(0));
+        assert!(
+            !view.overlay.is_open(),
+            "a removed picker target must not select another model"
+        );
+    }
+
     #[test]
     fn usage_writers_use_three_named_semantics() {
         let mut v = View::default();

@@ -691,16 +691,6 @@ impl App {
     fn overlay_action(&mut self, action: OverlayAction) {
         match action {
             OverlayAction::None => {}
-            OverlayAction::Model(index) => {
-                if let Some(choice) = self.view.model_choices.get(index) {
-                    self.controller.model(
-                        choice.id.clone(),
-                        choice.variant.clone(),
-                        None,
-                        &mut self.view,
-                    );
-                }
-            }
             OverlayAction::PickEffort(index) => {
                 // Preselect the entry's effective effort; "default" when unset.
                 let Some(choice) = self.view.model_choices.get(index) else {
@@ -724,14 +714,20 @@ impl App {
                 let Some(choice) = self.view.model_choices.get(model) else {
                     return;
                 };
-                let selection = match effort {
-                    Some(effort) => crate::models::EffortChoice::Set(effort),
-                    None => crate::models::EffortChoice::Config,
+                // Confirming the preselected value keeps its source intact:
+                // an inherited variant must not acquire an explicit override.
+                let selection = if effort.as_deref() == choice.effort.as_deref() {
+                    None
+                } else {
+                    Some(match effort {
+                        Some(effort) => crate::models::EffortChoice::Set(effort),
+                        None => crate::models::EffortChoice::Config,
+                    })
                 };
                 self.controller.model(
                     choice.id.clone(),
                     choice.variant.clone(),
-                    Some(selection),
+                    selection,
                     &mut self.view,
                 );
             }
@@ -994,6 +990,64 @@ mod tests {
         app.view.draft.set_text("");
         type_text(&mut app, "/editor");
         assert_eq!(app.handle(key(KeyCode::Enter)), Flow::Editor);
+        app.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_picker_confirms_in_two_steps_and_preserves_an_implicit_model() {
+        let (_dir, mut app) = fixture().await;
+        // This model resolves from the provider without a models-table entry.
+        app.view.model_choices = vec![crate::models::ModelChoice {
+            id: "mock/test".into(),
+            variant: None,
+            label: "mock/test".into(),
+            effort: None,
+        }];
+        app.view.draft.set_text("draft to keep");
+        app.view.overlay = Overlay::Models(0);
+        app.handle(key(KeyCode::Enter));
+        assert!(matches!(
+            app.view.overlay,
+            Overlay::Effort {
+                model: 0,
+                selected: 0
+            }
+        ));
+        assert!(
+            !app.controller.busy(),
+            "the first Enter must not switch models"
+        );
+        app.handle(key(KeyCode::Down));
+        app.handle(key(KeyCode::Esc));
+        assert!(matches!(app.view.overlay, Overlay::Models(0)));
+        assert!(!app.controller.busy(), "cancelling must not apply effort");
+        app.handle(key(KeyCode::Enter));
+        app.handle(key(KeyCode::Enter));
+        assert!(!app.view.overlay.is_open());
+        finish(&mut app).await;
+        assert!(
+            matches!(last_notice(&app.view), Some((Level::Info, text)) if text.contains("Model switched to mock/test")),
+            "{:?}",
+            last_notice(&app.view)
+        );
+        assert_eq!(app.view.draft.text(), "draft to keep");
+        // Explicit edits work even though the initial model was implicit.
+        app.view.overlay = Overlay::Models(0);
+        app.handle(key(KeyCode::Enter));
+        for _ in 0..5 {
+            app.handle(key(KeyCode::Down));
+        }
+        app.handle(key(KeyCode::Enter));
+        finish(&mut app).await;
+        assert_eq!(app.view.model.effort.as_deref(), Some("high"));
+        app.view.overlay = Overlay::Models(0);
+        app.handle(key(KeyCode::Enter));
+        for _ in 0..5 {
+            app.handle(key(KeyCode::Up));
+        }
+        app.handle(key(KeyCode::Enter));
+        finish(&mut app).await;
+        assert_eq!(app.view.model.effort, None);
         app.close().await.unwrap();
     }
 
