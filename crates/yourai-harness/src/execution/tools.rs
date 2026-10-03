@@ -211,7 +211,10 @@ impl ExecutionState<'_> {
                 biased;
                 _ = self.tc.cancel.cancelled() => return self.settle_cancelled_tool(call, &cancel, &mut future, AbortReason::Cancelled.into()).await,
                 _ = self.tc.outbox.closed() => return self.settle_cancelled_tool(call, &cancel, &mut future, AbortReason::Disconnected.into()).await,
-                _ = crate::time::sleep_until(deadline) => return Err(self.timeout_error("tool")),
+                _ = crate::time::sleep_until(deadline) => {
+                    let cause = self.timeout_error("tool");
+                    return self.settle_cancelled_tool(call, &cancel, &mut future, cause).await;
+                }
                 result = &mut future => return result,
                 Some(mut pending) = rx.recv() => {
                     if pending.reply.is_closed() { continue; }

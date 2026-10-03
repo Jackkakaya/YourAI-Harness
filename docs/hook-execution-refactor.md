@@ -50,6 +50,8 @@
 
 ## 验证记录
 
-最终验证：`cargo test --workspace` 共 19 个测试套件，477 通过、0 失败、2 忽略；`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 均通过。
+PR review 验证（2026-10-03）：`cargo test --workspace` 共 19 个测试套件，506 通过、0 失败、2 忽略；`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check` 和 `git diff --check` 均通过。
+
+Review 修复：thinking effort 的 `config default` 恢复原配置，继承模型级设置的选择器条目同步刷新；工具超时也进入取消宽限期，保留收尾期间返回的实际结果。回归覆盖重复覆盖/恢复、取消及超时收尾，以及真实 HTTP 请求中的 effort 恢复。
 
 新增自定义业务入口验证共 15 个场景（execution 14 个、context 1 个）。测试包括原始 AgentLoop 逆序调度、直接工具执行、Stop 继续、输入拒绝、权限拒绝、MCP 前后修改、最终模型失败、协作取消、配置保留调度器、内置与替换上下文摘要、摘要阻断/提交后停止、只剪枝，以及注册变化中的工具绑定、公开绑定 exec 的生命周期及底层接口拒绝替换 backend。

@@ -28,6 +28,9 @@ pub struct Config {
     /// Runtime selection; persisted configuration still uses CLI / picker variants.
     #[serde(skip)]
     pub selected_variant: Option<String>,
+    /// Original entry values captured before the first runtime effort override.
+    #[serde(skip)]
+    effort_defaults: BTreeMap<(String, Option<String>), Option<Value>>,
     /// Optional OpenCode-compatible maximum agentic iterations before a text-only final step.
     #[serde(alias = "max_model_calls")]
     pub steps: Option<u32>,
@@ -238,7 +241,7 @@ impl Config {
             .and_then(read)
             .or_else(|| read(model_options))
     }
-    /// Write or clear a runtime `reasoningEffort` override for one picker
+    /// Write or restore a runtime `reasoningEffort` override for one picker
     /// entry. Variant entries edit that variant (it wins over model options
     /// during the merge in `resolve`); no-variant entries edit the model.
     /// In-memory only: the config file on disk is never rewritten.
@@ -274,12 +277,24 @@ impl Config {
                 .ok_or("Unknown model variant")?,
             None => &mut model.options,
         };
+        let entry = (id.to_owned(), variant.map(str::to_owned));
         match keyword {
             Some(keyword) => {
+                self.effort_defaults
+                    .entry(entry)
+                    .or_insert_with(|| options.get("reasoningEffort").cloned());
                 options.insert("reasoningEffort".into(), Value::String(keyword.into()));
             }
             None => {
-                options.remove("reasoningEffort");
+                match self.effort_defaults.remove(&entry) {
+                    Some(Some(original)) => {
+                        options.insert("reasoningEffort".into(), original);
+                    }
+                    Some(None) => {
+                        options.remove("reasoningEffort");
+                    }
+                    None => {} // Already using the configured value.
+                }
             }
         }
         Ok(())
@@ -583,6 +598,47 @@ mod tests {
             },
             "soul_file": "./SOUL.md", "yolo": true
         })).unwrap()
+    }
+    #[test]
+    fn config_effort_restores_original_values_after_repeated_overrides() {
+        use crate::models::EffortChoice;
+        let mut cfg = config();
+        let id = "gateway/alias/with/slash";
+        // Choosing Config without an override must preserve the configured variant.
+        cfg.set_entry_effort(id, Some("short"), &EffortChoice::Config)
+            .unwrap();
+        assert_eq!(
+            cfg.effective_effort(id, Some("short")).as_deref(),
+            Some("high")
+        );
+        for keyword in ["low", "medium"] {
+            cfg.set_entry_effort(id, Some("short"), &EffortChoice::Set(keyword.into()))
+                .unwrap();
+        }
+        cfg.set_entry_effort(id, Some("short"), &EffortChoice::Config)
+            .unwrap();
+        assert_eq!(
+            cfg.effective_effort(id, Some("short")).as_deref(),
+            Some("high")
+        );
+        // Entries without an original value restore inheritance instead of erasing it.
+        cfg.set_entry_effort(id, None, &EffortChoice::Set("low".into()))
+            .unwrap();
+        cfg.set_entry_effort(id, Some("off"), &EffortChoice::Set("medium".into()))
+            .unwrap();
+        cfg.set_entry_effort(id, Some("off"), &EffortChoice::Config)
+            .unwrap();
+        assert_eq!(
+            cfg.effective_effort(id, Some("off")).as_deref(),
+            Some("low")
+        );
+        cfg.set_entry_effort(id, None, &EffortChoice::Config)
+            .unwrap();
+        assert_eq!(cfg.effective_effort(id, None), None);
+        assert_eq!(
+            cfg.effective_effort(id, Some("short")).as_deref(),
+            Some("high")
+        );
     }
     #[tokio::test]
     async fn minimal_gateway_config_uses_model_name_and_default_prompt() {

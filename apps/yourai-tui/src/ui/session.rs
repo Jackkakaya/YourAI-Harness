@@ -338,14 +338,9 @@ impl Controller {
                         message.push_str(&format!(" · thinking {effort}"));
                     }
                     view.notice(Level::Info, message);
-                    // Keep the picker row for this entry in sync with the
-                    // runtime effort override (labels are unique per entry).
-                    if let Some(choice) = view
-                        .model_choices
-                        .iter_mut()
-                        .find(|choice| choice.label == selected.label)
-                    {
-                        choice.effort = selected.effort.clone();
+                    // Model-level changes also affect variants inheriting its effort.
+                    if let Ok(config) = self.config.lock() {
+                        view.model_choices = crate::models::model_choices(&config);
                     }
                     view.touch_model(&selected.label);
                     view.model = selected;

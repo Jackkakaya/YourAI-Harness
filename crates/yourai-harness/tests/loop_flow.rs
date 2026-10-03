@@ -1416,7 +1416,7 @@ async fn explicit_deadline_still_cancels_an_unlimited_question() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn cancelled_tool_can_finish_within_grace_and_preserves_actual_result() {
+async fn cancelled_or_timed_out_tool_preserves_a_completion_within_grace() {
     struct SettlingTool;
     impl ToolHandler for SettlingTool {
         fn name(&self) -> &str {
@@ -1446,34 +1446,50 @@ async fn cancelled_tool_can_finish_within_grace_and_preserves_actual_result() {
             })
         }
     }
-    let registry = Arc::new(Registry::default());
-    registry.register(Arc::new(SettlingTool));
-    let history = Arc::new(History::default());
-    let agent = builder(
-        Arc::new(Model::new(vec![calls(&["tool"])])),
-        history.clone(),
-        LoopConfig::default(),
-    )
-    .tools(registry)
-    .build();
-    let mut handle = agent.start(In::user_text("go")).unwrap();
-    while let Some(event) = handle.outbox.recv().await {
-        if matches!(event, Out::ToolProgress { .. }) {
-            break;
+    for timeout in [false, true] {
+        let registry = Arc::new(Registry::default());
+        registry.register(Arc::new(SettlingTool));
+        let history = Arc::new(History::default());
+        let agent = builder(
+            Arc::new(Model::new(vec![calls(&["tool"]), answer("done")])),
+            history.clone(),
+            LoopConfig::default(),
+        )
+        .tools(registry)
+        .build();
+        let mut options = TurnOptions::default();
+        if timeout {
+            options.limits.tool_timeout = Some(Duration::from_millis(5));
         }
+        let mut handle = agent.start_with(In::user_text("go"), options).unwrap();
+        while let Some(event) = handle.outbox.recv().await {
+            if matches!(event, Out::ToolProgress { .. }) {
+                break;
+            }
+        }
+        if !timeout {
+            handle.interrupt();
+        }
+        let (events, result) = tokio::time::timeout(Duration::from_secs(1), collect(handle))
+            .await
+            .unwrap();
+        if timeout {
+            assert_eq!(result.unwrap().text, "done");
+        } else {
+            assert!(matches!(
+                *result.unwrap_err().error,
+                YourAiError::Aborted(AbortReason::Cancelled)
+            ));
+        }
+        assert!(events.iter().any(|e| matches!(e, Out::ToolDone { output, is_error: false, .. } if output["completed"] == true)));
+        let messages = history.messages();
+        let results: Vec<_> = messages
+            .iter()
+            .flat_map(|m| m.content.tool_responses())
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("completed"));
     }
-    handle.interrupt();
-    let (events, result) = tokio::time::timeout(Duration::from_secs(1), collect(handle))
-        .await
-        .unwrap();
-    assert!(matches!(
-        *result.unwrap_err().error,
-        YourAiError::Aborted(AbortReason::Cancelled)
-    ));
-    assert!(events.iter().any(|e| matches!(e, Out::ToolDone { output, is_error: false, .. } if output["completed"] == true)));
-    let messages = history.messages();
-    let result = messages.last().unwrap().content.tool_responses();
-    assert!(result[0].content.contains("completed"));
 }
 
 fn model_timeout(timeout: Duration) -> TurnOptions {

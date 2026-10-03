@@ -53,7 +53,7 @@ pub struct ExecutionConfig {
     pub hook_timeout: Option<Duration>,
     /// Optional bound for durable cleanup, independent of the cancelled turn.
     pub cleanup_timeout: Option<Duration>,
-    /// Grace for tools to settle after cancellation, shared with failure reporting.
+    /// Grace for tools to settle after cancellation or timeout, shared with failure reporting.
     pub tool_cleanup_timeout: Duration,
 }
 impl Default for ExecutionConfig {
