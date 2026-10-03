@@ -1,3 +1,5 @@
+> 工具与调度的当前调用接口见 [公共执行层](./execution.md)。业务 Loop 使用 AgentLoop；Hook、审批和执行不再放在 DefaultLoop。下文保留早期架构讨论。
+
 # YourAI 架构设计文档
 
 > 当前 workspace 已合并为 `yourai-core`、`yourai-harness`、`yourai-tui` 三个包。下文较早章节中的 `yourai-protocol`、`yourai-hooks`、`yourai-loop-default`、`yourai-runtime` 等名称表示历史 crate 或逻辑模块；当前实现分别位于 `yourai-core::protocol` 与 `crates/yourai-harness/src/` 的对应模块中。
@@ -494,7 +496,7 @@ pub trait ToolHandler: Send + Sync {
     fn name(&self) -> &str;
     fn definition(&self) -> Tool;                    // genai::chat::Tool
     fn security_context(&self, input: &Value) -> SecurityContext;
-    fn execute<'a>(&'a self, tc: ToolContext<'a>, input: Value) -> BoxFuture<'a, Result<Value, YourAiError>>;
+    fn run<'a>(&'a self, tc: ToolContext<'a>, input: Value) -> BoxFuture<'a, Result<Value, YourAiError>>;
 }
 
 pub trait ToolRegistry: Send + Sync {
@@ -503,7 +505,7 @@ pub trait ToolRegistry: Send + Sync {
     fn has(&self, name: &str) -> bool;
     fn definitions(&self) -> Vec<Tool>;              // 所有工具的 schema
     fn security_context(&self, name: &str, input: &Value) -> Result<SecurityContext>;
-    fn execute(&self, tc: ToolContext<'_>, name: &str, input: Value) -> BoxFuture<'_, Result<Value>>;
+    fn resolve(&self, name: &str) -> Result<Arc<dyn ToolHandler>, YourAiError>; // 管理/绑定侧接口
     fn count(&self) -> usize;
 }
 ```
@@ -781,7 +783,7 @@ YourAI 是开箱即用的 agent，用户可以零定制直接跑，也可以替�
 - **交互管道是 run 的参数**（借鉴 pi）：由 `Agent::start()` 每次 turn 装配进 TurnContext，不放 Context
 - **`start()` 是唯一 spawn 点**（对应 pi 低层 fire-and-forget）→ 返回 TurnHandle；`run()` 是丢弃 outbox 的阻塞变体（不建 channel，避免无人消费堆积）
 - **双路径**：取消走 CancellationToken 快路径（绕过 inbox 立即生效，能打断"正在等消息的 loop"本身）；其余一切消息走 inbox 慢路径（loop 独占拉取，消费时机是 loop 的自由）
-- **工具可发消息、可被取消**：`ToolHandler::execute(tc: ToolContext, input)`——subagent/browser/长任务可显示的先决条件
+- **工具可发消息、可被取消**：`ToolHandler::run(tc: ToolContext, input)`——subagent/browser/长任务可显示的先决条件
 - **生命周期不用消息表达**：开始 = start 返回；结束 = outbox 关闭；失败 = join 的 Err
 - **丢弃 TurnHandle 即取消**（drop → cancel token）：消费端离开（SSE 断开、客户端丢失句柄）后 turn 不再继续耗模型/工具资源；要 fire-and-forget 就把句柄存进任务表，不要丢弃
 - **`OutSink::send` 返回 `bool`**（false = 消费端已关闭）：loop 在每个 emit 点都能检测对端死亡，立即以 `Aborted(Disconnected)` 中止，不必等到下一个 recv 点
@@ -1076,7 +1078,7 @@ impl ToolHandler for SubagentTool {
         }
     }
 
-    fn execute<'a>(&'a self, tc: ToolContext<'a>, input: Value) -> BoxFuture<'a, Result<Value, YourAiError>> {
+    fn run<'a>(&'a self, tc: ToolContext<'a>, input: Value) -> BoxFuture<'a, Result<Value, YourAiError>> {
         Box::pin(async move {
             let child = Agent::builder()
                 .context_manager(Arc::new(
@@ -1336,7 +1338,7 @@ impl ToolHandler for WeatherTool {
         }
     }
 
-    fn execute<'a>(&'a self, tc: ToolContext<'a>, input: Value) -> BoxFuture<'a, Result<Value, YourAiError>> {
+    fn run<'a>(&'a self, tc: ToolContext<'a>, input: Value) -> BoxFuture<'a, Result<Value, YourAiError>> {
         Box::pin(async move {
             let city = input["city"].as_str().unwrap_or("unknown");
             // 调用天气 API

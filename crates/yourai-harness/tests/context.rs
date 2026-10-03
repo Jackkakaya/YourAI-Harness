@@ -1,6 +1,8 @@
 #[path = "support/context.rs"]
 mod context_fixture;
 use context_fixture::{ContextServices, MemoryContext};
+#[path = "support/execution.rs"]
+mod custom;
 #[path = "support/loop.rs"]
 mod support;
 use serde_json::json;
@@ -134,6 +136,62 @@ async fn seed_tools(c: &MemoryContext) {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn custom_loop_compaction_uses_summary_lifecycle_and_retains_current_input() {
+    let hooks = Arc::new(support::Hooks::new(|_, result| {
+        if let HookPointOutcome::Generic(outcome) = &mut result.outcome {
+            outcome
+                .additional_contexts
+                .push("compaction context".into());
+        }
+    }));
+    let model = Summarizer::new();
+    let (_dir, _store, history) = setup(policy(), model.clone(), None).await;
+    append(
+        &history,
+        vec![
+            ChatMessage::user("old task ".repeat(300)),
+            ChatMessage::assistant("old answer ".repeat(300)),
+        ],
+    )
+    .await;
+    let agent = Agent::builder()
+        .agent_loop(Arc::new(custom::CompactLoop))
+        .model(model.clone())
+        .context_manager(history.clone())
+        .hooks(hooks.clone())
+        .build();
+    let output = agent.run(In::user_text("current input")).await.unwrap();
+    assert_eq!(output.text, "compacted");
+    assert_eq!(
+        *hooks.seen.lock().unwrap(),
+        [
+            HookEventKind::UserPromptSubmit,
+            HookEventKind::PreCompact,
+            HookEventKind::PostCompact,
+            HookEventKind::Stop,
+        ]
+    );
+    let records = history.records();
+    assert!(records.iter().any(|r| r.summary));
+    assert!(records.iter().any(|r| r.runtime_context
+        && r.message
+            .content
+            .texts()
+            .join("")
+            .contains("compaction context")));
+    assert!(records.iter().any(|r| r.message.role == ChatRole::User
+        && r.message.content.texts().join("") == "current input"));
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .request
+        .system
+        .as_deref()
+        .unwrap()
+        .contains("compaction context"));
+}
 #[tokio::test]
 async fn projection_is_bounded_valid_json_and_original_is_preserved() {
     let mut p = policy();
@@ -264,20 +322,20 @@ async fn latest_user_unresolved_batch_and_parallel_pairs_are_protected() {
         "pending"
     );
     let req = &model.requests.lock().unwrap()[0].request;
-    assert_eq!(
-        req.messages
-            .iter()
-            .flat_map(|m| m.content.tool_calls())
-            .count(),
-        2
-    );
-    assert_eq!(
-        req.messages
-            .iter()
-            .flat_map(|m| m.content.tool_responses())
-            .count(),
-        2
-    );
+    // Historical tool pairs are serialized as data, not executable tool messages.
+    assert!(req
+        .messages
+        .iter()
+        .all(|m| m.content.tool_calls().is_empty() && m.content.tool_responses().is_empty()));
+    let text = req
+        .messages
+        .iter()
+        .flat_map(|m| m.content.texts())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("success"));
+    assert!(text.contains("call_id"));
+    assert!(text.contains("Historical records"));
 }
 #[tokio::test]
 async fn long_turn_can_compact_closed_batches_while_retaining_its_user_request() {
@@ -366,6 +424,41 @@ async fn invalid_summary_is_accounted_and_never_committed() {
         110
     );
 }
+#[tokio::test]
+async fn oversized_checkpoint_is_rejected_without_replacing_history() {
+    let model = Summarizer::new();
+    let (_, store, c) = setup(policy(), model.clone(), None).await;
+    append(
+        &c,
+        vec![
+            ChatMessage::user("old work ".repeat(500)),
+            ChatMessage::user("current request"),
+        ],
+    )
+    .await;
+    let original_ids: Vec<_> = c.records().iter().map(|r| r.id.clone()).collect();
+    let mut options = manual();
+    options.target_tokens = Some(1);
+    let result = c.compact(options, &CancellationToken::new()).await;
+    assert!(result.unwrap_err().to_string().contains("summary exceeds"));
+    assert_eq!(
+        c.records().iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        original_ids
+    );
+    assert_eq!(
+        model.requests.lock().unwrap()[0].options.max_tokens,
+        Some(1)
+    );
+    assert_eq!(
+        LocalUsage((*store).clone())
+            .session_usage(c.session_id())
+            .await
+            .unwrap()
+            .total_tokens,
+        110
+    );
+}
+
 #[tokio::test]
 async fn post_hook_stop_reports_committed_state_and_is_not_dispatched_twice() {
     let hooks = Arc::new(support::Hooks::new(|inv, r| {
@@ -813,4 +906,276 @@ async fn compaction_has_no_implicit_deadline_but_honors_explicit_deadline_and_ca
             )),
         }
     }
+}
+
+#[tokio::test]
+async fn checkpoint_bounds_tool_logs_and_anchors_the_active_request() {
+    let model = Summarizer::new();
+    let (_, _, c) = setup(policy(), model.clone(), None).await;
+    append(
+        &c,
+        vec![
+            ChatMessage::user("preserve the public API"),
+            vec![call("huge")].into(),
+            tool(
+                "huge",
+                json!({"ok": true, "output_paths": ["/tmp/full-output.txt"],
+            "output": "log".repeat(100_000)})
+                .to_string(),
+            ),
+            ChatMessage::assistant("next step"),
+        ],
+    )
+    .await;
+    let r = c
+        .compact(manual(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(r.verified);
+    assert_eq!(r.model_calls, 1);
+    assert_eq!(r.summarized_messages, 2);
+    assert_eq!(r.retained_messages, 2);
+    let requests = model.requests.lock().unwrap();
+    let text = serde_json::to_string(&requests[0].request).unwrap();
+    assert!(text.len() < 6000);
+    assert!(text.contains("preserve the public API"));
+    assert!(text.contains("/tmp/full-output.txt"));
+    assert!(text.contains("Constraints and preferences"));
+    assert_eq!(
+        c.records()[1].message.content.first_text(),
+        Some("preserve the public API")
+    );
+}
+
+#[tokio::test]
+async fn post_compact_budget_is_verified_and_reported_through_shared_events() {
+    let hooks = Arc::new(support::Hooks::new(|inv, result| {
+        if inv.event.kind() == HookEventKind::PostCompact {
+            if let HookPointOutcome::Generic(out) = &mut result.outcome {
+                out.additional_contexts.push("z".repeat(90_000));
+            }
+        }
+    }));
+    let (_, _, c) = setup(policy(), Summarizer::new(), Some(hooks)).await;
+    append(
+        &c,
+        vec![
+            ChatMessage::user("old task ".repeat(500)),
+            ChatMessage::user("latest"),
+        ],
+    )
+    .await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let r = yourai_harness::context::compact_with_events(
+        c.inner.as_ref(),
+        manual(),
+        &c.execution,
+        &CancellationToken::new(),
+        None,
+        &tx,
+    )
+    .await
+    .unwrap();
+    let actual = c.build_request(&[]).unwrap();
+    assert_eq!(r.tokens_after, actual.estimated_tokens);
+    assert_eq!(r.input_budget, actual.input_budget);
+    assert!(r.verified && r.stop_reason.is_some());
+    assert!(!actual.fits());
+    let mut phases = vec![];
+    let mut finished = 0;
+    while let Ok(out) = rx.try_recv() {
+        match out {
+            Out::Compaction {
+                event: CompactionEvent::Progress { phase, .. },
+            } => phases.push(phase),
+            Out::Compaction {
+                event: CompactionEvent::Finished { result, .. },
+            } => {
+                assert_eq!(result.tokens_after, actual.estimated_tokens);
+                assert!(result.stop_reason.is_some());
+                finished += 1;
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+    assert_eq!(
+        phases,
+        [
+            CompactionPhase::Preparing,
+            CompactionPhase::Summarizing,
+            CompactionPhase::Rebuilding
+        ]
+    );
+    assert_eq!(finished, 1);
+}
+
+#[tokio::test]
+async fn cancellation_after_commit_returns_a_verified_stopped_checkpoint() {
+    struct CancelAfterCommit(CancellationToken);
+    impl HookRuntime for CancelAfterCommit {
+        fn dispatch<'a>(
+            &'a self,
+            inv: &'a HookInvocation,
+        ) -> BoxFuture<'a, Result<HookDispatchResult, YourAiError>> {
+            Box::pin(async move {
+                if inv.event.kind() == HookEventKind::PostCompact {
+                    self.0.cancel();
+                    std::future::pending::<()>().await;
+                }
+                Ok(HookDispatchResult::empty(inv.event.kind()))
+            })
+        }
+    }
+    let cancel = CancellationToken::new();
+    let (_, _, c) = setup(
+        policy(),
+        Summarizer::new(),
+        Some(Arc::new(CancelAfterCommit(cancel.clone()))),
+    )
+    .await;
+    append(
+        &c,
+        vec![
+            ChatMessage::user("old task ".repeat(500)),
+            ChatMessage::user("latest"),
+        ],
+    )
+    .await;
+    let r = c.compact(manual(), &cancel).await.unwrap();
+    assert_eq!(r.action, CompactAction::Summarized);
+    assert!(r.verified && r.stop_reason.as_ref().unwrap().contains("committed"));
+    assert!(c.records()[0].summary);
+    assert_eq!(
+        r.tokens_after,
+        c.build_request(&[]).unwrap().estimated_tokens
+    );
+}
+
+#[tokio::test]
+async fn summary_savings_do_not_compare_provider_usage_to_a_different_local_estimate() {
+    let (_, _, c) = setup(policy(), Summarizer::new(), None).await;
+    append(
+        &c,
+        vec![
+            ChatMessage::user("old task".repeat(500)),
+            ChatMessage::user("latest"),
+        ],
+    )
+    .await;
+    let mut response = StoredMessage::new(ChatMessage::assistant("continue"));
+    response.model_response = true;
+    response.request_observation = Some(RequestObservation {
+        model: "summary".into(),
+        request: c.build_request(&[]).unwrap().request,
+        input_tokens: 1,
+    });
+    c.append(vec![response]).await.unwrap();
+    let r = c
+        .compact(manual(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.action, CompactAction::Summarized);
+    assert!(r.verified);
+    assert_eq!(
+        r.tokens_after,
+        c.build_request(&[]).unwrap().estimated_tokens
+    );
+}
+
+#[tokio::test]
+async fn recent_turns_are_preserved_as_complete_batches_within_budget() {
+    let model = Summarizer::new();
+    let mut p = policy();
+    p.keep_recent_tokens = 8000;
+    p.keep_recent_turns = 2;
+    let (_, _, c) = setup(p, model, None).await;
+    append(
+        &c,
+        vec![
+            ChatMessage::user("obsolete discussion".repeat(300)),
+            ChatMessage::assistant("done"),
+            ChatMessage::user("previous request"),
+            vec![call("recent")].into(),
+            tool("recent", "keep output".into()),
+            ChatMessage::user("current request"),
+            ChatMessage::assistant("working"),
+        ],
+    )
+    .await;
+    let r = c
+        .compact(manual(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.summarized_messages, 2);
+    assert_eq!(r.retained_messages, 5);
+    assert!(c
+        .records()
+        .iter()
+        .any(|r| r.message.content.first_text() == Some("previous request")));
+    assert!(c.records().iter().any(|r| r
+        .message
+        .content
+        .tool_responses()
+        .iter()
+        .any(|t| t.call_id == "recent")));
+}
+
+#[tokio::test]
+async fn automatic_compaction_uses_shared_events_then_resumes_the_same_turn() {
+    struct Model {
+        summary: Arc<Summarizer>,
+        answer: support::Model,
+    }
+    impl ModelProvider for Model {
+        fn model_iden(&self) -> &str {
+            "summary"
+        }
+        fn complete<'a>(
+            &'a self,
+            request: ModelRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
+            self.summary.complete(request)
+        }
+        fn stream_events<'a>(
+            &'a self,
+            request: ModelRequest,
+        ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
+            self.answer.stream_events(request)
+        }
+    }
+    let model = Arc::new(Model {
+        summary: Summarizer::new(),
+        answer: support::Model::new(vec![support::answer("continued")]),
+    });
+    let mut p = policy();
+    p.context_window = Some(4000);
+    p.advance_tokens = 2500;
+    let (_, _, c) = setup(p, model.clone(), None).await;
+    append(&c, vec![ChatMessage::user("old task".repeat(500))]).await;
+    let agent = Agent::builder()
+        .model(model)
+        .context_manager(c.clone())
+        .agent_loop(Arc::new(
+            yourai_harness::default_loop::DefaultLoop::default(),
+        ))
+        .build();
+    let (events, result) =
+        support::collect(agent.start(In::user_text("continue the task")).unwrap()).await;
+    assert_eq!(result.unwrap().text, "continued");
+    let completed = events
+        .iter()
+        .filter(|e| {
+            matches!(e, Out::Compaction {
+        event: CompactionEvent::Finished { trigger: CompactionTrigger::Threshold, result }
+    } if result.action == CompactAction::Summarized && result.verified)
+        })
+        .count();
+    assert_eq!(completed, 1);
+    assert_eq!(
+        c.records()
+            .iter()
+            .filter(|r| r.message.content.first_text() == Some("continue the task"))
+            .count(),
+        1
+    );
 }

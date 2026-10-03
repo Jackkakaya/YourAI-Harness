@@ -23,7 +23,7 @@ Everything behind the core seams is replaceable. The loop itself is a provider, 
 - **Turn-scoped transport** — `Agent::start` returns a `TurnHandle` with inbox, outbox, cancellation, and join semantics.
 - **Stable provider snapshots** — providers can be hot-swapped without changing the implementation seen by an in-flight turn.
 - **Typed interaction vocabulary** — `yourai-core::protocol` defines the complete `In` / `Out` language shared by loops and frontends.
-- **Claude-compatible Hooks** — 27 hook events, typed outcomes, command and HTTP transports, parallel execution, deterministic aggregation, async completion, and runtime registration.
+- **Claude-compatible Hooks** — 28 hook events, typed outcomes, command and HTTP transports, parallel execution, deterministic aggregation, async completion, and runtime registration.
 - **Small object-safe interfaces** — boxed futures keep provider traits usable behind `Arc<dyn Trait>` without `async_trait`.
 
 ## Workspace
@@ -47,6 +47,7 @@ To test a real model, copy `yourai.example.json` to `$XDG_CONFIG_HOME/yourai/you
 See [Runtime implementation and verification](./docs/runtime-implementation.md) for all five flow diagrams and the runnable example.
 
 See [DefaultLoop implementation and integration](./docs/default-loop-implementation.md) for configuration and assembly.
+Use [AgentLoop and public business operations](./docs/execution.md) for custom scheduling; business code does not dispatch hooks.
 
 Install a recent stable Rust toolchain, then clone and verify the workspace:
 

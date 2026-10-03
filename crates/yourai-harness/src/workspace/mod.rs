@@ -3,6 +3,8 @@
 //! `Workspace` intentionally holds a `Weak<SessionHost>` back-reference: every
 //! mutation is a host operation (hook dispatch + journal gate + watch-set
 //! update), so the dependency is real, not incidental.
+mod backend;
+mod operations;
 use crate::{
     error,
     storage::{atomic_write, read_json},
@@ -18,14 +20,7 @@ pub struct RuntimeConfig {
 }
 impl RuntimeConfig {
     pub(crate) fn apply(self, host: &SessionHost) {
-        let config = crate::default_loop::LoopConfig {
-            skill_ids: self.skill_ids,
-            memory_search_limit: self.memory_search_limit,
-            ..Default::default()
-        };
-        host.agent
-            .ctx()
-            .set_agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(config)));
+        host.configure_input(self.skill_ids, self.memory_search_limit);
     }
 }
 use serde::{Deserialize, Serialize};
@@ -69,86 +64,6 @@ impl Workspace {
             .upgrade()
             .ok_or_else(|| error("workspace", "session gone"))
     }
-    pub async fn setup(&self, trigger: &str) -> Result<(), YourAiError> {
-        let host = self.host()?;
-        let _gate = host.try_operation()?;
-        let result = host
-            .dispatch(HookEvent::Setup {
-                trigger: trigger.into(),
-            })
-            .await?;
-        host.consume_hook_async(&result, true).await
-    }
-    pub async fn load_instructions(&self, path: &Path, reason: &str) -> Result<(), YourAiError> {
-        let host = self.host()?;
-        let _gate = host.try_operation()?;
-        self.load_inner(&host, path, reason).await
-    }
-    async fn load_inner(
-        &self,
-        host: &Arc<SessionHost>,
-        path: &Path,
-        reason: &str,
-    ) -> Result<(), YourAiError> {
-        let path = resolve(&host.context().cwd, path)?;
-        let content = std::fs::read_to_string(&path).map_err(|e| error("instructions", e))?;
-        let result = host
-            .dispatch(HookEvent::InstructionsLoaded {
-                file_path: path.to_string_lossy().into_owned(),
-                memory_type: "project".into(),
-                load_reason: reason.into(),
-                globs: None,
-                trigger_file_path: None,
-                parent_file_path: None,
-            })
-            .await?;
-        host.consume_hook_async(&result, false).await?;
-        host.context.lock().unwrap().instructions.insert(
-            path.clone(),
-            format!("[Instructions: {}]\n{content}", path.display()),
-        );
-        host.watch_path_async(path).await?;
-        Ok(())
-    }
-    pub async fn notify(&self, message: &str, kind: &str) -> Result<(), YourAiError> {
-        let host = self.host()?;
-        let result = host
-            .dispatch(HookEvent::Notification {
-                message: message.into(),
-                title: None,
-                notification_type: kind.into(),
-            })
-            .await?;
-        host.consume_hook_async(&result, false).await?;
-        host.post_event_async(RuntimeEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            context: None,
-            notice: Some(message.into()),
-            wake: false,
-        })
-        .await?;
-        Ok(())
-    }
-    pub async fn change_config(&self, source: &str, value: Value) -> Result<(), YourAiError> {
-        let host = self.host()?;
-        let _gate = host.try_operation()?;
-        let config: RuntimeConfig =
-            serde_json::from_value(value.clone()).map_err(|e| error("config", e))?;
-        let path = host.dir.join("config.json");
-        let candidate = host.dir.join("config.candidate.json");
-        atomic_write(&candidate, &value)?;
-        let result = host
-            .dispatch(HookEvent::ConfigChange {
-                source: source.into(),
-                file_path: Some(candidate.to_string_lossy().into_owned()),
-            })
-            .await;
-        let _ = std::fs::remove_file(candidate);
-        host.consume_hook_async(&result?, true).await?;
-        atomic_write(&path, &value)?;
-        config.apply(&host);
-        Ok(())
-    }
     pub fn config(&self) -> Result<Value, YourAiError> {
         let p = self.host()?.dir.join("config.json");
         if p.exists() {
@@ -156,109 +71,6 @@ impl Workspace {
         } else {
             Ok(json!({}))
         }
-    }
-    pub async fn change_cwd(&self, path: &Path) -> Result<(), YourAiError> {
-        let host = self.host()?;
-        let _gate = host.try_operation()?;
-        let old = host.context().cwd;
-        let new = resolve(&old, path)?;
-        if !new.is_dir() {
-            return Err(error("workspace", "cwd is not a directory"));
-        }
-        let result = host
-            .dispatch(HookEvent::CwdChanged {
-                old_cwd: old.to_string_lossy().into_owned(),
-                new_cwd: new.to_string_lossy().into_owned(),
-            })
-            .await?;
-        host.consume_hook_async(&result, true).await?;
-        if let HookPointOutcome::CwdChanged(o) = result.outcome {
-            for p in o.watch_paths {
-                host.watch_path_async(PathBuf::from(p)).await?;
-            }
-        }
-        host.set_cwd_async(new).await
-    }
-    pub async fn create_worktree(&self, name: &str) -> Result<PathBuf, YourAiError> {
-        let host = self.host()?;
-        let _gate = host.try_operation()?;
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(error("workspace", "invalid worktree name"));
-        }
-        if self.worktrees.lock().unwrap().contains_key(name) {
-            return Err(error("workspace", "worktree already tracked"));
-        }
-        let result = host
-            .dispatch(HookEvent::WorktreeCreate { name: name.into() })
-            .await?;
-        host.consume_hook_async(&result, true).await?;
-        let custom = match result.outcome {
-            HookPointOutcome::WorktreeCreate(o) => o.worktree_path,
-            _ => None,
-        };
-        let path = if let Some(path) = custom {
-            let p = PathBuf::from(path)
-                .canonicalize()
-                .map_err(|e| error("workspace", e))?;
-            if !p.is_dir() {
-                return Err(error("workspace", "hook worktree path is not a directory"));
-            }
-            p
-        } else {
-            let p = host.dir.join("worktrees").join(name);
-            std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| error("workspace", e))?;
-            git(
-                &host.context().cwd,
-                &[
-                    "worktree",
-                    "add",
-                    "--detach",
-                    p.to_str()
-                        .ok_or_else(|| error("workspace", "non UTF-8 worktree path"))?,
-                    "HEAD",
-                ],
-            )
-            .await?;
-            p.canonicalize().map_err(|e| error("workspace", e))?
-        };
-        let mut map = self.worktrees.lock().unwrap();
-        map.insert(name.into(), path.clone());
-        atomic_write(&host.dir.join("worktrees.json"), &*map)?;
-        Ok(path)
-    }
-    pub async fn remove_worktree(&self, name: &str) -> Result<(), YourAiError> {
-        let host = self.host()?;
-        let _gate = host.try_operation()?;
-        let path = self
-            .worktrees
-            .lock()
-            .unwrap()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| error("workspace", "unknown worktree"))?;
-        let result = host
-            .dispatch(HookEvent::WorktreeRemove {
-                worktree_path: path.to_string_lossy().into_owned(),
-            })
-            .await?;
-        host.consume_hook_async(&result, true).await?;
-        git(
-            &host.context().cwd,
-            &[
-                "worktree",
-                "remove",
-                path.to_str()
-                    .ok_or_else(|| error("workspace", "non UTF-8 path"))?,
-            ],
-        )
-        .await?;
-        let mut map = self.worktrees.lock().unwrap();
-        map.remove(name);
-        atomic_write(&host.dir.join("worktrees.json"), &*map)
     }
     /// Polling watcher avoids OS-specific dependencies; only explicitly registered paths.
     pub fn start_watching(self: &Arc<Self>, interval: Duration) -> Result<(), YourAiError> {
@@ -324,28 +136,7 @@ impl Workspace {
                             } else {
                                 "modified"
                             };
-                            let result = host
-                                .dispatch(HookEvent::FileChanged {
-                                    file_path: path.to_string_lossy().into_owned(),
-                                    event: event.into(),
-                                })
-                                .await;
-                            if let Ok(r) = result {
-                                let _ = host.consume_hook_async(&r, false).await;
-                                if let HookPointOutcome::FileChanged(o) = r.outcome {
-                                    for p in o.watch_paths {
-                                        let _ = host.watch_path_async(PathBuf::from(p)).await;
-                                    }
-                                }
-                            }
-                            let _ = host
-                                .post_event_async(RuntimeEvent {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    context: Some(format!("File {event}: {}", path.display())),
-                                    notice: None,
-                                    wake: false,
-                                })
-                                .await;
+                            ws.file_changed(&host, &path, event).await;
                         }
                     }
                 }

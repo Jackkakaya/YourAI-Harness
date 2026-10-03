@@ -1,5 +1,7 @@
 # Core 组件接口契约
 
+普通自定义调度使用 Harness 的 [AgentLoop 与公共执行层](./execution.md)。Core AgentLoop 保留为底层运输接口。
+
 
 运行时补充接口：`TurnOptions.events` 绑定内部事件队列；ContextManager 内部协调持久化并维护归档身份索引；`SecurityProvider::update_permissions` 消费权限变更；`HookRuntime::subscribe_background / shutdown_session` 提供按会话订阅和后台回收。`TurnHandle::abort` 用于协作取消超时后的任务回收，宿主必须记录被强制中止执行的不确定状态。
 
@@ -12,11 +14,11 @@ Core 的 deadline watchdog（截止时间后 60 秒宽限）强制丢弃 Loop，
 | 流程 | 已定义的接口/类型 | 实现边界 |
 |---|---|---|
 | 图 1：会话宿主 | `SessionRuntime`、`SessionContext`、`SessionStatus`、`SessionTurn`、`InputRejected` | trait 在 core，具体宿主在外部实现；不是 Context 的新 Provider 插槽 |
-| 图 2：主循环 | `AgentLoop`、`TurnResult`、`TurnFailure`、`TurnInfo`、`TurnOptions`、`TurnLimits` | core 传递环境与结果；业务状态机、计数、超时和重试策略由 Loop 实现 |
-| 图 2：compact | `CompactionRequest`、`CompactionResult`、`CompactionTrigger`；更新 `ContextManager::compact` | ContextManager 内部触发摘要 Hook、计算并提交变更，返回执行状态 |
-| 图 3：工具 | `ToolRegistry::resolve`；`ToolInteraction`、`InteractionRequest`、`InteractionKind`；`ToolContext::ask` | ToolExecutor 为 Loop 内部模块，不新增 trait；交互桥已在 yourai-loop 实现 |
+| 图 2：主循环 | `AgentLoop`、`TurnResult`、`TurnFailure`、`TurnInfo`、`TurnOptions`、`TurnLimits` | core 传递环境与结果；AgentLoop 自主管理调度；公共业务操作管理超时、恢复、提交与 Hook |
+| 图 2：compact | `CompactionRequest`、`CompactionResult`、`CompactionTrigger`；更新 `ContextManager::prepare_compaction` | 公共 context.compact 触发 Hook；ContextManager 准备业务计划，CompactionJob 生成并提交摘要 |
+| 图 3：工具 | `ToolRegistry::resolve`；`ToolInteraction`、`InteractionRequest`、`InteractionKind`；`ToolContext::ask` | ToolExecutor 位于公共 execution 模块；AgentLoop 只获得包装能力，交互桥和回复路由归公共执行层 |
 | 图 4：可选扩展 | 复用 ToolHandler、HookRuntime、SessionRuntime | 不预先增加工作区、多 Agent、协作任务的公共 Provider |
-| 图 5：Hook | 复用现有 HookRuntime / HookRegistry / HookHandler | 此轮不修改 Hook wire 协议，不自动触发业务 Hook |
+| 图 5：Hook | 复用现有 HookRuntime / HookRegistry / HookHandler | 保持 Hook wire 协议；公共业务入口自动触发并消费 Hook，Core 底层运输接口不代替业务包装 |
 
 ## 1. 会话宿主
 
@@ -53,7 +55,7 @@ run_next(limits, outbox, cancel)
 
 - `context()` / `status()`：会话环境和展示用状态；不能先读状态再假设操作不会竞争。
 - `interrupt()`：请求取消当前 Turn，不清空后续输入，也不代表清理已经完成。
-- `compact(request, cancel)`：手动压缩，与 Turn 写历史互斥；调用方负责前后 Hook。
+- `compact(request, cancel)`：手动压缩，与 Turn 写历史互斥；ContextManager 的摘要生命周期包装负责前后 Hook。
 - `close(timeout: Option<Duration>)`：拒绝新输入、清理当前执行、SessionEnd、释放资源，成功时归还剩余输入；None 等待清理完成，Some 显式限制整个关闭过程。
 
 `SessionManager` 继续负责元数据；`ContextManager` 负责历史；SessionRuntime 不通过监听 Out 重复保存历史。状态机、互斥、后台事件与恢复策略是未来具体宿主的实现责任。

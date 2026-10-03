@@ -1,4 +1,4 @@
-use super::State;
+use super::ExecutionState;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -45,7 +45,7 @@ pub(crate) fn validate_schema(schema: &Value, value: &Value) -> Result<(), YourA
     })
 }
 
-impl State<'_> {
+impl ExecutionState<'_> {
     pub(crate) async fn ask(
         &mut self,
         id: String,

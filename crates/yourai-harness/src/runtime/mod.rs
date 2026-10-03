@@ -1,4 +1,6 @@
+mod compaction;
 mod journal;
+mod lifecycle;
 use crate::{
     error,
     storage::{atomic_write, read_json},
@@ -21,6 +23,7 @@ use yourai_core::{
 
 #[derive(Clone)]
 pub struct HostConfig {
+    pub input: yourai_core::turn::InputOptions,
     pub hook_timeout: Option<Duration>,
     /// Optional supervisor quarantine bound after cancellation.
     pub cleanup_timeout: Option<Duration>,
@@ -32,6 +35,7 @@ pub struct HostConfig {
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
+            input: yourai_core::turn::InputOptions::default(),
             hook_timeout: None,
             cleanup_timeout: None,
             allow_background_wake: true,
@@ -93,6 +97,7 @@ pub struct SessionHost {
     pub(crate) agent: Arc<Agent>,
     pub(crate) dir: PathBuf,
     config: HostConfig,
+    input_options: Mutex<yourai_core::turn::InputOptions>,
     live: Mutex<Live>,
     journal_gate: Mutex<()>,
     events: Arc<RuntimeEvents>,
@@ -114,6 +119,7 @@ struct StatusGuard<'a>(&'a SessionHost);
 impl Drop for StatusGuard<'_> {
     fn drop(&mut self) {
         let mut l = self.0.live.lock().unwrap();
+        l.cancel = None;
         if !self.0.closing.is_cancelled() {
             l.status = SessionStatus::Idle;
         }
@@ -129,6 +135,12 @@ pub struct ContextUsage {
 }
 
 impl SessionHost {
+    pub(crate) fn configure_input(&self, skill_ids: Vec<String>, memory_search_limit: usize) {
+        *self.input_options.lock().unwrap() = yourai_core::turn::InputOptions {
+            skill_ids,
+            memory_search_limit,
+        };
+    }
     pub fn context_usage(&self) -> Result<ContextUsage, YourAiError> {
         let snapshot = self.agent.ctx().snapshot()?;
         let history = snapshot
@@ -172,7 +184,7 @@ impl SessionHost {
         Self::open_owned(lease, context, agent, config, source).await
     }
 
-    pub(crate) async fn open_owned(
+    async fn run_open(
         lease: SessionLease,
         context: SessionContext,
         agent: Arc<Agent>,
@@ -206,6 +218,10 @@ impl SessionHost {
             context: Mutex::new(context),
             agent,
             dir,
+            input_options: Mutex::new(yourai_core::turn::InputOptions {
+                skill_ids: config.input.skill_ids.clone(),
+                memory_search_limit: config.input.memory_search_limit,
+            }),
             config,
             journal_gate: Mutex::new(()),
             live: Mutex::new(Live {
@@ -249,26 +265,6 @@ impl SessionHost {
         if was_interrupted {
             host.reconcile_history().await?;
             host.post_event_async(RuntimeEvent{id:format!("recovered-{}",uuid::Uuid::new_v4()),context:None,notice:Some("Previous execution was interrupted; tools were not replayed. Inspect interrupted_inputs() before continuing.".into()),wake:false}).await?;
-        }
-        let result = host
-            .dispatch(HookEvent::SessionStart {
-                source: source.into(),
-                model: host.agent.ctx().try_model().map(|m| m.model_iden().into()),
-            })
-            .await?;
-        host.consume_hook_async(&result, false).await?;
-        if let HookPointOutcome::SessionStart(o) = result.outcome {
-            for path in o.watch_paths {
-                host.watch_path_async(PathBuf::from(path)).await?;
-            }
-            if let Some(message) = o.initial_user_message {
-                host.submit_async(In::user_text(message))
-                    .await
-                    .map_err(|e| error("host", e))?;
-            }
-        }
-        if !host.watch_paths().is_empty() {
-            host.workspace()?.start_watching(WATCH_INTERVAL)?;
         }
         Ok(host)
     }
@@ -332,114 +328,6 @@ impl SessionHost {
         self.events.push(event);
         self.notify.notify_one();
         Ok(true)
-    }
-    pub(crate) async fn dispatch(
-        &self,
-        event: HookEvent,
-    ) -> Result<HookDispatchResult, YourAiError> {
-        let Some(hooks) = self.agent.ctx().try_hooks() else {
-            return Ok(HookDispatchResult::empty(event.kind()));
-        };
-        let c = self.context();
-        let mut base = BaseInput::new(c.id.as_str(), c.cwd.to_string_lossy());
-        base.transcript_path = c
-            .transcript_path
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let invocation = HookInvocation::new(base, event);
-        let result = crate::time::timeout(self.config.hook_timeout, hooks.dispatch(&invocation))
-            .await
-            .map_err(|_| error("hook", "host hook timed out"))??;
-        result.validate_for(invocation.event.kind())?;
-        Ok(result)
-    }
-    pub(crate) fn consume_hook(
-        &self,
-        r: &HookDispatchResult,
-        deny_block: bool,
-    ) -> Result<(), YourAiError> {
-        if r.common.prevent_continuation || (deny_block && !r.common.blocking_errors.is_empty()) {
-            return Err(
-                AbortReason::HookStopped(r.common.stop_reason.clone().unwrap_or_else(|| {
-                    r.common
-                        .blocking_errors
-                        .iter()
-                        .map(|e| e.message.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }))
-                .into(),
-            );
-        }
-        let contexts = match &r.outcome {
-            HookPointOutcome::SessionStart(o) => o.additional_contexts.clone(),
-            HookPointOutcome::Generic(o) => o.additional_contexts.clone(),
-            _ => vec![],
-        };
-        let notices: Vec<_> = r.notices().collect();
-        if !contexts.is_empty() || !notices.is_empty() {
-            self.post_event(RuntimeEvent {
-                id: uuid::Uuid::new_v4().to_string(),
-                context: (!contexts.is_empty()).then(|| contexts.join("\n")),
-                notice: (!notices.is_empty()).then(|| notices.join("\n")),
-                wake: false,
-            })?;
-        }
-        Ok(())
-    }
-    fn attach_background(self: &Arc<Self>) {
-        let Some(mut rx) = self
-            .agent
-            .ctx()
-            .try_hooks()
-            .and_then(|h| h.subscribe_background())
-        else {
-            return;
-        };
-        let weak = Arc::downgrade(self);
-        let cancel = self.closing.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                let event = tokio::select! {_=cancel.cancelled()=>break,e=rx.recv()=>e};
-                let Some(host) = weak.upgrade() else { break };
-                match event {
-                    Ok(e) if e.session_id == host.context().id.as_str() => {
-                        let wake = e.rewake && e.exit_code == 2;
-                        let text = if e.stderr.is_empty() {
-                            e.stdout
-                        } else {
-                            format!("{}\n{}", e.stdout, e.stderr)
-                        };
-                        if let Err(err) = host
-                            .post_event_async(RuntimeEvent {
-                                id: e.task_id,
-                                context: wake.then(|| text.clone()),
-                                notice: Some(text),
-                                wake,
-                            })
-                            .await
-                        {
-                            host.live.lock().unwrap().journal.last_error = Some(err.to_string());
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        let _ = host
-                            .post_event_async(RuntimeEvent {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                context: None,
-                                notice: Some(format!(
-                                    "Lost {n} background events; inspect hook logs"
-                                )),
-                                wake: false,
-                            })
-                            .await;
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        self.background.lock().unwrap().push(task);
     }
     pub(crate) async fn history(&self) -> Result<Arc<dyn ContextManager>, YourAiError> {
         self.agent.ctx().context_manager()
@@ -662,6 +550,7 @@ impl SessionRuntime for SessionHost {
                         options.session = Some(Arc::new(host.context()));
                         options.limits = limits;
                         options.events = Some(host.events.clone());
+                        options.input = Some(host.input_options.lock().unwrap().clone());
                         let handle = match host.agent.start_with(first.clone(), options) {
                             Ok(handle) => handle,
                             Err(e) => {
@@ -788,44 +677,7 @@ impl SessionRuntime for SessionHost {
                 // Stop hooks have settled and history + host journal are committed.
                 // This notification cannot change the turn outcome or request continuation.
                 if result.is_ok() {
-                    let through_seq = host
-                        .agent
-                        .ctx()
-                        .try_context_manager()
-                        .map(|h| h.last_sequence())
-                        .unwrap_or(after_seq);
-                    if through_seq > after_seq {
-                        match host
-                            .dispatch(HookEvent::TurnCompleted {
-                                turn_id: task_id.to_string(),
-                                after_seq,
-                                through_seq,
-                            })
-                            .await
-                        {
-                            Ok(r) => {
-                                for message in r
-                                    .visible_messages()
-                                    .map(|m| m.content.clone())
-                                    .chain(r.common.system_messages.iter().cloned())
-                                    .chain(
-                                        r.common.blocking_errors.iter().map(|e| e.message.clone()),
-                                    )
-                                {
-                                    let _ = tx.send(Out::Notice {
-                                        level: Level::Warning,
-                                        message,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Out::Notice {
-                                    level: Level::Warning,
-                                    message: format!("TurnCompleted hook failed: {e}"),
-                                });
-                            }
-                        }
-                    }
+                    host.notify_turn_completed(&task_id, after_seq, &tx).await;
                 }
                 let _ = done.send(Ok(Some(SessionTurn {
                     turn_id: task_id,
@@ -851,46 +703,10 @@ impl SessionRuntime for SessionHost {
     }
     fn compact<'a>(
         &'a self,
-        mut request: CompactionRequest,
+        request: CompactionRequest,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>> {
-        Box::pin(async move {
-            let _gate = self.try_operation()?;
-            {
-                let mut live = self.live.lock().unwrap();
-                // Publish under the same lock as close so a racing close can
-                // never have its Closing state overwritten by Compacting.
-                self.ensure_open()?;
-                live.status = SessionStatus::Compacting;
-            }
-            let _status = StatusGuard(self);
-            let deadline = request.deadline;
-            let token = cancel.child_token();
-            let _cancel_guard = token.clone().drop_guard();
-            let task = async {
-                request.trigger = CompactionTrigger::Manual;
-                let snapshot = self.agent.ctx().snapshot()?;
-                let context = self.context();
-                let history = snapshot
-                    .context_manager
-                    .clone()
-                    .ok_or_else(|| error("compact", "context not configured"))?;
-                history.restore().await?;
-                request.tools = snapshot
-                    .tools
-                    .as_ref()
-                    .map(|r| r.definitions())
-                    .unwrap_or_default();
-                let execution = ContextExecution::from_snapshot(
-                    &snapshot,
-                    history.session_id(),
-                    Some(&context),
-                )?;
-                history.compact(request, &execution, &token).await
-            };
-            tokio::pin!(task);
-            tokio::select! { r=&mut task=>r, _=self.closing.cancelled()=>{ token.cancel(); task.await }, _=cancel.cancelled()=>Err(AbortReason::Cancelled.into()), _=crate::time::sleep_until(deadline)=>Err(AbortReason::DeadlineExceeded.into()) }
-        })
+        self.compact_with_events(request, cancel, &yourai_core::context::DiscardSink)
     }
     fn close<'a>(
         &'a self,
@@ -909,98 +725,54 @@ impl SessionHost {
     pub(crate) fn close_warning(&self, error: &YourAiError) {
         self.live.lock().unwrap().journal.last_error = Some(error.to_string());
     }
-    /// Finish durable cleanup without transferring ownership of pending inputs.
-    pub(crate) async fn finish_close(&self, timeout: Option<Duration>) -> Result<(), YourAiError> {
-        if self.status() == SessionStatus::Closed {
-            return Ok(());
+    async fn run_shutdown(&self, timeout: Option<Duration>) -> Result<(), YourAiError> {
+        if let Some(ws) = self.workspace.get() {
+            ws.stop_watching().await;
         }
-        self.closing.cancel();
-        self.interrupt();
-        {
-            let mut live = self.live.lock().unwrap();
-            if live.status == SessionStatus::Closed {
-                return Ok(());
-            }
-            live.status = SessionStatus::Closing;
+        let children: Vec<_> = self
+            .children
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        for child in children {
+            child.close(self.config.cleanup_timeout.or(timeout)).await?;
         }
-        crate::time::timeout(timeout, async {
-            let gate = self.operation.clone().lock_owned().await;
-            if self.status() == SessionStatus::Closed {
-                return Ok(());
+        let tasks = std::mem::take(&mut *self.background.lock().unwrap());
+        for t in &tasks {
+            t.abort();
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+        Ok(())
+    }
+    async fn run_commit_close(
+        &self,
+        gate: tokio::sync::OwnedMutexGuard<()>,
+        hook_error: Option<String>,
+    ) -> Result<(), YourAiError> {
+        self.blocking(move |host| {
+            let _gate = gate;
+            let mut journal = host.journal();
+            if let Some(error) = hook_error {
+                journal.last_error = Some(error);
             }
-            if let Some(ws) = self.workspace.get() {
-                ws.stop_watching().await;
+            let pending: Vec<_> = journal.queue.drain(..).collect();
+            journal.closed = true;
+            if let Err(e) = journal.commit() {
+                journal.queue.extend(pending);
+                journal.closed = false;
+                return Err(e);
             }
-            let children: Vec<_> = self
-                .children
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(std::sync::Weak::upgrade)
-                .collect();
-            for child in children {
-                child.close(self.config.cleanup_timeout.or(timeout)).await?;
-            }
-            let tasks = std::mem::take(&mut *self.background.lock().unwrap());
-            for t in &tasks {
-                t.abort();
-            }
-            for t in tasks {
-                let _ = t.await;
-            }
-            // Closing hooks may report errors, but cannot prevent resource release.
-            let hook_result = crate::time::timeout(
-                timeout.map(|t| t / 4),
-                self.dispatch(HookEvent::SessionEnd {
-                    reason: "shutdown".into(),
-                }),
-            )
-            .await
-            .map_err(|_| error("hook", "SessionEnd cleanup deadline exceeded"))
-            .and_then(|r| r);
-            if let Some(hooks) = self.agent.ctx().try_hooks() {
-                hooks.shutdown_session(self.context().id.as_str()).await?;
-            }
-            self.blocking(move |host| {
-                let _gate = gate;
-                let mut journal = host.journal();
-                match hook_result {
-                    Err(e) => journal.last_error = Some(e.to_string()),
-                    Ok(r) => {
-                        let errors: Vec<_> = r
-                            .common
-                            .messages
-                            .iter()
-                            .filter(|m| matches!(m.kind, HookMessageKind::NonBlockingError))
-                            .map(|m| m.content.clone())
-                            .collect();
-                        if !errors.is_empty() {
-                            journal.last_error = Some(errors.join("\n"));
-                        }
-                    }
-                }
-                let pending: Vec<_> = journal.queue.drain(..).collect();
-                journal.closed = true;
-                if let Err(e) = journal.commit() {
-                    journal.queue.extend(pending);
-                    journal.closed = false;
-                    return Err(e);
-                }
-                // Retain the handoff before any fallible/cancellable step.
-                host.live.lock().unwrap().closed_pending.extend(pending);
-                FileExt::unlock(&host._lock).map_err(|e| error("host", e))?;
-                host.live.lock().unwrap().status = SessionStatus::Closed;
-                Ok(())
-            })
-            .await?
+            // Retain the handoff before any fallible/cancellable step.
+            host.live.lock().unwrap().closed_pending.extend(pending);
+            FileExt::unlock(&host._lock).map_err(|e| error("host", e))?;
+            host.live.lock().unwrap().status = SessionStatus::Closed;
+            Ok(())
         })
-        .await
-        .map_err(|_| {
-            error(
-                "host",
-                "close timed out; retry close to finish cleanup and collect pending inputs",
-            )
-        })?
+        .await?
     }
 }
 impl Drop for SessionHost {

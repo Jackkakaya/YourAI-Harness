@@ -54,7 +54,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
-        compact = any(m.get('role') == 'system' and 'Summarize for continuation' in str(m.get('content'))
+        compact = any(m.get('role') == 'system' and 'Create a structured checkpoint' in str(m.get('content'))
                       for m in body.get('messages', []))
         if compact:
             delta = {'content': 'Prior task list is complete.'}
@@ -213,8 +213,9 @@ with tempfile.TemporaryDirectory() as tmp:
         assert len(requests) == 4
         assert requests[3][2].get('stream') is True, 'compaction must use a progressing stream'
         assert all(value == 'model' for value in config_headers)
-        for _, _, body in requests:
-            assert body.get('max_tokens', body.get('max_completion_tokens')) == 4096, body
+        for index, (_, _, body) in enumerate(requests):
+            expected_output = 2000 if index == 3 else 4096
+            assert body.get('max_tokens', body.get('max_completion_tokens')) == expected_output, body
             assert body['temperature'] == 0.2
             assert body['top_p'] == 0.9
             assert body['reasoning_effort'] == 'high'
@@ -222,6 +223,8 @@ with tempfile.TemporaryDirectory() as tmp:
         assert all(path == '/v1/chat/completions' and auth == 'Bearer smoke-only'
                    and body['model'] == 'smoke-model' for path, auth, body in requests)
         assert any(m['role'] == 'tool' for m in requests[1][2]['messages'])
+        assert all(m['role'] != 'tool' and not m.get('tool_calls')
+                   for m in requests[3][2]['messages']), 'summary history must be serialized data'
         db = sqlite3.connect(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3')
         session = db.execute('SELECT session_id FROM sessions').fetchone()[0]
         assert db.execute("SELECT source, COUNT(*) FROM model_requests GROUP BY source ORDER BY source").fetchall() == [('compact', 1), ('main', 3)]

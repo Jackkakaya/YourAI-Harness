@@ -105,7 +105,9 @@ impl MemoryContext {
         let messages = self.project_messages(records, true)?;
         let mut request = ChatRequest::new(messages);
         request.system = system.map(str::to_owned);
-        request.tools = Some(tools.to_vec());
+        let mut tools = tools.to_vec();
+        tools.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        request.tools = Some(tools);
         Ok(request)
     }
     pub(super) fn project_messages(

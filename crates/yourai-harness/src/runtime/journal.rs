@@ -95,15 +95,6 @@ impl SessionHost {
     pub async fn watch_path_async(&self, path: PathBuf) -> Result<(), YourAiError> {
         self.blocking(move |host| host.watch_path(path)).await?
     }
-    pub(crate) async fn consume_hook_async(
-        &self,
-        result: &HookDispatchResult,
-        deny: bool,
-    ) -> Result<(), YourAiError> {
-        let result = result.clone();
-        self.blocking(move |host| host.consume_hook(&result, deny))
-            .await?
-    }
     pub(crate) async fn set_cwd_async(&self, cwd: PathBuf) -> Result<(), YourAiError> {
         self.blocking(move |host| host.set_cwd(cwd)).await?
     }

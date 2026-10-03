@@ -206,6 +206,11 @@ pub enum Out {
     /// token 用量
     Usage { usage: Usage },
 
+    /// Context maintenance progress and verified outcome, including manual operations.
+    Compaction {
+        event: crate::compaction::CompactionEvent,
+    },
+
     /// 提示级通知：压缩、降级、非致命错误
     Notice { level: Level, message: String },
 }
