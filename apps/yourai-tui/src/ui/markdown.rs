@@ -1,7 +1,7 @@
 //! Markdown is presentation only: no HTML execution, links or task-state mutations.
-use super::theme::{BLUE, CODE_SURFACE, GREEN, MUTED, TEXT};
+use super::theme::{BLUE, BRAND_TEAL, BRAND_VIOLET, CODE_SURFACE, GREEN, MUTED, TEXT};
 use crate::text::clean;
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::prelude::*;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -171,9 +171,14 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {}
-                Tag::Heading { .. } => {
+                Tag::Heading { level, .. } => {
                     w.blank();
-                    w.styles.push(w.style().fg(TEXT).bold());
+                    let color = match level {
+                        HeadingLevel::H1 => BRAND_VIOLET,
+                        HeadingLevel::H2 => BRAND_TEAL,
+                        _ => TEXT,
+                    };
+                    w.styles.push(w.style().fg(color).bold());
                 }
                 Tag::Strong => w.styles.push(w.style().bold()),
                 Tag::Emphasis => w.styles.push(w.style().italic()),

@@ -16,6 +16,8 @@ pub enum Parsed {
     Continue,
     Status,
     Quit,
+    /// `/editor`: edit the draft in `$VISUAL`/`$EDITOR`.
+    Editor,
     /// `/queue TEXT`: schedule a follow-up turn.
     Queue(String),
     /// `/theme` (None) opens the picker; a name switches directly.
@@ -57,6 +59,7 @@ pub fn parse(text: &str) -> Option<Parsed> {
     match head {
         "/quit" => Some(Parsed::Quit),
         "/help" => Some(Parsed::Help),
+        "/editor" => Some(Parsed::Editor),
         "/new" | "/clear" => Some(Parsed::New),
         "/continue" => Some(Parsed::Continue),
         "/status" => Some(Parsed::Status),
@@ -112,6 +115,11 @@ const COMMANDS: &[Command] = &[
         argument: false,
     },
     Command {
+        text: "/editor",
+        description: "Edit the draft in $VISUAL/$EDITOR · Ctrl-X",
+        argument: false,
+    },
+    Command {
         text: "/compact",
         description: "Compact current context",
         argument: false,
@@ -138,7 +146,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         text: "/models",
-        description: "Switch model (picker; or /models p/m [variant])",
+        description: "Switch model (picker; Tab sets thinking effort)",
         argument: false,
     },
     Command {
@@ -276,7 +284,7 @@ mod tests {
     fn filter_navigation_dismissal_and_arguments() {
         let mut menu = Menu::default();
         menu.sync("/", true);
-        assert_eq!(menu.items().len(), 12);
+        assert_eq!(menu.items().len(), 13);
         menu.step(true);
         assert_eq!(menu.items()[menu.selected].text, "/quit");
         menu.sync("/co", true);

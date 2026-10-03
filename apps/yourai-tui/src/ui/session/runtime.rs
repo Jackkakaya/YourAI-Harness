@@ -9,6 +9,25 @@ use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
 use yourai_harness::Harness;
 
+/// Provider errors arrive as multi-line Display chains whose tail is a raw
+/// JSON body ("… Response body: {…}"). Keep the provider's `message` field
+/// and drop the JSON blob so the notice stays a readable line or two.
+fn summarize_error(text: &str) -> String {
+    const MARKER: &str = "Response body: ";
+    let Some(at) = text.find(MARKER) else {
+        return text.to_owned();
+    };
+    let (head, body) = text.split_at(at);
+    let head = head.trim_end().trim_end_matches('.');
+    match serde_json::from_str::<serde_json::Value>(body[MARKER.len()..].trim()) {
+        Ok(value) => match value.get("message").and_then(|m| m.as_str()) {
+            Some(message) => format!("{head}: {message}"),
+            None => head.to_owned(),
+        },
+        Err(_) => head.to_owned(),
+    }
+}
+
 type Stats = (
     Option<yourai_harness::runtime::ContextUsage>,
     Option<u64>,
@@ -109,21 +128,14 @@ impl Runtime {
         let tx = self.tx.clone();
         let cancel = self.cancel.clone();
         self.compact = Some(tokio::spawn(async move {
-            let result = h
+            let _ = h
                 .host
-                .compact(CompactionRequest::new(CompactionTrigger::Manual), &cancel)
+                .compact_with_events(
+                    CompactionRequest::new(CompactionTrigger::Manual),
+                    &cancel,
+                    &tx,
+                )
                 .await;
-            let (level, message) = match result {
-                Ok(r) => (
-                    Level::Info,
-                    format!(
-                        "Context {:?}: {} -> {} estimated tokens. {}",
-                        r.action, r.tokens_before, r.tokens_after, r.reason
-                    ),
-                ),
-                Err(e) => (Level::Error, format!("Compact failed: {e}")),
-            };
-            let _ = tx.send(Out::Notice { level, message });
             h.usage
                 .session_usage(&h.host.context().id)
                 .await
@@ -138,6 +150,7 @@ impl Runtime {
     /// Only finished tasks are awaited here; storage and model work never hold
     /// the UI loop. Drain output before settling stream identities.
     pub async fn poll(&mut self, view: &mut View, first: Option<Out>) {
+        let context_revision = view.session.context_revision;
         if let Some(event) = first {
             view.event(event);
         }
@@ -147,6 +160,12 @@ impl Runtime {
                 Err(_) => break,
             }
         }
+        if context_revision != view.session.context_revision {
+            if let Some(stats) = self.stats.take() {
+                stats.abort();
+            }
+            self.stats_at = Instant::now() - Duration::from_secs(2);
+        }
         if self.driver.as_ref().is_some_and(|t| t.is_finished()) && self.rx.is_empty() {
             match self.driver.take().unwrap().await {
                 Ok(Err(YourAiError::Aborted(reason))) => view.notice(
@@ -155,7 +174,10 @@ impl Runtime {
                 ),
                 Ok(Err(e)) => view.notice(
                     Level::Error,
-                    format!("Execution failed: {e}. /continue retries pending inputs."),
+                    format!(
+                        "Execution failed: {}. /continue retries pending inputs.",
+                        summarize_error(&e.to_string())
+                    ),
                 ),
                 Err(e) => view.notice(Level::Error, format!("Driver failed: {e}")),
                 _ => {}
@@ -182,7 +204,10 @@ impl Runtime {
             }
         }
         view.session.model_metrics = self.h.model_snapshot();
-        if self.stats.is_none() && self.stats_at.elapsed() >= Duration::from_secs(1) {
+        if view.session.compaction.is_none()
+            && self.stats.is_none()
+            && self.stats_at.elapsed() >= Duration::from_secs(1)
+        {
             let host = self.h.host.clone();
             let usage = self.h.usage.clone();
             let id = host.context().id;
@@ -247,7 +272,7 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::Runtime;
+    use super::{summarize_error, Runtime};
     use crate::ui::{session, state::View};
     use std::time::{Duration, Instant};
     use yourai_core::prelude::*;
@@ -263,6 +288,44 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_completion_discards_a_ready_but_stale_stats_snapshot() {
+        let (_dir, mut controller, mut view) = session::fixture().await;
+        let old = yourai_harness::runtime::ContextUsage {
+            estimated_tokens: 999_999,
+            context_window: Some(128_000),
+            input_budget: Some(120_000),
+            output_reserve: 4096,
+        };
+        view.session.context_usage = Some(old.clone());
+        controller.runtime.stats = Some(tokio::spawn(async move { (Some(old), None, Ok(None)) }));
+        tokio::task::yield_now().await;
+        let mut result = CompactionResult::new(CompactAction::Summarized, 999_999, 500, "saved");
+        result.verified = true;
+        result.input_budget = Some(120_000);
+        controller
+            .runtime
+            .poll(
+                &mut view,
+                Some(Out::Compaction {
+                    event: CompactionEvent::Finished {
+                        trigger: CompactionTrigger::Manual,
+                        result,
+                    },
+                }),
+            )
+            .await;
+        assert_ne!(
+            view.session
+                .context_usage
+                .as_ref()
+                .map(|u| u.estimated_tokens),
+            Some(999_999)
+        );
+        assert!(view.session.compaction.is_none());
+        controller.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -365,5 +428,17 @@ mod tests {
             .title
             .is_none());
         controller.close().await.unwrap();
+    }
+
+    #[test]
+    fn error_summaries_drop_the_raw_provider_json() {
+        let raw = "model error: Web stream error for model 'Kimi (adapter: OpenAI)'.\nCause: Request failed with status code '400 Bad Request'.\nResponse body: {\"object\":\"error\",\"message\":\"Model only supports text input; received unsupported content type 'image_url'.\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}";
+        assert_eq!(
+            summarize_error(raw),
+            "model error: Web stream error for model 'Kimi (adapter: OpenAI)'.\nCause: Request failed with status code '400 Bad Request': Model only supports text input; received unsupported content type 'image_url'."
+        );
+        // No JSON body: unchanged. Unparseable body: keep the head only.
+        assert_eq!(summarize_error("plain failure"), "plain failure");
+        assert_eq!(summarize_error("head. Response body: not json"), "head");
     }
 }

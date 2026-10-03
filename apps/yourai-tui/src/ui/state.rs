@@ -1,3 +1,4 @@
+mod compaction;
 mod tool_output;
 use super::draft::Draft;
 use super::editor::Editor;
@@ -102,6 +103,18 @@ impl DiffRow {
         usize::from(self.old.is_some()) + usize::from(self.new.is_some())
     }
 }
+/// One answer to a permission ask: the y/a/n rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PermissionChoice {
+    /// y: approve this call only.
+    Once,
+    /// a: approve this call and auto-approve the same tool for the rest of
+    /// the session (never persisted; a new session asks again).
+    Always,
+    /// n: reject.
+    Deny,
+}
+
 pub enum Item {
     Text {
         role: Role,
@@ -121,19 +134,28 @@ pub struct Ask {
     pub editor: Editor,
     pub error: Option<String>,
     pub scroll: usize,
+    /// Permission asks only: selected row of the y/a/n choice list.
+    pub permission_choice: usize,
 }
 impl Ask {
     pub fn permission(&self) -> bool {
         self.payload["kind"] == "permission"
     }
+    /// The selected permission choice (y allow once / a always / n deny).
+    pub fn permission_selection(&self) -> PermissionChoice {
+        match self.permission_choice.min(2) {
+            0 => PermissionChoice::Once,
+            1 => PermissionChoice::Always,
+            _ => PermissionChoice::Deny,
+        }
+    }
     pub fn answer(&self) -> Result<Value, String> {
         let text = self.editor.text.trim();
         if self.permission() {
-            return match text.to_lowercase().as_str() {
-                "y" | "yes" => Ok(json!({"behavior":"allow"})),
-                "n" | "no" => Ok(json!({"behavior":"deny"})),
-                _ => Err("Enter y to allow once, or n to deny.".into()),
-            };
+            // Permissions answer from the choice list, never typed text.
+            return Ok(json!({
+                "behavior": if self.permission_selection() == PermissionChoice::Deny { "deny" } else { "allow" }
+            }));
         }
         if text.is_empty() {
             return Err("Enter a reply.".into());
@@ -185,6 +207,12 @@ pub struct View {
     pub overlay: super::overlay::Overlay,
     pub model_choices: Vec<crate::models::ModelChoice>,
     pub model: ModelInfo,
+    /// Indices into `model_choices` in most-recently-used order; F2 cycles
+    /// through it. Seeded once after `model_choices` is populated.
+    pub recent_models: Vec<usize>,
+    /// Live workspace/worktree/branch of the session cwd; refreshed by the
+    /// app loop, quiet (all None) outside a git repository.
+    pub git: crate::git::GitContext,
 }
 
 /// State belonging to one conversation; replaced together on a session switch.
@@ -192,6 +220,9 @@ pub struct View {
 pub struct SessionView {
     pub model_metrics: yourai_harness::model::BudgetSnapshot,
     pub retry: Option<RetryState>,
+    pub compaction: Option<(CompactionTrigger, CompactionPhase)>,
+    pub context_revision: u64,
+    pub last_compaction: Option<CompactionResult>,
     pub context_usage: Option<yourai_harness::runtime::ContextUsage>,
     items: VecDeque<Item>,
     item_versions: VecDeque<u64>,
@@ -204,6 +235,9 @@ pub struct SessionView {
     selected: Option<u64>,
     pub title: Option<String>,
     pub todos: Todos,
+    /// Tools the user approved with "always" this session. New asks for these
+    /// tools are auto-answered; a session switch starts empty again.
+    pub allowed_tools: std::collections::HashSet<String>,
     usage: Usage,
     recorded_responses: u64,
     pub revision: u64,
@@ -266,6 +300,8 @@ impl Todos {
 pub struct ModelInfo {
     pub label: String,
     pub pricing: Option<(f64, f64)>,
+    /// Effective reasoning effort for the current entry, when set.
+    pub effort: Option<String>,
 }
 impl View {
     pub fn model_activity(&self) -> &'static str {
@@ -276,6 +312,43 @@ impl View {
         } else {
             "Waiting for model"
         }
+    }
+
+    /// Seed the MRU model order: every choice once, the current model first.
+    pub fn seed_recent_models(&mut self) {
+        let mut order: Vec<usize> = (0..self.model_choices.len()).collect();
+        if let Some(at) = order
+            .iter()
+            .position(|&i| self.model_choices[i].label == self.model.label)
+        {
+            let current = order.remove(at);
+            order.insert(0, current);
+        }
+        self.recent_models = order;
+    }
+    /// A model switch landed: move its choice to the front of the MRU order.
+    pub fn touch_model(&mut self, label: &str) {
+        if let Some(at) = self
+            .recent_models
+            .iter()
+            .position(|&i| self.model_choices[i].label == label)
+        {
+            let choice = self.recent_models.remove(at);
+            self.recent_models.insert(0, choice);
+        } else if let Some(i) = self.model_choices.iter().position(|c| c.label == label) {
+            self.recent_models.insert(0, i);
+        }
+    }
+    /// The choice following the current model in MRU order, if a switch exists.
+    pub fn next_recent_model(&self) -> Option<usize> {
+        if self.recent_models.len() < 2 {
+            return None;
+        }
+        let at = self
+            .recent_models
+            .iter()
+            .position(|&i| self.model_choices[i].label == self.model.label)?;
+        Some(self.recent_models[(at + 1) % self.recent_models.len()])
     }
 
     /// Whether the item at `index` is the currently streaming thinking block.
@@ -517,6 +590,7 @@ impl View {
     /// Host status and forwarded output use separate channels. Idle may arrive before
     /// the final Message, so a status refresh must retain stream merge identities.
     pub fn idle(&mut self) {
+        self.session.compaction = None;
         self.session.active = false;
         self.session.since = None;
         self.session.retry = None;
@@ -723,10 +797,12 @@ impl View {
                         editor: Editor::default(),
                         error: None,
                         scroll: 0,
+                        permission_choice: 0,
                     });
                 }
                 self.touch();
             }
+            Out::Compaction { event } => self.compaction_event(event),
             Out::Usage { usage } => self.accumulate_usage(&usage),
             Out::Notice { level, message } => self.notice(level, message),
             _ => {}
@@ -809,6 +885,39 @@ impl View {
 mod tests {
     #[allow(clippy::wildcard_imports)]
     use super::*;
+    #[test]
+    fn recent_models_seed_touch_and_cycle() {
+        fn choice(label: &str) -> crate::models::ModelChoice {
+            crate::models::ModelChoice {
+                id: label.into(),
+                variant: None,
+                label: label.into(),
+                effort: None,
+            }
+        }
+        let mut v = View::default();
+        v.model.label = "b".into();
+        v.model_choices = vec![choice("a"), choice("b"), choice("c")];
+        // Seed: every choice, the current model first, the rest in order.
+        v.seed_recent_models();
+        assert_eq!(v.recent_models, vec![1, 0, 2]);
+        assert_eq!(v.next_recent_model(), Some(0), "after b comes a");
+        // A landed switch moves to the front; cycling follows the new order.
+        v.touch_model("c");
+        v.model.label = "c".into();
+        assert_eq!(v.recent_models, vec![2, 1, 0]);
+        assert_eq!(v.next_recent_model(), Some(1));
+        v.touch_model("a");
+        v.model.label = "a".into();
+        assert_eq!(v.next_recent_model(), Some(2), "wraps through the list");
+        // An unknown label (not in choices) is ignored, not invented.
+        v.touch_model("missing");
+        assert_eq!(v.recent_models, vec![0, 2, 1]);
+        // Fewer than two choices: nothing to cycle.
+        v.model_choices = vec![choice("a")];
+        v.seed_recent_models();
+        assert_eq!(v.next_recent_model(), None);
+    }
     #[test]
     fn usage_writers_use_three_named_semantics() {
         let mut v = View::default();
@@ -1015,15 +1124,24 @@ mod tests {
         assert_eq!(v.tool_mut("a").unwrap().status, ToolStatus::Interrupted);
     }
     #[test]
-    fn permissions_require_explicit_answer_and_drafts_are_separate() {
+    fn permissions_answer_from_the_choice_list_and_drafts_are_separate() {
         let mut v = View::default();
         v.draft.insert("draft");
         v.event(Out::Ask {
             id: "a".into(),
-            payload: json!({"kind":"permission"}),
+            payload: json!({"kind":"permission", "tool_name":"shell"}),
         });
-        assert!(v.session.asks[0].answer().is_err());
-        v.session.asks[0].editor.insert("n");
+        // Default selection is "allow once"; the list, not typed text, answers.
+        assert_eq!(
+            v.session.asks[0].answer().unwrap(),
+            json!({"behavior":"allow"})
+        );
+        v.session.asks[0].permission_choice = 1;
+        assert_eq!(
+            v.session.asks[0].permission_selection(),
+            super::PermissionChoice::Always
+        );
+        v.session.asks[0].permission_choice = 2;
         assert_eq!(
             v.session.asks[0].answer().unwrap(),
             json!({"behavior":"deny"})

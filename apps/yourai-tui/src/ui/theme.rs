@@ -15,41 +15,48 @@ const fn rgb(value: u32) -> Color {
 }
 
 // Baseline slot constants = the Dark palette. Renderers build every span from
-// these (and only these) colors.
+// these (and only these) colors. The Dark baseline favors warm neutrals for
+// text/surfaces but keeps the semantic slots clearly chromatic: focus is a
+// cool blue distinct from muted gray, and success/error/warning read as
+// green/red/amber at a glance (contrast ratios verified in tests).
 pub(crate) const BG: Color = rgb(0x000000);
-pub(crate) const PANEL: Color = rgb(0x181818);
+pub(crate) const PANEL: Color = rgb(0x242424);
 pub(crate) const TEXT: Color = rgb(0xE8E6E3);
 pub(crate) const MUTED: Color = rgb(0xB4B1AC);
 pub(crate) const FAINT: Color = rgb(0x63615F);
-pub(crate) const YELLOW: Color = rgb(0xE7C797);
-pub(crate) const ACCENT: Color = rgb(0xA8B8D0);
-pub(crate) const GREEN: Color = rgb(0xAED0AD);
-pub(crate) const RED: Color = rgb(0xE5A19A);
-pub(crate) const BLUE: Color = rgb(0xBACDE4);
+pub(crate) const YELLOW: Color = rgb(0xE6BF6E);
+pub(crate) const ACCENT: Color = rgb(0x8FB8E8);
+pub(crate) const GREEN: Color = rgb(0x93D08E);
+pub(crate) const RED: Color = rgb(0xE8897C);
+pub(crate) const BLUE: Color = rgb(0xA8CBEA);
 pub(crate) const CYAN: Color = rgb(0xAED5D5);
 pub(crate) const BORDER: Color = rgb(0x858580);
-pub(crate) const DIFF_ADD_BG: Color = rgb(0x1A1F1A);
-pub(crate) const DIFF_DEL_BG: Color = rgb(0x221817);
+pub(crate) const DIFF_ADD_BG: Color = rgb(0x161F15);
+pub(crate) const DIFF_DEL_BG: Color = rgb(0x231513);
 // Syntax highlight slots (Dark baseline values, derived in `Palette::derive`
 // with fixed mixes; keep in sync: test `dark_baseline_slots_match_palette`).
-pub(crate) const SY_KEYWORD: Color = rgb(0xCAABB2);
-pub(crate) const SY_STRING: Color = rgb(0xE6B499);
-pub(crate) const SY_FUNCTION: Color = rgb(0xE7D5B9);
-pub(crate) const SY_TYPE: Color = rgb(0xACC9D3);
-pub(crate) const SY_NUMBER: Color = rgb(0xACC9B7);
+pub(crate) const SY_KEYWORD: Color = rgb(0xC09EAD);
+pub(crate) const SY_STRING: Color = rgb(0xE7A475);
+pub(crate) const SY_FUNCTION: Color = rgb(0xE7D1A3);
+pub(crate) const SY_TYPE: Color = rgb(0xA2C9DD);
+pub(crate) const SY_NUMBER: Color = rgb(0x92C9A7);
 pub(crate) const SY_COMMENT: Color = rgb(0xB8B5B0);
 pub(crate) const SY_OPERATOR: Color = rgb(0xE0DEDB);
 pub(crate) const SY_PUNCT: Color = rgb(0xCECCC8);
-pub(crate) const SY_VARIABLE: Color = rgb(0xD3DBE3);
+pub(crate) const SY_VARIABLE: Color = rgb(0xCBDAE6);
 
-pub(crate) const USER_SURFACE: Color = rgb(0x101010);
+pub(crate) const USER_SURFACE: Color = rgb(0x181818);
 
-pub(crate) const CODE_SURFACE: Color = rgb(0x0B0B0B);
+pub(crate) const CODE_SURFACE: Color = rgb(0x111111);
 
-pub(crate) const FOCUS_SURFACE: Color = rgb(0x292828);
+pub(crate) const FOCUS_SURFACE: Color = rgb(0x343433);
+
+// Brand accents remain independent of success/failure and follow each theme.
+pub(crate) const BRAND_TEAL: Color = rgb(0x6DD6C5);
+pub(crate) const BRAND_VIOLET: Color = rgb(0xA8A5F6);
 
 /// Lookup ordering must match `Palette::slots()` exactly.
-pub(crate) const SLOTS: [Color; 26] = [
+pub(crate) const SLOTS: [Color; 28] = [
     BG,
     PANEL,
     TEXT,
@@ -76,6 +83,8 @@ pub(crate) const SLOTS: [Color; 26] = [
     USER_SURFACE,
     CODE_SURFACE,
     FOCUS_SURFACE,
+    BRAND_TEAL,
+    BRAND_VIOLET,
 ];
 
 /// Linear interpolation between two RGB colors; `t = 0` keeps `a`, `t = 1` is `b`.
@@ -98,6 +107,8 @@ pub(crate) fn mix(from: Color, toward: Color, t: f32) -> Color {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
+    pub brand_teal: Color,
+    pub brand_violet: Color,
     pub focus_surface: Color,
     pub code_surface: Color,
     pub user_surface: Color,
@@ -127,7 +138,7 @@ pub struct Palette {
 }
 impl Palette {
     /// Same slot order as `SLOTS`.
-    fn slots(self) -> [Color; 26] {
+    fn slots(self) -> [Color; 28] {
         [
             self.bg,
             self.panel,
@@ -155,6 +166,8 @@ impl Palette {
             self.user_surface,
             self.code_surface,
             self.focus_surface,
+            self.brand_teal,
+            self.brand_violet,
         ]
     }
     /// Build from the 11 base IDE colors; faint, diff surfaces and the nine
@@ -181,7 +194,19 @@ impl Palette {
         let (bg_c, muted_c, green_c, red_c) = (rgb(bg), rgb(muted), rgb(green), rgb(red));
         let (text_c, accent_c, yellow_c, blue_c, cyan_c) =
             (rgb(text), rgb(accent), rgb(yellow), rgb(blue), rgb(cyan));
+        let light = ((bg >> 16) & 255) + ((bg >> 8) & 255) + (bg & 255) > 384;
+        let shade = |color| {
+            if light {
+                mix(color, rgb(0), 0.2)
+            } else {
+                color
+            }
+        };
         Self {
+            // Theme hues dominate the brand slots: icy Nord, purple Dracula,
+            // warm Monokai/Gruvbox. Dark retains the YourAI signature below.
+            brand_teal: shade(mix(cyan_c, green_c, 0.18)),
+            brand_violet: shade(mix(accent_c, blue_c, 0.14)),
             bg: bg_c,
             panel: rgb(panel),
             text: text_c,
@@ -277,10 +302,10 @@ impl Theme {
         Self::ALL.iter().copied().find(|t| t.name() == name)
     }
     pub fn palette(self) -> Palette {
-        match self.effective() {
+        let mut palette = match self.effective() {
             Self::Dark | Self::System => Palette::derive(
-                0x000000, 0x181818, 0xE8E6E3, 0xB4B1AC, 0xA8B8D0, 0xAED0AD, 0xE5A19A, 0xE7C797,
-                0xBACDE4, 0xAED5D5, 0x858580,
+                0x000000, 0x242424, 0xE8E6E3, 0xB4B1AC, 0x8FB8E8, 0x93D08E, 0xE8897C, 0xE6BF6E,
+                0xA8CBEA, 0xAED5D5, 0x858580,
             ),
             Self::Light => Palette::derive(
                 0xFAFAF7, 0xE3E5DF, 0x161B16, 0x414A3E, 0x35522C, 0x2F633B, 0x98352E, 0x76520D,
@@ -322,7 +347,12 @@ impl Theme {
                 0x282828, 0x32302F, 0xEBDDB2, 0x928374, 0xFE8019, 0xB8BB26, 0xFB4934, 0xFABD2F,
                 0x83A598, 0x8EC07C, 0x504945,
             ),
+        };
+        if self.effective() == Self::Dark {
+            palette.brand_teal = BRAND_TEAL;
+            palette.brand_violet = BRAND_VIOLET;
         }
+        palette
     }
     /// Map a baseline (Dark) slot color to this theme's palette; colors outside
     /// the baseline set (pulse blends, gradient steps) pass through unchanged.
@@ -343,7 +373,7 @@ impl Theme {
             return;
         }
         // Build the slot→palette table once per frame instead of scanning the
-        // 26-slot array for every cell's foreground and background.
+        // slot array for every cell's foreground and background.
         let slots = self.palette().slots();
         let remap: std::collections::HashMap<Color, Color> = SLOTS
             .iter()
@@ -589,6 +619,8 @@ mod tests {
                 ("red", p.red),
                 ("yellow", p.yellow),
                 ("blue", p.blue),
+                ("brand_teal", p.brand_teal),
+                ("brand_violet", p.brand_violet),
             ];
             for (name, fg) in fgs {
                 for (surface, sname) in [(p.bg, "bg"), (p.panel, "panel")] {

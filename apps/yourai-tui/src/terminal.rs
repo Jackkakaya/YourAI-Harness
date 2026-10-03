@@ -2,7 +2,10 @@
 //! launcher and conversation UI.
 use crossterm::{
     cursor::Show,
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture,
+    },
     execute, queue,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -18,43 +21,52 @@ use unicode_width::UnicodeWidthStr;
 /// The transcript rectangle the renderer scrolls, published per frame.
 pub(crate) type SharedRegion = Arc<Mutex<Option<Rect>>>;
 
-/// Alternate-screen guard shared by the conversation UI and the launcher:
-/// raw mode, bracketed paste and mouse capture on open, everything restored
-/// on drop. Both front ends must not keep their own copies of this ritual —
-/// the launcher once drifted (missing mouse-mode fix) precisely because it did.
-pub(crate) struct Screen;
-impl Screen {
-    pub(crate) fn open() -> Result<Self, io::Error> {
-        enable_raw_mode()?;
-        let setup = (|| {
-            execute!(
-                io::stdout(),
-                EnterAlternateScreen,
-                EnableBracketedPaste,
-                EnableMouseCapture
-            )?;
-            // Keep button/drag/wheel tracking, without flooding the input
-            // queue on hover events.
-            #[cfg(unix)]
-            {
-                let mut output = io::stdout();
-                output.write_all(b"\x1b[?1003l\x1b[?1002h")?;
-                output.flush()?;
-            }
-            Ok::<(), io::Error>(())
-        })();
-        match setup {
-            Ok(()) => Ok(Self),
-            Err(e) => {
-                restore();
-                Err(e)
-            }
+/// Enter the alternate screen: raw mode, bracketed paste, mouse capture and
+/// focus reporting. Shared by first open and re-entry after an external
+/// editor; `Screen`'s open and Drop must not drift apart.
+fn enter() -> Result<(), io::Error> {
+    enable_raw_mode()?;
+    let setup = (|| {
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture,
+            EnableFocusChange
+        )?;
+        // Keep button/drag/wheel tracking, without flooding the input
+        // queue on hover events.
+        #[cfg(unix)]
+        {
+            let mut output = io::stdout();
+            output.write_all(b"\x1b[?1003l\x1b[?1002h")?;
+            output.flush()?;
+        }
+        Ok::<(), io::Error>(())
+    })();
+    match setup {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            restore();
+            Err(e)
         }
     }
 }
+
+/// Alternate-screen guard shared by the conversation UI and the launcher:
+/// everything set up by `enter` is restored on drop. Both front ends must
+/// not keep their own copies of this ritual — the launcher once drifted
+/// (missing mouse-mode fix) precisely because it did.
+pub(crate) struct Screen;
+impl Screen {
+    pub(crate) fn open() -> Result<Self, io::Error> {
+        enter()?;
+        Ok(Self)
+    }
+}
 /// Restore the terminal to its pre-screen state: alternate screen off, cooked
-/// mode, mouse/paste off, cursor visible, and synchronized output definitely
-/// closed (a crashed frame may have left it open).
+/// mode, mouse/paste/focus off, cursor visible, and synchronized output
+/// definitely closed (a crashed frame may have left it open).
 pub(crate) fn restore() {
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -62,6 +74,7 @@ pub(crate) fn restore() {
         LeaveAlternateScreen,
         DisableBracketedPaste,
         DisableMouseCapture,
+        DisableFocusChange,
         Show
     );
     let _ = io::stdout().write_all(b"\x1b[?2026l");
@@ -71,6 +84,26 @@ impl Drop for Screen {
     fn drop(&mut self) {
         restore();
     }
+}
+
+/// Park the alternate screen so a child process (the external editor) can
+/// own the terminal. Pairs with [`resume`]; the `Screen` guard stays alive
+/// so a panic in between still restores the terminal on drop.
+pub(crate) fn suspend() {
+    restore();
+}
+
+/// Re-enter the alternate screen after [`suspend`].
+pub(crate) fn resume() -> Result<(), io::Error> {
+    enter()
+}
+
+/// Ring the terminal bell once. Written between frames on the UI loop's
+/// thread, so it can never interleave with a frame's atomic write.
+pub(crate) fn bell() {
+    let mut out = io::stdout();
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
 }
 
 /// Backend wrapper whose `size()` reads the window size from our own stdio.

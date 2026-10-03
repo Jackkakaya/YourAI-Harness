@@ -14,6 +14,12 @@ pub enum Overlay {
         scroll: u16,
     },
     Models(usize),
+    /// Thinking-effort sub-picker for the `/models` entry at `model`.
+    /// `selected` indexes [`crate::models::EFFORT_CHOICES`].
+    Effort {
+        model: usize,
+        selected: usize,
+    },
     LoadingSessions,
     Sessions(SessionPickerState),
     Themes(usize),
@@ -22,6 +28,16 @@ pub enum Overlay {
 pub enum Action {
     None,
     Model(usize),
+    /// Open the thinking-effort sub-picker for the `/models` entry at this
+    /// index. The overlay stays open; the host swaps in `Overlay::Effort`
+    /// with the entry's current effort preselected.
+    PickEffort(usize),
+    /// Apply a thinking effort (`None` = config default) to the entry at
+    /// `model`, switching to it like `Action::Model` would.
+    Effort {
+        model: usize,
+        effort: Option<String>,
+    },
     Theme(Theme),
     Session(SessionId),
     Delete(SessionId),
@@ -67,7 +83,15 @@ impl Overlay {
                 return Some(action);
             }
         }
-        if key.code == KeyCode::Esc {
+        if key.code == KeyCode::Esc
+            || (matches!(self, Self::Effort { .. }) && key.code == KeyCode::Left)
+        {
+            // The effort sub-picker is one level below the model list: Esc (or
+            // Left, mirroring Right/Tab drill-in) pops back to it.
+            if let Self::Effort { model, .. } = self {
+                *self = Self::Models(*model);
+                return Some(Action::None);
+            }
             *self = Self::None;
             return Some(Action::None);
         }
@@ -90,8 +114,25 @@ impl Overlay {
             Self::Models(index) | Self::Themes(index) if up => *index = index.saturating_sub(1),
             Self::Models(index) if down => *index = (*index + 1).min(model_count.saturating_sub(1)),
             Self::Themes(index) if down => *index = (*index + 1).min(Theme::ALL.len() - 1),
+            Self::Models(index) if matches!(key.code, KeyCode::Tab | KeyCode::Right) => {
+                action = Action::PickEffort(*index)
+            }
             Self::Models(index) if key.code == KeyCode::Enter && *index < model_count => {
                 action = Action::Model(*index);
+                *self = Self::None;
+            }
+            Self::Effort { selected, .. } if up => *selected = selected.saturating_sub(1),
+            Self::Effort { selected, .. } if down => {
+                *selected = (*selected + 1).min(crate::models::EFFORT_CHOICES.len() - 1)
+            }
+            Self::Effort { model, selected }
+                if key.code == KeyCode::Enter
+                    && *selected < crate::models::EFFORT_CHOICES.len() =>
+            {
+                action = Action::Effort {
+                    model: *model,
+                    effort: crate::models::EFFORT_CHOICES[*selected].map(str::to_string),
+                };
                 *self = Self::None;
             }
             Self::Themes(index) if key.code == KeyCode::Enter => {
@@ -169,6 +210,66 @@ mod tests {
             Some(Action::None)
         ));
         assert!(modal.is_open());
+    }
+    #[test]
+    fn models_tab_opens_effort_picker_and_effort_enter_applies() {
+        // Tab (and Right) signals the host to open the sub-picker for the
+        // highlighted row, without closing the modal.
+        let mut modal = Overlay::Models(1);
+        assert!(matches!(
+            modal.key(key(KeyCode::Tab), 3),
+            Some(Action::PickEffort(1))
+        ));
+        let mut modal = Overlay::Models(2);
+        assert!(matches!(
+            modal.key(key(KeyCode::Right), 3),
+            Some(Action::PickEffort(2))
+        ));
+        // The host swaps in the effort picker; navigation is bounded by the
+        // level list and Enter applies the highlighted level.
+        let mut modal = Overlay::Effort {
+            model: 1,
+            selected: 0,
+        };
+        for _ in 0..9 {
+            assert!(matches!(
+                modal.key(key(KeyCode::Down), 3),
+                Some(Action::None)
+            ));
+        }
+        let Overlay::Effort { selected, .. } = &modal else {
+            panic!("effort picker must stay open on navigation");
+        };
+        assert_eq!(*selected, crate::models::EFFORT_CHOICES.len() - 1);
+        assert!(matches!(
+            modal.key(key(KeyCode::Enter), 3),
+            Some(Action::Effort {
+                model: 1,
+                effort: Some(e)
+            }) if e == "max"
+        ));
+        assert!(!modal.is_open());
+    }
+    #[test]
+    fn effort_picker_esc_and_left_return_to_model_list() {
+        let mut modal = Overlay::Effort {
+            model: 2,
+            selected: 4,
+        };
+        assert!(matches!(
+            modal.key(key(KeyCode::Esc), 3),
+            Some(Action::None)
+        ));
+        assert!(matches!(modal, Overlay::Models(2)));
+        let mut modal = Overlay::Effort {
+            model: 2,
+            selected: 4,
+        };
+        assert!(matches!(
+            modal.key(key(KeyCode::Left), 3),
+            Some(Action::None)
+        ));
+        assert!(matches!(modal, Overlay::Models(2)));
     }
     #[test]
     fn delete_requires_explicit_yes_and_paste_stays_in_search() {
