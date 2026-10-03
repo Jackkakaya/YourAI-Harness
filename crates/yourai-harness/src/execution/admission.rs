@@ -1,19 +1,17 @@
 //! User-input admission owns preparation, explicit rejection and history commit.
 //! No input leaves the pending queue until either rejection is delivered or the
 //! history write succeeds. Transient provider/storage failures retain ownership.
-use super::{attachment, State};
+use super::{attachment, ExecutionState};
 use yourai_core::prelude::*;
 
-impl State<'_> {
+impl ExecutionState<'_> {
     pub(crate) async fn accept_input(
         &mut self,
         index: usize,
         initial: bool,
     ) -> Result<bool, YourAiError> {
-        let (text, attachments) = match &self.queued[index] {
-            In::UserText {
-                text, attachments, ..
-            } => (text.clone(), attachments.clone()),
+        let text = match &self.queued[index] {
+            In::UserText { text, .. } => text.clone(),
             _ => return Ok(false),
         };
         let hook = self
@@ -25,6 +23,19 @@ impl State<'_> {
         if !hook.common.blocking_errors.is_empty() {
             return self.reject_input(index, super::hooks::feedback(&hook).join("\n"));
         }
+        let accepted = self.run_accept_input(index, initial).await?;
+        if accepted {
+            self.add_context(&super::hooks::additional(&hook)).await?;
+        }
+        Ok(accepted)
+    }
+    async fn run_accept_input(&mut self, index: usize, initial: bool) -> Result<bool, YourAiError> {
+        let (text, attachments) = match &self.queued[index] {
+            In::UserText {
+                text, attachments, ..
+            } => (text.clone(), attachments.clone()),
+            _ => return Ok(false),
+        };
         let history = self.history.clone();
         let prepared = if attachments.is_empty() {
             Ok(ChatMessage::user(&text))
@@ -134,7 +145,6 @@ impl State<'_> {
             .await?;
         self.queued.remove(index); // Transfer only after a successful commit.
         self.repeated_tool = None;
-        self.add_context(&super::hooks::additional(&hook)).await?;
         Ok(true)
     }
     fn reject_input(&mut self, index: usize, reason: String) -> Result<bool, YourAiError> {

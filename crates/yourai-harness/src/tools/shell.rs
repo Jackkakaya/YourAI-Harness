@@ -46,7 +46,7 @@ impl ToolHandler for Shell {
     fn security_context(&self, input: &Value) -> SecurityContext {
         security(self.name(), &self.cwd, input, true)
     }
-    fn execute<'a>(
+    fn run<'a>(
         &'a self,
         tc: ToolContext<'a>,
         input: Value,

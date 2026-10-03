@@ -8,14 +8,15 @@
 SessionHost：管理会话，启动执行，互斥处理手动压缩
     │
     ▼
-DefaultLoop：调用模型、执行工具，判断何时维护上下文
+Execution：调用模型、执行工具，判断何时维护上下文
     │
     ▼
 ContextManager：管理当前上下文及其变更流程
     ├─ restore：恢复
     ├─ append：追加
     ├─ build_request：读取并组装模型请求
-    └─ compact：清理或摘要，保存后更新内存
+    └─ prepare_compaction / CompactionJob：清理或摘要，原子保存
+         ↑ context.compact_with_events：统一 hooks、阶段事件与最终预算验证
          │
          ▼
 SessionManager：读取记录、保存消息、清理标记与摘要事务
@@ -26,23 +27,26 @@ SQLite
 
 | 组件 | 唯一职责 |
 |---|---|
-| DefaultLoop | 控制执行顺序、触发维护、管理执行预算与重试 |
+| Execution / DefaultLoop | 执行公共操作 / 控制执行顺序、触发维护和重试 |
+| context.compact_with_events | 统一维护生命周期、Hook、事件与完成后预算验证 |
 | ContextManager | 决定给模型看什么，并完成上下文变更 |
 | SessionManager | 实现记录读写与事务 |
 
 ContextManager 允许调用 SessionManager，但不实现 SQL、不管理数据库连接。所有修改统一采用“先保存、后更新内存”。Loop 不再手工串联保存、append、reset，也不把 SessionHistory 作为新的顶层组件。
 
-## 2. 四个公共操作
+## 2. 公共操作与实现协议
 
 ```text
 restore()                    从 SessionManager 恢复已提交的活跃上下文
 append(messages)             保存新消息，成功后追加到内存
-build_request(system, tools, execution)  只读组装请求，返回用量估算和预算状态
-compact(options, execution, cancel)     内部完成清理/摘要、提交和内存更新
+build_request(tools, execution)  只读组装请求，返回用量估算和预算状态
+context.compact_with_events(context, options, execution, cancel, hook_timeout, events)
+                             公共维护入口，协调清理/摘要、提交和最终验证
 ```
 
 - ContextManager 绑定 session_id；构造时只装配 SessionManager 和策略。ContextExecution 从本次执行快照取得 model、hooks、usage 和 Hook 基础信息，不在 ContextManager 内保存第二份 Provider 绑定。
-- system/tools 由调用方提供；compact 使用本次请求的 system/tools 和预算配置进行完整请求估算，不能只估算消息。
+- system 使用会话初始化时持久化的固定快照；tools 由本次执行提供。compact 使用同样的 system/tools 和预算配置估算完整请求，不能只估算消息。
+- ContextManager 实现 prepare_compaction，返回 Complete（无需摘要或已完成纯清理）或持锁的 CompactionJob。共享生命周期负责摘要 Hook 和终态校验，自定义实现无需复制 Hook 协议。
 - append 的消息 ID 在调用前确定，失败重试复用同一 ID。
 - restore 用于首次加载和故障恢复；普通 append/compact 成功后不要求调用方再次 restore。
 - prune、选区、候选、分块总结、reset 都是内部步骤，不公开为独立接口。
@@ -63,6 +67,8 @@ CompactionResult
   reason（例如未达阈值、没有可压缩内容、冷却中）
   stop_reason / notices（提交后 Hook 的停止与提示）
   usage（已记账用量，只用于展示，不再次写 UsageTracker）
+  verified / input_budget（最终请求是否成功重建及其预算）
+  summarized_messages / retained_messages / pruned_outputs / model_calls
 ```
 
 compact 返回执行结果，不返回待调用方提交的摘要或消息范围。失败返回错误。内部生成的新摘要可供 PostCompact 使用，不依赖公共返回值暴露。
@@ -79,11 +85,11 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
 
 真实 usage 基线只适用于同模型、同 system/tools、同请求消息前缀；仅追加消息时累加新增估算。模型、system/tools、展示内容或摘要变化后失效。未获得基线时，文本部分按序列化字节数 / 3 向上估算，媒体使用模型适配器估算；不是 provider 的精确 tokenizer。窗口未知时 build_request 明确返回 None，TUI 提示配置，摘要调用报配置错误。
 
-| 配置 | 初版设置 |
+| 配置 | 默认设置 |
 |---|---|
-| compact 内部主动清理阶段 | 默认关闭，启用后可独立满足维护目标，无需调用总结模型 |
-| 近期保留预算 | 目标 20k tokens，受可用窗口限制 |
-| 摘要目标长度 | 默认 2k tokens，可配置 |
+| compact 内部主动清理阶段 | 默认开启，启用后可独立满足维护目标，无需调用总结模型 |
+| 近期保留预算 | 最多最近两轮、目标 8k tokens，受可用窗口限制 |
+| 摘要目标长度 | 默认 2k tokens，同时约束模型输出与本地校验，可配置 |
 | 输出预留 / 安全余量 / 自动摘要提前量 | 4096 / 1024 / 4096 tokens |
 | 单条输出上限 | 16000 字符，含 JSON 包装和读取提示 |
 | 清理门槛 / 最小回收 / 再次增长 | 与自动摘要共用 T / 1024 / 2048 tokens |
@@ -138,13 +144,13 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
     └─ 无须摘要 → 按已完成处理返回 Unchanged / Pruned
 ② PreCompact（仅在实际进入摘要阶段时执行）
 ③ 固定快照，选择保留区和摘要区
-④ 旧摘要 + 选区原文 → 模型总结；必要时按安全边界分批
+④ 旧摘要 + 有界历史记录 + 当前任务锚点 → 结构化交接摘要；必要时按安全边界分批
 ⑤ 校验：非空、未截断、满足节省量、工具配对完整
 ⑥ 调 SessionManager 原子提交摘要变更及需要保留的清理标记
-⑦ 成功后更新内存，触发 PostCompact，返回 Summarized
+⑦ 更新内存、触发 PostCompact，再重建包含 system/tools/hooks 的完整请求并验证预算；返回带 verified/stop_reason 的结果
 ```
 
-来源标识传入摘要 Hook；Hook 由 ContextManager 内部通过注入的 HookRuntime 调用，Loop/Host 不重复触发。清理方案与摘要方案在内存中计算，失败不留下半应用状态；同一次维护若需两类变更，最终合并在一个数据库事务提交。
+来源标识传入摘要 Hook；Hook 由公共 context.compact 包装通过注入的 HookRuntime 调用；ContextManager.prepare_compaction 和 CompactionJob.run 只负责业务准备及提交，Loop/Host 不重复触发。清理方案与摘要方案在内存中计算，失败不留下半应用状态；同一次维护若需两类变更，最终合并在一个数据库事务提交。
 
 ```text
 压缩前：system | 旧摘要 | 较早消息........ | 最近消息.... | 当前执行片段
@@ -155,14 +161,14 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
 
 选区规则：
 
-- 从尾向前保留近期内容，软预算取配置值与 B/3 的较小值；overflow 缩到 B/8，已超过 B 时取消软保留。最新消息始终保护；长 Turn 可在完整工具批次之间切分。
+- 从尾向前按完整工具批次保留最近 keep_recent_turns 轮以内的内容，软预算取 keep_recent_tokens 与 B/3 的较小值；overflow 缩到 B/8，已超过 B 时取消软保留。最新消息始终保护；长 Turn 可在完整工具批次之间切分。
 - system 独立保留，最新真实用户请求和未完成工具批次受保护。
 - assistant 工具调用及全部对应结果不能跨摘要/保留边界。
-- 总结使用选区原文，不只总结被清理的占位内容。
+- 总结从选区原文生成有界历史数据：工具结果使用独立的 2000 字符头尾预览，保留状态、call_id、output_paths；不会把已清理的占位内容作为唯一信息来源。历史调用序列化为数据，不作为可执行的 tool 消息发送。
 - 分批调用共用取消、截止时间、执行预算，滚动摘要最终只提交一次；总结模型报告 overflow 时缩小分批输入预算，单个完整批次仍放不下则报错。
 - 单个不可拆内容超限、多模态内容无法安全处理或摘要无效时返回错误，不提交。
 
-摘要覆盖：任务目标与约束、已确认决定、已完成动作、关键文件与标识、当前进度和剩余工作。
+摘要使用固定章节：Objective、Constraints and preferences、Decisions、Completed work、Active work and blockers、Next steps、Relevant files and references。长 Turn 切分后，保留的最新用户请求作为只读锚点传给总结模型；过期决定应被更新而不是无限追加。
 
 ### 4.4 多模态边界
 
@@ -211,7 +217,7 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
 ④ 宿主展示 Summarized / Unchanged / 错误，释放互斥
 ```
 
-正常执行与手动压缩统一调用 AgentLoop.request_system，使用同样的 system、指令和已选技能。
+正常执行与手动压缩使用同一份会话 system 快照及当前模型和工具定义；维护不重新渲染或追加一份系统提示词。
 
 不先单独清理，不自动续写、不自动消费排队输入。取消、截止时间、调用预算和保护规则仍生效。下一次正常执行重新检查请求预算。
 
@@ -229,13 +235,13 @@ SQLite v2 增加 nullable `messages.tool_output_pruned_at`（UTC 毫秒），启
 - 计算或事务提交失败不应用内存变更；SQL 完成状态不确定时，由 ContextManager 恢复已提交视图后才允许继续。
 - PostCompact 发生在提交之后；其失败或停止请求不回滚已提交摘要。错误需区分提交前失败与提交后停止。
 - ContextManager 通过注入的 UsageTracker 记录已发生且已知的模型用量，包括验证/提交失败；不另存一份上下文用量账本。记账失败不得被当作未发生模型调用或未提交摘要。
-- 摘要调用使用调用方传入的剩余调用额度，失败/取消仍计入已尝试调用；默认手动上限 8 次。Harness 的共享 MeteredModel 同时限制主模型、摘要、Hook 模型和子 Agent。摘要 Hook 单次默认 30 秒，并受整次 compact 截止时间约束。
+- 摘要调用遵守 CompactionRequest.max_model_calls，失败/取消仍计入已尝试调用；默认单次维护上限 8 次。Harness 的共享 MeteredModel 同时限制主模型、摘要、Hook 模型和子 Agent。摘要 Hook 使用调用方配置的 hook_timeout，默认不隐式设限；整次 compact 可设置截止时间。
 - 自动摘要计算失败但原请求在 B 内时，Loop 可按恢复策略继续；持久化状态不确定时必须先恢复。
 - 压缩期间新到的 steer 留在队列，下一个安全点消费。
 
 ## 7. 验收清单
 
-- 四个公共操作分别负责恢复、追加、读取、压缩；调用方不提交候选或手动 reset。
+- 恢复、追加、读取与共享压缩入口职责独立；调用方不提交候选或手动 reset。
 - append 保存成功后更新内存，重试复用消息 ID。
 - build_request 限长不修改原文，结果原文可分页读取。
 - compact 仅清理时返回 Pruned，不调用总结模型、不触发摘要 Hook。
@@ -248,10 +254,33 @@ SQLite v2 增加 nullable `messages.tool_output_pruned_at`（UTC 毫秒），启
 
 ## 8. 实现位置与配置
 
-- `crates/yourai-core/src/context_manager.rs`：四个操作及只读视图/身份查询。
+- `crates/yourai-core/src/context_manager.rs`：上下文操作、维护计划/作业协议及只读视图/身份查询。
 - `crates/yourai-harness/src/context/mod.rs`：装配、串行写入、不确定提交恢复。
 - `crates/yourai-harness/src/context/projection.rs`：请求预算、usage 基线、输出预览。
-- `crates/yourai-harness/src/context/compact.rs`：选区、内部清理、分批摘要、Hook 与提交。
-- `crates/yourai-harness/src/tools/result.rs`：会话范围内的原始工具结果分页读取。
+- `crates/yourai-harness/src/context/compact.rs`：维护计划、分级清理和持锁摘要作业。
+- `crates/yourai-harness/src/context/selection.rs`：近期轮次、完整批次与未完成调用保护。
+- `crates/yourai-harness/src/context/summary.rs` / `summary_prompt.txt`：有界历史数据、结构化滚动摘要、长度验证和原子提交。
+- `crates/yourai-harness/src/context/compaction_lifecycle.rs`：共享阶段事件、hooks、取消与最终请求验证。
+- `crates/yourai-harness/src/runtime/compaction.rs`：手动入口的会话互斥与可中断生命周期。
 
 TUI 使用 JSON 配置；示例见 `yourai.example.json`。模型容量必须在 `provider.*.models.*.limit.context` 或 `limit.input` 中按实际模型填写，输出预留由 `limit.output` / `options.maxOutputTokens` 解析。MemoryContext::memory 仅用于无持久化需求的临时评估 Agent；正式会话通过 ContextServices 注入 SessionManager 和策略，Loop / Host 从当前 ProviderSnapshot 构造 ContextExecution。
+
+## 9. 统一生命周期与展示（2026-10-03）
+
+手动、Threshold、Overflow 共用 `compact_with_events`，静默调用使用同一操作和 DiscardSink。
+阶段通过 `Out::Compaction` 发布 Preparing / Summarizing / Rebuilding，终态为 Finished 或 Failed。
+Finished 包含前后请求估算、input_budget、verified、摘要/保留消息数、清理结果数、模型调用数和 stop_reason。
+纯清理跳过摘要 hooks 与模型调用；摘要及清理仍原子提交。取消导致 future 被丢弃时，生命周期 guard 发终态以清除 UI 的运行状态。
+
+PostCompact 追加内容也计入最终请求预算。摘要已保存之后取消或 hook 失败时，返回已提交且停止续跑的结果；不报告为成功续跑，也不声称回滚。
+提交状态不确定时继续使用 dirty/restore 协议，verified=false，调用方不得继续发送模型请求。
+结构变化后清除 provider usage 校准；摘要是否节省空间用同口径的本地估算比较，前后 UI 数字仍明确标为估算。
+
+手动压缩在发布 Compacting 状态的同一个锁内发布 cancellation token，Esc/close/调用方取消均生效，完成后清除 token。
+自动压缩沿用正在执行的 Turn，不另启 Turn、不重复接纳用户输入，仍受 overflow 重试上限约束。
+TUI 只消费这套事件生成完成提示，进度显示在原状态栏；详细保留/清理计数放在 Ctrl-B。
+事件变化废弃之前启动的统计任务，避免旧快照覆盖新估算；压缩期间不显示过期上下文百分比。
+
+配置新增 `keep_recent_turns`（默认 2）和 `summary_tool_output_chars`（默认 2000）；
+`keep_recent_tokens` 默认 8000，`prune_enabled` 默认 true。可显式关闭清理，历史原文仍持久化保留。
+这套本地 checkpoint 支持通用 ModelProvider；没有假定 provider 支持 Codex 专用远端压缩协议。

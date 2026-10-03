@@ -98,7 +98,7 @@ pub trait SessionRuntime: Send + Sync {
     /// 请求取消当前运行；不清空尚未运行的输入，不等价于完成清理。
     fn interrupt(&self);
 
-    /// 手动压缩，与 Turn 历史写入互斥；ContextManager 内部完成 Hook、提交和内存更新。
+    /// 手动压缩，与 Turn 历史写入互斥；公共压缩包装处理 Hook，ContextManager 的业务计划完成提交和内存更新。
     fn compact<'a>(
         &'a self,
         request: CompactionRequest,

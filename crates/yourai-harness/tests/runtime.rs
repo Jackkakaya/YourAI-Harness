@@ -407,7 +407,7 @@ async fn child_agent_runs_its_own_session_and_reports_lifecycle() {
         sandbox: None,
         interaction: None,
     };
-    let result = tool.execute(tc, json!({"prompt":"do work"})).await.unwrap();
+    let result = tool.run(tc, json!({"prompt":"do work"})).await.unwrap();
     assert_eq!(result["text"], "child result");
     // Completed children are released, not retained.
     assert_eq!(tool.child_ids().len(), 0);
@@ -1522,4 +1522,84 @@ async fn host_rejects_matching_event_with_wrong_hook_outcome() {
         .expect("wrong outcome must fail host startup")
         .to_string()
         .contains("mismatched"));
+}
+
+#[tokio::test]
+async fn interrupt_cancels_manual_compaction_and_releases_operation_ownership() {
+    struct SlowSummary(tokio::sync::Notify);
+    impl ModelProvider for SlowSummary {
+        fn model_iden(&self) -> &str {
+            "slow-summary"
+        }
+        fn complete<'a>(
+            &'a self,
+            _: ModelRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
+            Box::pin(async move {
+                self.0.notify_one();
+                std::future::pending().await
+            })
+        }
+        fn stream_events<'a>(
+            &'a self,
+            _: ModelRequest,
+        ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
+            Box::pin(async { Err(ErrorKind::Config("unused".into()).into()) })
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let model = Arc::new(SlowSummary(tokio::sync::Notify::new()));
+    let h = host(dir.path(), model.clone(), None).await;
+    let store = SqliteStore::open(&dir.path().join("sessions.sqlite3")).unwrap();
+    store
+        .append_messages(
+            &h.context().id,
+            vec![
+                StoredMessage::new(ChatMessage::user("old task ".repeat(500))),
+                StoredMessage::new(ChatMessage::user("latest")),
+            ],
+        )
+        .await
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task_host = h.clone();
+    let task = tokio::spawn(async move {
+        task_host
+            .compact_with_events(
+                CompactionRequest::new(CompactionTrigger::Manual),
+                &CancellationToken::new(),
+                &tx,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), model.0.notified())
+        .await
+        .unwrap();
+    assert_eq!(h.status(), SessionStatus::Compacting);
+    h.interrupt();
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(YourAiError::Aborted(AbortReason::Cancelled))
+    ));
+    assert_eq!(h.status(), SessionStatus::Idle);
+    let mut terminal = 0;
+    while let Ok(out) = rx.try_recv() {
+        if matches!(
+            out,
+            Out::Compaction {
+                event: CompactionEvent::Failed {
+                    committed: false,
+                    ..
+                }
+            }
+        ) {
+            terminal += 1;
+        }
+    }
+    assert_eq!(terminal, 1);
+    h.close(Some(Duration::from_secs(2))).await.unwrap();
 }

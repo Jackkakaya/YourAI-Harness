@@ -202,7 +202,7 @@ impl ToolHandler for Read {
     fn security_context(&self, input: &Value) -> SecurityContext {
         security(self.name(), &self.cwd, input, false)
     }
-    fn execute<'a>(
+    fn run<'a>(
         &'a self,
         tc: ToolContext<'a>,
         input: Value,
@@ -273,7 +273,7 @@ impl ToolHandler for Write {
     fn security_context(&self, input: &Value) -> SecurityContext {
         security(self.name(), &self.cwd, input, true)
     }
-    fn execute<'a>(
+    fn run<'a>(
         &'a self,
         tc: ToolContext<'a>,
         input: Value,
@@ -308,7 +308,7 @@ impl ToolHandler for Edit {
     fn security_context(&self, input: &Value) -> SecurityContext {
         security(self.name(), &self.cwd, input, true)
     }
-    fn execute<'a>(
+    fn run<'a>(
         &'a self,
         tc: ToolContext<'a>,
         input: Value,

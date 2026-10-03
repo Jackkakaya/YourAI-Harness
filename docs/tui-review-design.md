@@ -246,4 +246,4 @@ YourAI 是以开发任务为中心的现代工作台。终端是当前呈现载�
 
 ## 完整草稿与输入接纳重构（2026-09-27）
 
-文本、附件、补全及其异步任务统一归 `ui/draft.rs` 管理；App 只路由事件和提交，Renderer 只读草稿，会话切换移动完整草稿。输入接纳独立到 harness 的 `default_loop/admission.rs`，明确拒绝和可重试失败分流。见 [草稿与输入接纳设计](./draft-admission-design.md) 的职责、生命周期与验证约束。
+文本、附件、补全及其异步任务统一归 `ui/draft.rs` 管理；App 只路由事件和提交，Renderer 只读草稿，会话切换移动完整草稿。输入接纳独立到 harness 的 `execution/admission.rs`，明确拒绝和可重试失败分流。见 [草稿与输入接纳设计](./draft-admission-design.md) 的职责、生命周期与验证约束。

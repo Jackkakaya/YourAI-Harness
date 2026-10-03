@@ -653,13 +653,13 @@ pub enum FailurePolicy {
 /// Hook 运行时接口。
 ///
 /// 实现方在 `yourai-harness::hooks` crate（`ConcreteHookRuntime`）。
-/// Loop 通过此 trait 分发 Hook 调用并消费类型化结果。
+/// 业务操作的框架包装通过此 trait 分发 Hook 调用并消费类型化结果。
 ///
 /// ## 职责边界
 ///
 /// - **HookRuntime 负责**：匹配、执行、超时、取消、解析、校验、聚合
 /// - **HookRuntime 不负责**：修改 ContextManager、执行工具、向用户提问
-/// - **Loop 负责**：消费 `HookDispatchResult`，应用效果到业务流程
+/// - **业务操作包装负责**：消费 `HookDispatchResult`，应用效果到业务流程；Loop 只调度操作
 pub trait HookRuntime: Send + Sync {
     fn subscribe_background(
         &self,

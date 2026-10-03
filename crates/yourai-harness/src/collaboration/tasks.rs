@@ -1,3 +1,5 @@
+mod backend;
+mod operations;
 use crate::{
     error,
     storage::{atomic_write, read_json},
@@ -65,101 +67,6 @@ impl TaskBoard {
         v.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.id.cmp(&b.id)));
         v
     }
-    pub async fn create(
-        &self,
-        subject: String,
-        description: Option<String>,
-        owner: Option<String>,
-    ) -> Result<Task, YourAiError> {
-        let _gate = self.gate.lock().await;
-        let host = self
-            .host
-            .upgrade()
-            .ok_or_else(|| error("tasks", "host gone"))?;
-        let task = Task {
-            id: uuid::Uuid::new_v4().to_string(),
-            subject,
-            description,
-            owner,
-            completed: false,
-            seq: self
-                .seq
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-                .map_err(|_| error("tasks", "task creation sequence exhausted"))?
-                + 1,
-        };
-        let result = host
-            .dispatch(HookEvent::TaskCreated {
-                task_id: task.id.clone(),
-                task_subject: task.subject.clone(),
-                task_description: task.description.clone(),
-                teammate_name: task.owner.clone(),
-                team_name: Some(self.team.clone()),
-            })
-            .await?;
-        host.consume_hook_async(&result, true).await?;
-        let mut tasks = self.tasks.lock().unwrap();
-        let mut next = tasks.clone();
-        next.insert(task.id.clone(), task.clone());
-        atomic_write(&host.dir.join("tasks.json"), &next)?;
-        *tasks = next;
-        self.version.fetch_add(1, Ordering::Relaxed);
-        Ok(task)
-    }
-    pub async fn complete(&self, id: &str) -> Result<(), YourAiError> {
-        let _gate = self.gate.lock().await;
-        let host = self
-            .host
-            .upgrade()
-            .ok_or_else(|| error("tasks", "host gone"))?;
-        let task = self
-            .tasks
-            .lock()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| error("tasks", "unknown task"))?;
-        if task.completed {
-            return Ok(());
-        }
-        let result = host
-            .dispatch(HookEvent::TaskCompleted {
-                task_id: task.id,
-                task_subject: task.subject,
-                task_description: task.description,
-                teammate_name: task.owner,
-                team_name: Some(self.team.clone()),
-            })
-            .await?;
-        host.consume_hook_async(&result, true).await?;
-        let mut tasks = self.tasks.lock().unwrap();
-        let mut next = tasks.clone();
-        next.get_mut(id).unwrap().completed = true;
-        atomic_write(&host.dir.join("tasks.json"), &next)?;
-        *tasks = next;
-        self.version.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-    pub async fn idle(&self, teammate: &str) -> Result<(), YourAiError> {
-        let host = self
-            .host
-            .upgrade()
-            .ok_or_else(|| error("tasks", "host gone"))?;
-        if self
-            .list()
-            .iter()
-            .any(|t| t.owner.as_deref() == Some(teammate) && !t.completed)
-        {
-            return Err(error("tasks", "teammate has unfinished tasks"));
-        }
-        let result = host
-            .dispatch(HookEvent::TeammateIdle {
-                teammate_name: teammate.into(),
-                team_name: self.team.clone(),
-            })
-            .await?;
-        host.consume_hook_async(&result, true).await
-    }
 }
 impl ToolHandler for TaskBoard {
     fn name(&self) -> &str {
@@ -176,7 +83,7 @@ impl ToolHandler for TaskBoard {
             is_network: false,
         }
     }
-    fn execute<'a>(
+    fn run<'a>(
         &'a self,
         _: ToolContext<'a>,
         v: Value,

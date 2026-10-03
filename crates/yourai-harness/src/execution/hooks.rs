@@ -1,4 +1,4 @@
-use super::State;
+use super::ExecutionState;
 use yourai_core::prelude::*;
 
 pub(crate) fn feedback(result: &HookDispatchResult) -> Vec<String> {
@@ -18,7 +18,7 @@ pub(crate) fn additional(result: &HookDispatchResult) -> Vec<String> {
         _ => vec![],
     }
 }
-impl State<'_> {
+impl ExecutionState<'_> {
     pub(crate) fn invocation(&self, event: HookEvent) -> HookInvocation {
         let mut base = BaseInput::new(self.history.session_id().as_str(), "");
         if let Some(session) = &self.tc.info.options.session {

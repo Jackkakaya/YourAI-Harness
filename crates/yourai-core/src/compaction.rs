@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CompactionTrigger {
     Threshold,
     Overflow,
@@ -23,7 +23,11 @@ pub struct ContextPolicy {
     pub safety_margin: u64,
     pub advance_tokens: u64,
     pub keep_recent_tokens: u64,
+    /// Prefer at most this many recent turns, bounded by keep_recent_tokens.
+    pub keep_recent_turns: usize,
     pub summary_tokens: u64,
+    /// Summary input previews have a separate, smaller budget than normal requests.
+    pub summary_tool_output_chars: usize,
     pub tool_output_chars: usize,
     pub prune_enabled: bool,
     pub prune_min_savings: u64,
@@ -38,10 +42,12 @@ impl Default for ContextPolicy {
             output_reserve: 4096,
             safety_margin: 1024,
             advance_tokens: 4096,
-            keep_recent_tokens: 20_000,
+            keep_recent_tokens: 8_000,
+            keep_recent_turns: 2,
             summary_tokens: 2000,
+            summary_tool_output_chars: 2000,
             tool_output_chars: 16_000,
-            prune_enabled: false,
+            prune_enabled: true,
             prune_min_savings: 1024,
             prune_growth: 2048,
             summary_min_savings: 256,
@@ -54,9 +60,10 @@ impl ContextPolicy {
             || self.output_reserve > u32::MAX as u64
             || self.summary_tokens == 0
             || self.tool_output_chars < 256
+            || self.summary_tool_output_chars < 256
             || self.input_budget() == Some(0)
         {
-            return Err(crate::ErrorKind::Config("invalid context policy: require positive output/summary budgets, tool_output_chars >= 256, and nonzero available input".into()).into());
+            return Err(crate::ErrorKind::Config("invalid context policy: require positive output/summary budgets, tool_output_chars and summary_tool_output_chars >= 256, and nonzero available input".into()).into());
         }
         Ok(())
     }
@@ -102,13 +109,13 @@ impl CompactionRequest {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CompactAction {
     Unchanged,
     Pruned,
     Summarized,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompactionResult {
     pub action: CompactAction,
     pub tokens_before: u64,
@@ -119,6 +126,13 @@ pub struct CompactionResult {
     /// Post-commit hooks can stop continuation without undoing committed history.
     pub stop_reason: Option<String>,
     pub notices: Vec<String>,
+    /// True only after rebuilding the request, including post-compact context.
+    pub verified: bool,
+    pub input_budget: Option<u64>,
+    pub summarized_messages: usize,
+    pub retained_messages: usize,
+    pub pruned_outputs: usize,
+    pub model_calls: u32,
 }
 impl CompactionResult {
     pub fn new(action: CompactAction, before: u64, after: u64, reason: impl Into<String>) -> Self {
@@ -130,6 +144,37 @@ impl CompactionResult {
             usage: None,
             stop_reason: None,
             notices: vec![],
+            verified: false,
+            input_budget: None,
+            summarized_messages: 0,
+            retained_messages: 0,
+            pruned_outputs: 0,
+            model_calls: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CompactionPhase {
+    Preparing,
+    Summarizing,
+    Rebuilding,
+}
+
+/// One lifecycle for manual, threshold and overflow maintenance.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum CompactionEvent {
+    Progress {
+        trigger: CompactionTrigger,
+        phase: CompactionPhase,
+    },
+    Finished {
+        trigger: CompactionTrigger,
+        result: CompactionResult,
+    },
+    Failed {
+        trigger: CompactionTrigger,
+        message: String,
+        committed: bool,
+    },
 }
