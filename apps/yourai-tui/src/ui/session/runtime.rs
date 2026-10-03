@@ -20,6 +20,7 @@ pub(super) struct Runtime {
     rx: mpsc::UnboundedReceiver<Out>,
     cancel: CancellationToken,
     driver: Option<JoinHandle<Result<(), YourAiError>>>,
+    resume_after_settle: bool,
     compact: Option<JoinHandle<Option<Usage>>>,
     stats: Option<JoinHandle<Stats>>,
     stats_at: Instant,
@@ -54,6 +55,7 @@ impl Runtime {
             rx,
             cancel: CancellationToken::new(),
             driver: None,
+            resume_after_settle: false,
             compact: None,
             stats: None,
             stats_at: Instant::now() - Duration::from_secs(2),
@@ -81,8 +83,14 @@ impl Runtime {
             .load(std::sync::atomic::Ordering::SeqCst)
             != 0
     }
+    /// Explicit continuation can race the failed driver's final cleanup.
+    pub fn continue_execution(&mut self) {
+        self.resume_after_settle = self.driver.is_some() && self.h.host.last_error().is_some();
+        self.resume();
+    }
     pub fn resume(&mut self) {
         if self.driver.is_none() {
+            self.resume_after_settle = false;
             let host = self.h.host.clone();
             let tx = self.tx.clone();
             let cancel = self.cancel.clone();
@@ -155,12 +163,18 @@ impl Runtime {
                 ),
                 Ok(Err(e)) => view.notice(
                     Level::Error,
-                    format!("Execution failed: {e}. /continue retries pending inputs."),
+                    format!("Execution failed: {e}. /continue resumes queued inputs or continues from saved history."),
                 ),
                 Err(e) => view.notice(Level::Error, format!("Driver failed: {e}")),
                 _ => {}
             }
             view.settle();
+            if self.resume_after_settle {
+                self.resume();
+            }
+        }
+        if self.h.host.last_error().is_none() {
+            self.resume_after_settle = false;
         }
         let active = self.submitting()
             || !matches!(

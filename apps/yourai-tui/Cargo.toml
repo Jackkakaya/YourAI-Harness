@@ -36,4 +36,5 @@ tempfile = "3"
 wildcard_imports = "warn"
 
 [dev-dependencies]
+futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }

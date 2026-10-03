@@ -143,7 +143,10 @@ impl State<'_> {
                 return Err(self.fail_with_partial(
                     ErrorKind::Provider {
                         name: crate::model::MODEL_NAME,
-                        message: "stream ended without terminal event".into(),
+                        message: format!(
+                            "stream ended without terminal event (text_bytes={}, reasoning_bytes={}, tool_call_chunks_seen={saw_tool_chunk}); incomplete tools were not executed",
+                            text.len(), reasoning.len()
+                        ),
                     }
                     .into(),
                     &text,
@@ -216,14 +219,16 @@ impl State<'_> {
                         }
                         self.record_usage(crate::model::usage(u)).await?;
                     }
-                    if matches!(
-                        end.captured_stop_reason,
-                        Some(StopReason::MaxTokens(_) | StopReason::ContentFilter(_))
-                    ) {
+                    if let Some(
+                        reason @ (StopReason::MaxTokens(_) | StopReason::ContentFilter(_)),
+                    ) = &end.captured_stop_reason
+                    {
                         return Err(ErrorKind::Provider {
                             name: crate::model::MODEL_NAME,
-                            message: "model response truncated or filtered; tools will not execute"
-                                .into(),
+                            message: format!(
+                                "model response truncated or filtered; tools will not execute (finish_reason={})",
+                                reason.raw()
+                            ),
                         }
                         .into());
                     }
