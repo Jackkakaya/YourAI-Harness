@@ -1,4 +1,6 @@
+mod branding;
 mod config;
+mod git;
 mod launcher;
 mod models;
 mod picker;
@@ -18,11 +20,32 @@ async fn main() {
     // alternate screen.
     install_panic_hook();
     watch_termination_signals();
-    if let Err(e) = run().await {
-        eprintln!("YourAI: {e}");
-        std::process::exit(1);
+    let result = run().await;
+    let signal = TERMINATED.load(std::sync::atomic::Ordering::Relaxed);
+    match (result, signal) {
+        // A termination signal owns the exit status even when the shutdown
+        // path hit terminal errors on the way out (a dropped SSH tty, say):
+        // callers expect 128+signum, not a generic failure.
+        (_, code) if code != 0 => std::process::exit(code),
+        (Err(e), _) => {
+            eprintln!("YourAI: {e}");
+            std::process::exit(1);
+        }
+        (Ok(()), _) => {}
     }
 }
+
+/// How the process was asked to terminate: 0 = not at all, otherwise the
+/// conventional 128+signum. The UI loop polls this for a graceful shutdown;
+/// `main` turns it into the process exit status.
+pub(crate) static TERMINATED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Wakes the UI loop when a termination signal arrives. `notify_waiters`
+/// only reaches currently-registered waiters, so the loop also re-checks
+/// `TERMINATED` at the top of every iteration — its 100ms tick bounds the
+/// window in which a notification could be missed.
+pub(crate) static SHUTDOWN: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
 
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
@@ -32,8 +55,12 @@ fn install_panic_hook() {
     }));
 }
 
-/// SIGTERM/SIGHUP/SIGQUIT (SSH drop, tmux kill-pane, logout) terminate the
-/// process without running `Drop`, so restore the terminal explicitly first.
+/// SIGTERM/SIGHUP/SIGQUIT (SSH drop, tmux kill-pane, logout) trigger a
+/// graceful shutdown so the session close path (driver join, pending-input
+/// flush, title backfill) runs like a normal quit. If the UI loop cannot
+/// finish within the grace period — it has not started yet, or it is stuck
+/// in the external editor — restore the terminal and exit with the signal's
+/// conventional code.
 fn watch_termination_signals() {
     #[cfg(unix)]
     {
@@ -48,13 +75,16 @@ fn watch_termination_signals() {
             return;
         };
         tokio::spawn(async move {
-            tokio::select! {
-                _ = terminate.recv() => {}
-                _ = hangup.recv() => {}
-                _ = quit.recv() => {}
-            }
+            let code = tokio::select! {
+                _ = terminate.recv() => 128 + libc::SIGTERM,
+                _ = hangup.recv() => 128 + libc::SIGHUP,
+                _ = quit.recv() => 128 + libc::SIGQUIT,
+            };
+            TERMINATED.store(code, std::sync::atomic::Ordering::Relaxed);
+            SHUTDOWN.notify_waiters();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             terminal::restore();
-            std::process::exit(0);
+            std::process::exit(code);
         });
     }
 }
@@ -94,7 +124,7 @@ async fn run() -> Result<(), Error> {
             "--yolo" => yolo = true,
             "--import-json-sessions" => import_json = true,
             "--help" | "-h" => {
-                println!("yourai-tui [--config PATH] [--resume [SESSION_ID]] [--check-config] [--import-json-sessions] [--yolo] [--model PROVIDER/MODEL] [--variant NAME]\n--resume with no ID opens a session picker; Esc starts a fresh session.\nEnter send/reply | Ctrl-J newline | Up/Down·Ctrl-P/N history | Ctrl-A/E/W/U/K line edit | Click tool/thinking to expand | F6 select | Ctrl-O toggle | Ctrl-T todo panel | Ctrl-B stats\nEsc cancel/overlay | Ctrl-Q quit | PgUp/PgDn scroll | Ctrl-End follow | Ctrl-Home latest question | Ctrl-Up/Down browse questions | Ctrl-G YOLO\n/new | /clear (fresh context, saved history retained) | /yolo [on|off] | /queue TEXT | /compact | /continue | /theme NAME | /models | /sessions | /status | /help");
+                println!("yourai-tui [--config PATH] [--resume [SESSION_ID]] [--check-config] [--import-json-sessions] [--yolo] [--model PROVIDER/MODEL] [--variant NAME]\n--resume with no ID opens a session picker; Esc starts a fresh session.\nEnter send/reply | Ctrl-J newline | Up/Down·Ctrl-P/N history | Ctrl-A/E/W/U/K line edit | Click tool/thinking to expand | F6 select | Ctrl-O toggle | Ctrl-T todo panel | Ctrl-B stats\nEsc cancel/overlay | Ctrl-Q quit | PgUp/PgDn scroll | Ctrl-End follow | Ctrl-Home latest question | Ctrl-Up/Down browse questions | Ctrl-G YOLO | F2 cycle recent models | Ctrl-X edit draft in $VISUAL/$EDITOR\n/new | /clear (fresh context, saved history retained) | /yolo [on|off] | /queue TEXT | /compact | /continue | /editor | /theme NAME | /models | /sessions | /status | /help");
                 return Ok(());
             }
             _ => return Err(format!("Unknown argument: {arg}").into()),
@@ -143,7 +173,7 @@ async fn run() -> Result<(), Error> {
     // Bare `--resume` opens the launcher; Esc there falls through to a fresh session.
     if resume.as_ref().is_some_and(|id| id.as_str().is_empty()) {
         let catalog = SessionCatalog::new(&config.session_dir)?;
-        match launcher::pick(&catalog).await? {
+        match launcher::pick(&catalog, config.theme).await? {
             launcher::Choice::Resume(picked) => resume = Some(picked),
             launcher::Choice::New => resume = None,
             launcher::Choice::Quit => return Ok(()),

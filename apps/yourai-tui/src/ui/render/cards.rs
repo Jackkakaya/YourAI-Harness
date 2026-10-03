@@ -35,12 +35,14 @@ pub(super) fn surface_row(
 /// carries the status color; the subject is bright and is the only elidable
 /// span; the right-hand meta always survives intact.
 pub(super) fn tool_title(t: &ToolView, selected: bool, width: usize, tick: u64) -> Line<'static> {
-    let (glyph, color) = match t.status {
+    let failed = t.status == ToolStatus::Failed || t.exit_code.is_some_and(|c| c != 0);
+    let (glyph, color) = match if failed { ToolStatus::Failed } else { t.status } {
         ToolStatus::Running => (spinner_frame(tick).to_string(), ACCENT),
         ToolStatus::Done => ("✓".into(), GREEN),
         ToolStatus::Failed => ("✗".into(), RED),
         ToolStatus::Interrupted => ("■".into(), MUTED),
     };
+    let changed = matches!(t.name.as_str(), "edit" | "write");
     let mut meta = tool_meta(t);
     // Sub-second runs stay silent: "0s" is pure noise on fast tools.
     if let Some(n) = t.seconds.filter(|n| *n > 0) {
@@ -56,8 +58,35 @@ pub(super) fn tool_title(t: &ToolView, selected: bool, width: usize, tick: u64) 
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(t.name.as_str());
     // cursor(2) + glyph+space(2) + ≥2 pad + meta; subject gets the remainder.
-    let budget = width.saturating_sub(6 + meta.width()).max(4);
-    let subject = elide(subject, budget);
+    let action = match t.name.as_str() {
+        "shell" => "$ ",
+        "read" => "Read ",
+        "edit" => "Edit ",
+        "write" => "Write ",
+        "glob" | "grep" | "search" | "websearch" => "Search ",
+        "webfetch" => "Fetch ",
+        _ => "",
+    };
+    let action = if failed {
+        format!("Failed · {action}")
+    } else {
+        action.to_owned()
+    };
+    // Reserve status/meta before the subject, even in very narrow viewports.
+    meta = elide(&meta, width.saturating_sub(10));
+    let budget = width.saturating_sub(6 + meta.width());
+    let subject = if matches!(t.name.as_str(), "read" | "edit" | "write") {
+        if budget > action.width() + 3 {
+            format!(
+                "{action}{}",
+                crate::text::elide_tail(subject, budget - action.width())
+            )
+        } else {
+            crate::text::elide_tail(subject, budget)
+        }
+    } else {
+        elide(&format!("{action}{subject}"), budget)
+    };
     let pad = width
         .saturating_sub(4 + subject.width() + meta.width())
         .max(2);
@@ -70,14 +99,15 @@ pub(super) fn tool_title(t: &ToolView, selected: bool, width: usize, tick: u64) 
         Span::styled(
             subject,
             Style::default()
-                .fg(if t.status == ToolStatus::Running || selected {
+                .fg(if failed {
+                    RED
+                } else if changed || t.status == ToolStatus::Running || selected {
                     TEXT
                 } else {
                     MUTED
                 })
                 .add_modifier(
-                    if selected || t.status == ToolStatus::Running || t.status == ToolStatus::Failed
-                    {
+                    if selected || t.status == ToolStatus::Running || failed || changed {
                         Modifier::BOLD
                     } else {
                         Modifier::empty()
@@ -87,8 +117,10 @@ pub(super) fn tool_title(t: &ToolView, selected: bool, width: usize, tick: u64) 
         Span::raw(" ".repeat(pad)),
         Span::styled(
             meta,
-            if t.status == ToolStatus::Failed || t.exit_code.is_some_and(|code| code != 0) {
+            if failed {
                 Style::default().fg(RED).bold()
+            } else if changed && t.status == ToolStatus::Done {
+                Style::default().fg(GREEN).bold()
             } else {
                 Style::default().fg(MUTED)
             },
@@ -107,7 +139,11 @@ pub(super) fn tool_title_row(
     width: usize,
     tick: u64,
 ) -> Line<'static> {
-    let title = tool_title(t, selected, width, tick);
+    let mut title = tool_title(t, selected, width, tick);
+    title.spans[0] = Span::styled(
+        if expanded { "▾ " } else { "▸ " },
+        Style::default().fg(if selected { ACCENT } else { FAINT }),
+    );
     if block_tool(t, expanded) {
         surface_row(title, width, USER_SURFACE)
     } else {
@@ -557,14 +593,7 @@ pub(super) fn tool_preview(
                     width,
                     prefix,
                 );
-                if out.is_empty() {
-                    lines.extend(wrap_text(
-                        "no output",
-                        Style::default().fg(MUTED),
-                        width,
-                        prefix,
-                    ));
-                }
+                more_hint(lines, start, width);
             }
         }
         "edit" if t.status != ToolStatus::Running => match &t.diff_rows {
