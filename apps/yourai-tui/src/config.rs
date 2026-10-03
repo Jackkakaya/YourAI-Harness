@@ -269,7 +269,17 @@ impl Config {
             .provider
             .get_mut(provider_id)
             .ok_or("Unknown provider")?;
-        let model = provider.models.get_mut(model_key).ok_or("Unknown model")?;
+        // resolve() accepts implicit provider/model entries. Materialize an
+        // in-memory entry only when setting an explicit override for one.
+        let model = if variant.is_none() && keyword.is_some() {
+            provider.models.entry(model_key.to_owned()).or_default()
+        } else {
+            match provider.models.get_mut(model_key) {
+                Some(model) => model,
+                None if variant.is_none() => return Ok(()),
+                None => return Err("Unknown model".into()),
+            }
+        };
         let options = match variant {
             Some(name) => model
                 .variants
@@ -639,6 +649,32 @@ mod tests {
             cfg.effective_effort(id, Some("short")).as_deref(),
             Some("high")
         );
+    }
+    #[test]
+    fn effort_override_materializes_an_undeclared_model_entry() {
+        use crate::models::EffortChoice;
+        let mut cfg = config();
+        let id = "gateway/undeclared";
+        cfg.model = id.to_string();
+        cfg.resolve(None).unwrap();
+        // Restoring defaults requires no synthetic entry. An invalid variant
+        // must also leave the model table unchanged.
+        cfg.set_entry_effort(id, None, &EffortChoice::Config)
+            .unwrap();
+        assert!(!cfg.provider["gateway"].models.contains_key("undeclared"));
+        assert!(cfg
+            .set_entry_effort(id, Some("missing"), &EffortChoice::Set("high".into()))
+            .is_err());
+        assert!(!cfg.provider["gateway"].models.contains_key("undeclared"));
+        cfg.set_entry_effort(id, None, &EffortChoice::Set("high".into()))
+            .unwrap();
+        assert_eq!(cfg.effective_effort(id, None).as_deref(), Some("high"));
+        cfg.resolve(None).unwrap();
+        // Config restores the absent hint; the in-memory entry stays valid.
+        cfg.set_entry_effort(id, None, &EffortChoice::Config)
+            .unwrap();
+        assert_eq!(cfg.effective_effort(id, None), None);
+        cfg.resolve(None).unwrap();
     }
     #[tokio::test]
     async fn minimal_gateway_config_uses_model_name_and_default_prompt() {

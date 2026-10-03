@@ -84,12 +84,35 @@ with tempfile.TemporaryDirectory() as tmp:
                 if b'\x1b[6n' in data:
                     os.write(master, b'\x1b[1;1R')
 
+    def wait_for_switch(needle):
+        # Wait for the local operation, then force a complete repaint:
+        # sparse cell updates do not contain the whole notice as raw text.
+        time.sleep(0.5)
+        captured.clear()
+        rows, columns, _, _ = struct.unpack('HHHH', fcntl.ioctl(slave, termios.TIOCGWINSZ, bytes(8)))
+        columns = 100 if columns == 120 else 120
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
+        os.kill(child.pid, signal.SIGWINCH)
+        wait_for(needle)
+
     try:
         wait_for(b'New session')
         os.write(master, b'/models\r')
         wait_for(b'Models')
+        # Enter drills into the effort picker; a second Enter confirms the
+        # preselected level and switches.
         os.write(master, b'\r')
-        wait_for(b'Model switched to mock/smoke')
+        wait_for(b'config default')
+        os.write(master, b'\r')
+        wait_for_switch(b'Model switched to mock/smoke')
+        # Effort also works for the valid implicit model (models is empty).
+        captured.clear()
+        os.write(master, b'/models\r')
+        wait_for(b'Enter effort')
+        os.write(master, b'\r')
+        wait_for(b'config default')
+        os.write(master, b'\x1b[B' * 5 + b'\r')  # config default -> high
+        wait_for_switch('Model switched to mock/smoke · thinking high'.encode())
         captured.clear()
         # Open a dashboard while work is in flight. Text and Esc belong to it.
         os.write(master, b'after stats\r\x02')
@@ -100,6 +123,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert len(requests) == 1
         assert 'after stats' in json.dumps(requests[0][1])
         assert 'LEAK' not in json.dumps(requests[0][1])
+        assert requests[0][1].get('reasoning_effort') == 'high'
         db = sqlite3.connect(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3')
         db_path = Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3'
         # Local commands must reset the actual model context, retain old sessions,
@@ -112,6 +136,13 @@ with tempfile.TemporaryDirectory() as tmp:
         captured.clear()
         # /new is idle-guarded; the 'after stats' turn must be fully settled.
         wait_completed(db_path, 'main', 1)
+        os.write(master, b'/models\r')
+        wait_for(b'Enter effort')
+        os.write(master, b'\r')
+        wait_for(b'config default')
+        os.write(master, b'\x1b[A' * 5 + b'\r')  # high -> config default
+        wait_for_switch(b'Model switched to mock/smoke')
+        captured.clear()
         os.write(master, b'/new\r')
         wait_for(b'Session ready')
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before_new + 1
@@ -125,6 +156,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert 'after stats' not in json.dumps(requests[-1][1])
         assert 'fresh context' in json.dumps(requests[-1][1])
         assert '/new' not in json.dumps(requests[-1][1])
+        assert 'reasoning_effort' not in requests[-1][1], 'config default must clear the implicit model override'
         captured.clear()
         wait_completed(db_path, 'main', 2)
         os.write(master, b'/clear\r')
@@ -180,7 +212,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert wait_exit(child, master) == 0
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before
         db.close()
-        print('PASS: default model picker -> running dashboard Esc isolation -> new/clear context + runtime YOLO -> confirmed deletion -> 35-column stats -> launcher Ctrl-Q')
+        print('PASS: implicit model + effort/default -> running dashboard Esc isolation -> new/clear context + runtime YOLO -> confirmed deletion -> 35-column stats -> launcher Ctrl-Q')
     finally:
         if child.poll() is None:
             child.kill()

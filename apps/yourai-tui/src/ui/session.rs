@@ -340,7 +340,7 @@ impl Controller {
                     view.notice(Level::Info, message);
                     // Model-level changes also affect variants inheriting its effort.
                     if let Ok(config) = self.config.lock() {
-                        view.model_choices = crate::models::model_choices(&config);
+                        view.replace_model_choices(crate::models::model_choices(&config));
                     }
                     view.touch_model(&selected.label);
                     view.model = selected;
