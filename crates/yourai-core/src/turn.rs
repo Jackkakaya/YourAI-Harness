@@ -47,6 +47,13 @@ pub struct TurnLimits {
     pub hook_timeout: Option<Duration>,
 }
 
+/// Input admission settings captured once per turn.
+#[derive(Debug, Clone, Default)]
+pub struct InputOptions {
+    pub skill_ids: Vec<String>,
+    pub memory_search_limit: usize,
+}
+
 /// 宿主交给 Agent 的单次执行参数。
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -55,6 +62,7 @@ pub struct TurnOptions {
     pub session: Option<Arc<SessionContext>>,
     pub limits: TurnLimits,
     pub events: Option<Arc<crate::runtime_event::RuntimeEvents>>,
+    pub input: Option<InputOptions>,
 }
 
 /// 启动时确定的元数据，Loop 不从可变的全局环境猜测会话身份。

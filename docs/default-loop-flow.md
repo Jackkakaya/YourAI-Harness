@@ -1,6 +1,6 @@
 # DefaultLoop 完整执行流程与组件设计入口
 
-> ContextManager 内部完成提交协调与摘要 Hook；SessionManager 负责 SQLite 读写和事务。职责见 [存储设计](./session-storage-design.md)。
+> ContextManager 完成提交协调；公共 context.compact 完成摘要 Hook；SessionManager 负责 SQLite 读写和事务。职责见 [存储设计](./session-storage-design.md)。
 
 记录日期：2026-09-18。
 
@@ -8,13 +8,13 @@
 
 实际模块、配置、保证边界与测试见 [DefaultLoop 实现](./default-loop-implementation.md)。本文保留完整目标流程，已落地范围以实现文档为准。
 
-ContextManager 的接口与维护流程见 [压缩算法设计](./context-manager-design.md)：Loop/Host 调 compact 后接收执行结果，工具清理、摘要、持久化协调及摘要 Hook 均在内部完成。已移除 SessionHistory；图中摘要子流程属于 ContextManager。
+ContextManager 的接口与维护流程见 [压缩算法设计](./context-manager-design.md)：Loop/Host 调 compact 后接收执行结果，ContextManager 的业务计划负责摘要与持久化；公共 context.compact 包装负责摘要 Hook。已移除 SessionHistory；图中摘要子流程属于 ContextManager。
 
 已落地的接口及 Rust API 变更见 [Core 组件接口契约](./core-contracts.md)。图中的业务行为是各组件的设计契约。
 
 本文保存会话宿主、DefaultLoop、工具执行和 Hook 的完整协作流程，作为后续逐图设计组件的依据。图中的组件名是职责名称，不代表现在已经存在对应的 struct 或 crate，也不要求每个内部模块都成为可替换 Provider。
 
-`Harness::open` 提供统一装配入口；`SessionHost` 实现 SessionRuntime。Loop 接入 12 个 Hook，宿主与扩展接入另外 15 个。实际组件与逐图验证见 [Runtime 实现与验收](./runtime-implementation.md)。
+`Harness::open` 提供统一装配入口；`SessionHost` 实现 SessionRuntime。公共 execution 接入 10 个事件，ContextManager 接入 2 个，宿主与扩展接入另外 16 个。DefaultLoop 只调度公共操作，原图中的“Loop 工具执行”属于公共执行层。实际组件与逐图验证见 [Runtime 实现与验收](./runtime-implementation.md)。
 
 ## 阅读导航
 
@@ -26,7 +26,7 @@ ContextManager 的接口与维护流程见 [压缩算法设计](./context-manage
 - [图 4：外部事件与扩展模块](#flow-extensions)
 - [图 5：Hook 注册、执行与结果消费](#flow-hooks)
 - [消息、队列与统一控制规则](#messages-control)
-- [27 个 Hook 覆盖表](#hook-coverage)
+- [28 个 Hook 覆盖表](#hook-coverage)
 - [逐图组件设计清单](#component-design)
 
 <a id="boundaries"></a>
@@ -266,10 +266,10 @@ DefaultLoop
                      +-- 是                      |        |
                           |                      |        |
                           v                      |        |
-                   ContextManager.compact()      |        |
+                   ContextManager.prepare_compaction()
                           |                      |        |
-                          +-- 内部清理            |        |
-                          +-- 需要摘要时：        |        |
+                          +-- Complete: 内部清理  |        |
+                          +-- Summary: 需要摘要时 │        |
                           |    PreCompact         |        |
                           |    选区 → 分批摘要    |        |
                           +-- 单事务保存 → 内存更新       |
@@ -441,7 +441,7 @@ Out::ToolStarted
     +-- 允许 ----------------------+                      |
                                    |                      |
                                    v                      v
-                         ToolHandler.execute     [Hook: PermissionDenied]
+                         ToolHandler.run     [Hook: PermissionDenied]
                                    |                      |
                          内部策略 / Sandbox      有限重审或生成拒绝结果
                                    |                      |
@@ -693,18 +693,18 @@ inbox（Loop 独占消费）
 会话宿主的单次驱动入口为 run_next；返回报告前须把 pending 移回宿主队列并清空报告中的 pending，避免前端重复续跑。外层驱动再次调用 run_next 处理 follow-up。详见接口契约文档。
 
 <a id="hook-coverage"></a>
-## 27 个 Hook 覆盖表
+## 28 个 Hook 覆盖表
 
 | 位置 | Hook | 数量 |
 |---|---|---:|
-| 图 1：会话 | `SessionStart`、`SessionEnd` | 2 |
+| 图 1：会话 | `SessionStart`、`SessionEnd`、`TurnCompleted` | 3 |
 | 图 2：输入、压缩、结束 | `UserPromptSubmit`、`PreCompact`、`PostCompact`、`Stop`、`StopFailure` | 5 |
 | 图 3：工具与权限 | `PreToolUse`、`PostToolUse`、`PostToolUseFailure`、`PermissionRequest`、`PermissionDenied` | 5 |
 | 图 3：MCP | `Elicitation`、`ElicitationResult` | 2 |
 | 图 4：初始化、指令、通知 | `Setup`、`InstructionsLoaded`、`Notification` | 3 |
 | 图 4：工作区与配置 | `ConfigChange`、`CwdChanged`、`FileChanged`、`WorktreeCreate`、`WorktreeRemove` | 5 |
 | 图 4：子 Agent 与协作 | `SubagentStart`、`SubagentStop`、`TaskCreated`、`TaskCompleted`、`TeammateIdle` | 5 |
-| 合计 | 与当前 HookEventKind 的事件集合对应 | 27 |
+| 合计 | 与当前 HookEventKind 的事件集合对应 | 28 |
 
 图 5 是上述每次 Hook 调用共用的执行过程，不新增事件类型。
 
@@ -732,7 +732,7 @@ inbox（Loop 独占消费）
 - [Core 运行机制](../crates/yourai-core/src/context.rs)：当前 Agent、TurnContext、TurnHandle、快照和通道实现。
 - [ContextManager 接口](../crates/yourai-core/src/context_manager.rs)：当前历史与压缩接口。
 - [工具接口](../crates/yourai-core/src/tool.rs)：当前 ToolContext、ToolHandler、ToolRegistry。
-- [Hook 类型与接口](../crates/yourai-core/src/hooks.rs)：当前 27 个事件及结果类型。
+- [Hook 类型与接口](../crates/yourai-core/src/hooks.rs)：当前 28 个事件及结果类型。
 - [消息协议](../crates/yourai-core/src/protocol.rs)：当前 `In` / `Out` 词汇。
 
 本文约束完整流程；默认策略、实际组件与保证边界见 [Runtime 实现与验收](./runtime-implementation.md)。

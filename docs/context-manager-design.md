@@ -144,7 +144,7 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
 ⑦ 成功后更新内存，触发 PostCompact，返回 Summarized
 ```
 
-来源标识传入摘要 Hook；Hook 由 ContextManager 内部通过注入的 HookRuntime 调用，Loop/Host 不重复触发。清理方案与摘要方案在内存中计算，失败不留下半应用状态；同一次维护若需两类变更，最终合并在一个数据库事务提交。
+来源标识传入摘要 Hook；Hook 由公共 context.compact 包装通过注入的 HookRuntime 调用；ContextManager.prepare_compaction 和 CompactionJob.run 只负责业务准备及提交，Loop/Host 不重复触发。清理方案与摘要方案在内存中计算，失败不留下半应用状态；同一次维护若需两类变更，最终合并在一个数据库事务提交。
 
 ```text
 压缩前：system | 旧摘要 | 较早消息........ | 最近消息.... | 当前执行片段
@@ -206,7 +206,7 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
 ① 前端把请求交给 SessionHost
 ② 宿主尝试取得会话执行互斥
     ├─ 正在执行 Turn / 另一次压缩 → 返回 Busy
-    └─ 空闲 → 调 ContextManager.compact(Manual)
+    └─ 空闲 → 走公共 compact 包装（ContextManager.prepare_compaction）
 ③ 内部忽略自动阈值与自动冷却，执行摘要流程
 ④ 宿主展示 Summarized / Unchanged / 错误，释放互斥
 ```

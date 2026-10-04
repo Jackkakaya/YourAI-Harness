@@ -653,13 +653,13 @@ pub enum FailurePolicy {
 /// Hook 运行时接口。
 ///
 /// 实现方在 `yourai-harness::hooks` crate（`ConcreteHookRuntime`）。
-/// Loop 通过此 trait 分发 Hook 调用并消费类型化结果。
+/// 业务操作的框架包装通过此 trait 分发 Hook 调用并消费类型化结果。
 ///
 /// ## 职责边界
 ///
 /// - **HookRuntime 负责**：匹配、执行、超时、取消、解析、校验、聚合
 /// - **HookRuntime 不负责**：修改 ContextManager、执行工具、向用户提问
-/// - **Loop 负责**：消费 `HookDispatchResult`，应用效果到业务流程
+/// - **业务操作包装负责**：消费 `HookDispatchResult`，应用效果到业务流程；Loop 只调度操作
 pub trait HookRuntime: Send + Sync {
     fn subscribe_background(
         &self,
@@ -767,6 +767,30 @@ pub enum HookOutput {
     /// Handler 已转入后台执行。
     Backgrounded { task_id: String },
 }
+
+// region:    --- 宿主回调（core 操作模板的注入点） ---
+
+/// Host-side callbacks for core-owned operation templates.
+///
+/// 运行时宿主实现本 trait：`dispatch_hook` 用宿主的 hook runtime 派发事件；
+/// `consume_hook_result` 应用结果（阻断语义 + 通知/附加上下文进入宿主事件队列）。
+/// core 公共操作模板（任务、工作区等）通过它把 hook 结果交还宿主；
+/// 模板自身固定事件顺序与各操作的 `deny_block` 语义。
+pub trait HookHost: Send + Sync {
+    /// Dispatch one hook event with the host's hook runtime and timeout.
+    fn dispatch_hook(
+        &self,
+        event: HookEvent,
+    ) -> BoxFuture<'_, Result<HookDispatchResult, YourAiError>>;
+    /// Consume a dispatch result; `deny_block` marks operations whose
+    /// blocking errors abort the call site.
+    fn consume_hook_result<'a>(
+        &'a self,
+        result: &'a HookDispatchResult,
+        deny_block: bool,
+    ) -> BoxFuture<'a, Result<(), YourAiError>>;
+}
+// endregion: --- 宿主回调（core 操作模板的注入点） ---
 
 #[cfg(test)]
 mod tests {

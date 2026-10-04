@@ -352,7 +352,7 @@ async fn compaction_and_retry_are_bounded_and_do_not_repeat_user_history() {
             .iter()
             .filter(|k| **k == HookEventKind::PostCompact)
             .count(),
-        0
+        2 // Replacement ContextManager summaries use the common hook wrapper too.
     );
 }
 #[tokio::test]
@@ -1366,7 +1366,7 @@ async fn cancelled_tool_can_finish_within_grace_and_preserves_actual_result() {
                 is_network: false,
             }
         }
-        fn execute<'a>(
+        fn run<'a>(
             &'a self,
             tc: ToolContext<'a>,
             _: serde_json::Value,

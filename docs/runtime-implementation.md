@@ -2,7 +2,7 @@
 
 > 后续架构决定：默认由统一用户级 Server 持有和驱动会话，所有前端连接该服务，按 `session_id` 复用宿主并同步状态。尚未实现；当前 TUI 仍在进程内创建宿主。详见 [默认共享 Server 决定](./architecture.md#已确定的后续方向默认共享-server2026-10-01)。
 
-> 会话记录使用 SQLite；ContextManager 内部完成消息提交、工具清理、摘要 Hook 和模型视图更新。详见 [存储设计](./session-storage-design.md) 与 [ContextManager 设计](./context-manager-design.md)。
+> 会话记录使用 SQLite；ContextManager 完成消息提交和模型视图更新，公共 context.compact 处理摘要 Hook，公共工具操作处理未结调用清理。详见 [存储设计](./session-storage-design.md) 与 [ContextManager 设计](./context-manager-design.md)。
 
 `default-loop-flow.md` 的五张图现在统一实现在 `yourai-harness` 中，入口为 `yourai_harness::Harness::open`；`yourai-core` 仅保留协议、Provider 接口和 turn 运输机制，不反向依赖具体实现。
 
@@ -10,9 +10,9 @@
 
 | 图 | 实现 | 验证 |
 |---|---|---|
-| 1 会话宿主 | `crates/yourai-harness/src/runtime/mod.rs`：SessionHost；创建、恢复、队列、串行执行、serve 驱动、关闭、后台唤醒 | runtime 测试：队列恢复、驱动取消、并发关闭、跨会话事件隔离 |
-| 2 主循环与 compact | `crates/yourai-harness/src/default_loop/`；`crates/yourai-harness/src/context/` | loop 测试：压缩调度、限制、重试与收尾；runtime/context 测试：真实摘要、完整归档、手动压缩 |
-| 3 工具、审批、MCP | `crates/yourai-harness/src/default_loop/{tools,interaction}.rs`；Harness 的 ToolSet 与 PolicySecurity | loop 测试：参数重检、审批、MCP、批次中断；runtime 测试：权限持久化、完整 tasks 调用 |
+| 1 会话宿主 | `runtime/mod.rs`：SessionHost 业务；`runtime/lifecycle.rs`：会话生命周期包装 | runtime 测试：队列恢复、驱动取消、并发关闭、跨会话事件隔离 |
+| 2 主循环与 compact | `default_loop/`：调度；`execution/`：共享执行；`context/`：规划/业务及摘要生命周期包装 | loop 测试：压缩调度、限制、重试与收尾；runtime/context 测试：真实摘要、完整归档、手动与自定义调度压缩 |
+| 3 工具、审批、MCP | `execution/{tools,interaction}.rs`；Harness 的 ToolSet 与 PolicySecurity | loop/execution 测试：参数重检、审批、MCP、批次中断；runtime 测试：权限持久化、完整 tasks 调用 |
 | 4 扩展 | `crates/yourai-harness/src/{workspace,collaboration,memory,skills}/` | runtime 测试：Git worktree、配置恢复、任务状态、独立子会话 |
 | 5 Hook | `crates/yourai-harness/src/hooks/`；`assembly/model_hooks.rs` 模型执行器 | Hook、Loop 与 runtime 测试：注册、匹配、聚合、agent Hook、后台唤醒、关闭进程 |
 
@@ -23,7 +23,7 @@
 ```text
 Harness::open(config, model)
   +-- SessionCatalog + MemoryContext + SessionHost
-  +-- DefaultLoop + ToolSet + PolicySecurity
+  +-- AgentLoop + 公共 execution + ToolSet + PolicySecurity
   +-- ConcreteHookRuntime + DefaultHookModelExecutor
   +-- MeteredModel / ModelBudget
   +-- LocalUsage
@@ -66,16 +66,18 @@ Workspace 执行指令读取、通知、候选配置验证、工作目录切换�
 
 TaskBoard 持久化任务，完成前允许 TaskCompleted 阻止；队友有未完成任务时不得报告 idle。SubagentTool 创建独立宿主和 Loop，转发输出与交互；SubagentStop 可要求有界继续，取消和关闭传播到子会话。
 
+Workspace、TaskBoard 和 SubagentTool 的 operations 模块持有 Hook 包装，backend 模块只实现私有业务动作。会话 lifecycle 模块和上下文 compaction_lifecycle 模块同样隔离结果消费。公共入口与自定义 Loop 的关系见 [公共执行层](./execution.md)。
+
 RuntimeEvents 按 ID 去重，运行中在 Loop 检查点消费。空闲时的 asyncRewake 在宿主允许的情况下生成 follow-up，由 serve 或外层驱动执行。普通通知不自动启动模型；后台结果按 session_id 路由。
 
-## 27 个 Hook 的调用方
+## 28 个 Hook 的调用方
 
 | 调用方 | Hook |
 |---|---|
-| SessionHost | SessionStart、SessionEnd |
-| ContextManager | PreCompact、PostCompact（自动/overflow/手动共用） |
-| DefaultLoop | UserPromptSubmit、Stop、StopFailure |
-| tools / interaction | PreToolUse、PostToolUse、PostToolUseFailure、PermissionRequest、PermissionDenied、Elicitation、ElicitationResult |
+| SessionHost | SessionStart、SessionEnd、TurnCompleted |
+| 公共 context.compact | PreCompact、PostCompact（自动/overflow/手动共用） |
+| 公共 execution 完成、输入和模型入口 | UserPromptSubmit、Stop、StopFailure |
+| 公共 execution 工具、审批和交互入口 | PreToolUse、PostToolUse、PostToolUseFailure、PermissionRequest、PermissionDenied、Elicitation、ElicitationResult |
 | Workspace | Setup、InstructionsLoaded、Notification、ConfigChange、CwdChanged、FileChanged、WorktreeCreate、WorktreeRemove |
 | SubagentTool | SubagentStart、SubagentStop |
 | TaskBoard | TaskCreated、TaskCompleted、TeammateIdle |

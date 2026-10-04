@@ -333,21 +333,34 @@ impl ContextManager for MemoryContext {
             maintenance_needed,
         })
     }
-    fn compact<'a>(
+    fn prepare_compaction<'a>(
         &'a self,
-        options: CompactionRequest,
+        options: &'a CompactionRequest,
+        execution: &'a ContextExecution,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
+        Box::pin(async move { self.prepare(options, execution, cancel).await })
+    }
+}
+
+impl MemoryContext {
+    /// Convenience forwarding to the fixed public operation in
+    /// [`yourai_core::context_manager::compact`], shared with every
+    /// replacement ContextManager.
+    pub fn compact<'a>(
+        &'a self,
+        request: CompactionRequest,
         execution: &'a ContextExecution,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>> {
-        Box::pin(async move {
-            let deadline = options.deadline;
-            let committed = AtomicBool::new(false);
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => if committed.load(Ordering::Acquire) { Err(error("compact", "summary committed; cancelled during PostCompact")) } else { Err(AbortReason::Cancelled.into()) },
-                _ = crate::time::sleep_until(deadline) => if committed.load(Ordering::Acquire) { Err(error("compact", "summary committed; deadline exceeded during PostCompact")) } else { Err(AbortReason::DeadlineExceeded.into()) },
-                result = self.maintain(options, execution, cancel, &committed) => result
-            }
-        })
+        Box::pin(crate::context::compact(
+            self,
+            request,
+            execution,
+            cancel,
+            self.services.hook_timeout,
+        ))
     }
 }
+/// Fixed public compaction operation; the hook lifecycle lives in core.
+pub use yourai_core::context_manager::compact;

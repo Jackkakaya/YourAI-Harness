@@ -52,11 +52,13 @@
 
 pub mod agent_loop;
 pub mod compaction;
+pub mod completion;
 pub mod context;
 pub mod context_manager;
 pub mod error;
 pub mod future;
 pub mod hooks;
+pub mod inputs;
 pub mod interaction;
 pub mod memory;
 pub mod model;
@@ -66,12 +68,16 @@ pub mod runtime_event;
 pub mod sandbox;
 pub mod security;
 pub mod session;
+pub mod session_ops;
 pub mod session_runtime;
 pub mod skill;
+pub mod subagent;
+pub mod tasks;
 pub mod tool;
 pub mod turn;
 pub mod ui;
 pub mod usage;
+pub mod workspace;
 
 /// genai 类型 re-export（决策 5.6）：下游一律写 `yourai_core::chat::Xxx`
 pub mod chat {
@@ -95,26 +101,31 @@ pub mod prelude {
     pub use crate::compaction::{
         CompactAction, CompactionRequest, CompactionResult, CompactionTrigger, ContextPolicy,
     };
+    pub use crate::completion::{Completion, CompletionOperation};
     pub use crate::context::{
         Agent, AgentBuilder, Context, ProviderSnapshot, TurnContext, TurnHandle,
     };
-    pub use crate::context_manager::{ContextExecution, ContextManager, ContextRequest};
+    pub use crate::context_manager::{
+        compact, CompactionCommit, CompactionJob, CompactionPlan, ContextExecution, ContextManager,
+        ContextRequest,
+    };
     pub use crate::error::{AbortReason, ErrorKind, YourAiError};
     pub use crate::future::BoxFuture;
     pub use crate::hooks::{
         BaseInput, FailurePolicy, HookBlockingError, HookCommonOutcome, HookDispatchResult,
-        HookEvent, HookEventKind, HookHandler, HookInvocation, HookMessage, HookMessageKind,
-        HookOutput, HookPermission, HookPointOutcome, HookRegistry, HookRun, HookRunStatus,
-        HookRuntime, HookSource, NativeHookRegistration,
+        HookEvent, HookEventKind, HookHandler, HookHost, HookInvocation, HookMessage,
+        HookMessageKind, HookOutput, HookPermission, HookPointOutcome, HookRegistry, HookRun,
+        HookRunStatus, HookRuntime, HookSource, NativeHookRegistration,
     };
+    pub use crate::inputs::InputOperation;
     pub use crate::interaction::{InteractionKind, InteractionRequest, ToolInteraction};
     pub use crate::memory::{
         CompletedMemoryTurn, MemoryEntry, MemoryManager, MemoryProvider, MemorySession,
         RecallRequest, RecalledMemory,
     };
     pub use crate::model::{
-        ModelErrorClass, ModelEventStream, ModelProvider, ModelRecovery, ModelRequest,
-        ModelTimeouts,
+        ModelErrorClass, ModelEventStream, ModelOperation, ModelOptions, ModelOutput,
+        ModelProvider, ModelRecovery, ModelRequest, ModelTimeouts,
     };
     pub use crate::observability::{ObservabilityProvider, Span};
     pub use crate::protocol::{
@@ -128,12 +139,19 @@ pub mod prelude {
         CompactionChange, ContextChange, MessagePage, MessageQuery, MessageStatus,
         RequestObservation, SessionId, SessionManager, SessionMeta, StoredMessage,
     };
+    pub use crate::session_ops::{session_end, session_start, turn_completed, SessionStartSink};
     pub use crate::session_runtime::{
         InputRejected, SessionContext, SessionRuntime, SessionStatus, SessionTurn,
     };
     pub use crate::skill::{SkillContent, SkillInfo, SkillProvider};
-    pub use crate::tool::{ToolContext, ToolHandler, ToolRegistry};
-    pub use crate::turn::{TurnId, TurnInfo, TurnLimits, TurnOptions};
+    pub use crate::tasks::{
+        complete_task, create_task, teammate_idle, Task, TaskBoardProvider, TaskCompletePlan,
+        TaskCreatePlan,
+    };
+    pub use crate::tool::{
+        ExecutedTool, ToolBinding, ToolContext, ToolHandler, ToolOperation, ToolRegistry,
+    };
+    pub use crate::turn::{InputOptions, TurnId, TurnInfo, TurnLimits, TurnOptions};
     pub use crate::ui::OutSink;
     pub use crate::usage::{UsageEvent, UsageStats, UsageTracker};
 }

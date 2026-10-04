@@ -20,6 +20,8 @@ pub struct History {
     pub id: SessionId,
     pub messages: Mutex<Vec<ChatMessage>>,
     pub compactions: Mutex<Vec<CompactionTrigger>>,
+    pub summary_instructions: Mutex<Vec<Option<String>>>,
+    pub compaction_action: Mutex<Option<CompactAction>>,
     pub tokens: AtomicU64,
     pub append_failures: AtomicU64,
     pub usage: Mutex<Vec<Usage>>,
@@ -35,7 +37,7 @@ impl ContextManager for History {
         Box::pin(async move {
             if self
                 .append_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 return Err(ErrorKind::Provider {
@@ -85,15 +87,54 @@ impl ContextManager for History {
             maintenance_needed: self.tokens.load(Ordering::SeqCst) >= 80,
         })
     }
-    fn compact<'a>(
+    fn prepare_compaction<'a>(
         &'a self,
+        req: &'a CompactionRequest,
+        _: &'a ContextExecution,
+        _: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
+        Box::pin(async move {
+            let action = *self.compaction_action.lock().unwrap();
+            if let Some(action @ (CompactAction::Unchanged | CompactAction::Pruned)) = action {
+                self.compactions.lock().unwrap().push(req.trigger);
+                let before = self.tokens.load(Ordering::SeqCst);
+                let after = if action == CompactAction::Pruned {
+                    self.tokens.store(1, Ordering::SeqCst);
+                    1
+                } else {
+                    before
+                };
+                return Ok(CompactionPlan::Complete(CompactionResult::new(
+                    action,
+                    before,
+                    after,
+                    "no summary",
+                )));
+            }
+            Ok(CompactionPlan::Summary(Box::new(HistorySummary(self))))
+        })
+    }
+}
+struct HistorySummary<'a>(&'a History);
+impl CompactionJob for HistorySummary<'_> {
+    fn run<'a>(
+        self: Box<Self>,
         req: CompactionRequest,
         _: &'a ContextExecution,
         _: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>> {
+        committed: &'a std::sync::atomic::AtomicBool,
+    ) -> BoxFuture<'a, Result<CompactionCommit, YourAiError>>
+    where
+        Self: 'a,
+    {
         Box::pin(async move {
-            self.compactions.lock().unwrap().push(req.trigger);
-            let before = self.tokens.swap(1, Ordering::SeqCst);
+            self.0
+                .summary_instructions
+                .lock()
+                .unwrap()
+                .push(req.custom_instructions.clone());
+            self.0.compactions.lock().unwrap().push(req.trigger);
+            let before = self.0.tokens.swap(1, Ordering::SeqCst);
             req.calls.fetch_add(1, Ordering::SeqCst);
             req.usage.lock().unwrap().push(GenaiUsage {
                 prompt_tokens: Some(3),
@@ -108,10 +149,15 @@ impl ContextManager for History {
                 output_tokens: 1,
                 total_tokens: 4,
             });
-            Ok(r)
+            committed.store(true, Ordering::Release);
+            Ok(CompactionCommit {
+                result: r,
+                summary: "test summary".into(),
+            })
         })
     }
 }
+
 pub struct Model {
     pub steps: Mutex<VecDeque<ModelEventStream>>,
     pub requests: Mutex<Vec<ModelRequest>>,
@@ -245,7 +291,7 @@ impl ToolHandler for Handler {
             is_network: false,
         }
     }
-    fn execute<'a>(
+    fn run<'a>(
         &'a self,
         tc: ToolContext<'a>,
         input: Value,
@@ -263,9 +309,9 @@ impl ToolHandler for Handler {
     }
 }
 #[derive(Default)]
-pub struct Registry(pub Mutex<HashMap<String, Arc<dyn ToolHandler>>>);
+pub struct Registry(pub Mutex<HashMap<String, ToolBinding>>);
 impl ToolRegistry for Registry {
-    fn register(&self, h: Arc<dyn ToolHandler>) {
+    fn register_binding(&self, h: ToolBinding) {
         self.0.lock().unwrap().insert(h.name().into(), h);
     }
     fn unregister(&self, n: &str) {
@@ -282,7 +328,7 @@ impl ToolRegistry for Registry {
             .map(|h| h.definition())
             .collect()
     }
-    fn resolve(&self, n: &str) -> Result<Arc<dyn ToolHandler>, YourAiError> {
+    fn resolve(&self, n: &str) -> Result<ToolBinding, YourAiError> {
         self.0.lock().unwrap().get(n).cloned().ok_or_else(|| {
             ErrorKind::Tool {
                 name: n.into(),
