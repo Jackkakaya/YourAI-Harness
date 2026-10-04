@@ -47,7 +47,7 @@ impl AgentLoop for DefaultLoop {
                 ),
                 None => self.config.steps,
             };
-            let mut execution = TurnExecution::open(tc, (&self.config).into()).await?;
+            let mut execution = TurnExecution::open(tc, self.config.execution.clone()).await?;
             let result = async {
                 if !execution.input_accepted() {
                     return Ok(());

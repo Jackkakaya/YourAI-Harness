@@ -1,20 +1,49 @@
 //! Context mutations are committed before the active in-memory view changes.
-use crate::prelude::{
-    BaseInput, HookRuntime, ModelProvider, ProviderSnapshot, SessionContext, UsageTracker,
-};
+use crate::prelude::{BaseInput, HookRuntime, ModelProvider, ProviderSnapshot, SessionContext};
 use crate::{chat::*, compaction::*, error::YourAiError, future::BoxFuture, session::*};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-/// Dependencies selected once for this execution; context storage does not retain providers.
+/// Validated view of shared execution bindings; context storage retains no providers.
+/// Required capabilities cannot be removed after construction:
+/// ```compile_fail
+/// use yourai_core::prelude::*;
+/// fn invalidate(context: &mut ContextExecution) {
+///     context.bindings().model = None;
+/// }
+/// ```
 #[derive(Clone)]
 pub struct ContextExecution {
-    pub model: Arc<dyn ModelProvider>,
+    bindings: crate::context::ExecutionBindings,
     pub hooks: Option<Arc<dyn HookRuntime>>,
-    pub usage: Option<Arc<dyn UsageTracker>>,
     pub hook_base: BaseInput,
 }
 impl ContextExecution {
+    /// Validate the required capability once; consumers cannot remove it later.
+    pub fn new(
+        bindings: crate::context::ExecutionBindings,
+        hooks: Option<Arc<dyn HookRuntime>>,
+        hook_base: BaseInput,
+    ) -> Result<Self, YourAiError> {
+        if bindings.model.is_none() {
+            return Err(crate::ErrorKind::Config("model not configured".into()).into());
+        }
+        Ok(Self {
+            bindings,
+            hooks,
+            hook_base,
+        })
+    }
+    pub fn model(&self) -> &Arc<dyn ModelProvider> {
+        self.bindings
+            .model
+            .as_ref()
+            .expect("validated context model")
+    }
+    pub fn bindings(&self) -> &crate::context::ExecutionBindings {
+        &self.bindings
+    }
+
     pub fn from_snapshot(
         snapshot: &ProviderSnapshot,
         id: &SessionId,
@@ -29,15 +58,23 @@ impl ContextExecution {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
         }
-        Ok(Self {
-            model: snapshot
-                .model
-                .clone()
-                .ok_or_else(|| crate::ErrorKind::Config("model not configured".into()))?,
-            hooks: snapshot.hooks.clone(),
-            usage: snapshot.usage.clone(),
+        Self::new(
+            crate::context::ExecutionBindings::from_snapshot(snapshot),
+            snapshot.hooks.clone(),
             hook_base,
-        })
+        )
+    }
+}
+
+/// All transient request content is supplied before projection and admission.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestInput<'a> {
+    pub tools: &'a [Tool],
+    pub suffix: &'a [ChatMessage],
+}
+impl<'a> RequestInput<'a> {
+    pub fn tools(tools: &'a [Tool]) -> Self {
+        Self { tools, suffix: &[] }
     }
 }
 
@@ -60,7 +97,7 @@ pub trait ContextManager: Send + Sync {
     fn append(&self, messages: Vec<StoredMessage>) -> BoxFuture<'_, Result<(), YourAiError>>;
     fn build_request(
         &self,
-        tools: &[Tool],
+        input: RequestInput<'_>,
         execution: &ContextExecution,
     ) -> Result<ContextRequest, YourAiError>;
     /// Implementation-side planning. Public context operations own the hook lifecycle.
@@ -100,9 +137,6 @@ pub trait ContextManager: Send + Sync {
     }
     fn policy(&self) -> ContextPolicy {
         ContextPolicy::default()
-    }
-    fn default_options(&self) -> ChatOptions {
-        ChatOptions::default()
     }
 }
 

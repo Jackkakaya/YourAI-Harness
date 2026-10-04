@@ -30,6 +30,7 @@ impl ExecutionState<'_> {
                 .unwrap_or_default();
         }
         HookInvocation::new(base, event)
+            .with_execution(ExecutionBindings::from_snapshot(&self.tc.snap))
     }
     pub(crate) async fn hook(
         &mut self,

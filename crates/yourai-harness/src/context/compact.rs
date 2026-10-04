@@ -25,18 +25,18 @@ impl MemoryContext {
         let system = self.system_prompt();
         let records = self.records();
         let policy = &self.services.policy;
-        policy.validate()?;
+        policy.validate_for(execution.model().token_budget())?;
         let before = self.estimate(
             &self.project(&records, Some(system.as_str()), &options.tools)?,
             execution,
         )?;
-        let budget = policy.input_budget();
-        let threshold = budget.map(|b| b.saturating_sub(policy.advance_tokens));
+        let budget = policy.input_budget(execution.model().token_budget());
+        let threshold = policy.maintenance_threshold(execution.model().token_budget());
         let fingerprint = Self::fingerprint(
             &records,
             Some(system.as_str()),
-            &options.tools,
-            execution.model.model_iden(),
+            RequestInput::tools(&options.tools),
+            execution.model().as_ref(),
         );
         let unchanged = |reason| {
             let mut result =
@@ -56,7 +56,7 @@ impl MemoryContext {
         let summary_budget = budget.ok_or_else(|| {
             error(
                 "compact",
-                "configure context_window or input_limit before summarizing",
+                "configure model limit.context or limit.input before summarizing",
             )
         })?;
         if summary_budget == 0 {
@@ -144,8 +144,8 @@ impl MemoryContext {
             view.last_maintenance = Some(Self::fingerprint(
                 &view.records,
                 Some(system.as_str()),
-                &options.tools,
-                execution.model.model_iden(),
+                RequestInput::tools(&options.tools),
+                execution.model().as_ref(),
             ));
             let mut result = CompactionResult::new(
                 CompactAction::Pruned,

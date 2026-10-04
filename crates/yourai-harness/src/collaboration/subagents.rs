@@ -11,7 +11,7 @@ use yourai_core::prelude::*;
 /// Subagents are independent sessions. Parent owns cancellation and observes child output.
 pub struct SubagentTool {
     host: Weak<SessionHost>,
-    model: Arc<dyn ModelProvider>,
+    selection: ModelSelection,
     tools: Option<Arc<dyn ToolRegistry>>,
     children: Arc<Mutex<HashMap<String, Arc<SessionHost>>>>,
     // Opening a catalog scans the directory and opens SQLite; reuse it across runs.
@@ -20,12 +20,12 @@ pub struct SubagentTool {
 impl SubagentTool {
     pub fn new(
         host: &Arc<SessionHost>,
-        model: Arc<dyn ModelProvider>,
+        selection: ModelSelection,
         tools: Option<Arc<dyn ToolRegistry>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             host: Arc::downgrade(host),
-            model,
+            selection,
             tools,
             children: Arc::new(Mutex::new(HashMap::new())),
             catalog: Mutex::new(None),

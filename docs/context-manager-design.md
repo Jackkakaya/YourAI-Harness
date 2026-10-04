@@ -39,7 +39,7 @@ ContextManager 允许调用 SessionManager，但不实现 SQL、不管理数据�
 ```text
 restore()                    从 SessionManager 恢复已提交的活跃上下文
 append(messages)             保存新消息，成功后追加到内存
-build_request(tools, execution)  只读组装请求，返回用量估算和预算状态
+build_request(RequestInput { tools, suffix }, execution)  只读组装请求，返回用量估算和预算状态
 context.compact_with_events(context, options, execution, cancel, hook_timeout, events)
                              公共维护入口，协调清理/摘要、提交和最终验证
 ```
@@ -50,9 +50,14 @@ context.compact_with_events(context, options, execution, cancel, hook_timeout, e
 - append 的消息 ID 在调用前确定，失败重试复用同一 ID。
 - restore 用于首次加载和故障恢复；普通 append/compact 成功后不要求调用方再次 restore。
 - prune、选区、候选、分块总结、reset 都是内部步骤，不公开为独立接口。
-- build_request 不修改消息；三个写操作按会话串行执行。
+- build_request 不修改持久化消息；`RequestInput.suffix`（例如最后一步的 prefill）在估算和预算检查前加入临时请求。执行层不再在检查之后追加内容。三个写操作按会话串行执行。
 - append 成功直接应用存储返回的已提交消息，不重读完整历史；首次加载、手动刷新及不确定提交恢复才读取数据库视图。
 - ContextPolicy 是唯一的压缩策略来源，Loop 不另设 compact_threshold / compact_target。
+- 模型容量和输出预算由 `ModelProvider::token_budget()` 提供。`ModelLimits` 描述 `context/input/output` 容量，`ModelTokenBudget` 解析与校验生成预算；`ContextPolicy` 只保存安全余量、压缩阈值和摘要策略，不保存模型容量或生成参数。
+- 输入预算为已知约束的最小值：`min(limit.input, limit.context - max_output_tokens) - safety_margin`。未知约束不参与计算，两者都未知则返回未知；`input` 上限本身不再扣一次输出。
+- 输出优先级为 `options.maxOutputTokens` → `limit.output` → 缺省 32,000。缺省值不是上限，不会截断明确配置。预算超过已知容量时直接拒绝，不静默压低。
+- `ConfiguredModel` 将已解析预算绑定到具体模型，对完整响应和流式调用统一应用默认值并校验显式覆盖。配置嵌套时必须兼容底层已声明容量；扩大或隐藏底层上限在构造时失败。是否设置 timeout 不影响预算默认值。普通生成、上下文预检、摘要、Hook 和子 Agent 使用实际执行模型的预算；摘要可按独立目标请求更少输出。`reasoningEffort` 由协议适配器处理，不参与容量计算。
+- SDK 迁移：原 `ContextPolicy.context_window/input_limit/output_reserve` 改为通过 `ModelTokenBudget::resolve(ModelLimits { .. }, requested)` 绑定到 `ConfiguredModel::with_budget`；`ContextManager::default_options` 已移除。未声明容量的模型保留未知输入预算，默认输出为 32,000。
 
 ```text
 CompactionRequest

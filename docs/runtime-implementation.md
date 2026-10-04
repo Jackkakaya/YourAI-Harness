@@ -82,13 +82,13 @@ RuntimeEvents 按 ID 去重，运行中在 Loop 检查点消费。空闲时的 a
 | SubagentTool | SubagentStart、SubagentStop |
 | TaskBoard | TaskCreated、TaskCompleted、TeammateIdle |
 
-ConcreteHookRuntime 支持 command/http/native/prompt/agent。DefaultHookModelExecutor 提供 prompt 和 agent 的模型执行；评估 Agent 不装配 HookRuntime，避免递归。异步 command 归属于会话，显式关闭时回收；Unix 使用独立进程组终止 shell 及组内子进程。
+ConcreteHookRuntime 支持 command/http/native/prompt/agent。DefaultHookModelExecutor 通过 `ModelSelection` 明确继承当前调用快照或固定模型，提供 prompt 和 agent 的模型执行；评估 Agent 不装配 HookRuntime，避免递归。异步 command 归属于会话，显式关闭时回收；Unix 使用独立进程组终止 shell 及组内子进程。
 
 ## 默认策略的保证边界
 
 - Harness 的共享 ModelBudget 对主模型、compact、模型 Hook、子 Agent 统一记录调用次数并累计已知 token，但只做观测与限速（RequestPolicy 的 RPM/cooldown），不再设调用次数或 token 准入上限——与 OpenCode 一致：执行边界由 per-turn 的 `steps`、deadline 和各超时构成，没有跨 turn 费用硬上限。用量按当前装配生命周期累计，恢复后重新计数，历史用量仍保存。
 - 超时策略以 OpenCode `70a24697ea0028e19f22712fd63059538cb4bee7` 为参照：普通 provider 操作、用户审批、Hook 调度、压缩和持久化清理不再默认设置总时限；相应配置为 `Option<Duration>`，`None` 不启动计时器。显式 turn/compaction deadline、取消和断连仍生效。模型 HTTP 响应头和后续原始字节读取默认各 300 秒，覆盖主循环、压缩、模型 Hook 和子 Agent；SSE 心跳与尚未解析完成的事件也属于读取进展，持续输出不受总耗时限制。压缩通过流式请求收集最终回复。传输层由仓库内固定版本的 genai 补丁实现（`vendor/genai/PATCHES.md`）；ModelProvider 声明 `uses_transport_timeouts()` 后，主循环只保留显式总 deadline/取消/断连，不再叠加模型事件间隔计时。默认 Loop/TurnLimits 的模型时限通过 ChatOptions 传给传输层，MeteredModel 与 SourceModel 保留该能力。未提供传输层计时的自定义 ModelProvider 继续使用原事件级计时兜底。模型底层显式 HTTP 请求 timeout 仍独立生效。
-- 工具不再默认被统一的 610 秒外层计时器截断；由工具自己负责默认超时（shell 默认 120 秒、最大 600 秒，webfetch 自有网络时限），宿主仍可用 `LoopConfig.tool_timeout` / `TurnLimits.tool_timeout` 增加上限。工具内部问题没有 deadline 时也可等待用户回复。
+- 工具不再默认被统一的 610 秒外层计时器截断；由工具自己负责默认超时（shell 默认 120 秒、最大 600 秒，webfetch 自有网络时限），宿主仍可用 `LoopConfig.execution.tool_timeout` / `TurnLimits.tool_timeout` 增加上限。工具内部问题没有 deadline 时也可等待用户回复。
 - 重试最多 5 次，初始 2 秒、指数倍率 2、最多 25% 抖动；无响应头时上限 30 秒，服务端 Retry-After 优先，所有重试等待封顶 `i32::MAX` 毫秒。计量包装层不再把缺失的提示变成零秒提示；共享 provider cooldown 默认关闭（`cooldown_seconds = 0`），不再额外等待 60 秒；用户显式配置的 cooldown/RPM 和服务端提示仍可施加共享准入限制。[OpenCode retry.ts](https://github.com/anomalyco/opencode/blob/70a24697ea0028e19f22712fd63059538cb4bee7/packages/opencode/src/session/retry.ts)
 - 取消收尾区分工具宽限和历史写入：先取消工具 token，再给工具 `tool_cleanup_timeout`（默认 250 毫秒）完成收尾；保留宽限期内返回的真实结果，超时后丢弃 future 并记录中断。取消后的失败 Hook 只使用同一宽限期的剩余时间，不再另加等待。Host 对 cancel 只消费一次，避免无总清理超时时忙循环；可选 `cleanup_timeout` 仍支持隔离不合作的执行。正常 Harness/子 Agent 关闭使用 `close(None)` 等待收尾，调用方可用 `close(Some(duration))` 显式限制关闭期限。[OpenCode cleanup](https://github.com/anomalyco/opencode/blob/70a24697ea0028e19f22712fd63059538cb4bee7/packages/opencode/src/session/processor.ts#L553-L610)
 
@@ -105,3 +105,39 @@ ConcreteHookRuntime 支持 command/http/native/prompt/agent。DefaultHookModelEx
 
 模型超时统一由所选模型携带；Hook 共同校验、流式 HTTP 错误元数据、异步 journal
 事务和有序请求日志的实现与取消语义见[代码质量整改](./architecture-quality-repairs.md)。
+
+
+## 接口职责约束与迁移
+
+这些边界由公开类型、可见性和回归测试共同约束；新增功能应扩展其所属边界，不能在调用方另设一份默认值或绕行入口。
+
+| 概念 | 唯一职责归属 | 调用方约束 |
+|---|---|---|
+| 模型容量、生成预算、网络 timeout 默认值 | `ConfiguredModel` | `ConfiguredModel::new(raw, budget, timeouts)` 一次绑定；GenaiModel 只适配传输，Harness 不另存 timeout |
+| provider 速率与冷却策略 | `ModelSettings` | 创建和切换共用同一类型；通过 `model_snapshot()` 读取当前状态 |
+| 创建配置与冻结 prompt | `prepare_session` | Harness 与 SessionHost 创建/恢复共用；运行时 `RuntimeConfig` 拒绝 `system_prompt` |
+| 动态指令 | `SessionContext.instructions` → `RequestInput` | 每次请求构建前注入并参与预算；不改写冻结 prompt 或存储成用户历史 |
+| 会话记录读写 | `SessionManager` | 不包含破坏性删除 |
+| 会话删除 | `SessionCatalog` | 必须取得宿主租约；底层 store 私有 |
+| provider 绑定 | turn / 生命周期的执行快照 | memory 回调不捕获旧 provider；模型 hook 默认继承当前记账 provider |
+| skills 查询 / 管理 | `SkillProvider` / `SkillRegistry` | 只读实现无需伪造写操作；`SkillContent.tools` 声明必需工具，不隐式安装或授权 |
+| 计费响应交付 | `model::accounting::record_response` | main、compact、hook 共用；同一事件最多三次写入、重试复用 ID，不重放模型请求 |
+| SDK 错误解释 | `model::failure` | TUI 消费类型化 HTTP 错误的诊断结果，不解析 Display 字符串 |
+
+API 迁移：`HarnessConfig.model_provider/request_policy` 合并为 `model_settings`；删除 HarnessConfig 与 ModelSettings 的 timeout 字段以及 `GenaiModel::with_timeouts`，改用 `ConfiguredModel`；`Harness.memory/skills` 改为 `local_memory/local_skills`，只有实际选中本地 provider 时存在。外部 provider 由调用者持有其管理接口，不再创建无效的本地副本。`Harness.budget` 对外私有，状态统一通过 `model_snapshot()` 查询。`HostConfig.instruction_paths` 改为 `instruction_watch_paths`：它只通知和监听已冻结文件；动态加载必须通过 Workspace。已有工作区运行时 config.json 中若保存了旧 `system_prompt` 字段，需要删除该无效字段；新写入会在保存前拒绝它。
+
+手动分发原生生命周期 hook 时，需要传入 `HookInvocation::with_execution(ExecutionBindings::from_snapshot(...))`；缺少绑定不回退到旧对象。模型、memory、session repository、usage 来自同一执行快照，wire payload 不包含这些 Rust 能力。
+
+计费交付是有限重试：持续失败会报告事件 ID 和错误，主调用发出 Warning、压缩结果保留 notice；它不是持久化 outbox，不保证进程退出后自动补账。该故障不会覆盖成功的模型结果，也不会自动重发已付费请求。默认高层装配仍使用本地 SQLite；此轮没有增加远程存储工厂或第二套装配框架。
+
+约束测试位于 `tests/architecture_contracts.rs`、memory hook 绑定单元测试、类型化错误诊断测试及存储 API 的 compile-fail doctest。
+
+
+### 第二轮收敛：模型配置一次，执行绑定共用
+
+- `ConfiguredModel` 只保留 `new(provider, budget, timeouts)`；移除 `with_budget` 和 `wrap`。TUI 在解析配置时构造一次，Harness 创建/切换、SessionHost 创建/恢复、模型 hook 不再补默认值或重新包装。外部 SDK 使用者须提供已可用的 provider，或在自己的配置入口构造 ConfiguredModel。此约束消除框架自动嵌套；没有禁止调用者显式组合 provider。
+- `HookExecution` 更名并归入 `context::ExecutionBindings`，表达上下文维护与原生 hook 共用的受限能力集合，不包含完整 ProviderSnapshot 的 tools/security 等能力。
+- `ContextExecution` 只持有私有 bindings、hooks 和 hook_base。构造时验证模型存在，`model()` 返回已验证引用，`bindings()` 只读；转发 hook 时直接克隆 bindings，不再手工重列 provider 字段。
+- `ProviderSnapshot` 仍保留完整 turn 能力。它到 ExecutionBindings 的投影保留在单一位置；能力缩减有意保留，不向每个 hook 暴露整个 Context。
+
+新增约束覆盖缺失模型拒绝、旧/新快照身份、hook 复用绑定及不可移除已验证模型的编译期检查。原先测试“包装顺序可交换”改为测试“一次构造同时应用预算和 timeout，显式请求覆盖仍有效”。

@@ -5,6 +5,7 @@ pub(super) struct ChildPlan {
     pub(super) parent: Arc<SessionHost>,
     pub(super) root: PathBuf,
     pub(super) id: SessionId,
+    pub(super) providers: ProviderSnapshot,
 }
 impl SubagentTool {
     pub(super) async fn run_prepare(&self) -> Result<ChildPlan, YourAiError> {
@@ -30,15 +31,19 @@ impl SubagentTool {
                 }
             }
         };
-        let mut meta = catalog
-            .create_session(&parent.agent.ctx().context_manager()?.system_prompt())
-            .await?;
+        let providers = parent.agent.ctx().snapshot()?;
+        let history = providers
+            .context_manager
+            .as_ref()
+            .ok_or_else(|| error("subagent", "context not configured"))?;
+        let mut meta = catalog.create_session(&history.system_prompt()).await?;
         meta.parent_session_id = Some(parent.context().id);
         catalog.save_session(&meta).await?;
         Ok(ChildPlan {
             parent,
             root,
             id: meta.id,
+            providers,
         })
     }
     pub(super) async fn run_open_child(
@@ -51,10 +56,14 @@ impl SubagentTool {
             &plan.root,
             plan.id.clone(),
             plan.parent.context().cwd,
-            self.model.clone(),
-            plan.parent.agent.ctx().try_hooks(),
+            self.selection.resolve(plan.providers.model.as_ref())?,
+            plan.providers.hooks.clone(),
             self.tools.clone(),
-            plan.parent.agent.ctx().context_manager()?.policy(),
+            plan.providers
+                .context_manager
+                .as_ref()
+                .ok_or_else(|| error("subagent", "context not configured"))?
+                .policy(),
             "startup",
         )
         .await?;

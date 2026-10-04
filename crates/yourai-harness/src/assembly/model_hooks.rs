@@ -5,8 +5,9 @@ use yourai_core::prelude::*;
 /// Both prompt and agent hooks use the supplied (optionally shared-metered) model.
 /// Evaluator agents deliberately have no HookRuntime, preventing recursive evaluation.
 pub struct DefaultHookModelExecutor {
-    pub model: Arc<dyn ModelProvider>,
+    pub selection: ModelSelection,
     pub tools: Option<Arc<dyn ToolRegistry>>,
+    /// Explicit override; otherwise inherit the invocation snapshot.
     pub usage: Option<Arc<dyn UsageTracker>>,
     pub timeout: Duration,
     pub steps: u32,
@@ -17,10 +18,21 @@ impl HookModelExecutor for DefaultHookModelExecutor {
         request: HookModelRequest,
     ) -> BoxFuture<'a, Result<HookModelDecision, YourAiError>> {
         Box::pin(async move {
+            let usage = self
+                .usage
+                .as_ref()
+                .or(request.invocation.execution.usage.as_ref());
+            let selected = self
+                .selection
+                .resolve(request.invocation.execution.model.as_ref())?;
+            let model: Arc<dyn ModelProvider> = Arc::new(crate::model::SourceModel {
+                inner: selected,
+                source: "hook",
+            });
             if request
                 .model
                 .as_ref()
-                .is_some_and(|m| m != self.model.model_iden())
+                .is_some_and(|m| m != model.model_iden())
             {
                 return Err(error("hook_model", "requested model is not configured"));
             }
@@ -35,7 +47,7 @@ impl HookModelExecutor for DefaultHookModelExecutor {
                         },
                     );
                     let mut builder = Agent::builder()
-                        .model(self.model.clone())
+                        .model(model.clone())
                         .context_manager(history)
                         .agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
                             crate::default_loop::LoopConfig {
@@ -43,7 +55,7 @@ impl HookModelExecutor for DefaultHookModelExecutor {
                                 ..Default::default()
                             },
                         )));
-                    if let Some(usage) = &self.usage {
+                    if let Some(usage) = usage {
                         builder = builder.usage(Arc::new(HookUsage(usage.clone())));
                     }
                     if let Some(tools) = &self.tools {
@@ -56,8 +68,7 @@ impl HookModelExecutor for DefaultHookModelExecutor {
                         .map_err(|f| *f.error)?
                         .text
                 } else {
-                    let response = self
-                        .model
+                    let response = model
                         .complete(
                             ModelRequest::new(
                                 ChatRequest::from_user(request.prompt).with_system(instructions),
@@ -66,18 +77,14 @@ impl HookModelExecutor for DefaultHookModelExecutor {
                             .with_context("hook", request.invocation.base.session_id.clone()),
                         )
                         .await?;
-                    if let Some(usage) = &self.usage {
-                        usage
-                            .record_event(
-                                &SessionId::from(request.invocation.base.session_id.clone()),
-                                &UsageEvent::new(
-                                    Some(self.model.model_iden().into()),
-                                    "hook",
-                                    response.usage.clone(),
-                                ),
-                            )
-                            .await?;
-                    }
+                    crate::model::accounting::record_response(
+                        usage.map(|u| u.as_ref()),
+                        &SessionId::from(request.invocation.base.session_id.clone()),
+                        model.model_iden(),
+                        "hook",
+                        response.usage.clone(),
+                    )
+                    .await;
                     response.content.texts().join("")
                 };
                 let value: serde_json::Value =

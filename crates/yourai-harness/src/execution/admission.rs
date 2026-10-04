@@ -134,6 +134,20 @@ impl ExecutionState<'_> {
                 let skill = self
                     .wait(skills.load(id), self.op_timeout(), "skill")
                     .await?;
+                for tool in &skill.tools {
+                    if !self
+                        .tc
+                        .snap
+                        .tools
+                        .as_ref()
+                        .is_some_and(|registry| registry.has(tool))
+                    {
+                        return Err(ErrorKind::Config(format!(
+                            "skill {id:?} requires unavailable tool {tool:?}"
+                        ))
+                        .into());
+                    }
+                }
                 parts.push(ContentPart::from_text(format!(
                     "<skill id={id:?}>\n{}\n</skill>",
                     skill.instructions

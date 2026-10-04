@@ -74,12 +74,13 @@ impl ContextManager for History {
     }
     fn build_request(
         &self,
-        tools: &[Tool],
+        input: RequestInput<'_>,
         _: &ContextExecution,
     ) -> Result<ContextRequest, YourAiError> {
         let mut request = ChatRequest::new(self.messages());
         request.system = Some(self.system_prompt());
-        request.tools = Some(tools.to_vec());
+        request.tools = Some(input.tools.to_vec());
+        request.messages.extend_from_slice(input.suffix);
         Ok(ContextRequest {
             request,
             estimated_tokens: self.tokens.load(Ordering::SeqCst),

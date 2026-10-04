@@ -264,7 +264,6 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
         yourai_harness::context::ContextServices {
             store: Some(store.clone()),
             policy: ContextPolicy {
-                context_window: Some(32000),
                 keep_recent_tokens: 0,
                 summary_min_savings: 1,
                 ..Default::default()
@@ -288,13 +287,33 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
     .await
     .unwrap();
     let model = Arc::new(SummaryCapture(Mutex::new(vec![])));
-    let execution = ContextExecution {
-        model: model.clone(),
-        hooks: None,
-        usage: None,
-        hook_base: BaseInput::new(id.as_str(), ""),
-    };
-    let before = c.build_request(&[], &execution).unwrap();
+    let execution = ContextExecution::new(
+        ExecutionBindings {
+            model: Some(
+                yourai_harness::model::ConfiguredModel::new(
+                    model.clone(),
+                    ModelTokenBudget::resolve(
+                        ModelLimits {
+                            context: Some(32000),
+                            output: Some(4096),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .unwrap(),
+                    ModelTimeouts::default(),
+                )
+                .unwrap(),
+            ),
+            ..Default::default()
+        },
+        None,
+        BaseInput::new(id.as_str(), ""),
+    )
+    .unwrap();
+    let before = c
+        .build_request(RequestInput::default(), &execution)
+        .unwrap();
     assert!(before.estimated_tokens > 2000);
     let result = c
         .compact(
@@ -309,7 +328,7 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
     assert!(requests.contains("IMPORTANT-RECALL"));
     assert!(!requests.contains("FROZEN-DO-NOT-SUMMARIZE"));
     assert_eq!(
-        c.build_request(&[], &execution)
+        c.build_request(RequestInput::default(), &execution)
             .unwrap()
             .request
             .system

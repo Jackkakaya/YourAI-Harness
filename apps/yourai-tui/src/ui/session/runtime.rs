@@ -9,25 +9,6 @@ use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
 use yourai_harness::Harness;
 
-/// Provider errors arrive as multi-line Display chains whose tail is a raw
-/// JSON body ("… Response body: {…}"). Keep the provider's `message` field
-/// and drop the JSON blob so the notice stays a readable line or two.
-fn summarize_error(text: &str) -> String {
-    const MARKER: &str = "Response body: ";
-    let Some(at) = text.find(MARKER) else {
-        return text.to_owned();
-    };
-    let (head, body) = text.split_at(at);
-    let head = head.trim_end().trim_end_matches('.');
-    match serde_json::from_str::<serde_json::Value>(body[MARKER.len()..].trim()) {
-        Ok(value) => match value.get("message").and_then(|m| m.as_str()) {
-            Some(message) => format!("{head}: {message}"),
-            None => head.to_owned(),
-        },
-        Err(_) => head.to_owned(),
-    }
-}
-
 type Stats = (
     Option<yourai_harness::runtime::ContextUsage>,
     Option<u64>,
@@ -176,7 +157,7 @@ impl Runtime {
                     Level::Error,
                     format!(
                         "Execution failed: {}. /continue retries pending inputs.",
-                        summarize_error(&e.to_string())
+                        yourai_harness::model::failure::diagnostic(&e)
                     ),
                 ),
                 Err(e) => view.notice(Level::Error, format!("Driver failed: {e}")),
@@ -272,7 +253,7 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::{summarize_error, Runtime};
+    use super::Runtime;
     use crate::ui::{session, state::View};
     use std::time::{Duration, Instant};
     use yourai_core::prelude::*;
@@ -428,17 +409,5 @@ mod tests {
             .title
             .is_none());
         controller.close().await.unwrap();
-    }
-
-    #[test]
-    fn error_summaries_drop_the_raw_provider_json() {
-        let raw = "model error: Web stream error for model 'Kimi (adapter: OpenAI)'.\nCause: Request failed with status code '400 Bad Request'.\nResponse body: {\"object\":\"error\",\"message\":\"Model only supports text input; received unsupported content type 'image_url'.\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}";
-        assert_eq!(
-            summarize_error(raw),
-            "model error: Web stream error for model 'Kimi (adapter: OpenAI)'.\nCause: Request failed with status code '400 Bad Request': Model only supports text input; received unsupported content type 'image_url'."
-        );
-        // No JSON body: unchanged. Unparseable body: keep the head only.
-        assert_eq!(summarize_error("plain failure"), "plain failure");
-        assert_eq!(summarize_error("head. Response body: not json"), "head");
     }
 }

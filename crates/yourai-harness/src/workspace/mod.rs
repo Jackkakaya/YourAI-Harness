@@ -14,7 +14,6 @@ use crate::{
 #[derive(Default, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
-    pub system_prompt: Option<String>,
     pub skill_ids: Vec<String>,
     pub memory_search_limit: usize,
 }

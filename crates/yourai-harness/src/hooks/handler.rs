@@ -3,13 +3,11 @@
 //! `HookHandler` trait 在 `yourai-core` 定义；本模块提供具体实现和工厂函数。
 
 use crate::hooks::wire_output::HookJsonOutput;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 use yourai_core::hooks::{HookHandler, HookInvocation, HookOutput};
 
 /// Boxed future（与 core 的 BoxFuture 一致）。
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub use yourai_core::BoxFuture;
 
 /// Handler 分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

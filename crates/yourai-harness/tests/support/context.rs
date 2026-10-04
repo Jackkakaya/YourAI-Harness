@@ -37,17 +37,22 @@ impl MemoryContext {
             ..Default::default()
         };
         Arc::new(Self {
-            execution: ContextExecution {
-                model,
-                hooks: s.hooks,
-                usage: s.usage,
-                hook_base: BaseInput::new(id.as_str(), ""),
-            },
+            execution: ContextExecution::new(
+                ExecutionBindings {
+                    model: Some(model),
+                    usage: s.usage,
+                    ..Default::default()
+                },
+                s.hooks,
+                BaseInput::new(id.as_str(), ""),
+            )
+            .unwrap(),
             inner: yourai_harness::MemoryContext::new(id, services),
         })
     }
     pub fn build_request(&self, tools: &[Tool]) -> Result<ContextRequest, YourAiError> {
-        self.inner.build_request(tools, &self.execution)
+        self.inner
+            .build_request(RequestInput::tools(tools), &self.execution)
     }
     pub fn compact<'a>(
         &'a self,
@@ -82,15 +87,12 @@ impl ContextManager for MemoryContext {
     fn contains_context_marker(&self, id: &str) -> bool {
         self.inner.contains_context_marker(id)
     }
-    fn default_options(&self) -> ChatOptions {
-        self.inner.default_options()
-    }
     fn policy(&self) -> ContextPolicy {
         self.inner.policy()
     }
     fn build_request(
         &self,
-        t: &[Tool],
+        t: RequestInput<'_>,
         e: &ContextExecution,
     ) -> Result<ContextRequest, YourAiError> {
         self.inner.build_request(t, e)
@@ -103,4 +105,26 @@ impl ContextManager for MemoryContext {
     ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
         self.inner.prepare_compaction(r, e, c)
     }
+}
+
+/// Bind capacity to the model, as production configuration does.
+pub fn configured(
+    model: Arc<dyn ModelProvider>,
+    context: Option<u64>,
+    output: u32,
+) -> Arc<dyn ModelProvider> {
+    yourai_harness::model::ConfiguredModel::new(
+        model,
+        ModelTokenBudget::resolve(
+            ModelLimits {
+                context,
+                input: None,
+                output: Some(output),
+            },
+            None,
+        )
+        .unwrap(),
+        ModelTimeouts::default(),
+    )
+    .unwrap()
 }

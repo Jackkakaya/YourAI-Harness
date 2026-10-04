@@ -94,7 +94,6 @@ pub trait SessionManager: Send + Sync {
         session: &'a SessionMeta,
     ) -> BoxFuture<'a, Result<(), YourAiError>>;
     fn list_sessions<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SessionMeta>, YourAiError>>;
-    fn delete_session<'a>(&'a self, id: &'a SessionId) -> BoxFuture<'a, Result<(), YourAiError>>;
     fn fork_session<'a>(
         &'a self,
         id: &'a SessionId,

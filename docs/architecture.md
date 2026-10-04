@@ -1,3 +1,5 @@
+> 当前接口职责及破坏性 API 迁移见 [接口职责约束与迁移](./runtime-implementation.md#接口职责约束与迁移)。尤其注意：删除只由 SessionCatalog 提供，模型默认值由 ConfiguredModel 持有。
+
 > 工具与调度的当前调用接口见 [公共执行层](./execution.md)。业务 Loop 使用 AgentLoop；Hook、审批和执行不再放在 DefaultLoop。下文保留早期架构讨论。
 
 # YourAI 架构设计文档
@@ -372,7 +374,7 @@ impl AgentLoop for MyLoop {
             }
 
             let resp = model.complete(ModelRequest::new(
-                history.build_request(), history.default_options())).await?;
+                history.build_request(), ChatOptions::default().with_max_tokens(model.token_budget().max_output_tokens()))).await?;
             let text = resp.into_first_text().unwrap_or_default();
             history.add_assistant_message(&text).await?;
             Ok(TurnOutput { text, usage: None, pending: vec![] })
@@ -751,7 +753,7 @@ YourAI 是开箱即用的 agent，用户可以零定制直接跑，也可以替�
 
 ### 5.2 热替换的原子性 ✅ 已决策
 
-**决策：** `RwLock<Option<Arc<dyn Trait>>>` 够用，不引入 `arc-swap`。
+**决策：** 全部 provider 由同一个 `RwLock<ProviderSet>` 管理。`Context::update` 暂存并原子发布整组绑定，`snapshot` 读取单一版本，不引入 `arc-swap`。
 
 **语义（收敛修订：由"读取时取最新"收紧为 **turn 开始时快照**）：** `start()/run()` 在启动时把 12 个插槽快照成 `ProviderSnapshot` 装进 `TurnContext`——一个 turn 内所有 provider 读取都走快照，**热替换必然只影响下一 turn**。live Context 不进入 TurnContext；管理方经 `Agent::ctx()` 调 `set_*`/registry API。替换后旧 Arc 由快照持有，进行中的调用安全完成。agent 瓶颈在 IO，锁竞争可忽略；未来如需优化，换 `arc-swap` 是实现细节，不影响 trait 定义。
 
@@ -1247,7 +1249,7 @@ impl AgentLoop for MyLoop {
                 history.add_user_message(&text).await?;
             }
             let resp = model.complete(ModelRequest::new(
-                history.build_request(), history.default_options())).await?;
+                history.build_request(), ChatOptions::default().with_max_tokens(model.token_budget().max_output_tokens()))).await?;
             let text = resp.into_first_text().unwrap_or_default();
             history.add_assistant_message(&text).await?;
             Ok(TurnOutput { text, usage: None, pending: vec![] })

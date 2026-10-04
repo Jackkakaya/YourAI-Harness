@@ -17,6 +17,14 @@ pub(crate) fn now() -> i64 {
 fn sql(e: impl std::fmt::Display) -> YourAiError {
     error("sqlite", e)
 }
+/// Record persistence only. Session deletion requires the catalog's host lease.
+/// ```compile_fail
+/// use yourai_core::prelude::*;
+/// use yourai_harness::SqliteStore;
+/// async fn remove(store: &SqliteStore, id: &SessionId) {
+///     store.delete_session(id).await.unwrap();
+/// }
+/// ```
 #[derive(Clone)]
 pub struct SqliteStore {
     connection: Arc<Mutex<Connection>>,
@@ -87,6 +95,17 @@ impl SqliteStore {
         })
         .await
         .map_err(sql)?
+    }
+    pub(crate) fn delete_records<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        let id = id.clone();
+        Box::pin(self.run(move |c| {
+            c.execute("DELETE FROM sessions WHERE session_id=?1", [id.as_str()])
+                .map_err(sql)?;
+            Ok(())
+        }))
     }
     pub fn path(root: &Path) -> PathBuf {
         root.join("sessions.sqlite3")
@@ -296,14 +315,6 @@ impl SessionManager for SqliteStore {
     }
     fn list_sessions<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SessionMeta>, YourAiError>> {
         Box::pin(self.run(|c| { let mut q=c.prepare("SELECT session_id,title,created_at,updated_at,model,parent_session_id,provider,system_prompt FROM sessions ORDER BY updated_at DESC,session_id").map_err(sql)?; let rows=q.query_map([],meta_row).map_err(sql)?.collect::<Result<Vec<_>,_>>().map_err(sql)?; Ok(rows) }))
-    }
-    fn delete_session<'a>(&'a self, id: &'a SessionId) -> BoxFuture<'a, Result<(), YourAiError>> {
-        let id = id.clone();
-        Box::pin(self.run(move |c| {
-            c.execute("DELETE FROM sessions WHERE session_id=?1", [id.as_str()])
-                .map_err(sql)?;
-            Ok(())
-        }))
     }
     fn fork_session<'a>(
         &'a self,

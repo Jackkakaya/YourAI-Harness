@@ -96,12 +96,13 @@ pub mod prelude {
         CompactAction, CompactionEvent, CompactionPhase, CompactionRequest, CompactionResult,
         CompactionTrigger, ContextPolicy,
     };
+    pub use crate::context::ExecutionBindings;
     pub use crate::context::{
-        Agent, AgentBuilder, Context, ProviderSnapshot, TurnContext, TurnHandle,
+        Agent, AgentBuilder, Context, ProviderSet, ProviderSnapshot, TurnContext, TurnHandle,
     };
     pub use crate::context_manager::{
         CompactionCommit, CompactionJob, CompactionPlan, ContextExecution, ContextManager,
-        ContextRequest,
+        ContextRequest, RequestInput,
     };
     pub use crate::error::{AbortReason, ErrorKind, YourAiError};
     pub use crate::future::BoxFuture;
@@ -117,8 +118,8 @@ pub mod prelude {
         RecallRequest, RecalledMemory,
     };
     pub use crate::model::{
-        ModelErrorClass, ModelEventStream, ModelProvider, ModelRecovery, ModelRequest,
-        ModelTimeouts,
+        ModelErrorClass, ModelEventStream, ModelLimits, ModelProvider, ModelRecovery, ModelRequest,
+        ModelSelection, ModelTimeouts, ModelTokenBudget,
     };
     pub use crate::observability::{ObservabilityProvider, Span};
     pub use crate::protocol::{
@@ -135,7 +136,7 @@ pub mod prelude {
     pub use crate::session_runtime::{
         InputRejected, SessionContext, SessionRuntime, SessionStatus, SessionTurn,
     };
-    pub use crate::skill::{SkillContent, SkillInfo, SkillProvider};
+    pub use crate::skill::{SkillContent, SkillInfo, SkillProvider, SkillRegistry};
     pub use crate::tool::{
         ExecutedTool, ToolBinding, ToolContext, ToolHandler, ToolOperation, ToolRegistry,
     };

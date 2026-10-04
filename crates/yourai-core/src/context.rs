@@ -1,6 +1,6 @@
 //! Context 容器 + Agent + turn 运输机制。
 //!
-//! - [`Context`]：12 个 provider 插槽，`RwLock<Option<Arc<dyn>>>`，
+//! - [`Context`]：统一版本的 provider 集合，`RwLock<ProviderSet>`，
 //!   turn 级热替换（决策 5.2）；读取缺失报 `Config`（决策 5.8），
 //!   可选读取用 `try_*`（供 DefaultLoop 依赖矩阵使用）
 //! - [`Agent`]：组装产物；[`Agent::start`] 是**全局唯一 spawn 点**
@@ -48,71 +48,49 @@ macro_rules! provider_slots {
         /// 所有 provider 的容器——纯粹的 provider 容器，交互管道不在这里
         ///（每次 turn 由 [`Agent::start`] 装配进 [`TurnContext`]，决策 5.5）。
         pub struct Context {
-            $req: RwLock<Option<Arc<dyn $req_trait>>>,
-            $( $field: RwLock<Option<Arc<dyn $trait>>> ),*
+            providers: RwLock<ProviderSet>,
         }
 
-        // 必需读取器：缺失报 Config 错——缺什么在使用点报（决策 5.8）。
-        // 锁中毒视为可恢复：provider slot 的数据仍然一致。
+        /// One version of all provider bindings; updates publish the whole set.
+        #[derive(Clone, Default)]
+        pub struct ProviderSet {
+            pub $req: Option<Arc<dyn $req_trait>>,
+            $( pub $field: Option<Arc<dyn $trait>>, )*
+        }
         impl Context {
+            /// Apply a synchronous transaction to a staged copy. Readers see either version.
+            /// The callback must not re-enter this Context. A panic leaves bindings unchanged.
+            pub fn update(&self, change: impl FnOnce(&mut ProviderSet)) {
+                let mut current = self.providers.write().unwrap_or_else(|p| p.into_inner());
+                let mut next = current.clone();
+                change(&mut next);
+                *current = next;
+            }
             $(
-                #[doc = concat!("读取 provider `", stringify!($field), "`；未装配时返回 `Config` 错误（决策 5.8）")]
                 pub fn $field(&self) -> Result<Arc<dyn $trait>, YourAiError> {
-                    self.$field
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone()
-                        .ok_or_else(|| {
-                            YourAiError::Error(ErrorKind::Config(format!(
-                                "provider not configured: {}",
-                                stringify!($field)
-                            )))
-                        })
+                    self.$try().ok_or_else(|| ErrorKind::Config(format!("provider not configured: {}", stringify!($field))).into())
                 }
-                #[doc = concat!("可选读取 `", stringify!($field), "`；未装配返回 `None`（决策 5.8 依赖矩阵的可选侧）")]
                 pub fn $try(&self) -> Option<Arc<dyn $trait>> {
-                    self.$field
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone()
+                    self.providers.read().unwrap_or_else(|p| p.into_inner()).$field.clone()
                 }
-                #[doc = concat!("运行时热替换 `", stringify!($field), "`（决策 5.2）：正在跑的 turn 用旧快照跑完，下一 turn 生效")]
-                pub fn $setter(&self, v: Arc<dyn $trait>) {
-                    *self.$field.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(v);
+                pub fn $setter(&self, value: Arc<dyn $trait>) {
+                    self.update(|p| p.$field = Some(value));
                 }
             )*
-            // 必需槽的访问器形式与可选槽一致；snapshot 是它唯一不同的地方。
-            #[doc = concat!("读取 provider `", stringify!($req), "`；未装配时返回 `Config` 错误（决策 5.8）")]
             pub fn $req(&self) -> Result<Arc<dyn $req_trait>, YourAiError> {
-                self.$req
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-                    .ok_or_else(|| {
-                        YourAiError::Error(ErrorKind::Config(format!(
-                            "provider not configured: {}",
-                            stringify!($req)
-                        )))
-                    })
+                self.$req_try().ok_or_else(|| ErrorKind::Config(format!("provider not configured: {}", stringify!($req))).into())
             }
-            #[doc = concat!("可选读取 `", stringify!($req), "`；未装配返回 `None`")]
             pub fn $req_try(&self) -> Option<Arc<dyn $req_trait>> {
-                self.$req
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
+                self.providers.read().unwrap_or_else(|p| p.into_inner()).$req.clone()
             }
-            #[doc = concat!("运行时热替换 `", stringify!($req), "`（决策 5.2）")]
-            pub fn $req_set(&self, v: Arc<dyn $req_trait>) {
-                *self.$req.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(v);
+            pub fn $req_set(&self, value: Arc<dyn $req_trait>) {
+                self.update(|p| p.$req = Some(value));
             }
-
-            /// turn 开始时的 provider 快照（决策 5.2：一个 turn 内实现恒定）。
-            /// 缺少必需槽时返回 Config 错误，不通过公开 API 暴露 panic 路径。
             pub fn snapshot(&self) -> Result<ProviderSnapshot, YourAiError> {
+                let p = self.providers.read().unwrap_or_else(|p| p.into_inner());
                 Ok(ProviderSnapshot {
-                    $req: self.$req()?,
-                    $( $field: self.$try(), )*
+                    $req: p.$req.clone().ok_or_else(|| ErrorKind::Config(format!("provider not configured: {}", stringify!($req))))?,
+                    $( $field: p.$field.clone(), )*
                 })
             }
         }
@@ -154,8 +132,10 @@ macro_rules! provider_slots {
             /// 组装 Agent（不做完整性检查，决策 5.8）
             pub fn build(self) -> Arc<Agent> {
                 let ctx = Context {
-                    $req: RwLock::new(self.$req),
-                    $( $field: RwLock::new(self.$field), )*
+                    providers: RwLock::new(ProviderSet {
+                        $req: self.$req,
+                        $( $field: self.$field, )*
+                    }),
                 };
                 Arc::new(Agent { ctx: Arc::new(ctx) })
             }
@@ -544,6 +524,33 @@ impl OutSink for UnboundedSender<Out> {
 // endregion: --- 内置 OutSink 实现 ---
 
 // region:    --- 机制自测（stub loop，非插件实现） ---
+
+/// Restricted runtime capabilities shared by context maintenance and native hooks.
+/// These references are execution-scoped and never part of a wire payload.
+#[derive(Clone, Default)]
+pub struct ExecutionBindings {
+    pub model: Option<std::sync::Arc<dyn crate::model::ModelProvider>>,
+    pub memory: Option<std::sync::Arc<dyn crate::memory::MemoryProvider>>,
+    pub sessions: Option<std::sync::Arc<dyn crate::session::SessionManager>>,
+    pub usage: Option<std::sync::Arc<dyn crate::usage::UsageTracker>>,
+}
+impl ExecutionBindings {
+    pub fn from_snapshot(snapshot: &crate::context::ProviderSnapshot) -> Self {
+        Self {
+            model: snapshot.model.clone(),
+            memory: snapshot.memory.clone(),
+            sessions: snapshot.session.clone(),
+            usage: snapshot.usage.clone(),
+        }
+    }
+}
+impl std::fmt::Debug for ExecutionBindings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionBindings")
+            .field("model", &self.model.as_ref().map(|m| m.model_iden()))
+            .finish()
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -8,11 +8,12 @@ impl Workspace {
         path: PathBuf,
         content: String,
     ) -> Result<(), YourAiError> {
+        // Publish instructions only after the durable watch registration succeeds.
+        host.watch_path_async(path.clone()).await?;
         host.context.lock().unwrap().instructions.insert(
             path.clone(),
             format!("[Instructions: {}]\n{content}", path.display()),
         );
-        host.watch_path_async(path).await?;
         Ok(())
     }
     pub(super) async fn run_notify(

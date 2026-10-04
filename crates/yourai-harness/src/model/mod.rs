@@ -1,3 +1,4 @@
+pub(crate) mod accounting;
 mod configured;
 mod control;
 pub mod failure;
@@ -34,7 +35,6 @@ pub struct GenaiModel {
     client: genai::Client,
     model: String,
     headers: genai::Headers,
-    timeouts: ModelTimeouts,
 }
 impl GenaiModel {
     pub fn new(client: genai::Client, model: impl Into<String>) -> Self {
@@ -42,26 +42,11 @@ impl GenaiModel {
             client,
             model: model.into(),
             headers: genai::Headers::default(),
-            timeouts: ModelTimeouts::default(),
         }
     }
     /// Defaults applied to every request, including compaction and child agents.
     pub fn with_headers(mut self, headers: genai::Headers) -> Self {
         self.headers = headers;
-        self
-    }
-    /// Applied to every network call, including collected compaction responses.
-    pub fn with_timeouts(
-        mut self,
-        header: Option<std::time::Duration>,
-        chunk: Option<std::time::Duration>,
-    ) -> Self {
-        if let Some(header) = header {
-            self.timeouts.headers = header;
-        }
-        if let Some(chunk) = chunk {
-            self.timeouts.read = chunk;
-        }
         self
     }
     async fn open_stream(
@@ -89,16 +74,13 @@ impl GenaiModel {
             headers.merge_with(overrides);
         }
         request.options.extra_headers = Some(headers);
-        self.timeouts.apply(&mut request.options);
+        ModelTimeouts::default().apply(&mut request.options);
         request
     }
 }
 impl ModelProvider for GenaiModel {
     fn classify_error(&self, error: &YourAiError) -> ModelErrorClass {
         failure::classify(error)
-    }
-    fn timeouts(&self) -> ModelTimeouts {
-        self.timeouts
     }
     fn uses_transport_timeouts(&self) -> bool {
         true
@@ -316,6 +298,9 @@ impl MeteredModel {
     }
 }
 impl ModelProvider for MeteredModel {
+    fn token_budget(&self) -> ModelTokenBudget {
+        self.inner.token_budget()
+    }
     fn timeouts(&self) -> ModelTimeouts {
         self.inner.timeouts()
     }
@@ -406,6 +391,9 @@ pub(crate) struct SourceModel {
     pub source: &'static str,
 }
 impl ModelProvider for SourceModel {
+    fn token_budget(&self) -> ModelTokenBudget {
+        self.inner.token_budget()
+    }
     fn timeouts(&self) -> ModelTimeouts {
         self.inner.timeouts()
     }

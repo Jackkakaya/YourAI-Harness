@@ -11,7 +11,10 @@ async fn hook(
     let result = match &execution.hooks {
         Some(hooks) => crate::time::timeout(
             timeout,
-            hooks.dispatch(&HookInvocation::new(execution.hook_base.clone(), event)),
+            hooks.dispatch(
+                &HookInvocation::new(execution.hook_base.clone(), event)
+                    .with_execution(execution.bindings().clone()),
+            ),
         )
         .await
         .map_err(|_| error("compact", "hook deadline exceeded"))??,
@@ -219,7 +222,7 @@ pub async fn compact_with_events(
     let outcome = outcome.map(|mut result| {
         // Rebuild from committed history using the same system and tool definitions
         // as the next model request. PostCompact additions are part of this budget.
-        match context.build_request(&options.tools, execution) {
+        match context.build_request(RequestInput::tools(&options.tools), execution) {
             Ok(request) => {
                 result.tokens_after = request.estimated_tokens;
                 result.input_budget = request.input_budget;

@@ -209,7 +209,11 @@ async fn fork_copies_history_with_new_identities_and_delete_cascades() {
         .record_event(&id, &UsageEvent::new(None, "main", GenaiUsage::default()))
         .await
         .unwrap();
-    store.delete_session(&id).await.unwrap();
+    yourai_harness::SessionCatalog::new(dir.path())
+        .unwrap()
+        .delete_session(&id)
+        .await
+        .unwrap();
     assert_eq!(usage.total().await.unwrap().request_count, 0);
     assert_eq!(
         store

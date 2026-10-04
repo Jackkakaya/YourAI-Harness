@@ -83,7 +83,7 @@ pub async fn prepare(
     instructions: &[PathBuf],
     skills: Option<&dyn SkillProvider>,
     memory: Option<&dyn MemoryProvider>,
-    policy: &ContextPolicy,
+    input_budget: Option<u64>,
     cancel: &CancellationToken,
 ) -> Result<PreparedPrompt, YourAiError> {
     if cancel.is_cancelled() {
@@ -201,9 +201,7 @@ pub async fn prepare(
         }
     }
     let system = out.join("\n\n");
-    if policy.input_budget().is_some_and(|budget| {
-        (system.len().div_ceil(3) as u64) >= budget.saturating_sub(policy.advance_tokens)
-    }) {
+    if input_budget.is_some_and(|budget| (system.len().div_ceil(3) as u64) >= budget) {
         return Err(error(
             "prompt",
             "fixed prompt exceeds budget reserved for prompt, messages and output",

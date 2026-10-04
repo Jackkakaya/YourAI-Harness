@@ -1,8 +1,10 @@
 //! ModelProvider：LLM API 封装（直接使用 genai 类型，决策 5.1/5.6）。
 //!
 //! 调用参数是 [`ModelRequest`]——`ChatRequest` + `ChatOptions` 一起走，
-//! capture_usage / capture_tool_calls / capture_reasoning_content 等
-//! 选项由 ContextManager 组装请求时带出，不再断链。
+//! 模型持有容量与生成预算；调用者提供本次执行的捕获选项或显式覆盖。
+
+mod token_budget;
+pub use token_budget::{ModelLimits, ModelTokenBudget};
 
 use crate::chat::ChatStreamEvent;
 use crate::chat::{ChatOptions, ChatRequest, ChatResponse};
@@ -88,7 +90,35 @@ impl ModelRequest {
     }
 }
 
+/// Selection policy is independent of provider configuration and execution lifetime.
+#[derive(Clone, Default)]
+pub enum ModelSelection {
+    #[default]
+    Inherit,
+    Pinned(std::sync::Arc<dyn ModelProvider>),
+}
+impl ModelSelection {
+    pub fn resolve(
+        &self,
+        inherited: Option<&std::sync::Arc<dyn ModelProvider>>,
+    ) -> Result<std::sync::Arc<dyn ModelProvider>, YourAiError> {
+        match self {
+            Self::Pinned(model) => Ok(model.clone()),
+            Self::Inherit => inherited.cloned().ok_or_else(|| {
+                crate::ErrorKind::Config(
+                    "inherited model is not configured for this execution".into(),
+                )
+                .into()
+            }),
+        }
+    }
+}
+
 pub trait ModelProvider: Send + Sync {
+    /// Capacity and resolved generation budget travel with the selected model.
+    fn token_budget(&self) -> ModelTokenBudget {
+        ModelTokenBudget::default()
+    }
     fn timeouts(&self) -> ModelTimeouts {
         ModelTimeouts::default()
     }

@@ -31,6 +31,8 @@ impl SkillProvider for LocalSkills {
                 .ok_or_else(|| error("skills", "unknown skill"))
         })
     }
+}
+impl SkillRegistry for LocalSkills {
     fn register<'a>(&'a self, skill: SkillContent) -> BoxFuture<'a, Result<(), YourAiError>> {
         Box::pin(async move {
             self.0.update(|d| {

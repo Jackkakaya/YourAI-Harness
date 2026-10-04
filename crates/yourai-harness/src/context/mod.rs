@@ -247,16 +247,18 @@ impl MemoryContext {
     fn fingerprint(
         records: &[StoredMessage],
         system: Option<&str>,
-        tools: &[Tool],
-        model: &str,
+        input: RequestInput<'_>,
+        model: &dyn ModelProvider,
     ) -> String {
         format!(
-            "{model}:{:?}:{system:?}:{}",
+            "{}:{:?}:{:?}:{system:?}:{}",
+            model.model_iden(),
+            model.token_budget(),
             records
                 .iter()
                 .map(|m| (&m.id, m.tool_output_pruned_at))
                 .collect::<Vec<_>>(),
-            serde_json::to_string(tools).unwrap_or_default()
+            serde_json::to_string(&(input.tools, input.suffix)).unwrap_or_default()
         )
     }
 }
@@ -272,10 +274,6 @@ impl ContextManager for MemoryContext {
     }
     fn policy(&self) -> ContextPolicy {
         self.services.policy.clone()
-    }
-    fn default_options(&self) -> ChatOptions {
-        ChatOptions::default()
-            .with_max_tokens(self.services.policy.output_reserve.min(u32::MAX as u64) as u32)
     }
     fn restore(&self) -> BoxFuture<'_, Result<(), YourAiError>> {
         Box::pin(async {
@@ -305,10 +303,12 @@ impl ContextManager for MemoryContext {
     }
     fn build_request(
         &self,
-        tools: &[Tool],
+        input: RequestInput<'_>,
         execution: &ContextExecution,
     ) -> Result<ContextRequest, YourAiError> {
-        self.services.policy.validate()?;
+        self.services
+            .policy
+            .validate_for(execution.model().token_budget())?;
         if self.dirty.load(Ordering::Acquire) {
             return Err(error(
                 "context",
@@ -318,20 +318,26 @@ impl ContextManager for MemoryContext {
         let owned_system = self.system_prompt();
         let system = Some(owned_system.as_str());
         let records = self.records();
-        let request = self.project(&records, system, tools)?;
+        let mut request = self.project(&records, system, input.tools)?;
+        request.messages.extend_from_slice(input.suffix);
         let estimated_tokens = self.estimate(&request, execution)?;
-        let input_budget = self.services.policy.input_budget();
+        let input_budget = self
+            .services
+            .policy
+            .input_budget(execution.model().token_budget());
         let unchanged = self.view.lock().unwrap().last_maintenance.as_ref()
             == Some(&Self::fingerprint(
                 &records,
                 system,
-                tools,
-                execution.model.model_iden(),
+                input,
+                execution.model().as_ref(),
             ));
         let maintenance_needed = !unchanged
-            && input_budget.is_some_and(|b| {
-                estimated_tokens >= b.saturating_sub(self.services.policy.advance_tokens)
-            });
+            && self
+                .services
+                .policy
+                .maintenance_threshold(execution.model().token_budget())
+                .is_some_and(|threshold| estimated_tokens >= threshold);
         Ok(ContextRequest {
             request,
             estimated_tokens,

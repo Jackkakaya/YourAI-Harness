@@ -36,7 +36,8 @@ impl SessionHost {
         &self,
         event: HookEvent,
     ) -> Result<HookDispatchResult, YourAiError> {
-        let Some(hooks) = self.agent.ctx().try_hooks() else {
+        let snapshot = self.agent.ctx().snapshot()?;
+        let Some(hooks) = &snapshot.hooks else {
             return Ok(HookDispatchResult::empty(event.kind()));
         };
         let c = self.context();
@@ -45,7 +46,8 @@ impl SessionHost {
             .transcript_path
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let invocation = HookInvocation::new(base, event);
+        let invocation = HookInvocation::new(base, event)
+            .with_execution(ExecutionBindings::from_snapshot(&snapshot));
         let result = crate::time::timeout(self.config.hook_timeout, hooks.dispatch(&invocation))
             .await
             .map_err(|_| error("hook", "host hook timed out"))??;

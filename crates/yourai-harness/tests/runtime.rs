@@ -16,15 +16,15 @@ fn default_agent_budgets_are_unlimited() {
     let loop_config = default_loop::LoopConfig::default();
     assert_eq!(loop_config.steps, None);
     // OpenCode attachment.image defaults: 5 MiB base64 / 2000x2000 / resize.
-    assert!(loop_config.attachment_image.auto_resize);
-    assert_eq!(loop_config.attachment_image.max_width, 2000);
-    assert_eq!(loop_config.attachment_image.max_height, 2000);
+    assert!(loop_config.execution.attachment_image.auto_resize);
+    assert_eq!(loop_config.execution.attachment_image.max_width, 2000);
+    assert_eq!(loop_config.execution.attachment_image.max_height, 2000);
     assert_eq!(
-        loop_config.attachment_image.max_base64_bytes,
+        loop_config.execution.attachment_image.max_base64_bytes,
         5 * 1024 * 1024
     );
     // Text files attached by reference are capped at 50k chars.
-    assert_eq!(loop_config.attachment_text_max_chars, 50_000);
+    assert_eq!(loop_config.execution.attachment_text_max_chars, 50_000);
 }
 
 fn context(
@@ -37,10 +37,13 @@ fn context(
     services.store = Some(store.clone());
     services.hooks = hooks;
     services.usage = Some(Arc::new(storage::LocalUsage((*store).clone())));
-    services.policy.context_window = Some(32_000);
     services.policy.keep_recent_tokens = 0;
     services.policy.summary_min_savings = 1;
-    MemoryContext::new(id, model, services)
+    MemoryContext::new(
+        id,
+        context_fixture::configured(model, Some(32_000), 4096),
+        services,
+    )
 }
 async fn host(
     dir: &std::path::Path,
@@ -52,6 +55,7 @@ async fn host(
         Some(meta) => meta.id.clone(),
         None => store.create_session("").await.unwrap().id,
     };
+    let model = context_fixture::configured(model, Some(32_000), 4096);
     let history = context(id.clone(), model.clone(), store.clone(), hooks.clone());
     let mut b = Agent::builder()
         .agent_loop(Arc::new(
@@ -219,10 +223,10 @@ async fn startup_instructions_configuration_and_notifications_are_real_operation
     ws.load_instructions(std::path::Path::new("AGENTS.md"), "startup")
         .await
         .unwrap();
-    ws.change_config("project", json!({"system_prompt":"configured"}))
+    ws.change_config("project", json!({"memory_search_limit":2}))
         .await
         .unwrap();
-    assert_eq!(ws.config().unwrap()["system_prompt"], "configured");
+    assert_eq!(ws.config().unwrap()["memory_search_limit"], 2);
     ws.notify("notice", "custom").await.unwrap();
     let child = dir.path().join("cwd");
     std::fs::create_dir(&child).unwrap();
@@ -397,7 +401,7 @@ async fn child_agent_runs_its_own_session_and_reports_lifecycle() {
     )
     .await;
     let child_model = Arc::new(Model::new(vec![answer("child result")]));
-    let tool = SubagentTool::new(&h, child_model, None);
+    let tool = SubagentTool::new(&h, ModelSelection::Pinned(child_model), None);
     let cancel = CancellationToken::new();
     let tc = ToolContext {
         call_id: "child-tool".into(),
@@ -734,7 +738,7 @@ async fn harness_runs_real_task_tool_through_loop_and_restores_session() {
         .unwrap()
         .change_config("project", json!({"system_prompt":"runtime-config"}))
         .await
-        .unwrap();
+        .unwrap_err();
     harness.host.submit(In::user_text("create a task")).unwrap();
     let report = harness
         .host
@@ -748,7 +752,7 @@ async fn harness_runs_real_task_tool_through_loop_and_restores_session() {
         .unwrap();
     assert_eq!(report.result.unwrap().text, "created");
     assert_eq!(harness.tasks.as_ref().unwrap().list().len(), 1);
-    assert_eq!(harness.budget.snapshot().calls, 2);
+    assert_eq!(harness.model_snapshot().calls, 2);
     assert_eq!(harness.usage.total().await.unwrap().total_tokens, 6);
     let id = harness.host.context().id;
     harness.close().await.unwrap();
@@ -785,13 +789,13 @@ async fn agent_hook_uses_real_loop_and_shared_budget() {
     use yourai_harness::hooks::{HookModelExecutor, HookModelRequest};
     let budget = ModelBudget::new();
     let executor = assembly::model_hooks::DefaultHookModelExecutor {
-        model: Arc::new(MeteredModel {
+        selection: ModelSelection::Pinned(Arc::new(MeteredModel {
             inner: Arc::new(Model::new(vec![
                 answer(r#"{"ok":false,"reason":"unfinished"}"#),
                 answer(r#"{"ok":true}"#),
             ])),
             budget: budget.clone(),
-        }),
+        })),
         tools: None,
         usage: None,
         timeout: Duration::from_secs(1),
@@ -955,7 +959,11 @@ async fn failed_storage_never_changes_memory_context() {
         .unwrap();
     let before = serde_json::to_string(&memory.messages()).unwrap();
     // Deleting the session makes a subsequent write fail its FK constraint.
-    store.delete_session(&id).await.unwrap();
+    yourai_harness::SessionCatalog::new(dir.path())
+        .unwrap()
+        .delete_session(&id)
+        .await
+        .unwrap();
     assert!(history
         .append(vec![StoredMessage::new(ChatMessage::user(
             "must not enter memory"
@@ -1022,8 +1030,8 @@ async fn basic_harness_has_todos_without_optional_extensions() {
         h.workspace.is_none()
             && h.tasks.is_some()
             && h.subagents.is_none()
-            && h.memory.is_none()
-            && h.skills.is_none()
+            && h.local_memory.is_none()
+            && h.local_skills.is_none()
     );
     assert!(
         h.tools.has("tasks")
@@ -1090,7 +1098,7 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
     let old_hooks = Arc::new(Hooks::new(|_, _| {}));
     let new_hooks = Arc::new(Hooks::new(|_, _| {}));
     let agent = Agent::builder()
-        .model(old.clone())
+        .model(context_fixture::configured(old.clone(), Some(32000), 4096))
         .context_manager(history.inner.clone())
         .hooks(old_hooks.clone())
         .agent_loop(Arc::new(
@@ -1113,7 +1121,9 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
         ])
         .await
         .unwrap();
-    agent.ctx().set_model(new.clone());
+    agent
+        .ctx()
+        .set_model(context_fixture::configured(new.clone(), Some(64000), 4096));
     agent.ctx().set_hooks(new_hooks.clone());
     let usage = Arc::new(storage::LocalUsage((*store).clone()));
     agent.ctx().set_usage(usage.clone());
@@ -1122,7 +1132,7 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
             .unwrap();
     let before = history
         .inner
-        .build_request(&[], &execution)
+        .build_request(RequestInput::default(), &execution)
         .unwrap()
         .estimated_tokens;
     let result = h
@@ -1155,9 +1165,13 @@ async fn context_usage_estimates_active_request_without_calling_model() {
     let dir = TempDir::new().unwrap();
     let model = Arc::new(Model::new(vec![answer("done")]));
     let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
-    config.context_policy.context_window = Some(32_000);
     config.system_prompt = Some("You are a coding assistant.".into());
-    let h = Harness::open(config, model.clone()).await.unwrap();
+    let h = Harness::open(
+        config,
+        context_fixture::configured(model.clone(), Some(32_000), 4096),
+    )
+    .await
+    .unwrap();
     let before = h.host.context_usage().unwrap();
     assert_eq!(before.context_window, Some(32_000));
     assert_eq!(before.input_budget, Some(32_000 - 4096 - 1024));
@@ -1258,9 +1272,13 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
     let dir = TempDir::new().unwrap();
     let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
     config.system_prompt = Some("test".into());
-    config.context_policy.context_window = Some(64_000);
     let old = Arc::new(Model::new(vec![answer("first")]));
-    let h = Harness::open(config, old.clone()).await.unwrap();
+    let h = Harness::open(
+        config,
+        context_fixture::configured(old.clone(), Some(64_000), 4096),
+    )
+    .await
+    .unwrap();
     h.host.submit(In::user_text("one")).unwrap();
     h.host
         .run_next(
@@ -1273,29 +1291,37 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
         .unwrap()
         .result
         .unwrap();
-    assert_eq!(h.budget.snapshot().calls, 1);
+    assert_eq!(h.model_snapshot().calls, 1);
 
     let new = Arc::new(Model::new(vec![answer("second")]));
-    let policy = ContextPolicy {
-        context_window: Some(32_000),
-        output_reserve: 2048,
-        ..ContextPolicy::default()
-    };
+    let policy = ContextPolicy::default();
     h.switch_model_with_settings(
-        new.clone(),
+        {
+            let provider: Arc<dyn ModelProvider> =
+                context_fixture::configured(new.clone(), Some(300_000), 131072);
+            let budget = provider.token_budget();
+            yourai_harness::model::ConfiguredModel::new(
+                provider,
+                budget,
+                ModelTimeouts {
+                    headers: Duration::from_secs(1),
+                    read: Duration::from_secs(1),
+                },
+            )
+        }
+        .unwrap(),
         policy,
         yourai_harness::assembly::ModelSettings {
             provider: "other".into(),
             requests: Default::default(),
-            header_timeout: Some(Duration::from_secs(1)),
-            chunk_timeout: Some(Duration::from_secs(1)),
         },
     )
     .await
     .unwrap();
     let usage = h.host.context_usage().unwrap();
-    assert_eq!(usage.context_window, Some(32_000));
-    assert_eq!(usage.output_reserve, 2048);
+    assert_eq!(usage.context_window, Some(300_000));
+    assert_eq!(usage.output_reserve, 131072);
+    assert_eq!(usage.input_budget, Some(300000 - 131072 - 1024));
     assert_eq!(
         h.sessions
             .load_session(&h.host.context().id)
@@ -1317,9 +1343,17 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
         .unwrap()
         .result
         .unwrap();
-    assert_eq!(h.budget.snapshot().calls, 2);
-    assert_eq!(h.budget.snapshot().requests.completed, 2);
+    assert_eq!(h.model_snapshot().calls, 2);
+    assert_eq!(h.model_snapshot().requests.completed, 2);
     assert_eq!(old.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        old.requests.lock().unwrap()[0].options.max_tokens,
+        Some(4096)
+    );
+    assert_eq!(
+        new.requests.lock().unwrap()[0].options.max_tokens,
+        Some(131072)
+    );
     assert!(new.requests.lock().unwrap()[0]
         .request
         .messages
@@ -1333,9 +1367,13 @@ async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
     let dir = TempDir::new().unwrap();
     let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
     config.system_prompt = Some("test".into());
-    config.context_policy.context_window = Some(64_000);
     let old = Arc::new(Model::new(vec![Box::pin(futures_util::stream::pending())]));
-    let h = Harness::open(config, old.clone()).await.unwrap();
+    let h = Harness::open(
+        config,
+        context_fixture::configured(old.clone(), Some(64_000), 4096),
+    )
+    .await
+    .unwrap();
     h.host.submit(In::user_text("wait")).unwrap();
     let host = h.host.clone();
     let turn = tokio::spawn(async move {
@@ -1353,13 +1391,13 @@ async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
     })
     .await
     .unwrap();
-    let policy = ContextPolicy {
-        context_window: Some(32_000),
-        ..ContextPolicy::default()
-    };
+    let policy = ContextPolicy::default();
     let new = Arc::new(Model::new(vec![answer("new")]));
     assert!(h
-        .switch_model(new.clone(), policy)
+        .switch_model(
+            context_fixture::configured(new.clone(), Some(32_000), 4096),
+            policy
+        )
         .await
         .unwrap_err()
         .to_string()
@@ -1387,13 +1425,23 @@ async fn model_switch_publishes_chunk_timeout_with_model() {
         .unwrap();
     let next = Arc::new(Model::new(vec![hangs_after("partial")]));
     h.switch_model_with_settings(
-        next,
+        {
+            let provider: Arc<dyn ModelProvider> = next;
+            let budget = provider.token_budget();
+            yourai_harness::model::ConfiguredModel::new(
+                provider,
+                budget,
+                ModelTimeouts {
+                    headers: Duration::from_millis(20),
+                    read: Duration::from_millis(20),
+                },
+            )
+        }
+        .unwrap(),
         ContextPolicy::default(),
         yourai_harness::assembly::ModelSettings {
             provider: "new".into(),
             requests: Default::default(),
-            header_timeout: Some(Duration::from_millis(20)),
-            chunk_timeout: Some(Duration::from_millis(20)),
         },
     )
     .await
@@ -1452,8 +1500,6 @@ async fn harness_model_settings_are_inherited_by_child_default_loop() {
     config.system_prompt = Some("test".into());
     config.extensions = true;
     config.yolo = true;
-    config.model_header_timeout = Some(Duration::from_secs(7));
-    config.model_chunk_timeout = Some(Duration::from_secs(11));
     let mut spawn = call("spawn", "subagent");
     spawn.fn_arguments = json!({"prompt":"child task"});
     let model = Arc::new(Model::new(vec![
@@ -1461,7 +1507,36 @@ async fn harness_model_settings_are_inherited_by_child_default_loop() {
         answer("child done"),
         answer("parent done"),
     ]));
-    let h = Harness::open(config, model.clone()).await.unwrap();
+    let old = Arc::new(Model::new(vec![]));
+    let h = Harness::open(
+        config,
+        context_fixture::configured(old.clone(), Some(64000), 16000),
+    )
+    .await
+    .unwrap();
+    h.switch_model_with_settings(
+        {
+            let provider: Arc<dyn ModelProvider> =
+                context_fixture::configured(model.clone(), Some(300000), 131072);
+            let budget = provider.token_budget();
+            yourai_harness::model::ConfiguredModel::new(
+                provider,
+                budget,
+                ModelTimeouts {
+                    headers: Duration::from_secs(7),
+                    read: Duration::from_secs(11),
+                },
+            )
+        }
+        .unwrap(),
+        ContextPolicy::default(),
+        assembly::ModelSettings {
+            provider: "new".into(),
+            requests: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
     h.host.submit_async(In::user_text("go")).await.unwrap();
     let result = h
         .host
@@ -1479,6 +1554,7 @@ async fn harness_model_settings_are_inherited_by_child_default_loop() {
         assert_eq!(requests.len(), 3);
         assert_ne!(requests[0].session_id, requests[1].session_id);
         for request in requests.iter() {
+            assert_eq!(request.options.max_tokens, Some(131072));
             assert_eq!(
                 request.options.stream_header_timeout,
                 Some(Duration::from_secs(7))
@@ -1489,6 +1565,7 @@ async fn harness_model_settings_are_inherited_by_child_default_loop() {
             );
         }
     }
+    assert!(old.requests.lock().unwrap().is_empty());
     h.close().await.unwrap();
 }
 

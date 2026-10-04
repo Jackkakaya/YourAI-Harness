@@ -25,6 +25,27 @@ impl Workspace {
     ) -> Result<(), YourAiError> {
         let path = resolve(&host.context().cwd, path)?;
         let content = std::fs::read_to_string(&path).map_err(|e| error("instructions", e))?;
+        Self::instructions_loaded(host, &path, reason).await?;
+        self.run_load_instructions(host, path, content).await
+    }
+    /// Startup files are already frozen into the prompt. Only register their
+    /// lifecycle and watcher here; dynamic injection is a separate operation.
+    pub(crate) async fn watch_instructions(
+        &self,
+        path: &Path,
+        reason: &str,
+    ) -> Result<(), YourAiError> {
+        let host = self.host()?;
+        let _gate = host.try_operation()?;
+        let path = resolve(&host.context().cwd, path)?;
+        Self::instructions_loaded(&host, &path, reason).await?;
+        host.watch_path_async(path).await
+    }
+    async fn instructions_loaded(
+        host: &Arc<SessionHost>,
+        path: &Path,
+        reason: &str,
+    ) -> Result<(), YourAiError> {
         let result = host
             .dispatch(HookEvent::InstructionsLoaded {
                 file_path: path.to_string_lossy().into_owned(),
@@ -36,7 +57,7 @@ impl Workspace {
             })
             .await?;
         host.consume_hook_async(&result, false).await?;
-        self.run_load_instructions(host, path, content).await
+        Ok(())
     }
     pub async fn notify(&self, message: &str, kind: &str) -> Result<(), YourAiError> {
         let host = self.host()?;

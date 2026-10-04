@@ -60,14 +60,22 @@ impl ModelProvider for CustomProvider {
 }
 fn wrapped(class: ModelErrorClass, mode: Mode) -> (Arc<dyn ModelProvider>, Arc<ModelBudget>) {
     let budget = ModelBudget::new();
-    let inner = ConfiguredModel::wrap(
-        Arc::new(SourceModel {
+    let inner = {
+        let provider: Arc<dyn ModelProvider> = Arc::new(SourceModel {
             inner: Arc::new(CustomProvider { class, mode }),
             source: "test",
-        }),
-        Some(Duration::from_secs(1)),
-        None,
-    )
+        });
+        let budget = provider.token_budget();
+        let defaults = provider.timeouts();
+        ConfiguredModel::new(
+            provider,
+            budget,
+            ModelTimeouts {
+                headers: Duration::from_secs(1),
+                read: defaults.read,
+            },
+        )
+    }
     .unwrap();
     (
         Arc::new(MeteredModel {
@@ -185,4 +193,87 @@ fn unspecified_provider_does_not_inherit_vendor_protocol_policy() {
     );
     assert_eq!(Unspecified.recovery(&error), ModelRecovery::Fatal);
     assert_eq!(Unspecified.retry_after(&error), None);
+}
+
+#[tokio::test]
+async fn wrappers_preserve_token_budget_and_apply_it_to_both_call_paths() {
+    struct Capture(Mutex<Vec<ModelRequest>>);
+    impl ModelProvider for Capture {
+        fn model_iden(&self) -> &str {
+            "capture"
+        }
+        fn complete<'a>(
+            &'a self,
+            r: ModelRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
+            self.0.lock().unwrap().push(r);
+            Box::pin(async { Err(failure()) })
+        }
+        fn stream_events<'a>(
+            &'a self,
+            r: ModelRequest,
+        ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
+            self.0.lock().unwrap().push(r);
+            Box::pin(async { Ok(Box::pin(futures_util::stream::empty()) as ModelEventStream) })
+        }
+    }
+    let capture = Arc::new(Capture(Mutex::new(vec![])));
+    let tokens = ModelTokenBudget::resolve(
+        ModelLimits {
+            context: Some(300000),
+            input: Some(200000),
+            output: Some(131072),
+        },
+        None,
+    )
+    .unwrap();
+    let configured = ConfiguredModel::new(
+        capture.clone(),
+        tokens,
+        ModelTimeouts {
+            headers: Duration::from_secs(3),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let metered = Arc::new(MeteredModel {
+        inner: configured,
+        budget: ModelBudget::new(),
+    });
+    let attributed = Arc::new(SourceModel {
+        inner: metered,
+        source: "summary",
+    });
+    let model = attributed;
+    assert_eq!(model.token_budget(), tokens);
+    for output in [None, Some(2000), Some(65536)] {
+        let mut r = request();
+        r.options.max_tokens = output;
+        r.options.reasoning_effort = Some(genai::chat::ReasoningEffort::Max);
+        assert!(model.complete(r.clone()).await.is_err());
+        let _ = model.stream_events(r).await.unwrap();
+    }
+    {
+        let calls = capture.0.lock().unwrap();
+        assert_eq!(calls.len(), 6);
+        for (r, expected) in calls.iter().zip([131072, 131072, 2000, 2000, 65536, 65536]) {
+            assert_eq!(r.options.max_tokens, Some(expected));
+            assert!(matches!(
+                r.options.reasoning_effort,
+                Some(genai::chat::ReasoningEffort::Max)
+            ));
+            assert_eq!(r.source, "summary");
+            assert_eq!(
+                r.options.stream_header_timeout,
+                Some(Duration::from_secs(3))
+            );
+        }
+    }
+    for output in [0, 131073] {
+        let mut r = request();
+        r.options.max_tokens = Some(output);
+        assert!(model.complete(r.clone()).await.is_err());
+        assert!(model.stream_events(r).await.is_err());
+    }
+    assert_eq!(capture.0.lock().unwrap().len(), 6);
 }

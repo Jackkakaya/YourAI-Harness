@@ -291,16 +291,36 @@ impl HookEvent {
     }
 }
 
+use crate::context::ExecutionBindings;
+
 /// 一次完整的 Hook 调用：base 上下文 + 事件。
 #[derive(Debug, Clone)]
 pub struct HookInvocation {
+    pub execution: ExecutionBindings,
     pub base: BaseInput,
     pub event: HookEvent,
 }
 
 impl HookInvocation {
     pub fn new(base: BaseInput, event: HookEvent) -> Self {
-        Self { base, event }
+        Self {
+            base,
+            event,
+            execution: ExecutionBindings::default(),
+        }
+    }
+
+    pub fn with_execution(mut self, execution: ExecutionBindings) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    pub fn with_model(
+        mut self,
+        model: Option<std::sync::Arc<dyn crate::model::ModelProvider>>,
+    ) -> Self {
+        self.execution.model = model;
+        self
     }
 
     pub fn event_name(&self) -> &'static str {

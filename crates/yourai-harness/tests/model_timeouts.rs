@@ -14,7 +14,7 @@ use yourai_harness::{
     MeteredModel, ModelBudget,
 };
 
-async fn server(mode: &'static str) -> (GenaiModel, tokio::task::JoinHandle<()>) {
+async fn server(mode: &'static str) -> (Arc<dyn ModelProvider>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = genai::resolver::Endpoint::from_owned(format!(
         "http://{}/v1/",
@@ -140,10 +140,19 @@ async fn server(mode: &'static str) -> (GenaiModel, tokio::task::JoinHandle<()>)
         })
         .build();
     (
-        GenaiModel::new(client, "test").with_timeouts(
-            Some(Duration::from_millis(200)),
-            Some(Duration::from_millis(200)),
-        ),
+        {
+            let provider: Arc<dyn ModelProvider> = Arc::new(GenaiModel::new(client, "test"));
+            let budget = provider.token_budget();
+            yourai_harness::model::ConfiguredModel::new(
+                provider,
+                budget,
+                ModelTimeouts {
+                    headers: Duration::from_millis(200),
+                    read: Duration::from_millis(200),
+                },
+            )
+        }
+        .unwrap(),
         task,
     )
 }
@@ -226,10 +235,19 @@ async fn headers_and_body_have_independent_deadlines() {
         } else {
             (200, 700)
         };
-        let model = model.with_timeouts(
-            Some(Duration::from_millis(header)),
-            Some(Duration::from_millis(read)),
-        );
+        let model = {
+            let provider: Arc<dyn ModelProvider> = model;
+            let budget = provider.token_budget();
+            yourai_harness::model::ConfiguredModel::new(
+                provider,
+                budget,
+                ModelTimeouts {
+                    headers: Duration::from_millis(header),
+                    read: Duration::from_millis(read),
+                },
+            )
+        }
+        .unwrap();
         let response = tokio::time::timeout(Duration::from_secs(3), model.complete(request()))
             .await
             .unwrap()
@@ -248,7 +266,7 @@ async fn raw_byte_progress_keeps_compaction_and_metered_main_loop_alive() {
         for main in [false, true] {
             let (model, server) = server(mode).await;
             let model = Arc::new(MeteredModel {
-                inner: Arc::new(model),
+                inner: model,
                 budget: ModelBudget::new(),
             });
             let text = if main {
@@ -256,7 +274,10 @@ async fn raw_byte_progress_keeps_compaction_and_metered_main_loop_alive() {
                     .model(model)
                     .context_manager(Arc::new(support::History::default()))
                     .agent_loop(Arc::new(DefaultLoop::new(LoopConfig {
-                        max_model_retries: 0,
+                        execution: yourai_harness::execution::ExecutionConfig {
+                            max_model_retries: 0,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     })))
                     .build();
@@ -285,7 +306,7 @@ async fn raw_byte_progress_keeps_compaction_and_metered_main_loop_alive() {
 async fn explicit_turn_deadline_still_stops_a_healthy_heartbeat_stream() {
     let (model, server) = server("heartbeat-until-cancel").await;
     let agent = Agent::builder()
-        .model(Arc::new(model))
+        .model(model)
         .context_manager(Arc::new(support::History::default()))
         .agent_loop(Arc::new(DefaultLoop::default()))
         .build();
@@ -312,12 +333,15 @@ async fn per_turn_model_limit_is_forwarded_to_transport() {
     let (model, server) = server("slow-headers").await;
     let agent = Agent::builder()
         .model(Arc::new(MeteredModel {
-            inner: Arc::new(model),
+            inner: model,
             budget: ModelBudget::new(),
         }))
         .context_manager(Arc::new(support::History::default()))
         .agent_loop(Arc::new(DefaultLoop::new(LoopConfig {
-            max_model_retries: 0,
+            execution: yourai_harness::execution::ExecutionConfig {
+                max_model_retries: 0,
+                ..Default::default()
+            },
             ..Default::default()
         })))
         .build();
@@ -374,11 +398,18 @@ async fn real_stream_errors_preserve_status_headers_and_retry_hint() {
 async fn configured_model_defaults_reach_collected_and_default_loop_requests() {
     for collected in [false, true] {
         let (model, task) = server("headers").await;
-        let model = yourai_harness::model::ConfiguredModel::wrap(
-            Arc::new(model),
-            Some(Duration::from_millis(40)),
-            Some(Duration::from_millis(70)),
-        )
+        let model = {
+            let provider: Arc<dyn ModelProvider> = model;
+            let budget = provider.token_budget();
+            yourai_harness::model::ConfiguredModel::new(
+                provider,
+                budget,
+                ModelTimeouts {
+                    headers: Duration::from_millis(40),
+                    read: Duration::from_millis(70),
+                },
+            )
+        }
         .unwrap();
         let model = Arc::new(MeteredModel {
             inner: model,

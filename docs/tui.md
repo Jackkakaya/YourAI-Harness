@@ -56,7 +56,7 @@ cargo run -p yourai-tui
 - `options.baseURL` 填基础地址（例如 `/v1`），不要填 `/chat/completions`；省略时使用 genai 的默认服务地址。
 - `options.apiKey` 支持 `{env:VAR}`；无需认证的本地服务可填任意非空占位值，或按 provider 默认认证方式省略。
 - `session_dir` 和提示词文件路径相对配置文件解析；工作目录仍是启动 TUI 时所在目录。
-- 模型窗口与输出上限放在 `provider.*.models.*.limit`；`options.maxOutputTokens` 不得超过 `limit.output`。旧的 `context.context_window/input_limit/output_reserve` 配置会被拒绝。
+- 模型窗口与输出上限放在 `provider.*.models.*.limit`。每次请求的输出预算优先使用 `options.maxOutputTokens`，未设置时使用 `limit.output`；两者都未设置时才默认使用 32,000 tokens。配置的预算不会被额外压到 32k；`options.maxOutputTokens` 不得超过 `limit.output`。旧的 `context.context_window/input_limit/output_reserve` 配置会被拒绝。`limit.input` 是独立输入容量，`limit.context` 是输入与输出共享的总窗口；`reasoningEffort` 独立控制推理，不用于推算这三个容量。模型切换时预算随模型一起切换，`context` 只保存维护策略。默认 Hook 和新建子 Agent 继承此次执行选择；显式固定模型的执行器保持固定，已开始的执行保留原快照。
 - `variants` 会合并到模型 `options`；含 `"disabled": true` 的 variant 不会出现在 `/models` 选择器中。
 - `options.reasoningEffort`（或 variant 内同名键）设置思考强度：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`。OpenAI 系以 `reasoning_effort` 发送；Anthropic/Gemini/Bedrock 会换算成 thinking budget。variant 内的设置优先于模型级。
 - 可选 `pricing` 使用每百万 token 的美元价格：`{"input": 5.0, "output": 15.0}`。状态栏和仪表盘会显示估算成本；未配置时不显示。

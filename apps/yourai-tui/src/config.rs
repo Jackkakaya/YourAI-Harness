@@ -12,7 +12,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use yourai_harness::GenaiModel;
+use yourai_core::model::{ModelLimits, ModelProvider, ModelTokenBudget};
+use yourai_harness::{model::ConfiguredModel, GenaiModel};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// Borrowed option maps for one picker entry: (model options, variant options).
 type EntryOptions<'a> = (&'a Map<String, Value>, Option<&'a Map<String, Value>>);
@@ -103,7 +104,7 @@ pub struct ModelConfig {
     #[serde(rename = "name")]
     pub _name: Option<String>,
     #[serde(default)]
-    pub limit: Limits,
+    pub limit: ModelLimits,
     #[serde(default)]
     pub options: Map<String, Value>,
     #[serde(default)]
@@ -121,26 +122,13 @@ pub struct Pricing {
     pub input: Option<f64>,
     pub output: Option<f64>,
 }
-#[derive(Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Limits {
-    pub context: Option<u64>,
-    pub input: Option<u64>,
-    pub output: Option<u32>,
-}
-
 pub struct ResolvedModel {
-    pub model: Arc<GenaiModel>,
-    pub context: yourai_core::prelude::ContextPolicy,
+    pub model: Arc<dyn ModelProvider>,
     pub settings: yourai_harness::assembly::ModelSettings,
 }
 impl ResolvedModel {
     pub fn apply_to(&self, config: &mut yourai_harness::HarnessConfig) {
-        config.context_policy = self.context.clone();
-        config.model_provider = self.settings.provider.clone();
-        config.request_policy = self.settings.requests.clone();
-        config.model_header_timeout = self.settings.header_timeout;
-        config.model_chunk_timeout = self.settings.chunk_timeout;
+        config.model_settings = self.settings.clone();
     }
 }
 
@@ -329,11 +317,8 @@ impl Config {
             parse("chunkTimeout", options.chunk_timeout_ms)?,
         ))
     }
-    /// Resolve the selected model (plus optional variant) into a live model
-    /// handle together with the context policy matching its limits. Pure:
-    /// callers explicitly adopt the policy (typically `self.context = …`),
-    /// keeping the model→context coupling visible at each call site instead
-    /// of hidden behind a mutation here.
+    /// Resolve provider transport, model capacities, and variant options without mutation.
+    /// Token budgets belong to the returned model; context only carries maintenance policy.
     pub fn resolve(&self, variant: Option<&str>) -> Result<ResolvedModel, Error> {
         let requests = self.request_policy()?;
         if self.steps == Some(0) {
@@ -369,30 +354,13 @@ impl Config {
             .map(|v| {
                 v.as_u64()
                     .filter(|v| *v > 0 && *v <= u32::MAX as u64)
+                    .map(|v| v as u32)
                     .ok_or("maxOutputTokens must be a positive integer")
             })
             .transpose()?;
-        if model.limit.output == Some(0)
-            || model.limit.context == Some(0)
-            || model.limit.input == Some(0)
-        {
-            return Err("Model limits must be positive".into());
-        }
-        let output =
-            requested.unwrap_or(u64::from(model.limit.output.unwrap_or(32_000).min(32_000)));
-        if model
-            .limit
-            .output
-            .is_some_and(|limit| output > u64::from(limit))
-        {
-            return Err("maxOutputTokens exceeds model limit.output".into());
-        }
-        let mut context = self.context.clone();
-        context.context_window = model.limit.context;
-        context.input_limit = model.limit.input;
-        context.output_reserve = output;
-        context.validate()?;
-        let mut chat = ChatOptions::default().with_max_tokens(output as u32);
+        let budget = ModelTokenBudget::resolve(model.limit, requested)?;
+        self.context.validate_for(budget)?;
+        let mut chat = ChatOptions::default();
         if let Some(v) = options.remove("temperature") {
             chat.temperature = Some(
                 v.as_f64()
@@ -450,19 +418,20 @@ impl Config {
             .collect::<Result<_, Error>>()?;
         let client = provider.client(provider_id, chat)?;
         let (header_timeout, chunk_timeout) = self.model_timeouts()?;
-        let model = Arc::new(
-            GenaiModel::new(client, name)
-                .with_headers(headers.into())
-                .with_timeouts(header_timeout, chunk_timeout),
-        );
+        let defaults = yourai_core::model::ModelTimeouts::default();
+        let model = ConfiguredModel::new(
+            Arc::new(GenaiModel::new(client, name).with_headers(headers.into())),
+            budget,
+            yourai_core::model::ModelTimeouts {
+                headers: header_timeout.unwrap_or(defaults.headers),
+                read: chunk_timeout.unwrap_or(defaults.read),
+            },
+        )?;
         Ok(ResolvedModel {
             model,
-            context,
             settings: yourai_harness::assembly::ModelSettings {
                 provider: provider_id.into(),
                 requests,
-                header_timeout,
-                chunk_timeout,
             },
         })
     }
@@ -678,7 +647,6 @@ mod tests {
     }
     #[tokio::test]
     async fn minimal_gateway_config_uses_model_name_and_default_prompt() {
-        use yourai_core::model::ModelProvider;
         let config: Config = serde_json::from_value(json!({
             "model":"gateway/glm",
             "provider":{"gateway":{"options":{"baseURL":"http://localhost:8080/v1","apiKey":"test-only"}}}
@@ -706,19 +674,46 @@ mod tests {
     }
     #[test]
     fn selects_model_and_variant_without_resolving_unused_credentials() {
-        use yourai_core::model::ModelProvider;
         let config = config();
-        let ResolvedModel { model, context, .. } = config.resolve(Some("short")).unwrap();
+        let ResolvedModel { model, .. } = config.resolve(Some("short")).unwrap();
         assert_eq!(model.model_iden(), "actual-api-model");
-        // The returned policy carries the model's limits and the variant's
-        // output reserve; adopting it is the caller's explicit choice.
-        assert_eq!(context.context_window, Some(64000));
-        assert_eq!(context.output_reserve, 4000);
+        // Limits and the variant's output budget travel with the selected model.
+        assert_eq!(model.token_budget().limits().context, Some(64000));
+        assert_eq!(model.token_budget().max_output_tokens(), 4000);
         assert!(config.resolve(Some("off")).is_err());
         assert!(config.resolve(Some("missing")).is_err());
         let mut config = config;
         config.model = "absent/model".into();
         assert!(config.resolve(None).is_err());
+    }
+    #[test]
+    fn output_budget_follows_configured_limits_and_overrides() {
+        for (limit, requested, expected) in [
+            (Some(131072), None, 131072),
+            (Some(16000), None, 16000),
+            (Some(131072), Some(65536), 65536),
+            (None, Some(131072), 131072),
+            (None, None, 32000),
+        ] {
+            let mut config = config();
+            let model = config
+                .provider
+                .get_mut("gateway")
+                .unwrap()
+                .models
+                .get_mut("alias/with/slash")
+                .unwrap();
+            model.limit.context = Some(300000);
+            model.limit.output = limit;
+            model.options.remove("maxOutputTokens");
+            if let Some(requested) = requested {
+                model
+                    .options
+                    .insert("maxOutputTokens".into(), json!(requested));
+            }
+            let resolved = config.resolve(None).unwrap();
+            assert_eq!(resolved.model.token_budget().max_output_tokens(), expected);
+        }
     }
     #[test]
     fn validates_output_and_protects_runtime_fields() {
@@ -744,6 +739,103 @@ mod tests {
             .options
             .insert("messages".into(), json!([]));
         assert!(config.resolve(None).is_err());
+    }
+    #[tokio::test]
+    async fn resolved_output_and_effort_reach_the_provider_independently() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        use yourai_core::prelude::{ChatMessage, ChatRequest, ModelRequest};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut bodies = vec![];
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut data = vec![];
+                let mut buffer = [0; 4096];
+                loop {
+                    let len = socket.read(&mut buffer).await.unwrap();
+                    assert!(len > 0);
+                    data.extend_from_slice(&buffer[..len]);
+                    if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..end]);
+                        let len: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if data.len() >= end + 4 + len {
+                            bodies.push(
+                                serde_json::from_slice::<Value>(&data[end + 4..end + 4 + len])
+                                    .unwrap(),
+                            );
+                            break;
+                        }
+                    }
+                }
+                let event = json!({"id":"test","object":"chat.completion.chunk","model":"test","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]});
+                let body = format!("data: {event}\n\ndata: [DONE]\n\n");
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let mut config: Config = serde_json::from_value(json!({
+            "model":"gateway/test",
+            "provider":{"gateway":{"api":"openai-compatible", "options":{"baseURL":endpoint,"apiKey":"test-only"},
+                "models":{"test":{"limit":{"context":300000,"output":131072},"options":{"reasoningEffort":"high"},"variants":{"short":{"maxOutputTokens":65536}}}}
+            }}
+        })).unwrap();
+        let request = |output| {
+            ModelRequest::new(
+                ChatRequest::new(vec![ChatMessage::user("hello")]),
+                ChatOptions {
+                    max_tokens: output,
+                    ..Default::default()
+                },
+            )
+        };
+        config
+            .resolve(None)
+            .unwrap()
+            .model
+            .complete(request(None))
+            .await
+            .unwrap();
+        config
+            .set_entry_effort(
+                "gateway/test",
+                None,
+                &crate::models::EffortChoice::Set("max".into()),
+            )
+            .unwrap();
+        let model = config.resolve(None).unwrap().model;
+        model.complete(request(None)).await.unwrap();
+        model.complete(request(Some(2000))).await.unwrap();
+        config
+            .resolve(Some("short"))
+            .unwrap()
+            .model
+            .complete(request(None))
+            .await
+            .unwrap();
+        let bodies = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        for (body, (output, effort)) in bodies.iter().zip([
+            (131072, "high"),
+            (131072, "max"),
+            (2000, "max"),
+            (65536, "max"),
+        ]) {
+            assert_eq!(body["max_tokens"], output);
+            assert_eq!(body["reasoning_effort"], effort);
+        }
     }
     #[tokio::test]
     async fn endpoint_and_protocol_are_explicit() {

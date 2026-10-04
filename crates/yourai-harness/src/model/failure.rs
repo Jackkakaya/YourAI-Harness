@@ -158,3 +158,46 @@ mod tests {
         }
     }
 }
+
+/// User-facing diagnostic from typed SDK fields; no Display-string parsing.
+pub fn diagnostic(error: &YourAiError) -> String {
+    let Some((status, body)) = http_error(error) else {
+        return error.to_string();
+    };
+    let body: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let message = body
+        .pointer("/error/message")
+        .or_else(|| body.get("message"))
+        .and_then(|v| v.as_str());
+    match message {
+        Some(message) => format!("Model request failed (HTTP {status}): {message}"),
+        None => format!("Model request failed (HTTP {status})"),
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_reads_typed_http_body_and_preserves_plain_errors() {
+        for body in [
+            r#"{"error":{"message":"unsupported image"}}"#,
+            r#"{"message":"unsupported image"}"#,
+        ] {
+            let error = ErrorKind::Model {
+                source: genai::Error::HttpError {
+                    status: "400".parse().unwrap(),
+                    canonical_reason: "Bad Request".into(),
+                    body: body.into(),
+                },
+            }
+            .into();
+            assert_eq!(
+                diagnostic(&error),
+                "Model request failed (HTTP 400): unsupported image"
+            );
+        }
+        let error = ErrorKind::Config("plain error".into()).into();
+        assert_eq!(diagnostic(&error), error.to_string());
+    }
+}

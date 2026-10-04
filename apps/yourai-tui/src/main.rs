@@ -153,9 +153,8 @@ async fn run() -> Result<(), Error> {
     }
     let selection = config.resolve(variant.as_deref())?;
     let model = selection.model.clone();
-    config.context = selection.context.clone();
     config.selected_variant = variant;
-    if config.context.input_budget().is_none() {
+    if config.context.input_budget(model.token_budget()).is_none() {
         eprintln!("Context window unknown: configure provider.<id>.models.<id>.limit.context to enable automatic/manual summarization.");
     }
     if check {
@@ -180,6 +179,7 @@ async fn run() -> Result<(), Error> {
         }
     }
     let mut hc = HarnessConfig::new(config.session_dir.clone(), std::env::current_dir()?);
+    hc.context_policy = config.context.clone();
     selection.apply_to(&mut hc);
     hc.resume = resume.take();
     hc.system_prompt = config.system_prompt.clone();

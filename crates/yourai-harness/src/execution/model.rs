@@ -59,7 +59,26 @@ impl ExecutionState<'_> {
             self.history.session_id(),
             self.tc.info.options.session.as_deref(),
         )?;
-        let mut prepared = self.history.build_request(&tools, &execution)?;
+        let mut suffix = Vec::new();
+        if let Some(session) = &self.tc.info.options.session {
+            suffix.extend(
+                session
+                    .instructions
+                    .values()
+                    .map(|text| ChatMessage::user(text.clone())),
+            );
+        }
+        suffix.extend(
+            model_options
+                .prefill
+                .iter()
+                .map(|text| ChatMessage::assistant(text.clone())),
+        );
+        let input = RequestInput {
+            tools: &tools,
+            suffix: &suffix,
+        };
+        let mut prepared = self.history.build_request(input, &execution)?;
         if prepared.maintenance_needed {
             if let Err(e) = self.compact(CompactionTrigger::Threshold).await {
                 if matches!(e, YourAiError::Aborted(_)) || !prepared.fits() {
@@ -69,7 +88,7 @@ impl ExecutionState<'_> {
                 self.history.restore().await?;
                 self.notice(Level::Warning, format!("Automatic maintenance failed: {e}"))?;
             }
-            prepared = self.history.build_request(&tools, &execution)?;
+            prepared = self.history.build_request(input, &execution)?;
         }
         if !prepared.fits() {
             return Err(ErrorKind::Loop(
@@ -77,20 +96,14 @@ impl ExecutionState<'_> {
             )
             .into());
         }
-        if let Some(prefill) = &model_options.prefill {
-            // opencode runner (llm.ts "isLastStep"): append an assistant-role
-            // MAX_STEPS_PROMPT prefill to the outgoing request only — never to
-            // persisted history — and forbid tool calls at the API level.
-            prepared
-                .request
-                .messages
-                .push(ChatMessage::assistant(prefill.clone()));
-        }
         let request = prepared.request;
         let observed_request = request.clone();
-        let mut options = self
-            .history
-            .default_options()
+        let model = self
+            .model
+            .clone()
+            .ok_or_else(|| ErrorKind::Config("model not configured".into()))?;
+        let mut options = ChatOptions::default()
+            .with_max_tokens(model.token_budget().max_output_tokens())
             .with_capture_content(true)
             .with_capture_tool_calls(true)
             .with_capture_usage(true)
@@ -98,10 +111,6 @@ impl ExecutionState<'_> {
         if !model_options.tools_enabled {
             options = options.with_tool_choice(ToolChoice::None);
         }
-        let model = self
-            .model
-            .clone()
-            .ok_or_else(|| ErrorKind::Config("model not configured".into()))?;
         let model_timeout = self.tc.info.options.limits.model_timeout;
         let header_timeout = model_timeout
             .or(options.stream_header_timeout)
@@ -148,7 +157,10 @@ impl ExecutionState<'_> {
                 return Err(self.fail_with_partial(
                     ErrorKind::Provider {
                         name: crate::model::MODEL_NAME,
-                        message: "stream ended without terminal event".into(),
+                        message: format!(
+                            "stream ended without terminal event (text_bytes={}, reasoning_bytes={}, tool_call_chunks_seen={saw_tool_chunk}); incomplete tools were not executed",
+                            text.len(), reasoning.len()
+                        ),
                     }
                     .into(),
                     &text,
@@ -199,17 +211,16 @@ impl ExecutionState<'_> {
                             ),
                         );
                     }
-                    if let Some(tracker) = &self.tc.snap.usage {
-                        tracker
-                            .record_event(
-                                self.history.session_id(),
-                                &UsageEvent::new(
-                                    Some(model.model_iden().into()),
-                                    "main",
-                                    end.captured_usage.clone().unwrap_or_default(),
-                                ),
-                            )
-                            .await?;
+                    if let Some(warning) = crate::model::accounting::record_response(
+                        self.tc.snap.usage.as_deref(),
+                        self.history.session_id(),
+                        model.model_iden(),
+                        "main",
+                        end.captured_usage.clone().unwrap_or_default(),
+                    )
+                    .await
+                    {
+                        self.notice(Level::Warning, warning)?;
                     }
                     if let Some(u) = &end.captured_usage {
                         if let Some(input_tokens) = u.prompt_tokens.filter(|n| *n >= 0) {
@@ -221,14 +232,16 @@ impl ExecutionState<'_> {
                         }
                         self.record_usage(crate::model::usage(u)).await?;
                     }
-                    if matches!(
-                        end.captured_stop_reason,
-                        Some(StopReason::MaxTokens(_) | StopReason::ContentFilter(_))
-                    ) {
+                    if let Some(
+                        reason @ (StopReason::MaxTokens(_) | StopReason::ContentFilter(_)),
+                    ) = &end.captured_stop_reason
+                    {
                         return Err(ErrorKind::Provider {
                             name: crate::model::MODEL_NAME,
-                            message: "model response truncated or filtered; tools will not execute"
-                                .into(),
+                            message: format!(
+                                "model response truncated or filtered; tools will not execute (finish_reason={})",
+                                reason.raw()
+                            ),
                         }
                         .into());
                     }

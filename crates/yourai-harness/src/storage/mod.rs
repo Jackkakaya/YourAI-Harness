@@ -66,10 +66,15 @@ fn lock(path: &Path) -> Result<File, YourAiError> {
 }
 
 /// Session directories hold host/extension state, while all session records use SQLite.
+/// The raw backend is not an alternative public lifecycle entry point.
+/// ```compile_fail
+/// use yourai_harness::SessionCatalog;
+/// fn backend(catalog: &SessionCatalog) { let _ = &catalog.store; }
+/// ```
 pub struct SessionCatalog {
     root: PathBuf,
     pub(crate) tool_output: Arc<crate::tools::ToolOutputStore>,
-    pub store: Arc<crate::SqliteStore>,
+    pub(crate) store: Arc<crate::SqliteStore>,
 }
 impl SessionCatalog {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, YourAiError> {
@@ -104,6 +109,17 @@ impl SessionCatalog {
             root,
             store,
             tool_output,
+        })
+    }
+    pub fn delete_session<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(async move {
+            let dir = self.directory(id)?;
+            let _guard = lock(&dir.join("host.lock"))?;
+            self.store.delete_records(id).await?;
+            fs::remove_dir_all(dir).map_err(|e| error("storage", e))
         })
     }
     pub fn directory(&self, id: &SessionId) -> Result<PathBuf, YourAiError> {
@@ -146,14 +162,6 @@ impl SessionManager for SessionCatalog {
     }
     fn list_sessions<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SessionMeta>, YourAiError>> {
         self.store.list_sessions()
-    }
-    fn delete_session<'a>(&'a self, id: &'a SessionId) -> BoxFuture<'a, Result<(), YourAiError>> {
-        Box::pin(async move {
-            let dir = self.directory(id)?;
-            let _guard = lock(&dir.join("host.lock"))?;
-            self.store.delete_session(id).await?;
-            fs::remove_dir_all(dir).map_err(|e| error("storage", e))
-        })
     }
     fn fork_session<'a>(
         &'a self,

@@ -131,6 +131,11 @@ Setup、idle 等本身就是操作/扩展边界，不制造空的 run 方法。�
 - 工具实现方法 `execute` 改为 `run`；自定义注册表保存 ToolBinding，实现 register_binding 和返回绑定的 resolve。
 - 自定义调度直接实现 AgentLoop；上一轮临时引入的 LoopProgram/LoopRun/ProgramLoop 接口已移除。
 - ContextManager 的 compact 实现改为 prepare_compaction 与业务 CompactionJob；调用方使用公共 context.compact。
-- DefaultLoop 和原 LoopConfig 的 struct 字段装配方式保留；ExecutionConfig 只包含业务操作策略。
+- `LoopConfig` 只拥有调度字段 `steps` 和 `execution: ExecutionConfig`。原 `LoopConfig.tool_timeout` 等业务字段迁移为 `LoopConfig.execution.tool_timeout`；自定义 Loop 直接使用同一 ExecutionConfig。
+- `Context::update` 在暂存副本上修改一组 provider 并一次发布，snapshot 在同一把锁下读取整个版本。不要用连续的独立 setter 表达需要一致生效的变更。
+- `ModelSelection::Inherit` 从当前执行快照选择模型；`Pinned(model)` 固定选择。HookInvocation.execution 是不进入 wire payload 的执行能力，新建子 Agent 也捕获父执行快照，已开始的执行保留原选择。
+- `ConfiguredModel::with_budget` 现在返回 Result；与底层容量冲突时构造失败，调用方使用 `?`。配置 timeout 与预算的先后顺序不影响有效值。
+- `SubagentTool::new` 的 model 参数改为 `ModelSelection`；`DefaultHookModelExecutor.model` 改为 `selection`。框架自动给 HookInvocation 绑定执行模型；手工调用继承型 Hook 时用 `with_model` 显式提供选择。
+- `ContextManager::build_request` 接收 `RequestInput`；自定义实现需要将 `suffix` 加入临时请求后再估算。无临时内容用 `RequestInput::tools(&tools)`。
 
 计划、验收与代码位置见 [重构计划](./hook-execution-refactor.md)。

@@ -29,7 +29,8 @@ pub struct HostConfig {
     pub cleanup_timeout: Option<Duration>,
     pub allow_background_wake: bool,
     pub max_followups: usize,
-    pub instruction_paths: Vec<PathBuf>,
+    /// Files already frozen in the system prompt; observe without reinjecting.
+    pub instruction_watch_paths: Vec<PathBuf>,
     pub workspace_enabled: bool,
 }
 impl Default for HostConfig {
@@ -40,7 +41,7 @@ impl Default for HostConfig {
             cleanup_timeout: None,
             allow_background_wake: true,
             max_followups: 64,
-            instruction_paths: vec![],
+            instruction_watch_paths: vec![],
             workspace_enabled: false,
         }
     }
@@ -157,13 +158,13 @@ impl SessionHost {
             history.session_id(),
             Some(&self.context()),
         )?;
-        let request = history.build_request(&tools, &execution)?;
-        let policy = history.policy();
+        let request = history.build_request(RequestInput::tools(&tools), &execution)?;
+        let budget = execution.model().token_budget();
         Ok(ContextUsage {
             estimated_tokens: request.estimated_tokens,
-            context_window: policy.context_window,
+            context_window: budget.limits().context,
             input_budget: request.input_budget,
-            output_reserve: policy.output_reserve,
+            output_reserve: u64::from(budget.max_output_tokens()),
         })
     }
 
@@ -249,7 +250,7 @@ impl SessionHost {
             read_json::<crate::workspace::RuntimeConfig>(&host.dir.join("config.json"))?
                 .apply(&host);
         }
-        if host.config.workspace_enabled || !host.config.instruction_paths.is_empty() {
+        if host.config.workspace_enabled || !host.config.instruction_watch_paths.is_empty() {
             let workspace = host.workspace()?;
             workspace
                 .setup(if source == "startup" {
@@ -258,8 +259,8 @@ impl SessionHost {
                     "maintenance"
                 })
                 .await?;
-            for path in &host.config.instruction_paths {
-                workspace.load_instructions(path, source).await?;
+            for path in &host.config.instruction_watch_paths {
+                workspace.watch_instructions(path, source).await?;
             }
         }
         if was_interrupted {
@@ -796,27 +797,11 @@ impl SessionHost {
         hooks: Option<Arc<dyn HookRuntime>>,
         tools: Option<Arc<dyn ToolRegistry>>,
     ) -> Result<Arc<Self>, YourAiError> {
-        let catalog = Arc::new(crate::SessionCatalog::new(root)?);
-        let prompt = crate::context::prompt::prepare(
-            &crate::PromptConfig::default(),
-            &cwd,
-            None,
-            &[],
-            None,
-            None,
-            &ContextPolicy::default(),
-            &CancellationToken::new(),
-        )
-        .await?;
-        let meta = catalog.create_session(&prompt.system).await?;
-        Self::restore(
-            root,
-            meta.id,
-            cwd,
+        Self::open_config(
+            crate::HarnessConfig::new(root.into(), cwd),
             model,
             hooks,
             tools,
-            ContextPolicy::default(),
             "startup",
         )
         .await
@@ -832,40 +817,46 @@ impl SessionHost {
         policy: ContextPolicy,
         source: &str,
     ) -> Result<Arc<Self>, YourAiError> {
-        let catalog = Arc::new(crate::SessionCatalog::new(root)?);
-        let lease = SessionLease::acquire(catalog.directory(&id)?)?;
-        let mut meta = catalog.load_session(&id).await?;
-        if meta.system_prompt.is_none() {
-            let prompt = crate::context::prompt::prepare(
-                &crate::PromptConfig::default(),
-                &cwd,
-                None,
-                &[],
-                None,
-                None,
-                &policy,
-                &CancellationToken::new(),
-            )
-            .await?;
-            meta.system_prompt = Some(catalog.initialize_system(&id, &prompt.system).await?);
-        }
-        meta.model = Some(model.model_iden().into());
-        catalog.save_session(&meta).await?;
+        let mut config = crate::HarnessConfig::new(root.into(), cwd);
+        config.resume = Some(id);
+        config.context_policy = policy;
+        Self::open_config(config, model, hooks, tools, source).await
+    }
+    async fn open_config(
+        config: crate::HarnessConfig,
+        model: Arc<dyn ModelProvider>,
+        hooks: Option<Arc<dyn HookRuntime>>,
+        tools: Option<Arc<dyn ToolRegistry>>,
+        source: &str,
+    ) -> Result<Arc<Self>, YourAiError> {
+        let catalog = Arc::new(crate::SessionCatalog::new(&config.root)?);
+        let crate::assembly::PreparedSession { id, lease, notices } =
+            crate::assembly::prepare_session(&catalog, &config, model.as_ref()).await?;
         let usage = Arc::new(crate::storage::LocalUsage((*catalog.store).clone()));
         let (agent, _) = crate::assembly::assemble(
             &catalog,
             &id,
-            &cwd,
+            &config.cwd,
             false,
             model,
             hooks,
             Some(usage),
             tools,
-            policy,
+            config.context_policy,
         )
         .await?;
-        let mut context = SessionContext::new(id, cwd);
-        context.transcript_path = Some(crate::SqliteStore::path(root));
-        Self::open_owned(lease, context, agent, HostConfig::default(), source).await
+        let mut context = SessionContext::new(id, config.cwd);
+        context.transcript_path = Some(crate::SqliteStore::path(&config.root));
+        let host = Self::open_owned(lease, context, agent, HostConfig::default(), source).await?;
+        for notice in notices {
+            host.post_event_async(yourai_core::runtime_event::RuntimeEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                context: None,
+                notice: Some(notice),
+                wake: false,
+            })
+            .await?;
+        }
+        Ok(host)
     }
 }

@@ -25,7 +25,7 @@ Agent.start / run
 |---|---|
 | `default_loop/mod.rs` | DefaultLoop：调用公共模型和工具入口，提交候选完成 |
 | `execution/mod.rs` | TurnExecution、共享操作状态、业务能力与完成操作 |
-| `execution/config.rs` | ExecutionConfig 业务操作策略；default_loop/config.rs 保留原 LoopConfig 字段和 steps |
+| `execution/config.rs` | ExecutionConfig 业务操作策略及其唯一默认值；LoopConfig 只保留 steps，并组合 execution: ExecutionConfig |
 | `execution/control.rs` | 可取消等待、唯一 inbox 消费、历史、用量与清理 |
 | `execution/admission.rs` | 输入 Hook、附件准备、拒绝与提交 |
 | `execution/model.rs` | 请求装配、工具绑定、流式事件、完整消息与工具 ID 校验 |

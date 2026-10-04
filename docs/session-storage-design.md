@@ -37,11 +37,12 @@ ContextManager 通过 SessionManager 保存消息和摘要，通过 UsageTracker
 |---|---|
 | create_session / load_session / save_session | 会话元数据创建、读取、更新 |
 | list_sessions | 列出元数据，按 updated_at、session_id 排序 |
-| delete_session | 级联删除消息和用量；宿主须已关闭 |
 | fork_session | 事务复制历史，新会话和新消息 ID；不复制用量、队列和工具副作用 |
 | read_messages(id, MessageQuery) | active/full 过滤，按 seq 升序，after 游标分页 |
 | append_messages(id, batch) | 原子追加普通消息，返回已存记录 |
 | save_context(id, ContextChange) | 单事务保存清理标记及可选摘要替换 |
+
+删除属于 `SessionCatalog::delete_session`，不属于 `SessionManager`：先取得宿主独占租约，再删除记录与目录。`SqliteStore` 不提供公开删除方法，catalog 的底层 store 也不公开。
 
 调用方在提交前分配消息 ID，重试复用同一 ID。同 ID、同内容不重复插入；内容或所属会话不同则报冲突。seq 是会话内顺序，不是身份。
 

@@ -29,7 +29,9 @@ impl MemoryContext {
             .target_tokens
             .unwrap_or(policy.summary_tokens)
             .min(summary_budget / 4)
-            .min(policy.output_reserve)
+            .min(u64::from(
+                execution.model().token_budget().max_output_tokens(),
+            ))
             .max(1);
         let instruction = format!(
             "{}\nKeep the checkpoint within {target} tokens.\n{}",
@@ -45,6 +47,7 @@ impl MemoryContext {
             .map(|i| self.summary_records(&records[i..i + 1]))
             .transpose()?;
         let mut summary = String::new();
+        let mut accounting_notices = Vec::new();
         let mut cursor = 0;
         while cursor < selected.len() {
             let mut req = ChatRequest::new(vec![]);
@@ -86,7 +89,7 @@ impl MemoryContext {
             }
             options.calls.fetch_add(1, Ordering::AcqRel);
             let response = match execution
-                .model
+                .model()
                 .complete(
                     ModelRequest::new(
                         req,
@@ -100,7 +103,7 @@ impl MemoryContext {
             {
                 Ok(response) => response,
                 Err(e)
-                    if execution.model.recovery(&e) == ModelRecovery::Compact
+                    if execution.model().recovery(&e) == ModelRecovery::Compact
                         && cursor - start > 1 =>
                 {
                     cursor = start;
@@ -111,17 +114,16 @@ impl MemoryContext {
             };
             options.usage.lock().unwrap().push(response.usage.clone());
             // Account BEFORE validation or commit; those can fail after a paid call.
-            if let Some(tracker) = &execution.usage {
-                tracker
-                    .record_event(
-                        &self.id,
-                        &UsageEvent::new(
-                            Some(execution.model.model_iden().into()),
-                            "compact",
-                            response.usage.clone(),
-                        ),
-                    )
-                    .await?;
+            if let Some(warning) = crate::model::accounting::record_response(
+                execution.bindings().usage.as_deref(),
+                &self.id,
+                execution.model().model_iden(),
+                "compact",
+                response.usage.clone(),
+            )
+            .await
+            {
+                accounting_notices.push(warning);
             }
             summary = response.content.texts().join("\n");
             if summary.trim().is_empty() || response.stop_reason.is_some_and(|s| s.is_max_tokens())
@@ -187,8 +189,8 @@ impl MemoryContext {
             view.last_maintenance = Some(Self::fingerprint(
                 &view.records,
                 Some(system.as_str()),
-                &options.tools,
-                execution.model.model_iden(),
+                RequestInput::tools(&options.tools),
+                execution.model().as_ref(),
             ));
             view.last_prune_tokens = after;
         }
@@ -198,6 +200,7 @@ impl MemoryContext {
             after,
             "summary committed",
         );
+        outcome.notices.extend(accounting_notices);
         outcome.summarized_messages = summarized_messages;
         outcome.retained_messages = retained_messages;
         outcome.pruned_outputs = pruned_outputs;

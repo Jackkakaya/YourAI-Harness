@@ -68,7 +68,7 @@ impl MemoryContext {
         request: &ChatRequest,
         execution: &ContextExecution,
     ) -> Result<u64, YourAiError> {
-        estimate(request, execution.model.as_ref())
+        estimate(request, execution.model().as_ref())
     }
 
     pub(super) fn estimate(
@@ -80,7 +80,7 @@ impl MemoryContext {
         let view = self.view.lock().unwrap();
         if let Some(o) = &view.observation {
             let n = o.request.messages.len();
-            if o.model == execution.model.model_iden()
+            if o.model == execution.model().model_iden()
                 && n <= request.messages.len()
                 && o.request.system == request.system
                 && serde_json::to_value(&o.request.tools).ok()
