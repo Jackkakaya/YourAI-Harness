@@ -141,3 +141,9 @@ API 迁移：`HarnessConfig.model_provider/request_policy` 合并为 `model_sett
 - `ProviderSnapshot` 仍保留完整 turn 能力。它到 ExecutionBindings 的投影保留在单一位置；能力缩减有意保留，不向每个 hook 暴露整个 Context。
 
 新增约束覆盖缺失模型拒绝、旧/新快照身份、hook 复用绑定及不可移除已验证模型的编译期检查。原先测试“包装顺序可交换”改为测试“一次构造同时应用预算和 timeout，显式请求覆盖仍有效”。
+
+### 默认排队与显式 steer
+
+TUI 普通发送统一使用 `InputMode::FollowUp`。宿主持有带稳定 ID 的待处理消息，TUI 只读取队列快照；点击 `Steer` 调用 `SessionHost::steer_pending(id)`，在同一 journal 事务内转移所有权，再投递当前 Turn。旧点击不会按文本或列表下标匹配另一条消息，重复点击不会重复投递，附件随原消息保留。旧 host.json 的裸输入队列会在读取时升级，Turn 的 `In` wire 协议保持兼容。
+
+移除 `/queue`、`/continue`；错误或停止后由下一次显式发送恢复驱动，不自动构造任务提示词，不重放已消费输入。底层仍保留 Steer / FollowUp 两种调度语义，审批答复仍走 Reply。

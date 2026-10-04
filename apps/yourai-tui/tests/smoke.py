@@ -169,7 +169,7 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'Copied')
         assert clipboard_file.read_text() == 'New session', repr(clipboard_file.read_text())
         os.write(master, b'/')
-        wait_for(b'/continue')
+        wait_for(b'/compact')
         os.write(master, b'\x1b\x7f/theme nord\r')
         # Esc dismisses completion; Backspace removes the slash before a new command.
         # Theme command is local; wait for the editor to clear (no theme button in footer now).

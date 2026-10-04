@@ -1,3 +1,5 @@
+mod pending;
+pub use pending::PendingInput;
 mod compaction;
 mod journal;
 mod lifecycle;
@@ -74,7 +76,8 @@ impl SessionLease {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Journal {
-    queue: VecDeque<In>,
+    #[serde(deserialize_with = "pending::deserialize_queue")]
+    queue: VecDeque<PendingInput>,
     active: Vec<In>,
     interrupted: Vec<In>,
     events: Vec<RuntimeEvent>,
@@ -323,7 +326,9 @@ impl SessionHost {
             && self.status() == SessionStatus::Idle
             && journal.queue.is_empty()
         {
-            journal.queue.push_back(In::follow_up(RUNTIME_EVENT_PROMPT));
+            journal
+                .queue
+                .push_back(In::follow_up(RUNTIME_EVENT_PROMPT).into());
         }
         journal.commit()?;
         self.events.push(event);
@@ -490,12 +495,12 @@ impl SessionRuntime for SessionHost {
         if steer {
             journal.active.push(input.clone());
         } else {
-            journal.queue.push_back(input.clone());
+            journal.queue.push_back(input.clone().into());
         }
         journal.commit().map_err(|e| reject(e.to_string()))?;
         if steer && inbox.unwrap().send(input.clone()).is_err() {
             journal.active.pop();
-            journal.queue.push_back(input);
+            journal.queue.push_back(input.into());
             if let Err(e) = journal.commit() {
                 journal.retain_for_recovery(&e);
             }
@@ -541,7 +546,7 @@ impl SessionRuntime for SessionHost {
                         let Some(first) = journal.queue.pop_front() else {
                             return Ok(None);
                         };
-                        journal.active = vec![first.clone()];
+                        journal.active = vec![first.input.clone()];
                         journal.commit()?;
                         if host.closing.is_cancelled() || start_cancel.is_cancelled() {
                             journal.restore_unstarted(first)?;
@@ -552,7 +557,7 @@ impl SessionRuntime for SessionHost {
                         options.limits = limits;
                         options.events = Some(host.events.clone());
                         options.input = Some(host.input_options.lock().unwrap().clone());
-                        let handle = match host.agent.start_with(first.clone(), options) {
+                        let handle = match host.agent.start_with(first.input.clone(), options) {
                             Ok(handle) => handle,
                             Err(e) => {
                                 journal.restore_unstarted(first)?;
@@ -632,7 +637,7 @@ impl SessionRuntime for SessionHost {
                         if !uncertain {
                             for input in pending.into_iter().rev() {
                                 if matches!(input, In::UserText { .. }) {
-                                    journal.queue.push_front(input);
+                                    journal.queue.push_front(input.into());
                                 }
                             }
                         }
@@ -652,7 +657,9 @@ impl SessionRuntime for SessionHost {
                             && journal.queue.is_empty()
                             && host.config.allow_background_wake
                         {
-                            journal.queue.push_back(In::follow_up(RUNTIME_EVENT_PROMPT));
+                            journal
+                                .queue
+                                .push_back(In::follow_up(RUNTIME_EVENT_PROMPT).into());
                         }
                         if let Err(e) = journal.commit() {
                             journal.retain_for_recovery(&e);
@@ -768,7 +775,11 @@ impl SessionHost {
                 return Err(e);
             }
             // Retain the handoff before any fallible/cancellable step.
-            host.live.lock().unwrap().closed_pending.extend(pending);
+            host.live
+                .lock()
+                .unwrap()
+                .closed_pending
+                .extend(pending.into_iter().map(|entry| entry.input));
             FileExt::unlock(&host._lock).map_err(|e| error("host", e))?;
             host.live.lock().unwrap().status = SessionStatus::Closed;
             Ok(())

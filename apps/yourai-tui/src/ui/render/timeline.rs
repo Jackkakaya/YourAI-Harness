@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn viewport_matches_full_layout_and_reuses_unchanged_blocks() {
         let mut view = View::default();
-        view.user("你好，检查 parser", false);
+        view.user("你好，检查 parser");
         view.event(Out::Chunk {
             text: "## Result\n\n```rust\nlet x = 1;\n```".into(),
         });
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn exploration_groups_expand_without_hiding_failures_or_edits() {
         let mut view = View::default();
-        view.user("Investigate", false);
+        view.user("Investigate");
         for (id, name, failed) in [
             ("a", "read", false),
             ("b", "grep", false),

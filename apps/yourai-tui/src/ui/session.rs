@@ -168,9 +168,9 @@ impl Controller {
     pub fn can_reply(&self) -> bool {
         self.operation.is_none()
     }
-    pub fn resume(&mut self, view: &mut View) {
+    pub fn steer_pending(&mut self, id: String, view: &mut View) {
         if self.available(view) {
-            self.runtime.resume();
+            self.runtime.steer_pending(id);
         }
     }
     pub fn compact(&mut self, view: &mut View) {
@@ -515,7 +515,7 @@ mod tests {
             label: "mock/test · fast".into(),
             effort: None,
         }];
-        view.user("belongs to the old session", false);
+        view.user("belongs to the old session");
         view.session.title = Some("old title".into());
         view.restore_usage(
             Usage {

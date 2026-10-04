@@ -32,7 +32,7 @@ impl Transaction<'_> {
         }
     }
 
-    pub fn restore_unstarted(&mut self, input: In) -> Result<(), YourAiError> {
+    pub fn restore_unstarted(&mut self, input: PendingInput) -> Result<(), YourAiError> {
         self.candidate.active.clear();
         self.candidate.queue.push_front(input);
         if let Err(error) = self.commit() {
@@ -169,6 +169,78 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), saved);
         assert_eq!(reopened.close(None).await.unwrap().len(), 1);
     }
+    #[tokio::test]
+    async fn promotion_preserves_identity_attachments_and_rejects_stale_clicks() {
+        let (_dir, harness) = fixture().await;
+        let host = &harness.host;
+        let input = In::UserText {
+            text: "same text".into(),
+            mode: InputMode::FollowUp,
+            attachments: vec![UserAttachment::file("notes.txt", None)],
+        };
+        host.submit_async(input.clone()).await.unwrap();
+        host.submit_async(input).await.unwrap();
+        let before = host.pending_inputs();
+        assert_ne!(before[0].id, before[1].id);
+        assert!(!host.steer_pending(before[0].id.clone()).await.unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        {
+            let mut live = host.live.lock().unwrap();
+            live.status = SessionStatus::Running {
+                turn_id: TurnId::new(),
+            };
+            live.inbox = Some(tx);
+        }
+        let path = host.dir.join("host.json");
+        let backup = path.with_extension("backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(host.steer_pending(before[1].id.clone()).await.is_err());
+        assert_eq!(host.queued(), 2);
+        assert!(rx.try_recv().is_err());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        assert!(host.steer_pending(before[1].id.clone()).await.unwrap());
+        assert!(!host.steer_pending(before[1].id.clone()).await.unwrap());
+        let In::UserText {
+            text,
+            mode,
+            attachments,
+        } = rx.try_recv().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(text, "same text");
+        assert_eq!(mode, InputMode::Steer);
+        assert_eq!(attachments.len(), 1);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(host.pending_inputs()[0].id, before[0].id);
+        let saved: Journal = read_json(&host.dir.join("host.json")).unwrap();
+        assert_eq!(saved.queue[0].id, before[0].id);
+        assert_eq!(saved.active.len(), 1);
+        drop(rx);
+        assert!(!host.steer_pending(before[0].id.clone()).await.unwrap());
+        assert_eq!(host.pending_inputs()[0].id, before[0].id);
+        {
+            let mut live = host.live.lock().unwrap();
+            live.status = SessionStatus::Idle;
+            live.inbox = None;
+        }
+        harness.close().await.unwrap();
+    }
+
+    #[test]
+    fn legacy_queue_migrates_without_changing_turn_input_protocol() {
+        let mut value = serde_json::to_value(Journal::default()).unwrap();
+        value["queue"] = serde_json::json!([In::follow_up("old")]);
+        let journal: Journal = serde_json::from_value(value).unwrap();
+        assert_eq!(journal.queue.len(), 1);
+        let restored: Journal =
+            serde_json::from_value(serde_json::to_value(&journal).unwrap()).unwrap();
+        assert_eq!(restored.queue[0].id, journal.queue[0].id);
+        assert!(matches!(&restored.queue[0].input, In::UserText { text, .. } if text == "old"));
+    }
+
     async fn hold_writer(
         host: Arc<SessionHost>,
     ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
@@ -351,7 +423,7 @@ mod tests {
         {
             let mut transaction = host.journal();
             let first = transaction.queue.pop_front().unwrap();
-            transaction.active.push(first.clone());
+            transaction.active.push(first.input.clone());
             transaction.commit().unwrap();
             std::fs::rename(&path, &backup).unwrap();
             std::fs::create_dir(&path).unwrap();

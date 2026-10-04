@@ -25,11 +25,11 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use yourai_core::prelude::Level;
 #[cfg(test)]
 use yourai_core::prelude::Out;
 #[cfg(test)]
 use yourai_core::prelude::SessionStatus;
+use yourai_core::prelude::{In, Level};
 
 pub struct Metadata {
     pub session: String,
@@ -53,6 +53,8 @@ pub struct Renderer {
 }
 #[derive(Default)]
 struct Layout {
+    pending_area: Rect,
+    pending_hits: Vec<(Rect, String)>,
     /// Transcript viewport: the reading column, the native-scroll window and
     /// the anchor row base.
     transcript: Rect,
@@ -86,6 +88,7 @@ struct HomeLayout {
 /// about its own layout; the resulting View mutations live in the action
 /// layer (`app::click_dispatch`), keeping input state out of the render path.
 pub(crate) enum Hit<'a> {
+    Steer(&'a str),
     /// The "↓ Latest" pill shown above the composer while scrolled up.
     FollowLatest,
     /// A row of the slash-command menu.
@@ -99,6 +102,10 @@ pub(crate) enum Hit<'a> {
 }
 
 impl Renderer {
+    pub fn wheel_on_pending(&self, x: u16, y: u16) -> bool {
+        self.layout.pending_area.contains(Position::new(x, y))
+    }
+
     pub fn begin_selection(&mut self, x: u16, y: u16) {
         let point = Position::new(x, y);
         let region = if self.layout.transcript.contains(point) {
@@ -139,6 +146,14 @@ impl Renderer {
                 .iter()
                 .find(|(r, _)| r.contains(point))
                 .map(|(_, i)| Hit::Mention(*i));
+        }
+        if let Some((_, id)) = self
+            .layout
+            .pending_hits
+            .iter()
+            .find(|(r, _)| r.contains(point))
+        {
+            return Some(Hit::Steer(id));
         }
         if self.layout.todo_hit.is_some_and(|r| r.contains(point)) {
             return Some(Hit::TodoToggle);
@@ -237,6 +252,8 @@ impl Renderer {
         compact: bool,
     ) {
         let area = f.area();
+        self.layout.pending_hits.clear();
+        self.layout.pending_area = Rect::default();
         self.layout.hits.clear();
         self.layout.command_hits.clear();
         self.layout.command_area = None;
@@ -342,11 +359,19 @@ impl Renderer {
         );
         // One status row below the composer, total: while busy the footer's
         // left side carries the spinner/activity instead of title and path.
+        let pending_height = if v.session.pending_inputs.is_empty() {
+            0
+        } else {
+            (v.session.pending_inputs.len() as u16)
+                .saturating_add(1)
+                .min((area.height / 4).max(2))
+        };
         let rows = ratatui::layout::Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(ask_height),
             Constraint::Length(narrow_dock),
             Constraint::Length(input_height),
+            Constraint::Length(pending_height),
         ])
         .split(content_area);
         let cols = if sidebar_visible {
@@ -365,6 +390,7 @@ impl Renderer {
                 ))
             })
             .flatten();
+        layout.pending_area = rows[4];
         layout.transcript = inner;
         layout.panel = cols.get(1).copied();
         layout.rows = rows.to_vec();
@@ -530,7 +556,7 @@ impl Renderer {
             rows[3],
             v.asks_empty() && !v.overlay.is_open(),
             if v.session.active {
-                "Add guidance…"
+                "Queue a message…"
             } else {
                 "Ask anything…"
             },
@@ -546,6 +572,57 @@ impl Renderer {
                 home: layout.home.is_some(),
             },
         );
+        if layout.pending_area.height > 0 {
+            let rect = layout.pending_area;
+            let count = v.session.pending_inputs.len();
+            let visible = rect.height.saturating_sub(1) as usize;
+            v.session.pending_offset = v.session.pending_offset.min(count.saturating_sub(visible));
+            f.render_widget(
+                Paragraph::new(format!(" Queued ({count}) · scroll to browse"))
+                    .style(Style::default().fg(MUTED)),
+                Rect::new(rect.x, rect.y, rect.width, 1),
+            );
+            for (row, entry) in v
+                .session
+                .pending_inputs
+                .iter()
+                .skip(v.session.pending_offset)
+                .take(visible)
+                .enumerate()
+            {
+                let In::UserText {
+                    text, attachments, ..
+                } = &entry.input
+                else {
+                    continue;
+                };
+                let label = if attachments.is_empty() {
+                    text.clone()
+                } else {
+                    format!("{text} [{} attachments]", attachments.len())
+                };
+                let action = if v.session.can_steer {
+                    "[Steer] "
+                } else {
+                    "[queued] "
+                };
+                let line = Line::from(vec![
+                    Span::styled(action, Style::default().fg(ACCENT)),
+                    Span::raw(elide(
+                        &label.replace(['\n', '\r'], " "),
+                        rect.width.saturating_sub(action.len() as u16 + 1) as usize,
+                    )),
+                ]);
+                let y = rect.y + 1 + row as u16;
+                f.render_widget(Paragraph::new(line), Rect::new(rect.x, y, rect.width, 1));
+                if v.session.can_steer {
+                    layout.pending_hits.push((
+                        Rect::new(rect.x, y, action.len() as u16, 1),
+                        entry.id.clone(),
+                    ));
+                }
+            }
+        }
         // Show one recovery action only while reading history; keep idle input quiet.
         if v.session.navigation.offset() > 0 && rows[3].height >= 3 && !v.overlay.is_open() {
             let label = "↓ Latest";
@@ -1350,7 +1427,7 @@ fn draw_narrow_todo_dock(f: &mut Canvas, area: Rect, v: &View) {
 /// Truncated labels and the overflow mark point to the full details in Ctrl-B.
 fn help(f: &mut Canvas, area: Rect, scroll: u16) {
     let rect = crate::picker::centered(area, 78, area.height.saturating_sub(2) as usize);
-    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\nF2              Cycle recent models\nCtrl-X          Edit prompt in $VISUAL/$EDITOR\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nCtrl-V          Paste image from clipboard (Esc clears)\n@               Reference a file (text inlined; images/PDF attached)\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/continue       Retry pending execution failures\n/editor         Edit the draft in $VISUAL/$EDITOR\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model then thinking effort (picker)\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y allow once · a always this session · n deny (YOLO skips approvals).";
+    let text="Enter          Queue message; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\nF2              Cycle recent models\nCtrl-X          Edit prompt in $VISUAL/$EDITOR\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nCtrl-V          Paste image from clipboard (Esc clears)\n@               Reference a file (text inlined; images/PDF attached)\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\nClick Steer    Apply a queued message to the current turn\n/editor         Edit the draft in $VISUAL/$EDITOR\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model then thinking effort (picker)\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y allow once · a always this session · n deny (YOLO skips approvals).";
     let lines: Vec<_> = text
         .lines()
         .flat_map(|line| {
@@ -1400,7 +1477,7 @@ mod tests {
         let mut v = View::default();
         v.theme = Theme::Dark;
         for _ in 0..500 {
-            v.user("Review the parser and preserve compatibility.", false);
+            v.user("Review the parser and preserve compatibility.");
             v.event(Out::Message { text: "## Changes\n\nUpdated the parser and its error handling.\n\n```rust\nfn parse(input: &str) -> bool {\n    !input.is_empty()\n}\n```\n\n- Tests passed\n- Public API unchanged".into() });
             v.settle();
         }
@@ -1495,7 +1572,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
         let mut renderer = Renderer::default();
         let mut view = View::default();
-        view.user("Continue the task", false);
+        view.user("Continue the task");
         view.session.context_usage = Some(yourai_harness::runtime::ContextUsage {
             estimated_tokens: 32_000,
             context_window: Some(128_000),
@@ -1544,7 +1621,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
         let mut renderer = Renderer::default();
         let mut v = View::default();
-        v.user("Review parser", false);
+        v.user("Review parser");
         v.event(Out::Message {
             text: "## Result\n**Done**, with `code`.".into(),
         });
@@ -1627,17 +1704,17 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(text.contains("Commands"));
-        assert!(text.contains("/continue"));
+        assert!(!text.contains("/continue"));
         assert!(text.contains("Copied"));
         let (rect, _) = renderer
             .layout
             .command_hits
             .iter()
-            .find(|(_, c)| c.text == "/queue")
+            .find(|(_, c)| c.text == "/theme")
             .copied()
             .unwrap();
         super::super::app::click_dispatch(&mut renderer, &mut v, rect.x, rect.y);
-        assert_eq!(v.draft.text(), "/queue ");
+        assert_eq!(v.draft.text(), "/theme");
         v.draft.set_text("");
         v.toast = None;
         v.session.context_usage.as_mut().unwrap().context_window = None;
@@ -1768,7 +1845,7 @@ mod tests {
                 renderer.layout.home.is_some(),
                 "local setup keeps the home editor in place"
             );
-            view.user("First prompt", false);
+            view.user("First prompt");
             terminal
                 .draw(|f| renderer.draw(f, &mut view, &m, &SessionStatus::Idle, 0, false))
                 .unwrap();
@@ -1962,7 +2039,7 @@ mod tests {
             )
             .unwrap();
         }
-        v.user("Review code", false);
+        v.user("Review code");
         v.session.active = true;
         v.event(Out::Reasoning {
             text: "checking".into(),
@@ -1983,7 +2060,7 @@ mod tests {
         let screen = rows(&terminal).join("\n");
         assert!(!screen.contains("yourai · your"));
         assert!(screen.contains("Running cargo"));
-        assert!(screen.contains("Add guidance…"));
+        assert!(screen.contains("Queue a message…"));
         // Queued count is now in the footer left slot.
         assert!(screen.contains("2 queued"));
         v.event(Out::Ask {
@@ -2019,7 +2096,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(90, 32)).unwrap();
         let mut renderer = Renderer::default();
         let mut view = View::default();
-        view.user("检查实现", false);
+        view.user("检查实现");
         view.event(Out::Reasoning {
             text: "private-thought".into(),
         });
@@ -2259,7 +2336,7 @@ mod tests {
                 input_budget: None,
                 output_reserve: 0,
             });
-            v.user("Fix the parser and run tests", false);
+            v.user("Fix the parser and run tests");
             v.event(Out::Reasoning {
                 text: "Inspect the parser boundary and preserve existing behavior.".into(),
             });
@@ -2361,7 +2438,7 @@ mod tests {
         let mut v = View::default();
         v.theme = Theme::Dark;
         v.model.label = "example/coding-model".into();
-        v.user("Fix the parser boundary and verify the change.", false);
+        v.user("Fix the parser boundary and verify the change.");
         v.session.active = true;
         v.event(Out::Reasoning {
             text: "Inspect the empty-input branch before editing.".into(),
@@ -2462,7 +2539,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         let mut renderer = Renderer::default();
         let mut v = View::default();
-        v.user("Review this change", false);
+        v.user("Review this change");
         v.event(Out::Message {
             text: "A readable paragraph.\n\n".repeat(80),
         });
@@ -2624,7 +2701,7 @@ mod tests {
         }
 
         // A turn starts: busy indicator with the pulse animation.
-        v.user("Fix the parser boundary conditions", false);
+        v.user("Fix the parser boundary conditions");
         v.session.active = true;
         v.session.since = Some(std::time::Instant::now());
         frame!("user prompt submitted", SessionStatus::Idle);
@@ -2740,7 +2817,7 @@ mod regression_tests {
             yolo: false,
         };
         for question in ["First short question", "Second short question"] {
-            view.user(question, false);
+            view.user(question);
             view.event(Out::Message {
                 text: "A long response paragraph.\n\n".repeat(80),
             });
@@ -2949,7 +3026,7 @@ mod regression_tests {
     #[test]
     fn narrow_footer_preserves_permissions_and_all_dashboard_sizes_fit() {
         let mut v = View::default();
-        v.user("Review context pressure", false);
+        v.user("Review context pressure");
         v.model.label = "provider/model".into();
         v.session.context_usage = Some(yourai_harness::runtime::ContextUsage {
             estimated_tokens: 90000,

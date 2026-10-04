@@ -109,7 +109,7 @@ impl In {
     }
 
     /// 便捷构造：FollowUp 模式输入。与 Steer 的区别：FollowUp 不打断当前
-    /// 正在进行的模型步骤/工具调用，而是排队到当前步骤完成后作为下一条
+    /// 正在进行的模型步骤/工具调用，而是排队到当前 Turn 完成后作为下一条
     /// 用户输入消费；Steer 会在下一个决策点立即生效并改写当前步骤走向。
     pub fn follow_up(text: impl Into<String>) -> Self {
         In::UserText {

@@ -9,6 +9,11 @@ use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
 use yourai_harness::Harness;
 
+enum InputAction {
+    Submit(In),
+    Steer(String),
+}
+
 type Stats = (
     Option<yourai_harness::runtime::ContextUsage>,
     Option<u64>,
@@ -20,11 +25,12 @@ pub(super) struct Runtime {
     rx: mpsc::UnboundedReceiver<Out>,
     cancel: CancellationToken,
     driver: Option<JoinHandle<Result<(), YourAiError>>>,
+    resume_after_settle: bool,
     compact: Option<JoinHandle<Option<Usage>>>,
     stats: Option<JoinHandle<Stats>>,
     stats_at: Instant,
     limits: TurnLimits,
-    submissions: Option<mpsc::UnboundedSender<In>>,
+    submissions: Option<mpsc::UnboundedSender<InputAction>>,
     submitter: JoinHandle<()>,
     pending_submissions: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -39,8 +45,26 @@ impl Runtime {
         let events = tx.clone();
         let submitter = tokio::spawn(async move {
             while let Some(input) = inputs.recv().await {
-                if let Err(rejection) = host.submit_async(input).await {
-                    let _ = events.send(Out::InputRejected { rejection });
+                match input {
+                    InputAction::Submit(input) => {
+                        if let Err(rejection) = host.submit_async(input).await {
+                            let _ = events.send(Out::InputRejected { rejection });
+                        }
+                    }
+                    InputAction::Steer(id) => {
+                        let result = host.steer_pending(id).await;
+                        if !matches!(result, Ok(true)) {
+                            let message = match result {
+                                Ok(false) => "Message is no longer pending, or the turn has ended; nothing was resent.".into(),
+                                Err(e) => format!("Could not steer queued message: {e}"),
+                                _ => unreachable!(),
+                            };
+                            let _ = events.send(Out::Notice {
+                                level: Level::Warning,
+                                message,
+                            });
+                        }
+                    }
                 }
                 pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -54,6 +78,7 @@ impl Runtime {
             rx,
             cancel: CancellationToken::new(),
             driver: None,
+            resume_after_settle: false,
             compact: None,
             stats: None,
             stats_at: Instant::now() - Duration::from_secs(2),
@@ -62,6 +87,12 @@ impl Runtime {
     }
     /// Queue in input order; durable rejection returns through the normal event reducer.
     pub fn submit(&mut self, input: In) -> bool {
+        self.dispatch(InputAction::Submit(input))
+    }
+    pub fn steer_pending(&mut self, id: String) {
+        self.dispatch(InputAction::Steer(id));
+    }
+    fn dispatch(&mut self, input: InputAction) -> bool {
         self.pending_submissions
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self
@@ -82,7 +113,15 @@ impl Runtime {
             != 0
     }
     pub fn resume(&mut self) {
+        if self.driver.as_ref().is_some_and(|t| t.is_finished())
+            || (self.driver.is_some()
+                && self.h.host.last_error().is_some()
+                && matches!(self.h.host.status(), SessionStatus::Idle))
+        {
+            self.resume_after_settle = true;
+        }
         if self.driver.is_none() {
+            self.resume_after_settle = false;
             let host = self.h.host.clone();
             let tx = self.tx.clone();
             let cancel = self.cancel.clone();
@@ -151,12 +190,12 @@ impl Runtime {
             match self.driver.take().unwrap().await {
                 Ok(Err(YourAiError::Aborted(reason))) => view.notice(
                     Level::Info,
-                    format!("Stopped: {reason}. Queued inputs remain; /continue resumes them."),
+                    format!("Stopped: {reason}. Queued inputs remain; send a message to resume."),
                 ),
                 Ok(Err(e)) => view.notice(
                     Level::Error,
                     format!(
-                        "Execution failed: {}. /continue retries pending inputs.",
+                        "Execution failed: {}. Send a message to resume.",
                         yourai_harness::model::failure::diagnostic(&e)
                     ),
                 ),
@@ -164,7 +203,12 @@ impl Runtime {
                 _ => {}
             }
             view.settle();
+            if self.resume_after_settle {
+                self.resume();
+            }
         }
+        view.session.pending_inputs = self.h.host.pending_inputs();
+        view.session.can_steer = matches!(self.h.host.status(), SessionStatus::Running { .. });
         let active = self.submitting()
             || !matches!(
                 self.h.host.status(),
@@ -258,6 +302,77 @@ mod tests {
     use std::time::{Duration, Instant};
     use yourai_core::prelude::*;
 
+    struct FailingModel(std::sync::Mutex<Vec<ChatRequest>>);
+    impl ModelProvider for FailingModel {
+        fn model_iden(&self) -> &str {
+            "failing"
+        }
+        fn complete<'a>(
+            &'a self,
+            _: ModelRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
+            Box::pin(async { unreachable!() })
+        }
+        fn stream_events<'a>(
+            &'a self,
+            request: ModelRequest,
+        ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
+            self.0.lock().unwrap().push(request.request);
+            Box::pin(async { Err(ErrorKind::Config("test failure".into()).into()) })
+        }
+    }
+    #[tokio::test]
+    async fn new_submission_resumes_after_failure_even_before_driver_is_reaped() {
+        let (_dir, mut controller, mut view) = session::fixture().await;
+        let model = std::sync::Arc::new(FailingModel(std::sync::Mutex::new(vec![])));
+        controller
+            .runtime
+            .h
+            .switch_model(model.clone(), ContextPolicy::default())
+            .await
+            .unwrap();
+        assert!(controller.submit(In::follow_up("first"), &mut view));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while controller.runtime.h.host.last_error().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Deliberately submit before polling/reaping the old driver.
+        assert!(controller.submit(In::follow_up("continue with this instruction"), &mut view));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                controller.poll(&mut view, None).await;
+                if model.0.lock().unwrap().len() == 2 && controller.runtime.driver.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let requests = model.0.lock().unwrap();
+            let text = requests[1]
+                .messages
+                .iter()
+                .flat_map(|m| m.content.texts())
+                .collect::<Vec<_>>();
+            assert_eq!(text.iter().filter(|t| **t == "first").count(), 1);
+            assert_eq!(
+                text.iter()
+                    .filter(|t| **t == "continue with this instruction")
+                    .count(),
+                1
+            );
+            assert!(!text
+                .iter()
+                .any(|t| t.starts_with("Continue the previous task")));
+        }
+        controller.close().await.unwrap();
+    }
+
     async fn refresh(runtime: &mut Runtime, view: &mut View) {
         runtime.stats_at = Instant::now() - Duration::from_secs(2);
         runtime.poll(view, None).await;
@@ -315,7 +430,7 @@ mod tests {
         let h = controller.harness();
         let context = h.host.context();
         // A UI preview is not an admitted input and must never name a session.
-        view.user("uncommitted preview", false);
+        view.user("uncommitted preview");
         refresh(&mut controller.runtime, &mut view).await;
         assert!(view.session.title.is_none());
         h.sessions
