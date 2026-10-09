@@ -668,16 +668,6 @@ impl App {
     fn overlay_action(&mut self, action: OverlayAction) {
         match action {
             OverlayAction::None => {}
-            OverlayAction::Model(index) => {
-                if let Some(choice) = self.view.model_choices.get(index) {
-                    self.controller.model(
-                        choice.id.clone(),
-                        choice.variant.clone(),
-                        None,
-                        &mut self.view,
-                    );
-                }
-            }
             OverlayAction::PickEffort(index) => {
                 // Preselect the entry's effective effort; "default" when unset.
                 let Some(choice) = self.view.model_choices.get(index) else {
@@ -701,14 +691,20 @@ impl App {
                 let Some(choice) = self.view.model_choices.get(model) else {
                     return;
                 };
-                let selection = match effort {
-                    Some(effort) => crate::models::EffortChoice::Set(effort),
-                    None => crate::models::EffortChoice::Config,
+                // Confirming the preselected value keeps its source intact:
+                // an inherited variant must not acquire an explicit override.
+                let selection = if effort.as_deref() == choice.effort.as_deref() {
+                    None
+                } else {
+                    Some(match effort {
+                        Some(effort) => crate::models::EffortChoice::Set(effort),
+                        None => crate::models::EffortChoice::Config,
+                    })
                 };
                 self.controller.model(
                     choice.id.clone(),
                     choice.variant.clone(),
-                    Some(selection),
+                    selection,
                     &mut self.view,
                 );
             }
@@ -1395,5 +1391,192 @@ mod tests {
         let actual = app.controller.harness().host.context().cwd;
         app.close().await.unwrap();
         assert_eq!(actual, expected);
+    }
+    #[tokio::test]
+    async fn model_picker_confirms_in_two_steps_and_preserves_an_implicit_model() {
+        let (_dir, mut app) = fixture().await;
+        // This model resolves from the provider without a models-table entry.
+        app.view.model_choices = vec![crate::models::ModelChoice {
+            id: "mock/test".into(),
+            variant: None,
+            label: "mock/test".into(),
+            effort: None,
+        }];
+        app.view.draft.set_text("draft to keep");
+        app.view.overlay = Overlay::Models(0);
+        app.handle(key(KeyCode::Enter));
+        assert!(matches!(
+            app.view.overlay,
+            Overlay::Effort {
+                model: 0,
+                selected: 0
+            }
+        ));
+        assert!(
+            !app.controller.busy(),
+            "the first Enter must not switch models"
+        );
+        app.handle(key(KeyCode::Down));
+        app.handle(key(KeyCode::Esc));
+        assert!(matches!(app.view.overlay, Overlay::Models(0)));
+        assert!(!app.controller.busy(), "cancelling must not apply effort");
+        app.handle(key(KeyCode::Enter));
+        app.handle(key(KeyCode::Enter));
+        assert!(!app.view.overlay.is_open());
+        finish(&mut app).await;
+        assert!(
+            matches!(last_notice(&app.view), Some((Level::Info, text)) if text.contains("Model switched to mock/test")),
+            "{:?}",
+            last_notice(&app.view)
+        );
+        assert_eq!(app.view.draft.text(), "draft to keep");
+        // Explicit edits work even though the initial model was implicit.
+        app.view.overlay = Overlay::Models(0);
+        app.handle(key(KeyCode::Enter));
+        for _ in 0..5 {
+            app.handle(key(KeyCode::Down));
+        }
+        app.handle(key(KeyCode::Enter));
+        finish(&mut app).await;
+        assert_eq!(app.view.model.effort.as_deref(), Some("high"));
+        app.view.overlay = Overlay::Models(0);
+        app.handle(key(KeyCode::Enter));
+        for _ in 0..5 {
+            app.handle(key(KeyCode::Up));
+        }
+        app.handle(key(KeyCode::Enter));
+        finish(&mut app).await;
+        assert_eq!(app.view.model.effort, None);
+        app.close().await.unwrap();
+    }
+    async fn model_fixture(
+        variants: bool,
+    ) -> (
+        tempfile::TempDir,
+        App,
+        std::sync::Arc<std::sync::Mutex<crate::config::Config>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut value = serde_json::json!({
+            "model":"mock/a", "extensions":false,
+            "provider":{"mock":{"options":{"baseURL":"http://127.0.0.1:1/v1","apiKey":"test"},"models":{
+                "a":{"options":{"reasoningEffort":"low"}},"b":{},"c":{}
+            }}}
+        });
+        if variants {
+            value["provider"]["mock"]["models"]["a"]["variants"] =
+                serde_json::json!({"inherit":{}});
+        }
+        let cfg: crate::config::Config = serde_json::from_value(value).unwrap();
+        let model = cfg.resolve(None).unwrap().model;
+        let mut hc =
+            yourai_harness::HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+        hc.system_prompt = Some("test".into());
+        let h = yourai_harness::Harness::open(hc.clone(), model)
+            .await
+            .unwrap();
+        let mut view = View::default();
+        view.model.label = "mock/a".into();
+        view.model.effort = Some("low".into());
+        view.model_choices = crate::models::model_choices(&cfg);
+        let cfg = std::sync::Arc::new(std::sync::Mutex::new(cfg));
+        let controller = session::Controller::new(h, cfg.clone(), hc, TurnLimits::default(), false);
+        let app = App::new(
+            controller,
+            view,
+            Metadata {
+                session: "test".into(),
+                cwd: dir.path().to_string_lossy().into(),
+                trusted_shell: false,
+                yolo: false,
+            },
+        );
+        (dir, app, cfg)
+    }
+
+    #[tokio::test]
+    async fn f2_visits_all_three_models_after_async_switches() {
+        let (_dir, mut app, _cfg) = model_fixture(false).await;
+        let mut visited = Vec::new();
+        for _ in 0..4 {
+            app.handle(key(KeyCode::F(2)));
+            finish(&mut app).await;
+            visited.push(app.view.model.label.clone());
+        }
+        app.close().await.unwrap();
+        assert_eq!(visited, ["mock/b", "mock/c", "mock/a", "mock/b"]);
+    }
+
+    #[tokio::test]
+    async fn confirming_effort_preserves_inheritance_and_explicit_overrides() {
+        let (_dir, mut app, cfg) = model_fixture(true).await;
+        let inherited = app
+            .view
+            .model_choices
+            .iter()
+            .position(|c| c.variant.as_deref() == Some("inherit"))
+            .unwrap();
+        app.view.overlay = Overlay::Models(inherited);
+        app.handle(key(KeyCode::Enter));
+        app.handle(key(KeyCode::Enter));
+        finish(&mut app).await;
+        assert!(
+            !cfg.lock().unwrap().provider["mock"].models["a"].variants["inherit"]
+                .contains_key("reasoningEffort")
+        );
+        // A base change must still reach the variant after that confirmation.
+        app.controller.model(
+            "mock/a".into(),
+            None,
+            Some(crate::models::EffortChoice::Set("high".into())),
+            &mut app.view,
+        );
+        finish(&mut app).await;
+        app.view.overlay = Overlay::Models(inherited);
+        app.handle(key(KeyCode::Enter));
+        app.handle(key(KeyCode::Enter));
+        finish(&mut app).await;
+        assert_eq!(app.view.model.effort.as_deref(), Some("high"));
+        assert!(
+            !cfg.lock().unwrap().provider["mock"].models["a"].variants["inherit"]
+                .contains_key("reasoningEffort")
+        );
+        // Intentionally changing high to low pins only the variant.
+        app.view.overlay = Overlay::Models(inherited);
+        app.handle(key(KeyCode::Enter));
+        app.handle(key(KeyCode::Up));
+        app.handle(key(KeyCode::Up));
+        app.handle(key(KeyCode::Enter));
+        finish(&mut app).await;
+        app.controller.model(
+            "mock/a".into(),
+            None,
+            Some(crate::models::EffortChoice::Set("medium".into())),
+            &mut app.view,
+        );
+        finish(&mut app).await;
+        app.view.overlay = Overlay::Models(inherited);
+        app.handle(key(KeyCode::Enter));
+        app.handle(key(KeyCode::Enter));
+        finish(&mut app).await;
+        assert_eq!(app.view.model.effort.as_deref(), Some("low"));
+        assert_eq!(
+            cfg.lock().unwrap().provider["mock"].models["a"].variants["inherit"]["reasoningEffort"],
+            "low"
+        );
+        // Config default removes that override and resumes live inheritance.
+        app.view.overlay = Overlay::Models(inherited);
+        app.handle(key(KeyCode::Enter));
+        for _ in 0..3 {
+            app.handle(key(KeyCode::Up));
+        }
+        app.handle(key(KeyCode::Enter));
+        finish(&mut app).await;
+        assert_eq!(app.view.model.effort.as_deref(), Some("medium"));
+        assert!(
+            !cfg.lock().unwrap().provider["mock"].models["a"].variants["inherit"]
+                .contains_key("reasoningEffort")
+        );
+        app.close().await.unwrap();
     }
 }

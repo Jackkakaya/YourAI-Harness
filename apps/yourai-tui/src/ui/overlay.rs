@@ -27,13 +27,12 @@ pub enum Overlay {
 #[derive(Debug)]
 pub enum Action {
     None,
-    Model(usize),
     /// Open the thinking-effort sub-picker for the `/models` entry at this
     /// index. The overlay stays open; the host swaps in `Overlay::Effort`
     /// with the entry's current effort preselected.
     PickEffort(usize),
     /// Apply a thinking effort (`None` = config default) to the entry at
-    /// `model`, switching to it like `Action::Model` would.
+    /// `model` and switch to it.
     Effort {
         model: usize,
         effort: Option<String>,
@@ -114,12 +113,14 @@ impl Overlay {
             Self::Models(index) | Self::Themes(index) if up => *index = index.saturating_sub(1),
             Self::Models(index) if down => *index = (*index + 1).min(model_count.saturating_sub(1)),
             Self::Themes(index) if down => *index = (*index + 1).min(Theme::ALL.len() - 1),
-            Self::Models(index) if matches!(key.code, KeyCode::Tab | KeyCode::Right) => {
+            // Enter drills into the effort picker: every model switch
+            // confirms a thinking effort in the same flow. Tab and Right
+            // stay as aliases.
+            Self::Models(index)
+                if matches!(key.code, KeyCode::Enter | KeyCode::Tab | KeyCode::Right)
+                    && *index < model_count =>
+            {
                 action = Action::PickEffort(*index)
-            }
-            Self::Models(index) if key.code == KeyCode::Enter && *index < model_count => {
-                action = Action::Model(*index);
-                *self = Self::None;
             }
             Self::Effort { selected, .. } if up => *selected = selected.saturating_sub(1),
             Self::Effort { selected, .. } if down => {
@@ -212,9 +213,14 @@ mod tests {
         assert!(modal.is_open());
     }
     #[test]
-    fn models_tab_opens_effort_picker_and_effort_enter_applies() {
-        // Tab (and Right) signals the host to open the sub-picker for the
-        // highlighted row, without closing the modal.
+    fn models_enter_opens_effort_picker_and_effort_enter_applies() {
+        // Enter (and Tab/Right) signals the host to open the sub-picker for
+        // the highlighted row, without closing the modal.
+        let mut modal = Overlay::Models(1);
+        assert!(matches!(
+            modal.key(key(KeyCode::Enter), 3),
+            Some(Action::PickEffort(1))
+        ));
         let mut modal = Overlay::Models(1);
         assert!(matches!(
             modal.key(key(KeyCode::Tab), 3),
@@ -224,6 +230,12 @@ mod tests {
         assert!(matches!(
             modal.key(key(KeyCode::Right), 3),
             Some(Action::PickEffort(2))
+        ));
+        // An out-of-range row never drills in.
+        let mut modal = Overlay::Models(3);
+        assert!(matches!(
+            modal.key(key(KeyCode::Enter), 3),
+            Some(Action::None)
         ));
         // The host swaps in the effort picker; navigation is bounded by the
         // level list and Enter applies the highlighted level.

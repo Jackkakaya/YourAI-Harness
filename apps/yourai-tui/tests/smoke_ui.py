@@ -1,4 +1,5 @@
 from smoke_support import wait_completed, wait_exit
+from pty_probe import Screen
 """UI regression flows: modal isolation, model defaults, deletion, narrow stats and launcher quit."""
 import fcntl
 import http.server
@@ -72,24 +73,79 @@ with tempfile.TemporaryDirectory() as tmp:
     binary = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
     child = subprocess.Popen([str(binary), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, XDG_DATA_HOME=str(Path(tmp) / 'xdg-data')))
     captured = bytearray()
+    screen = Screen(120, 35)
 
-    def wait_for(needle, timeout=10):
+    def read_output(timeout):
+        if select.select([master], [], [], timeout)[0]:
+            data = os.read(master, 65536)
+            captured.extend(data)
+            screen.feed(data)
+            if b'\x1b[6n' in data:
+                os.write(master, b'\x1b[1;1R')
+            return True
+        return False
+
+    def visible(needle):
+        text = screen.text()
+        if needle.startswith(b'Model switched'):
+            notices = [line.strip().lstrip('· ') for line in text.splitlines() if 'Model switched' in line]
+            return bool(notices) and notices[-1] == needle.decode()
+        return needle in text.encode()
+
+    def wait_for(needle, timeout=10, current=False):
         end = time.monotonic() + timeout
-        while needle not in re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured):
+        while not (visible(needle) if current else needle in re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured)):
             if time.monotonic() > end:
                 raise AssertionError(f'Missing {needle!r}; requests: {len(requests)}; output: ' + re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', captured).decode(errors='replace')[-2000:])
-            if select.select([master], [], [], 0.1)[0]:
-                data = os.read(master, 65536)
-                captured.extend(data)
-                if b'\x1b[6n' in data:
-                    os.write(master, b'\x1b[1;1R')
+            read_output(0.1)
+
+    last_confirmation = None
+
+    def wait_for_switch(needle):
+        global last_confirmation
+        assert needle != last_confirmation, 'unchanged targets are covered by App contract tests'
+        wait_for(needle, current=True)
+        last_confirmation = needle
+
+    def wait_new_session(previous_ids):
+        # Storage creates the record before the host is ready. Match its new
+        # identity in the UI too, so an old Session ready cannot release us.
+        deadline = time.monotonic() + 10
+        while True:
+            current = {row[0] for row in db.execute('SELECT session_id FROM sessions')}
+            added = current - previous_ids
+            if added: break
+            if time.monotonic() >= deadline: raise AssertionError('new session was not persisted')
+            read_output(0.1)
+        assert len(added) == 1, added
+        session_id = added.pop()
+        assert all(old[:8] != session_id[:8] for old in previous_ids)
+        os.write(master, b'\x02')  # dashboard is available while opening
+        wait_for(('session ' + session_id[:8]).encode(), current=True)
+        os.write(master, b'\x1b')
+        while 'Session · Esc' in screen.text():
+            if time.monotonic() >= deadline: raise AssertionError('dashboard did not close')
+            read_output(0.1)
+        return session_id
 
     try:
         wait_for(b'New session')
         os.write(master, b'/models\r')
         wait_for(b'Models')
+        # Enter drills into the effort picker; a second Enter confirms the
+        # preselected level and switches.
         os.write(master, b'\r')
-        wait_for(b'Model switched to mock/smoke')
+        wait_for(b'config default')
+        os.write(master, b'\r')
+        wait_for_switch(b'Model switched to mock/smoke')
+        # Effort also works for the valid implicit model (models is empty).
+        captured.clear()
+        os.write(master, b'/models\r')
+        wait_for(b'Enter effort')
+        os.write(master, b'\r')
+        wait_for(b'config default')
+        os.write(master, b'\x1b[B' * 5 + b'\r')  # config default -> high
+        wait_for_switch('Model switched to mock/smoke · thinking high'.encode())
         captured.clear()
         # Open a dashboard while work is in flight. Text and Esc belong to it.
         os.write(master, b'after stats\r\x02')
@@ -100,6 +156,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert len(requests) == 1
         assert 'after stats' in json.dumps(requests[0][1])
         assert 'LEAK' not in json.dumps(requests[0][1])
+        assert requests[0][1].get('reasoning_effort') == 'high'
         db = sqlite3.connect(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3')
         db_path = Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3'
         # Local commands must reset the actual model context, retain old sessions,
@@ -112,8 +169,16 @@ with tempfile.TemporaryDirectory() as tmp:
         captured.clear()
         # /new is idle-guarded; the 'after stats' turn must be fully settled.
         wait_completed(db_path, 'main', 1)
+        os.write(master, b'/models\r')
+        wait_for(b'Enter effort')
+        os.write(master, b'\r')
+        wait_for(b'config default')
+        os.write(master, b'\x1b[A' * 5 + b'\r')  # high -> config default
+        wait_for_switch(b'Model switched to mock/smoke')
+        captured.clear()
+        previous_ids = {row[0] for row in db.execute('SELECT session_id FROM sessions')}
         os.write(master, b'/new\r')
-        wait_for(b'Session ready')
+        wait_new_session(previous_ids)
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before_new + 1
         captured.clear()
         os.write(master, b'\x07')
@@ -125,13 +190,15 @@ with tempfile.TemporaryDirectory() as tmp:
         assert 'after stats' not in json.dumps(requests[-1][1])
         assert 'fresh context' in json.dumps(requests[-1][1])
         assert '/new' not in json.dumps(requests[-1][1])
+        assert 'reasoning_effort' not in requests[-1][1], 'config default must clear the implicit model override'
         captured.clear()
         wait_completed(db_path, 'main', 2)
+        previous_ids = {row[0] for row in db.execute('SELECT session_id FROM sessions')}
         os.write(master, b'/clear\r')
         # Titles follow committed history on background refresh; a quick turn
         # can finish while the footer still says New session. Wait for the
         # new host's notice, not a footer that need not emit different pixels.
-        wait_for(b'Session ready')
+        wait_new_session(previous_ids)
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before_new + 2
         captured.clear()
         os.write(master, b'after reset\r')
@@ -180,7 +247,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert wait_exit(child, master) == 0
         assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == before
         db.close()
-        print('PASS: default model picker -> running dashboard Esc isolation -> new/clear context + runtime YOLO -> confirmed deletion -> 35-column stats -> launcher Ctrl-Q')
+        print('PASS: implicit model + effort/default -> running dashboard Esc isolation -> new/clear context + runtime YOLO -> confirmed deletion -> 35-column stats -> launcher Ctrl-Q')
     finally:
         if child.poll() is None:
             child.kill()
