@@ -324,6 +324,24 @@ impl View {
         Some((at + 1) % self.model_choices.len())
     }
 
+    /// Refresh candidates while keeping an open picker on the same model/variant.
+    pub fn replace_model_choices(&mut self, choices: Vec<crate::models::ModelChoice>) {
+        if let super::overlay::Overlay::Models(index)
+        | super::overlay::Overlay::Effort { model: index, .. } = &mut self.overlay
+        {
+            let replacement = self.model_choices.get(*index).and_then(|old| {
+                choices
+                    .iter()
+                    .position(|new| new.id == old.id && new.variant == old.variant)
+            });
+            match replacement {
+                Some(replacement) => *index = replacement,
+                None => self.overlay = super::overlay::Overlay::None,
+            }
+        }
+        self.model_choices = choices;
+    }
+
     /// Whether the item at `index` is the currently streaming thinking block.
     pub fn is_thinking_at(&self, index: usize) -> bool {
         self.session.thinking == Some(index)
@@ -888,6 +906,35 @@ mod tests {
         v.model_choices.truncate(1);
         assert_eq!(v.next_model(), None);
     }
+
+    #[test]
+    fn refreshed_candidates_keep_picker_identity_and_close_removed_targets() {
+        let choice = |id: &str, variant: Option<&str>| crate::models::ModelChoice {
+            id: id.into(),
+            variant: variant.map(str::to_string),
+            label: variant.map_or_else(|| id.into(), |v| format!("{id} · {v}")),
+            effort: None,
+        };
+        let mut v = View {
+            model_choices: vec![choice("a", None), choice("b", Some("variant"))],
+            overlay: super::super::overlay::Overlay::Effort {
+                model: 1,
+                selected: 5,
+            },
+            ..View::default()
+        };
+        v.replace_model_choices(vec![choice("b", Some("variant")), choice("a", None)]);
+        assert!(matches!(
+            v.overlay,
+            super::super::overlay::Overlay::Effort {
+                model: 0,
+                selected: 5
+            }
+        ));
+        v.replace_model_choices(vec![choice("a", None)]);
+        assert!(!v.overlay.is_open());
+    }
+
     #[test]
     fn permission_choice_only_requests_session_scope_for_always() {
         assert_eq!(PermissionChoice::Once.reply(), json!({"behavior":"allow"}));

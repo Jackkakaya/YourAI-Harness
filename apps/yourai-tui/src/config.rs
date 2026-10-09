@@ -269,6 +269,11 @@ impl Config {
             .provider
             .get_mut(provider_id)
             .ok_or("Unknown provider")?;
+        // An implicit entry has no runtime override to restore. Keep a
+        // default confirmation from creating an otherwise empty model row.
+        if variant.is_none() && keyword.is_none() && !provider.models.contains_key(model_key) {
+            return Ok(());
+        }
         let options = match variant {
             Some(name) => provider
                 .models
@@ -785,5 +790,31 @@ mod tests {
     #[test]
     fn config_dir_errors_without_home_or_xdg() {
         assert!(config_dir(None, None).is_err());
+    }
+    #[test]
+    fn effort_override_materializes_an_undeclared_model_entry() {
+        use crate::models::EffortChoice;
+        let mut cfg = config();
+        let id = "gateway/undeclared";
+        cfg.model = id.to_string();
+        cfg.resolve(None).unwrap();
+        // Restoring defaults requires no synthetic entry. An invalid variant
+        // must also leave the model table unchanged.
+        cfg.set_entry_effort(id, None, &EffortChoice::Config)
+            .unwrap();
+        assert!(!cfg.provider["gateway"].models.contains_key("undeclared"));
+        assert!(cfg
+            .set_entry_effort(id, Some("missing"), &EffortChoice::Set("high".into()))
+            .is_err());
+        assert!(!cfg.provider["gateway"].models.contains_key("undeclared"));
+        cfg.set_entry_effort(id, None, &EffortChoice::Set("high".into()))
+            .unwrap();
+        assert_eq!(cfg.effective_effort(id, None).as_deref(), Some("high"));
+        cfg.resolve(None).unwrap();
+        // Config restores the absent hint; the in-memory entry stays valid.
+        cfg.set_entry_effort(id, None, &EffortChoice::Config)
+            .unwrap();
+        assert_eq!(cfg.effective_effort(id, None), None);
+        cfg.resolve(None).unwrap();
     }
 }

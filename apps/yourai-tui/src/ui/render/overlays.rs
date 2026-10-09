@@ -337,7 +337,7 @@ pub(super) fn model_picker_overlay(f: &mut Canvas, area: Rect, v: &View) {
         f,
         area,
         56,
-        " Models · ↑↓ · Enter · Tab effort · Esc ",
+        " Models · ↑↓ · Enter effort · Esc ",
         &[],
         &rows,
         selected,
@@ -863,7 +863,10 @@ mod tests {
             "effort is appended to the row: {text}"
         );
         assert!(text.contains("gateway/glm-4.6"));
-        assert!(text.contains("Tab effort"), "hint mentions the sub-picker");
+        assert!(
+            text.contains("Enter effort"),
+            "hint mentions the sub-picker"
+        );
     }
 
     #[test]
