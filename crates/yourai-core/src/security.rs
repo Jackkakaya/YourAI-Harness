@@ -51,6 +51,17 @@ pub trait SecurityProvider: Send + Sync {
         false
     }
 
+    /// Remember an approval for this provider's session, without changing
+    /// persisted rules or bypassing explicit denies and hook decisions.
+    fn remember_tool_approval<'a>(
+        &'a self,
+        _tool: &'a str,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(async {
+            Err(crate::ErrorKind::Config("session approvals unsupported".into()).into())
+        })
+    }
+
     /// Apply validated policy updates atomically. Unsupported providers fail explicitly.
     fn update_permissions<'a>(
         &'a self,

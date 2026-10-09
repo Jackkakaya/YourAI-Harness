@@ -108,9 +108,18 @@ pub(super) async fn switch_model(
     harness: &Harness,
     model_id: &str,
     variant: Option<String>,
+    effort: Option<crate::models::EffortChoice>,
 ) -> Result<ModelInfo, String> {
     let mut candidate = config.lock().map_err(|e| e.to_string())?.clone();
     candidate.model = model_id.to_string();
+    // Resolve the in-memory override before switching the main model and
+    // compaction model. Already-bound hooks and child factories retain their
+    // models; a newly opened session uses this selection. Disk is untouched.
+    if let Some(effort) = &effort {
+        candidate
+            .set_entry_effort(model_id, variant.as_deref(), effort)
+            .map_err(|e| e.to_string())?;
+    }
     let crate::config::ResolvedModel {
         model,
         context,
@@ -124,6 +133,7 @@ pub(super) async fn switch_model(
         .switch_model_with_settings(model, context, settings)
         .await
         .map_err(|e| e.to_string())?;
+    let effective_effort = candidate.effective_effort(model_id, variant.as_deref());
     let p = candidate.pricing();
     *config.lock().map_err(|e| e.to_string())? = candidate;
     let pricing = match (p.input, p.output) {
@@ -135,7 +145,11 @@ pub(super) async fn switch_model(
     } else {
         model_id.to_string()
     };
-    Ok(ModelInfo { label, pricing })
+    Ok(ModelInfo {
+        label,
+        pricing,
+        effort: effective_effort,
+    })
 }
 
 /// Rebuild model-dependent settings from the structured runtime selection.
@@ -217,9 +231,11 @@ mod switch_tests {
             ("mock/small", Some("invalid")),
             ("mock/small", Some("missing")),
         ] {
-            assert!(switch_model(&config, &h, id, variant.map(str::to_owned))
-                .await
-                .is_err());
+            assert!(
+                switch_model(&config, &h, id, variant.map(str::to_owned), None)
+                    .await
+                    .is_err()
+            );
             let cfg = config.lock().unwrap();
             assert_eq!(cfg.model, "mock/large");
             assert_eq!(cfg.context.context_window, Some(64000));
@@ -227,7 +243,7 @@ mod switch_tests {
             assert_eq!(view.model.label, "mock/large");
             assert_eq!(h.host.context_usage().unwrap().context_window, Some(64000));
         }
-        let selected = switch_model(&config, &h, "mock/small", Some("short".into()))
+        let selected = switch_model(&config, &h, "mock/small", Some("short".into()), None)
             .await
             .unwrap();
         view.model.label = selected.label;
@@ -241,6 +257,89 @@ mod switch_tests {
             Some("short")
         );
         assert_eq!(view.model.label, "mock/small · short");
+        h.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn effort_override_sets_clears_and_reports_effective() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg: Config = serde_json::from_value(serde_json::json!({
+            "model": "mock/large",
+            "provider": { "mock": {
+                "npm": "@ai-sdk/openai-compatible",
+                "options": {"baseURL": "http://127.0.0.1:1/v1", "apiKey": "test"},
+                "models": {
+                    "large": {"limit": {"context": 64000, "output": 4096},
+                        "options": {"reasoningEffort": "low"}},
+                    "small": {"limit": {"context": 32000, "output": 4096},
+                        "variants": {"short": {"maxOutputTokens": 2048}}}
+                }
+            }}
+        }))
+        .unwrap();
+        let crate::config::ResolvedModel { model, context, .. } = cfg.resolve(None).unwrap();
+        cfg.context = context;
+        let mut hc = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+        hc.system_prompt = Some("test".into());
+        hc.context_policy = cfg.context.clone();
+        let h = Harness::open(hc, model).await.unwrap();
+        let config = Arc::new(std::sync::Mutex::new(cfg));
+
+        // Set: writes the variant's options and reports the effective effort.
+        let selected = switch_model(
+            &config,
+            &h,
+            "mock/small",
+            Some("short".into()),
+            Some(crate::models::EffortChoice::Set("high".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.effort.as_deref(), Some("high"));
+        assert_eq!(
+            config.lock().unwrap().provider["mock"].models["small"].variants["short"]
+                .get("reasoningEffort"),
+            Some(&serde_json::json!("high"))
+        );
+        // The file-configured model-level effort still applies to its entry.
+        assert_eq!(
+            config
+                .lock()
+                .unwrap()
+                .effective_effort("mock/large", None)
+                .as_deref(),
+            Some("low")
+        );
+
+        // Config: clears the override on that entry (falls back to none here).
+        let selected = switch_model(
+            &config,
+            &h,
+            "mock/small",
+            Some("short".into()),
+            Some(crate::models::EffortChoice::Config),
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.effort, None);
+        assert!(
+            !config.lock().unwrap().provider["mock"].models["small"].variants["short"]
+                .contains_key("reasoningEffort")
+        );
+
+        // Invalid keywords never reach the resolve or the shared config.
+        assert!(switch_model(
+            &config,
+            &h,
+            "mock/small",
+            None,
+            Some(crate::models::EffortChoice::Set("nope".into())),
+        )
+        .await
+        .is_err());
+        assert!(!config.lock().unwrap().provider["mock"].models["small"]
+            .options
+            .contains_key("reasoningEffort"));
         h.close().await.unwrap();
     }
 }

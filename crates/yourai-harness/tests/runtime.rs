@@ -1074,6 +1074,63 @@ async fn permission_updates_are_atomic_persistent_and_cannot_expand_scope() {
         ApprovalDecision::Allow
     ));
 }
+
+#[tokio::test]
+async fn remembered_approvals_are_ephemeral_and_explicit_denies_still_win() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("permissions.json");
+    let policy = PolicySecurity::open(path.clone(), vec!["danger".into()]).unwrap();
+    let context = |name: &str| SecurityContext {
+        action: name.into(),
+        input: json!({}),
+        is_destructive: false,
+        is_network: false,
+    };
+    assert!(policy.remember_tool_approval("danger").await.is_err());
+    policy.remember_tool_approval("safe").await.unwrap();
+    assert_eq!(
+        policy.check_tool_call(&context("safe")).await.unwrap(),
+        ApprovalDecision::Allow
+    );
+    assert!(!path.exists());
+    policy
+        .update_permissions(&[
+            json!({"type":"addRules","behavior":"allow","rules":[{"toolName":"other"}]}),
+        ])
+        .await
+        .unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("safe"));
+    assert!(!saved.contains("session_allow"));
+    let reopened = PolicySecurity::open(path, vec![]).unwrap();
+    assert_eq!(
+        reopened.check_tool_call(&context("safe")).await.unwrap(),
+        ApprovalDecision::Ask
+    );
+    assert_eq!(
+        reopened.check_tool_call(&context("other")).await.unwrap(),
+        ApprovalDecision::Allow
+    );
+    policy
+        .update_permissions(&[
+            json!({"type":"addRules","behavior":"deny","rules":[{"toolName":"safe"}]}),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        policy.check_tool_call(&context("safe")).await.unwrap(),
+        ApprovalDecision::Deny
+    );
+    assert!(policy.remember_tool_approval("safe").await.is_err());
+    assert_eq!(
+        policy.check_command("anything").await.unwrap(),
+        PolicyDecision::Deny
+    );
+    assert_eq!(
+        policy.check_file_access("anything", true).await.unwrap(),
+        PolicyDecision::Deny
+    );
+}
 #[tokio::test]
 async fn harness_runs_real_task_tool_through_loop_and_restores_session() {
     let dir = TempDir::new().unwrap();

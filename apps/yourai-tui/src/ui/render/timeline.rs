@@ -3,7 +3,9 @@ use super::cards::{block_tool, surface_row, tool_expanded, tool_preview, tool_ti
 use crate::text::elide;
 use crate::ui::markdown::wrap_text;
 use crate::ui::state::{Item, Role, ToolStatus, View};
-use crate::ui::theme::{Theme, ACCENT, CODE_SURFACE, MUTED, RED, TEXT, USER_SURFACE, YELLOW};
+use crate::ui::theme::{
+    Theme, ACCENT, CODE_SURFACE, FAINT, MUTED, RED, TEXT, USER_SURFACE, YELLOW,
+};
 use ratatui::prelude::*;
 use std::{collections::HashMap, ops::Range, sync::Arc};
 use yourai_core::prelude::Level;
@@ -219,28 +221,22 @@ fn item_lines(
             role: Role::Thinking,
             text,
         } => {
-            let first_line = text
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("")
-                .chars()
-                .take(40)
-                .collect::<String>();
             let is_running = v.is_thinking_at(index);
-            let glyph = "✦";
+            let glyph = if expanded { "▾" } else { "▸" };
             let color = if selected || is_running {
                 ACCENT
             } else {
-                MUTED
+                FAINT
             };
-            let title = if first_line.is_empty() {
-                format!("  {glyph} Thinking")
-            } else {
-                format!("  {glyph} Thinking · {first_line}")
-            };
+            let phase = if is_running { "Thinking" } else { "Reasoning" };
+            // Internal reasoning is supporting detail, not the answer.
+            let title = format!(
+                "  {glyph} {phase}{}",
+                if expanded { "" } else { " · Ctrl-O" }
+            );
             lines.push(Line::from(Span::styled(
                 elide(&title, width),
-                Style::default().fg(color).add_modifier(Modifier::ITALIC),
+                Style::default().fg(color),
             )));
             if expanded {
                 let dim = |line: Line<'static>| {
@@ -267,11 +263,11 @@ fn item_lines(
             role: Role::User,
             text,
         } => {
-            lines.push(Line::from(" ".repeat(width)).style(Style::default().bg(USER_SURFACE)));
+            lines.push(surface_row(Line::default(), width, USER_SURFACE));
             for line in text.lines() {
                 for row in wrap_text(
                     line,
-                    Style::default().fg(TEXT).bold(),
+                    Style::default().fg(TEXT),
                     width.saturating_sub(2),
                     "  ",
                 ) {
@@ -293,8 +289,23 @@ fn item_lines(
                 Level::Warning => YELLOW,
                 _ => MUTED,
             };
-            for line in text.lines() {
-                lines.extend(wrap_text(line, Style::default().fg(color), width, "  · "));
+            let prefix = match level {
+                Level::Error => "  Error · ",
+                Level::Warning => "  Warning · ",
+                _ => "  · ",
+            };
+            for (index, line) in text.lines().enumerate() {
+                let style = if index == 0 && matches!(level, Level::Error | Level::Warning) {
+                    Style::default().fg(color).bold()
+                } else {
+                    Style::default().fg(color)
+                };
+                lines.extend(wrap_text(
+                    line,
+                    style,
+                    width,
+                    if index == 0 { prefix } else { "    " },
+                ));
             }
         }
         Item::Tool(t) => {
@@ -306,14 +317,22 @@ fn item_lines(
             }
             if block_tool(t, expanded) {
                 lines.push(tool_title_row(t, selected, expanded, width, tick));
+                let quiet = !expanded
+                    && t.name == "shell"
+                    && t.status == ToolStatus::Done
+                    && t.exit_code.is_none_or(|c| c == 0);
                 if !body.is_empty() {
-                    lines.push(surface_row(Line::default(), width, CODE_SURFACE));
+                    if !quiet {
+                        lines.push(surface_row(Line::default(), width, CODE_SURFACE));
+                    }
                     lines.extend(
                         body.into_iter()
                             .map(|row| surface_row(row, width, CODE_SURFACE)),
                     );
                 }
-                lines.push(surface_row(Line::default(), width, CODE_SURFACE));
+                if !quiet {
+                    lines.push(surface_row(Line::default(), width, CODE_SURFACE));
+                }
             } else {
                 lines.push(tool_title_row(t, selected, expanded, width, tick));
                 lines.extend(body);

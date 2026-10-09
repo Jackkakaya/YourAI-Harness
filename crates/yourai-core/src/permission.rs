@@ -82,8 +82,8 @@ pub async fn authorize(
                         )
                     }
                 };
-                let decision = match decision {
-                    Some(decision) => decision,
+                let (decision, remember) = match decision {
+                    Some(decision) => (decision, false),
                     None => {
                         let reason = match &hook_permission {
                             HookPermission::Ask { reason } => reason.as_str(),
@@ -109,13 +109,16 @@ pub async fn authorize(
                         match reply {
                             Ok(reply) => parse_decision(reply)?,
                             Err(e @ YourAiError::Aborted(_)) => return Err(e),
-                            Err(e) => PermissionRequestDecision {
-                                behavior: PermissionRequestBehavior::Deny,
-                                updated_input: None,
-                                updated_permissions: vec![],
-                                message: Some(e.to_string()),
-                                interrupt: false,
-                            },
+                            Err(e) => (
+                                PermissionRequestDecision {
+                                    behavior: PermissionRequestBehavior::Deny,
+                                    updated_input: None,
+                                    updated_permissions: vec![],
+                                    message: Some(e.to_string()),
+                                    interrupt: false,
+                                },
+                                false,
+                            ),
                         }
                     }
                 };
@@ -153,6 +156,19 @@ pub async fn authorize(
                     ) {
                         denied = Some("security policy denied approved input".into());
                     } else {
+                        if remember {
+                            let policy = turn.tc.snap.security.clone().ok_or_else(|| {
+                                ErrorKind::Config(
+                                    "session approvals require SecurityProvider".into(),
+                                )
+                            })?;
+                            turn.wait_operation(
+                                policy.remember_tool_approval(&call.fn_name),
+                                turn.op_timeout(),
+                                "security",
+                            )
+                            .await?;
+                        }
                         return Ok(());
                     }
                 } else {
@@ -186,8 +202,9 @@ pub async fn authorize(
     }
     unreachable!("inclusive permission loop always returns")
 }
-fn parse_decision(value: Value) -> Result<PermissionRequestDecision, YourAiError> {
-    // UI replies cannot rewrite arguments or policy. The displayed scope is immutable.
+fn parse_decision(value: Value) -> Result<(PermissionRequestDecision, bool), YourAiError> {
+    // UI replies cannot rewrite arguments or arbitrary policy. Session scope
+    // can only remember the tool named by the immutable approval request.
     let behavior = match value.get("behavior").and_then(Value::as_str) {
         Some("allow") => PermissionRequestBehavior::Allow,
         Some("deny") => PermissionRequestBehavior::Deny,
@@ -199,11 +216,44 @@ fn parse_decision(value: Value) -> Result<PermissionRequestDecision, YourAiError
             .into())
         }
     };
-    Ok(PermissionRequestDecision {
-        behavior,
-        updated_input: None,
-        updated_permissions: vec![],
-        message: None,
-        interrupt: false,
-    })
+    let remember = match value.get("scope") {
+        None => false,
+        Some(scope) if scope == "session" && behavior == PermissionRequestBehavior::Allow => true,
+        _ => return Err(ErrorKind::Config("invalid approval scope".into()).into()),
+    };
+    Ok((
+        PermissionRequestDecision {
+            behavior,
+            updated_input: None,
+            updated_permissions: vec![],
+            message: None,
+            interrupt: false,
+        },
+        remember,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_decision;
+    use serde_json::json;
+
+    #[test]
+    fn reply_scope_is_limited_to_allowing_the_displayed_tool_for_this_session() {
+        assert!(!parse_decision(json!({"behavior":"allow"})).unwrap().1);
+        assert!(
+            parse_decision(json!({"behavior":"allow","scope":"session"}))
+                .unwrap()
+                .1
+        );
+        for value in [
+            json!({"behavior":"deny","scope":"session"}),
+            json!({"behavior":"allow","scope":"user"}),
+        ] {
+            assert!(parse_decision(value).is_err());
+        }
+        let (decision, _) = parse_decision(json!({"behavior":"allow","scope":"session","updated_input":{"x":1},"updated_permissions":[{}]})).unwrap();
+        assert!(decision.updated_input.is_none());
+        assert!(decision.updated_permissions.is_empty());
+    }
 }

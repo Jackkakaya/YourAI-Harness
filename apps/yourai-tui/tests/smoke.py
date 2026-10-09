@@ -161,7 +161,8 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'16.0K')
         os.write(master, b'\x02')  # Close the dashboard.
         time.sleep(0.3)
-        os.write(master, b'\x1b[<0;1;35M\x1b[<32;11;35M\x1b[<0;11;35m')
+        # The centered 100-column home puts its title at x=13 (zero-based), row 0.
+        os.write(master, b'\x1b[<0;14;1M\x1b[<32;24;1M\x1b[<0;24;1m')
         wait_for(b'Copied')
         assert clipboard_file.read_text() == 'New session', repr(clipboard_file.read_text())
         os.write(master, b'/')
@@ -176,9 +177,12 @@ with tempfile.TemporaryDirectory() as tmp:
             wait_for(b'YOLO')
         else:
             wait_for(b'Allow tasks?')
-            os.write(master, b'\r')
-            wait_for(b'Enter y to allow once')
-            assert len(requests) == 1, 'empty reply approved a tool'
+            wait_for(b'y  Allow once')
+            os.write(master, b'x')  # unrelated keys never answer an approval
+            time.sleep(0.3)
+            assert len(requests) == 1, 'a stray key approved a tool'
+            os.write(master, b'a')  # allow once and for the rest of the session
+            wait_for(b'Session approval submitted for tasks')
         if yolo:
             wait_for(b'SMOKE_STREAM_OK')
         content = next(m['content'] for m in requests[0][2]['messages'] if m['role'] == 'user')
@@ -186,7 +190,6 @@ with tempfile.TemporaryDirectory() as tmp:
             content = ''.join(p.get('text', '') for p in content)
         assert content == 'list tasks\nsecond line', repr(content)
         if not yolo:
-            os.write(master, b'y\r')
             # Clear the historical approval dialog (which contains the tool input JSON)
             # before checking the folded card preview — only the current screen matters.
             captured.clear()

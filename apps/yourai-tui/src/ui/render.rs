@@ -8,15 +8,16 @@ use super::{
     editor::Editor,
     state::{Item, ToolStatus, View},
     theme::{
-        lerp_color, Theme, ACCENT, BG, BLUE, BORDER, CODE_SURFACE, FOCUS_SURFACE, GREEN, MUTED,
-        PANEL, TEXT,
+        lerp_color, Theme, ACCENT, BG, BLUE, BORDER, BRAND_TEAL, BRAND_VIOLET, CODE_SURFACE,
+        FOCUS_SURFACE, GREEN, MUTED, PANEL, TEXT,
     },
 };
 use crate::text::elide;
 use cards::tool_title_row;
-use footer::footer_lines;
+use footer::{footer_lines, tokens};
 use overlays::{
-    ask_overlay, model_picker_overlay, sessions_overlay, stats_overlay, theme_picker_overlay,
+    ask_overlay, effort_picker_overlay, model_picker_overlay, sessions_overlay, stats_overlay,
+    theme_picker_overlay,
 };
 use ratatui::{
     prelude::*,
@@ -24,6 +25,7 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use yourai_core::prelude::Level;
 #[cfg(test)]
 use yourai_core::prelude::Out;
 #[cfg(test)]
@@ -54,10 +56,11 @@ struct Layout {
     /// Transcript viewport: the reading column, the native-scroll window and
     /// the anchor row base.
     transcript: Rect,
-    /// The stacked rows: [transcript, ask, activity, todo dock, input].
+    /// The stacked rows: [transcript, ask, todo dock, input].
     rows: Vec<Rect>,
     /// Todo sidebar rect when the wide layout shows it.
     panel: Option<Rect>,
+    home: Option<HomeLayout>,
     lines: timeline::LayoutLines,
     headers: Vec<(usize, u64)>,
     turns: Vec<(usize, u64)>,
@@ -70,6 +73,15 @@ struct Layout {
     todo_hit: Option<Rect>,
     todo_area: Option<Rect>,
 }
+#[derive(Clone, Copy)]
+struct HomeLayout {
+    logo: Rect,
+    workspace: Option<Rect>,
+    metrics: Option<Rect>,
+    suggestions: Option<Rect>,
+    footer: Rect,
+}
+
 /// What a click on the last painted frame hit. The renderer answers queries
 /// about its own layout; the resulting View mutations live in the action
 /// layer (`app::click_dispatch`), keeping input state out of the render path.
@@ -256,7 +268,13 @@ impl Renderer {
         self.relayout(area, v, compact);
         // The native-scroll window rides on the canvas; Presentation hands it
         // to the terminal backend. The renderer never touches terminal state.
-        f.set_scroll_region(self.layout.transcript);
+        // An empty rectangle explicitly clears a previous session's scroll
+        // window; Canvas::None means preserve the backend's current window.
+        f.set_scroll_region(if self.layout.home.is_some() {
+            Rect::default()
+        } else {
+            self.layout.transcript
+        });
         // Stage 2: navigation — pending intents resolve against the new
         // layout. This and the anchor above are the only View writes in the
         // prepare path.
@@ -273,24 +291,40 @@ impl Renderer {
     /// Compute the frame's rects and, on a cache miss, relayout the timeline.
     fn relayout(&mut self, area: Rect, v: &mut View, compact: bool) {
         let layout = &mut self.layout;
+        let home = v.items().iter().all(|item| {
+            matches!(
+                item,
+                Item::Notice {
+                    level: Level::Info,
+                    ..
+                }
+            )
+        }) && !v.session.active
+            && !compact
+            && v.asks_empty()
+            && !v.session.todos.panel_open();
+        layout.home = None;
         let content_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
         // Todo panel appears only when there are tasks to inspect.
         // Preserve a readable conversation column; compact windows use the task dock.
         let sidebar_visible = v.session.todos.panel_open() && area.width >= 100;
-        let panel_w = (area.width / 3).clamp(28, 40);
+        let panel_w = (area.width / 3).clamp(32, 44);
         // The composer owns the whole window width, independently of Todo.
-        let width = content_area.width.saturating_sub(4).max(2) as usize;
+        let composer_width = if home {
+            area.width.saturating_sub(4).min(100)
+        } else {
+            content_area.width
+        };
+        let width = composer_width.saturating_sub(4).max(2) as usize;
         let (editor_lines, _, _) = v.draft.editor().layout(width);
         // One editable row plus breathing room; grow only as the draft wraps.
         let input_height = editor_lines
             .len()
-            .saturating_add(2)
+            .saturating_add(if area.height >= 16 { 3 } else { 2 })
             .max(3)
             .min(usize::from((area.height / 3).clamp(3, 8)))
             .min(usize::from(area.height.saturating_sub(6))) as u16;
         let input_height = if v.asks_empty() { input_height } else { 0 };
-        let busy = v.session.active || compact || !v.asks_empty();
-        let activity_height = if busy { 1 } else { 0 };
         let narrow_dock = if !sidebar_visible && v.session.todos.panel_open() {
             1
         } else {
@@ -304,12 +338,13 @@ impl Renderer {
         let ask_height = ask_height.min(
             content_area
                 .height
-                .saturating_sub(input_height + activity_height + narrow_dock + 1),
+                .saturating_sub(input_height + narrow_dock + 1),
         );
+        // One status row below the composer, total: while busy the footer's
+        // left side carries the spinner/activity instead of title and path.
         let rows = ratatui::layout::Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(ask_height),
-            Constraint::Length(activity_height),
             Constraint::Length(narrow_dock),
             Constraint::Length(input_height),
         ])
@@ -333,6 +368,46 @@ impl Renderer {
         layout.transcript = inner;
         layout.panel = cols.get(1).copied();
         layout.rows = rows.to_vec();
+        if home {
+            let logo_height = if composer_width >= 60 && area.height >= 20 {
+                5
+            } else {
+                1
+            };
+            let rich = composer_width >= 64 && area.height >= 26;
+            let gap = if area.height >= 16 { 2 } else { 1 };
+            let extra = if rich { 6 } else { 0 };
+            let group_height = logo_height + gap + extra + input_height + if rich { 5 } else { 2 };
+            let x = area.x + (area.width - composer_width) / 2;
+            let y = content_area.y + content_area.height.saturating_sub(group_height) / 2;
+            let split_brand = rich && composer_width >= 92;
+            let input_y = y + logo_height + gap + extra;
+            layout.rows[3] = Rect::new(x, input_y, composer_width, input_height);
+            layout.home = Some(HomeLayout {
+                logo: Rect::new(
+                    x,
+                    y,
+                    if split_brand { 46 } else { composer_width },
+                    logo_height,
+                ),
+                workspace: split_brand.then(|| Rect::new(x + 52, y, composer_width - 52, 5)),
+                metrics: rich.then(|| Rect::new(x, y + logo_height + gap, composer_width, 4)),
+                suggestions: rich.then(|| {
+                    Rect::new(
+                        x + 3,
+                        layout.rows[3].bottom() + 3,
+                        composer_width.saturating_sub(4),
+                        1,
+                    )
+                }),
+                footer: Rect::new(
+                    x + 3,
+                    layout.rows[3].bottom() + 1,
+                    composer_width.saturating_sub(4),
+                    1,
+                ),
+            });
+        }
         let preview_rows = edit_preview_quota(inner.height);
         let key = (
             v.session.revision,
@@ -344,7 +419,7 @@ impl Renderer {
         if self.key != Some(key) {
             (layout.lines, layout.headers) = self.timeline.layout(
                 v,
-                inner.width.saturating_sub(2) as usize,
+                inner.width.saturating_sub(4) as usize,
                 preview_rows,
                 self.tick,
             );
@@ -373,7 +448,29 @@ impl Renderer {
         let layout = &mut self.layout;
         let inner = layout.transcript;
         let rows = layout.rows.clone();
-        let footer_lines = footer_lines(area.width as usize, v, m, queued);
+        // While busy, the footer's left side becomes the activity status
+        // (spinner + action + elapsed + esc hint) — no second status row.
+        let busy_status = {
+            let busy = v.session.active || compact || !v.asks_empty();
+            busy.then(|| {
+                let act = activity(v, compact, time.monotonic);
+                let elapsed = elapsed_str(v, time.monotonic);
+                let spinner = spinner_frame(self.tick);
+                let text = if elapsed.is_empty() {
+                    format!("{spinner} {act} · esc stop")
+                } else {
+                    format!("{spinner} {act} · {elapsed} · esc stop")
+                };
+                (text, pulse_color(self.tick as f32 * 0.1, v.theme))
+            })
+        };
+        let footer_lines = footer_lines(
+            area.width as usize,
+            v,
+            m,
+            queued,
+            busy_status.as_ref().map(|(t, c)| (t.as_str(), *c)),
+        );
         let height = inner.height as usize;
         let end = layout
             .lines
@@ -397,7 +494,7 @@ impl Renderer {
                         tool,
                         v.selected() == Some(id),
                         v.expanded(id),
-                        inner.width.saturating_sub(2) as usize,
+                        inner.width.saturating_sub(4) as usize,
                         self.tick,
                     );
                 }
@@ -407,41 +504,59 @@ impl Renderer {
                 id,
             ));
         }
-        f.render_widget(Paragraph::new(visible), inner);
-        if v.items().is_empty() {
-            welcome(f, inner);
+        let reading = Rect::new(
+            inner.x + 1,
+            inner.y,
+            inner.width.saturating_sub(2),
+            inner.height,
+        );
+        if let Some(home) = layout.home {
+            welcome(f, home, v, m);
+        } else {
+            f.render_widget(Paragraph::new(visible), reading);
         }
-        // Staged-attachment badge on the input block: clipboard images and
-        // @file references wait for the next submit; Esc clears them.
+        // Staged-attachment badge on the composer's meta row (right side);
+        // the model label takes the left side, inside draw_editor.
         let (n_img, n_ref) = v.draft.attachment_counts();
         let badge = match (n_img, n_ref) {
             (0, 0) => String::new(),
-            (0, r) => format!(" {r} ref · Esc clears "),
-            (i, 0) => format!(" {i} img · Esc clears "),
-            (i, r) => format!(" {i} img · {r} ref · Esc clears "),
+            (0, r) => format!("{r} ref · Esc clears"),
+            (i, 0) => format!("{i} img · Esc clears"),
+            (i, r) => format!("{i} img · {r} ref · Esc clears"),
         };
         draw_editor(
             f,
             v.draft.editor(),
-            rows[4],
+            rows[3],
             v.asks_empty() && !v.overlay.is_open(),
             if v.session.active {
                 "Add guidance…"
             } else {
                 "Ask anything…"
             },
-            &badge,
+            ComposerMeta {
+                // The composer's model tag carries the effective thinking
+                // effort, e.g. "gateway/kimi-k3 · high".
+                model: &match &v.model.effort {
+                    Some(effort) => format!("{} · {}", v.model.label, effort),
+                    None => v.model.label.clone(),
+                },
+                badge: &badge,
+                active: v.session.active,
+                home: layout.home.is_some(),
+            },
         );
         // Show one recovery action only while reading history; keep idle input quiet.
-        if v.session.navigation.offset() > 0 && rows[4].height >= 3 && !v.overlay.is_open() {
+        if v.session.navigation.offset() > 0 && rows[3].height >= 3 && !v.overlay.is_open() {
             let label = "↓ Latest";
-            if rows[4].width >= label.width() as u16 + 4 {
+            if rows[3].width >= label.width() as u16 + 4 {
                 let rect = Rect::new(
-                    rows[4].right() - label.width() as u16 - 2,
-                    rows[4].bottom() - 1,
+                    rows[3].right() - label.width() as u16 - 2,
+                    rows[3].y.saturating_sub(1),
                     label.width() as u16,
                     1,
                 );
+                f.render_widget(Clear, rect);
                 f.render_widget(
                     Paragraph::new(label).style(Style::default().fg(MUTED).bg(PANEL)),
                     rect,
@@ -450,26 +565,26 @@ impl Renderer {
             }
         }
         ask_overlay(f, rows[1], v);
-        // Breathing bar: one line above the input, visible only while busy.
-        if rows[2].height > 0 {
-            draw_activity_bar(f, rows[2], v, compact, self.tick, time.monotonic);
-        }
         // Narrow-screen TODO dock (single line, only when panel won't fit).
-        if rows[3].height > 0 {
-            draw_narrow_todo_dock(f, rows[3], v);
-            layout.todo_hit = Some(rows[3]);
+        if rows[2].height > 0 {
+            draw_narrow_todo_dock(f, rows[2], v);
+            layout.todo_hit = Some(rows[2]);
         }
         let footer = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
-        f.render_widget(Paragraph::new(footer_lines), footer);
+        if layout.home.is_none() {
+            f.render_widget(Paragraph::new(footer_lines), footer);
+        }
         let menu = v.menu();
         let commands = menu.items();
         let selected_command = menu.selected;
         if !commands.is_empty() {
-            let height = (commands.len() as u16 + 2).min(rows[4].y.saturating_sub(area.y));
+            let height = (commands.len() as u16 + 2)
+                .min(12)
+                .min(rows[3].y.saturating_sub(area.y));
             let rect = Rect::new(
-                rows[4].x,
-                rows[4].y.saturating_sub(height),
-                rows[4].width.min(62),
+                rows[3].x,
+                rows[3].y.saturating_sub(height),
+                rows[3].width.min(62),
                 height,
             );
             layout.command_area = Some(rect);
@@ -492,21 +607,21 @@ impl Renderer {
                 .skip(start)
                 .take(visible)
                 .map(|(i, c)| {
-                    Line::from(Span::styled(
-                        format!(
-                            " {} {:<17} {}",
-                            if i == selected_command { "›" } else { " " },
-                            c.text,
-                            c.description
+                    let selected = i == selected_command;
+                    let label = format!(" {} {:<13} ", if selected { "›" } else { " " }, c.text);
+                    let description = elide(
+                        c.description,
+                        (rect.width as usize).saturating_sub(2 + label.width()),
+                    );
+                    Line::from(vec![
+                        Span::styled(
+                            label,
+                            Style::default()
+                                .fg(if selected { ACCENT } else { TEXT })
+                                .bold(),
                         ),
-                        Style::default()
-                            .fg(if i == selected_command { ACCENT } else { TEXT })
-                            .add_modifier(if i == selected_command {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
-                    ))
+                        Span::styled(description, Style::default().fg(MUTED)),
+                    ])
                     .style(Style::default().bg(if i == selected_command {
                         FOCUS_SURFACE
                     } else {
@@ -522,7 +637,8 @@ impl Renderer {
                         Block::default()
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(BORDER))
-                            .title(" Commands · ↑↓ · Enter · Tab "),
+                            .title(" Commands ")
+                            .title_bottom(" ↑↓ select · Enter apply · Esc close "),
                     ),
                 rect,
             );
@@ -534,10 +650,10 @@ impl Renderer {
             && !v.draft.mention().entries.is_empty()
         {
             let entries = &v.draft.mention().entries;
-            let height = (entries.len() as u16 + 2).min(rows[4].y.saturating_sub(area.y));
+            let height = (entries.len() as u16 + 2).min(rows[3].y.saturating_sub(area.y));
             let rect = Rect::new(
                 inner.x,
-                rows[4].y.saturating_sub(height),
+                rows[3].y.saturating_sub(height),
                 inner.width.min(62),
                 height,
             );
@@ -572,28 +688,32 @@ impl Renderer {
                 .skip(start)
                 .take(visible)
                 .map(|(i, e)| {
-                    let icon = if e.is_dir { "📁" } else { "📄" };
+                    let icon = if e.is_dir { "dir" } else { "file" };
                     Line::from(Span::styled(
-                        format!(
-                            " {} {:<40}",
-                            if i == v.draft.mention().selected {
-                                "›"
-                            } else {
-                                " "
-                            },
-                            format!("{icon} {}", e.display)
+                        elide(
+                            &format!(
+                                " {} {icon:<4} {}",
+                                if i == v.draft.mention().selected {
+                                    "›"
+                                } else {
+                                    " "
+                                },
+                                e.display
+                            ),
+                            rect.width.saturating_sub(2) as usize,
                         ),
-                        Style::default()
-                            .fg(if i == v.draft.mention().selected {
-                                ACCENT
-                            } else {
-                                TEXT
-                            })
-                            .bg(if i == v.draft.mention().selected {
-                                BG
-                            } else {
-                                PANEL
-                            }),
+                        Style::default().fg(if i == v.draft.mention().selected {
+                            ACCENT
+                        } else {
+                            TEXT
+                        }),
+                    ))
+                    .style(Style::default().bg(
+                        if i == v.draft.mention().selected {
+                            FOCUS_SURFACE
+                        } else {
+                            PANEL
+                        },
                     ))
                 })
                 .collect::<Vec<_>>();
@@ -604,7 +724,8 @@ impl Renderer {
                         Block::default()
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(BORDER))
-                            .title(" @ files · ↑↓ · Enter · Esc "),
+                            .title(" @ Files ")
+                            .title_bottom(" ↑↓ select · Enter attach · Esc close "),
                     ),
                 rect,
             );
@@ -614,10 +735,11 @@ impl Renderer {
             layout.todo_hit = hits.0;
             layout.todo_area = hits.1;
         }
-        match &v.overlay {
+        match &mut v.overlay {
             Overlay::None => {}
             Overlay::Stats { .. } => stats_overlay(f, area, v, m),
             Overlay::Models(_) => model_picker_overlay(f, area, v),
+            Overlay::Effort { .. } => effort_picker_overlay(f, area, v),
             Overlay::LoadingSessions => {
                 let rect = crate::picker::centered(area, 40, 3);
                 f.render_widget(Clear, rect);
@@ -629,7 +751,7 @@ impl Renderer {
             }
             Overlay::Sessions(_) => sessions_overlay(f, area, v, time.unix_seconds),
             Overlay::Themes(_) => theme_picker_overlay(f, area, v),
-            Overlay::Help { scroll } => help(f, area, *scroll),
+            Overlay::Help { scroll } => help(f, area, scroll),
         }
         v.theme.apply(f.buffer_mut());
         self.selection
@@ -639,7 +761,7 @@ impl Renderer {
                 let width = (message.width() as u16 + 6).min(area.width.saturating_sub(4));
                 let rect = Rect::new(
                     area.x + (area.width - width) / 2,
-                    rows[4].y.saturating_sub(4),
+                    rows[3].y.saturating_sub(4),
                     width,
                     3,
                 );
@@ -682,7 +804,7 @@ fn activity(v: &View, compact: bool, now: std::time::Instant) -> String {
         .into();
     }
     if compact {
-        return "Compacting context".into();
+        return "Preparing context".into();
     }
     if let Some(retry) = &v.session.retry {
         let seconds = retry
@@ -691,7 +813,7 @@ fn activity(v: &View, compact: bool, now: std::time::Instant) -> String {
             .as_secs_f64()
             .ceil() as u64;
         return format!(
-            "{} · {}s 后重试 ({}/{})",
+            "{} · retry in {}s ({}/{})",
             retry.reason, seconds, retry.attempt, retry.max
         );
     }
@@ -723,48 +845,215 @@ fn elapsed_str(v: &View, now: std::time::Instant) -> String {
         })
         .unwrap_or_default()
 }
-/// Context pressure ratio for color thresholds.
-fn welcome(f: &mut Canvas, area: Rect) {
-    // A task-oriented empty state; no terminal banner or persistent title bar.
-    let wide = area.width >= 60 && area.height >= 10;
-    let content = if wide {
-        vec![
-            ("YourAI", Style::default().fg(TEXT).bold()),
-            ("", Style::default()),
-            (
-                "Build something. Solve a problem.",
-                Style::default().fg(TEXT).bold(),
-            ),
-            (
-                "Describe a change, debug an issue, or review code.",
-                Style::default().fg(MUTED),
-            ),
-            ("", Style::default()),
-            (
-                "/sessions  Resume work     /models  Choose model",
-                Style::default().fg(MUTED),
-            ),
-        ]
+/// Empty sessions keep the brand, actual editor and orientation in one group.
+/// This is the same editor used in a conversation, including paste and menus.
+fn welcome(f: &mut Canvas, home: HomeLayout, v: &View, m: &Metadata) {
+    let area = f.area();
+    let logo = if home.logo.height >= 5 {
+        crate::branding::wordmark()
     } else {
-        vec![
-            ("YourAI", Style::default().fg(TEXT).bold()),
-            ("Build · Debug · Review", Style::default().fg(TEXT)),
-            ("/ commands · F1 help", Style::default().fg(MUTED)),
-        ]
+        vec![Line::from(Span::styled(
+            "YourAI",
+            Style::default().fg(BRAND_TEAL).bold(),
+        ))
+        .alignment(Alignment::Center)]
     };
-    let height = (content.len() as u16).min(area.height);
-    let width = area.width.saturating_sub(4).min(52);
-    let rect = Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 3,
-        width,
-        height,
+    f.render_widget(Paragraph::new(logo), home.logo);
+    f.render_widget(
+        Paragraph::new("New session").style(Style::default().fg(MUTED)),
+        Rect::new(home.footer.x, area.y, home.footer.width, 1),
     );
-    let lines = content
-        .into_iter()
-        .map(|(text, style)| Line::from(Span::styled(elide(text, width as usize), style)))
-        .collect::<Vec<_>>();
-    f.render_widget(Paragraph::new(lines), rect);
+    if let Some(rect) = home.workspace {
+        let lines = vec![
+            Line::from(Span::styled("WORKSPACE", Style::default().fg(BRAND_TEAL))),
+            Line::from(Span::styled(
+                crate::text::elide_tail(&m.cwd, rect.width as usize),
+                Style::default().fg(TEXT).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Think clearly. Build confidently.",
+                Style::default().fg(BRAND_VIOLET),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines), rect);
+    }
+    if let Some(rect) = home.metrics {
+        // This is an empty conversation. A next-request estimate includes
+        // system/tool overhead, so it must not read as messages already sent.
+        let capacity = v
+            .session
+            .context_usage
+            .as_ref()
+            .and_then(|u| u.context_window)
+            .filter(|w| *w > 0)
+            .map(|w| format!("{} token window", tokens(w)))
+            .unwrap_or_else(|| "Capacity unavailable".into());
+        let access = if m.yolo {
+            "YOLO"
+        } else if m.trusted_shell {
+            "Trusted shell"
+        } else {
+            "Ask before execution"
+        };
+        let detail = if m.yolo {
+            "All tools auto-approved"
+        } else if m.trusted_shell {
+            "Other permissions still ask"
+        } else {
+            "/yolo toggles auto-approval"
+        };
+        let cols =
+            ratatui::layout::Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+                .spacing(2)
+                .split(rect);
+        for (card, title, value, detail, color) in [
+            (
+                cols[0],
+                "MODEL CAPACITY",
+                capacity,
+                "No messages sent",
+                BRAND_TEAL,
+            ),
+            (
+                cols[1],
+                "EXECUTION",
+                access.into(),
+                detail,
+                if m.yolo {
+                    super::theme::YELLOW
+                } else {
+                    BRAND_VIOLET
+                },
+            ),
+        ] {
+            f.render_widget(
+                Block::default().style(Style::default().bg(CODE_SURFACE)),
+                card,
+            );
+            let width = card.width.saturating_sub(4) as usize;
+            let lines = vec![
+                Line::from(Span::styled(
+                    elide(title, width),
+                    Style::default().fg(color),
+                )),
+                Line::from(Span::styled(
+                    elide(&value, width),
+                    Style::default().fg(TEXT).bold(),
+                )),
+                Line::from(Span::styled(
+                    elide(detail, width),
+                    Style::default().fg(MUTED),
+                )),
+            ];
+            f.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(CODE_SURFACE)),
+                Rect::new(card.x + 3, card.y, card.width.saturating_sub(4), 3),
+            );
+        }
+    }
+    if let Some(rect) = home.suggestions {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Try  ", Style::default().fg(BRAND_VIOLET)),
+                Span::styled(
+                    elide(
+                        "Map this project · Review changes · Fix a failing test",
+                        rect.width.saturating_sub(5) as usize,
+                    ),
+                    Style::default().fg(MUTED),
+                ),
+            ])),
+            rect,
+        );
+    }
+    let permission = if m.yolo {
+        "YOLO"
+    } else if m.trusted_shell {
+        "trusted"
+    } else {
+        "ask"
+    };
+    let tips = if home.footer.width >= 80 {
+        "/sessions · /models · /theme · F1"
+    } else if home.footer.width >= 50 {
+        "/ commands · F1 help"
+    } else {
+        "/ · F1"
+    };
+    // Each fact has one home: workspace above when visible, permissions in
+    // their card when visible; compact layouts move those facts to this row.
+    let permission = if home.metrics.is_none() {
+        permission
+    } else {
+        ""
+    };
+    let right = if permission.is_empty() {
+        tips.into()
+    } else {
+        format!("{tips} · {permission}")
+    };
+    let width = home.footer.width as usize;
+    let path = if home.workspace.is_none() {
+        crate::text::elide_tail(&m.cwd, width.saturating_sub(right.width() + 2))
+    } else {
+        String::new()
+    };
+    let gap = if path.is_empty() {
+        0
+    } else {
+        width.saturating_sub(path.width() + right.width())
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(path, Style::default().fg(MUTED)),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(tips, Style::default().fg(MUTED)),
+            Span::styled(
+                if permission.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {permission}")
+                },
+                Style::default().fg(if m.yolo { super::theme::YELLOW } else { MUTED }),
+            ),
+        ])),
+        home.footer,
+    );
+    // Local setup actions (such as choosing a model) keep the home editor
+    // in place and show their latest confirmation directly beneath it.
+    if home.footer.bottom() < area.bottom() - 1 {
+        if let Some(Item::Notice {
+            level: Level::Info,
+            text,
+        }) = v.items().back()
+        {
+            f.render_widget(
+                Paragraph::new(elide(
+                    &format!("· {}", text.lines().next().unwrap_or("")),
+                    home.footer.width as usize,
+                ))
+                .style(Style::default().fg(MUTED)),
+                Rect::new(home.footer.x, home.footer.bottom(), home.footer.width, 1),
+            );
+        }
+    }
+    f.render_widget(
+        Paragraph::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(MUTED)),
+        Rect::new(home.footer.x, area.bottom() - 1, home.footer.width, 1),
+    );
+}
+
+/// The composer uses a colored left rail,
+/// text with breathing room, and a meta row underneath — the active model on
+/// the left, staged attachments on the right. The rail brightens with focus.
+struct ComposerMeta<'a> {
+    model: &'a str,
+    badge: &'a str,
+    active: bool,
+    home: bool,
 }
 
 fn draw_editor(
@@ -773,53 +1062,92 @@ fn draw_editor(
     area: Rect,
     focus: bool,
     placeholder: &str,
-    badge: &str,
+    meta: ComposerMeta<'_>,
 ) {
+    let ComposerMeta {
+        model,
+        badge,
+        active,
+        home,
+    } = meta;
     if area.is_empty() {
         return;
     }
-    let mut block = Block::default()
-        .style(Style::default().bg(PANEL).fg(TEXT))
-        .padding(ratatui::widgets::Padding::new(3, 1, 1, 1));
-    if !badge.is_empty() {
-        // Staged-attachment counts ride on the input block's first row.
-        block = block.title(
-            Line::from(Span::styled(badge.to_owned(), Style::default().fg(MUTED)))
-                .alignment(ratatui::layout::Alignment::Right),
-        );
-    }
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(if focus {
+            if home {
+                BRAND_TEAL
+            } else {
+                ACCENT
+            }
+        } else {
+            BORDER
+        }))
+        .border_set(ratatui::symbols::border::Set {
+            vertical_left: "│",
+            ..ratatui::symbols::border::Set::default()
+        })
+        .style(Style::default().bg(PANEL))
+        .padding(ratatui::widgets::Padding::new(2, 1, 1, 0));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    if !inner.is_empty() {
-        f.render_widget(
-            Paragraph::new("›").style(
-                Style::default()
-                    .fg(if focus { ACCENT } else { MUTED })
-                    .bold(),
-            ),
-            Rect::new(area.x + 1, inner.y, 1, 1),
-        );
-        if e.text.is_empty() {
-            f.render_widget(
-                Paragraph::new(elide(placeholder, inner.width as usize))
-                    .style(Style::default().fg(MUTED)),
-                inner,
-            );
-        }
-    }
+    // The text viewport gives its last row to the meta line.
     let (lines, row, col) = e.layout(inner.width as usize);
-    let top = row.saturating_sub(inner.height.saturating_sub(1) as usize);
+    let view = (inner.height as usize).saturating_sub(1);
+    let top = row.saturating_sub(view.saturating_sub(1));
+    let text_rect = Rect::new(inner.x, inner.y, inner.width, view as u16);
     if !e.text.is_empty() {
         f.render_widget(
             Paragraph::new(
                 lines
                     .into_iter()
                     .skip(top)
-                    .take(inner.height as usize)
+                    .take(view)
                     .map(Line::from)
                     .collect::<Vec<_>>(),
             ),
-            inner,
+            text_rect,
+        );
+    } else if !text_rect.is_empty() {
+        f.render_widget(
+            Paragraph::new(elide(placeholder, inner.width as usize))
+                .style(Style::default().fg(MUTED)),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+    }
+    if inner.height > 0 {
+        let meta = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+        let submit = if active { "Enter steer" } else { "Enter send" };
+        let hint = if !badge.is_empty() {
+            badge.to_owned()
+        } else if home {
+            String::new()
+        } else if meta.width >= 70 {
+            format!("/ commands · @ files · {submit}")
+        } else if meta.width >= 42 {
+            format!("/ commands · {submit}")
+        } else {
+            String::new()
+        };
+        let hint = elide(&hint, (meta.width as usize).saturating_sub(12));
+        let model_label = crate::text::elide_tail(
+            model,
+            (meta.width as usize)
+                .saturating_sub(hint.width() + 2)
+                .min(48),
+        );
+        let gap = (meta.width as usize).saturating_sub(model_label.width() + hint.width());
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    model_label,
+                    Style::default().fg(if home { BRAND_VIOLET } else { ACCENT }),
+                ),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(hint, Style::default().fg(MUTED)),
+            ])),
+            meta,
         );
     }
     if focus && inner.width > 0 && inner.height > 0 {
@@ -829,7 +1157,7 @@ fn draw_editor(
         ));
     }
 }
-/// Todo-only panel; diagnostics are available in the dashboard.
+/// Session orientation and task progress; full diagnostics stay in the dashboard.
 fn sidebar(f: &mut Canvas, area: Rect, v: &View) -> (Option<Rect>, Option<Rect>) {
     let block = Block::default()
         .padding(ratatui::widgets::Padding::new(2, 2, 1, 1))
@@ -843,19 +1171,37 @@ fn sidebar(f: &mut Canvas, area: Rect, v: &View) -> (Option<Rect>, Option<Rect>)
         .iter()
         .filter(|t| t.completed)
         .count();
-    f.render_widget(
-        Paragraph::new(format!(
-            " Todo · {done}/{} · ^T",
-            v.session.todos.items().len()
-        ))
-        .style(Style::default().fg(TEXT).bold()),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
+    let mut heading = Vec::new();
+    let title = v.session.title.as_deref().unwrap_or("New session");
+    if inner.height >= 8 {
+        for text in wrap_todo_text(title, inner.width as usize)
+            .into_iter()
+            .take(2)
+        {
+            heading.push(Line::from(Span::styled(
+                text,
+                Style::default().fg(TEXT).bold(),
+            )));
+        }
+        heading.push(Line::default());
+    }
+    // Context has one compact home in the footer; this panel focuses on tasks.
+    let title_y = inner.y + heading.len() as u16;
+    heading.push(Line::from(vec![
+        Span::styled(
+            format!("Todo · {done}/{}", v.session.todos.items().len()),
+            Style::default().fg(TEXT).bold(),
+        ),
+        Span::styled("  ^T", Style::default().fg(MUTED)),
+    ]));
+    heading.push(Line::default());
+    let heading_height = heading.len() as u16;
+    f.render_widget(Paragraph::new(heading), inner);
     let body = Rect::new(
         inner.x,
-        inner.y.saturating_add(2),
+        inner.y.saturating_add(heading_height),
         inner.width,
-        inner.height.saturating_sub(2),
+        inner.height.saturating_sub(heading_height),
     );
     let current = v.session.todos.items().iter().position(|t| !t.completed);
     let mut lines = Vec::new();
@@ -893,6 +1239,7 @@ fn sidebar(f: &mut Canvas, area: Rect, v: &View) -> (Option<Rect>, Option<Rect>)
                 ),
             ]));
         }
+        lines.push(Line::default());
     }
     let scroll = v
         .session
@@ -909,7 +1256,7 @@ fn sidebar(f: &mut Canvas, area: Rect, v: &View) -> (Option<Rect>, Option<Rect>)
         body,
     );
     (
-        Some(Rect::new(inner.x, inner.y, inner.width, 1)),
+        Some(Rect::new(inner.x, title_y, inner.width, 1)),
         Some(body),
     )
 }
@@ -926,8 +1273,23 @@ fn wrap_todo_text(text: &str, width: usize) -> Vec<String> {
         if used + gw > width && !line.is_empty() {
             // Trailing whitespace at the break point is invisible padding;
             // drop it so wrapped lines carry only their real text.
-            result.push(std::mem::take(&mut line).trim_end().to_string());
-            used = 0;
+            let split = line
+                .rfind(char::is_whitespace)
+                .filter(|&at| at > 0 && !line[..at].trim().is_empty());
+            if !g.chars().all(char::is_whitespace) {
+                if let Some(at) = split {
+                    let rest = line[at..].trim_start().to_owned();
+                    result.push(line[..at].trim_end().to_owned());
+                    line = rest;
+                    used = line.width();
+                } else {
+                    result.push(std::mem::take(&mut line).trim_end().to_owned());
+                    used = 0;
+                }
+            } else {
+                result.push(std::mem::take(&mut line).trim_end().to_owned());
+                used = 0;
+            }
             // The whitespace that triggered the break belongs to the end of
             // the previous line; keeping it would shift the continuation one
             // column past the 4-space indent and misalign wrapped rows.
@@ -971,34 +1333,10 @@ fn draw_narrow_todo_dock(f: &mut Canvas, area: Rect, v: &View) {
     );
 }
 
-fn draw_activity_bar(
-    f: &mut Canvas,
-    area: Rect,
-    v: &View,
-    compact: bool,
-    tick: u64,
-    now: std::time::Instant,
-) {
-    let spinner = spinner_frame(tick);
-    let act = activity(v, compact, now);
-    let elapsed = elapsed_str(v, now);
-    let text = if elapsed.is_empty() {
-        format!("{spinner} {act} · Esc 打断")
-    } else {
-        format!("{spinner} {act} · {elapsed} · Esc 打断")
-    };
-    let color = pulse_color(tick as f32 * 0.1, v.theme);
-    f.render_widget(
-        Paragraph::new(elide(&text, area.width as usize)).style(Style::default().fg(color)),
-        area,
-    );
-}
-
-/// One full-width row. Drop optional metrics before clipping a value or its unit.
-/// Truncated labels and the overflow mark point to the full details in Ctrl-B.
-fn help(f: &mut Canvas, area: Rect, scroll: u16) {
+/// Wrapped help with one stored offset matching the visible scroll position.
+fn help(f: &mut Canvas, area: Rect, scroll: &mut u16) {
     let rect = crate::picker::centered(area, 78, area.height.saturating_sub(2) as usize);
-    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nCtrl-V          Paste image from clipboard (Esc clears)\n@               Reference a file (text inlined; images/PDF attached)\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/continue       Retry pending execution failures\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker or /models p/m [variant])\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y/n + Enter (YOLO skips approvals).";
+    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\nF2              Cycle configured models\nCtrl-X          Edit prompt in $VISUAL/$EDITOR\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nCtrl-V          Paste image from clipboard (Esc clears)\n@               Reference a file (text inlined; images/PDF attached)\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/continue       Retry pending execution failures\n/editor         Edit the draft in $VISUAL/$EDITOR\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker; Tab sets thinking effort)\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y allow once · a always this session · n deny (YOLO skips approvals).";
     let lines: Vec<_> = text
         .lines()
         .flat_map(|line| {
@@ -1009,11 +1347,12 @@ fn help(f: &mut Canvas, area: Rect, scroll: u16) {
             )
         })
         .collect();
-    let offset = (scroll as usize).min(
+    let offset = (*scroll as usize).min(
         lines
             .len()
             .saturating_sub(rect.height.saturating_sub(2) as usize),
     ) as u16;
+    *scroll = offset;
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines)
@@ -1185,7 +1524,7 @@ mod tests {
                 .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
                 .unwrap();
             assert_eq!(
-                terminal.backend().buffer()[(0, 0)].bg,
+                terminal.backend().buffer()[(1, 0)].bg,
                 theme.color(USER_SURFACE)
             );
             let text = terminal
@@ -1255,11 +1594,231 @@ mod tests {
     }
 
     #[test]
+    fn model_label_rides_the_composer_meta_row() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut renderer = Renderer::default();
+        let mut v = View::default();
+        v.model.label = "gateway/kimi-k3".into();
+        let m = Metadata {
+            session: "session-123".into(),
+            cwd: "/workspace".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        terminal
+            .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        // The active model is always visible; a staged attachment shares the row.
+        assert!(
+            text.contains("gateway/kimi-k3"),
+            "model label missing from the input area"
+        );
+        assert!(text.contains("Ask anything…"), "placeholder still visible");
+        v.draft
+            .stage_image(super::super::clipboard::ClipboardImage {
+                mime: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            });
+        terminal
+            .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("1 img · Esc clears"));
+        assert!(text.contains("gateway/kimi-k3"));
+    }
+
+    #[test]
+    fn centered_home_keeps_cursor_menus_and_first_turn_inside_their_regions() {
+        let m = Metadata {
+            session: "home".into(),
+            cwd: "/workspace".into(),
+            trusted_shell: false,
+            yolo: true,
+        };
+        for (width, height) in [(30, 10), (50, 16), (68, 26), (96, 26), (120, 35)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut renderer = Renderer::default();
+            let mut view = View::default();
+            view.draft.insert(&"long draft 中文 ".repeat(50));
+            terminal
+                .draw(|f| renderer.draw(f, &mut view, &m, &SessionStatus::Idle, 0, false))
+                .unwrap();
+            let home = renderer
+                .layout
+                .home
+                .expect("empty session uses home layout");
+            let input = renderer.layout.rows[3];
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert!(home.logo.bottom() <= input.y);
+            assert_eq!(home.footer.x, input.x + 3);
+            assert_eq!(home.footer.right(), input.right() - 1);
+            assert!(home.footer.y > input.bottom());
+            assert!(home.footer.bottom() < height);
+            if let Some(metrics) = home.metrics {
+                assert!(metrics.bottom() < input.y);
+            }
+            if let Some(suggestions) = home.suggestions {
+                assert_eq!(suggestions.x, home.footer.x);
+                assert_eq!(suggestions.width, home.footer.width);
+                assert!(suggestions.y > home.footer.bottom());
+                assert!(suggestions.bottom() < height);
+            }
+            assert!(cursor.x >= input.x + 3 && cursor.x < input.right() - 1);
+            assert!(cursor.y > input.y && cursor.y < input.bottom() - 1);
+            let row = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(
+                row.matches("YOLO").count() == 1,
+                "home must preserve permission mode: {row}"
+            );
+            view.draft.set_text("/");
+            terminal
+                .draw(|f| renderer.draw(f, &mut view, &m, &SessionStatus::Idle, 0, false))
+                .unwrap();
+            assert_eq!(
+                renderer.layout.command_area.unwrap().bottom(),
+                renderer.layout.rows[3].y
+            );
+            view.draft.set_text("");
+            view.notice(Level::Info, "Model switched to example/model");
+            terminal
+                .draw(|f| renderer.draw(f, &mut view, &m, &SessionStatus::Idle, 0, false))
+                .unwrap();
+            assert!(
+                renderer.layout.home.is_some(),
+                "local setup keeps the home editor in place"
+            );
+            view.user("First prompt", false);
+            terminal
+                .draw(|f| renderer.draw(f, &mut view, &m, &SessionStatus::Idle, 0, false))
+                .unwrap();
+            assert!(renderer.layout.home.is_none());
+            assert_eq!(renderer.layout.rows[3].x, 0);
+            assert_eq!(renderer.layout.rows[3].width, width);
+            assert_eq!(renderer.layout.rows[3].bottom(), height - 1);
+        }
+    }
+
+    #[test]
+    fn home_alignment_and_theme_mapping_follow_the_actual_editor() {
+        let m = Metadata {
+            session: "home".into(),
+            cwd: "/workspace/project".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        let mut brand_pairs = std::collections::HashSet::new();
+        for &theme in Theme::ALL.iter().filter(|t| **t != Theme::System) {
+            let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+            let mut renderer = Renderer::default();
+            let mut view = View::default();
+            view.theme = theme;
+            view.model.label = "example/coding-model".into();
+            view.session.context_usage = Some(yourai_harness::runtime::ContextUsage {
+                estimated_tokens: 0,
+                context_window: Some(128_000),
+                input_budget: Some(119_000),
+                output_reserve: 8_000,
+            });
+            terminal
+                .draw(|f| renderer.draw(f, &mut view, &m, &SessionStatus::Idle, 0, false))
+                .unwrap();
+            let home = renderer.layout.home.unwrap();
+            let input = renderer.layout.rows[3];
+            let buffer = terminal.backend().buffer();
+            let first_text_x = |y| {
+                (0..120)
+                    .find(|&x| {
+                        let symbol = buffer[(x, y)].symbol();
+                        !symbol.trim().is_empty() && symbol != "│"
+                    })
+                    .unwrap()
+            };
+            assert_eq!(
+                first_text_x(input.y + 1),
+                home.footer.x,
+                "{} prompt",
+                theme.name()
+            );
+            assert_eq!(
+                first_text_x(input.bottom() - 1),
+                home.footer.x,
+                "{} model",
+                theme.name()
+            );
+            assert_eq!(
+                first_text_x(home.footer.y),
+                home.footer.x,
+                "{} shortcuts",
+                theme.name()
+            );
+            assert_eq!(
+                first_text_x(home.suggestions.unwrap().y),
+                home.footer.x,
+                "{} suggestions",
+                theme.name()
+            );
+            let version_end = (0..120)
+                .rfind(|&x| !buffer[(x, 31)].symbol().trim().is_empty())
+                .unwrap()
+                + 1;
+            assert_eq!(version_end, home.footer.right(), "{} version", theme.name());
+            assert_eq!(buffer[(0, 0)].bg, theme.color(BG));
+            assert_eq!(buffer[(input.x + 1, input.y)].bg, theme.color(PANEL));
+            assert_eq!(
+                buffer[(home.footer.x, input.bottom() - 1)].fg,
+                theme.color(BRAND_VIOLET)
+            );
+            for slot in [BRAND_TEAL, BRAND_VIOLET] {
+                assert!(
+                    buffer
+                        .content()
+                        .iter()
+                        .any(|cell| cell.symbol() == "█" && cell.fg == theme.color(slot)),
+                    "{} wordmark",
+                    theme.name()
+                );
+            }
+            assert!(
+                brand_pairs.insert((theme.color(BRAND_TEAL), theme.color(BRAND_VIOLET))),
+                "{} brand hues should be distinctive",
+                theme.name()
+            );
+            if let Ok(prefix) = std::env::var("YOURAI_HOME_THEME_SNAPSHOT") {
+                let cells = buffer.content().iter().map(|c| json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD)})).collect::<Vec<_>>();
+                std::fs::write(
+                    format!("{prefix}-{}.json", theme.name()),
+                    serde_json::to_vec(&json!({"width":120,"height":32,"cells":cells})).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn welcome_footer_and_live_activity() {
         let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
         let mut renderer = Renderer::default();
         let mut v = View::default();
-        v.model.label = "test-model".into();
+        v.model.label = "pai/Kimi-k3[300k]".into();
         let m = Metadata {
             session: "session-123".into(),
             cwd: "/workspace".into(),
@@ -1279,11 +1838,60 @@ mod tests {
         };
         let screen = rows(&terminal);
         // Empty state explains useful tasks and exposes existing command entry points.
-        assert!(screen.iter().any(|r| r.contains("YourAI")));
+        assert!(screen.iter().any(|r| r.contains("WORKSPACE")));
         assert!(screen.iter().any(|r| r.contains("/sessions")));
-        assert!(screen[31].contains("New session"));
+        assert!(screen.iter().any(|r| r.contains("pai/Kimi-k3[300k]")));
+        assert!(screen.iter().any(|r| r.contains("/workspace")));
+        assert!(screen.iter().any(|r| r.contains("MODEL CAPACITY")));
+        assert!(
+            screen.iter().any(|r| r.contains("Capacity unavailable")),
+            "model labels cannot imply context capacity"
+        );
+        assert!(screen.iter().any(|r| r.contains("Ask before execution")));
+        let home_text = screen.join("\n");
+        assert_eq!(home_text.matches("/workspace").count(), 1);
+        assert!(!home_text.contains("SETUP"));
+        assert!(!home_text.contains("Theme ·"));
+        assert!(screen[0].contains("New session"));
+        assert!(screen[31].contains(env!("CARGO_PKG_VERSION")));
+        assert!(renderer.layout.rows[3].x > 0, "home composer is centered");
+        assert!(
+            renderer.layout.rows[3].bottom() < 27,
+            "home composer leaves space below"
+        );
 
         assert!(!v.overlay.is_open());
+        // Runtime metadata refreshes the home cards without moving the editor.
+        let input_before = renderer.layout.rows[3];
+        v.session.context_usage = Some(yourai_harness::runtime::ContextUsage {
+            estimated_tokens: 18_000,
+            context_window: Some(300_000),
+            input_budget: Some(291_000),
+            output_reserve: 8_000,
+        });
+        v.model_choices = (0..3)
+            .map(|index| crate::models::ModelChoice {
+                id: format!("example/model-{index}"),
+                variant: None,
+                label: format!("example/model-{index}"),
+                effort: None,
+            })
+            .collect();
+        terminal
+            .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
+            .unwrap();
+        assert_eq!(renderer.layout.rows[3], input_before);
+        let refreshed = rows(&terminal).join("\n");
+        assert!(refreshed.contains(&format!("{} token window", tokens(300_000))));
+        assert!(refreshed.contains("No messages sent"));
+        assert!(
+            !refreshed.contains(&tokens(18_000)),
+            "system/tool estimate is not conversation usage"
+        );
+        assert!(!refreshed.contains("6% used"));
+        assert!(!refreshed.contains("reserve"));
+        assert!(!refreshed.contains("3 model profiles"));
+        assert_eq!(refreshed.matches("/workspace").count(), 1);
         if let Ok(path) = std::env::var("YOURAI_WELCOME_SNAPSHOT") {
             let cells = terminal.backend().buffer().content().iter().map(|c| json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD)})).collect::<Vec<_>>();
             std::fs::write(
@@ -1394,12 +2002,28 @@ mod tests {
             .lines
             .iter()
             .any(|l| l.to_string().contains("\"command\"")));
-        // Expanded thinking shows full text (card title already has a summary).
+        // Expanding the tool must not expand supporting reasoning.
+        assert!(!renderer
+            .layout
+            .lines
+            .iter()
+            .any(|l| l.to_string().contains("private-thought")));
+        let (thought_rect, thought_id) = renderer.layout.hits[0];
+        super::super::app::click_dispatch(
+            &mut renderer,
+            &mut view,
+            thought_rect.x + 2,
+            thought_rect.y,
+        );
+        terminal
+            .draw(|f| renderer.draw(f, &mut view, &m, &SessionStatus::Idle, 0, false))
+            .unwrap();
         assert!(renderer
             .layout
             .lines
             .iter()
             .any(|l| l.to_string().contains("private-thought")));
+        view.toggle(thought_id);
         terminal.backend_mut().resize(50, 20);
         terminal.resize(Rect::new(0, 0, 50, 20)).unwrap();
         terminal
@@ -1565,6 +2189,14 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             let mut renderer = Renderer::default();
             let mut v = View::default();
+            v.model.label = "pai/Kimi-k3[300k]".into();
+            v.session.title = Some("Parser boundary review".into());
+            v.session.context_usage = Some(yourai_harness::runtime::ContextUsage {
+                estimated_tokens: 106_394,
+                context_window: Some(300_000),
+                input_budget: None,
+                output_reserve: 0,
+            });
             v.user("Fix the parser and run tests", false);
             v.event(Out::Reasoning {
                 text: "Inspect the parser boundary and preserve existing behavior.".into(),
@@ -1631,7 +2263,20 @@ mod tests {
                 assert!(!content.contains("AGENT"));
                 assert!(!content.contains("YOU"));
                 assert!(content.contains("Fix the parser and run tests"));
-                assert!(content.contains("›"));
+                assert!(content.contains("Parser boundary review"));
+                assert!(!content.contains("106.4K tokens"));
+                assert!(!content.contains("35% used"));
+                assert_eq!(content.matches("ctx 35%").count(), 1);
+                let title = renderer
+                    .layout
+                    .todo_hit
+                    .expect("task title remains clickable");
+                assert!(title.y < renderer.layout.panel.unwrap().y + 6);
+                assert!(content.contains("│"), "composer left rail present");
+                assert!(
+                    !content.contains("╹"),
+                    "composer uses a continuous focus rail"
+                );
                 assert!(!content.contains("╭"), "composer has no rounded frame");
                 if let Ok(path) = std::env::var("YOURAI_TUI_SNAPSHOT") {
                     let cells=terminal.backend().buffer().content().iter().map(|c|json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg),"bold":c.modifier.contains(Modifier::BOLD)})).collect::<Vec<_>>();
@@ -1653,8 +2298,12 @@ mod tests {
     fn completed_turn_keeps_original_evidence_without_duplicate_summary() {
         let mut v = View::default();
         v.theme = Theme::Dark;
+        v.model.label = "example/coding-model".into();
         v.user("Fix the parser boundary and verify the change.", false);
         v.session.active = true;
+        v.event(Out::Reasoning {
+            text: "Inspect the empty-input branch before editing.".into(),
+        });
         for (id, name, input, output, error) in [
             (
                 "read-a",
@@ -1715,7 +2364,7 @@ mod tests {
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
             .unwrap();
-        v.event(Out::Message { text:"## Parser boundary updated\n\nThe empty-input case still needs a follow-up fix.\n\n- Build command exited successfully.\n- Parser test command failed; inspect the diagnostic below.".into() });
+        v.event(Out::Message { text:"## Parser boundary updated\n\nThe empty-input case **still needs a fix**.\n\n### Verification\n- Build passed.\n- **Parser test failed**: empty input triggers an assertion.\n\n### Next step\nHandle empty input, then rerun the parser tests.".into() });
         v.settle();
         terminal
             .draw(|f| renderer.draw(f, &mut v, &m, &SessionStatus::Idle, 0, false))
@@ -1727,6 +2376,11 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
+        assert!(!content.contains("You"));
+        assert!(!content.contains("YourAI"));
+        assert!(content.contains("Failed · $ cargo test parser"));
+        assert!(content.contains("Read & search · 2 operations"));
+        assert!(!content.contains("Inspect the empty-input branch"));
         assert!(!content.contains("Recorded actions"));
         assert!(content.contains("parser_empty_input"));
         assert!(content.contains("cargo check"));
@@ -1833,9 +2487,10 @@ mod tests {
                 let cursor = terminal.get_cursor_position().unwrap();
                 let buffer = terminal.backend().buffer();
                 let prompt_y = (0..height)
-                    .find(|&y| buffer[(1, y)].symbol() == "›")
-                    .expect("borderless input prompt remains visible");
-                // Surface extends under the sidebar, including its right edge.
+                    .find(|&y| buffer[(0, y)].symbol() == "│")
+                    .expect("composer left rail remains visible")
+                    + 1; // the first text row under the rail's breathing room
+                         // Surface extends under the sidebar, including its right edge.
                 assert_eq!(buffer[(width - 1, prompt_y)].bg, PANEL);
                 assert_eq!(buffer[(width - 1, height - 2)].bg, PANEL);
                 if let Some(panel) = renderer.layout.panel {
@@ -1848,7 +2503,8 @@ mod tests {
                     .collect::<String>();
                 assert!(footer.contains("YOLO"));
                 if text.is_empty() {
-                    let input_height = 3.min((height / 3).clamp(3, 8));
+                    let input_height =
+                        (if height >= 16 { 4 } else { 3 }).min((height / 3).clamp(3, 8));
                     assert_eq!(
                         prompt_y,
                         height - input_height,
@@ -2073,6 +2729,45 @@ mod regression_tests {
         assert_eq!(view.session.navigation.offset(), 0);
     }
     #[test]
+    fn busy_footer_carries_the_activity_status_instead_of_title_and_path() {
+        let mut v = View::default();
+        v.session.title = Some("session title".into());
+        let m = Metadata {
+            session: "s".into(),
+            cwd: "/workspace".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        let line = footer_lines(
+            100,
+            &v,
+            &m,
+            0,
+            Some(("⠋ Running cargo test · 12s · esc stop", GREEN)),
+        )
+        .remove(0);
+        let text = line
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect::<String>();
+        assert!(
+            text.contains("⠋ Running cargo test · 12s · esc stop"),
+            "{text}"
+        );
+        assert!(!text.contains("session title"), "{text}");
+        assert!(!text.contains("/workspace"), "{text}");
+        // Idle keeps the title/path and carries no status.
+        let idle = footer_lines(100, &v, &m, 0, None).remove(0);
+        let idle_text = idle
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect::<String>();
+        assert!(idle_text.contains("session title"), "{idle_text}");
+        assert!(!idle_text.contains("esc stop"), "{idle_text}");
+    }
+    #[test]
     fn footer_measures_unicode_long_labels_and_large_metrics() {
         let mut v = View::default();
         v.session.title = Some("这是一个很长的会话标题 🔎 review ".repeat(6));
@@ -2088,6 +2783,12 @@ mod regression_tests {
             .model_metrics
             .requests
             .last_output_tokens_per_second = Some(f64::MAX);
+        v.session.context_usage = Some(yourai_harness::runtime::ContextUsage {
+            estimated_tokens: u64::MAX,
+            context_window: Some(100),
+            input_budget: None,
+            output_reserve: 0,
+        });
         let m = Metadata {
             session: "test".into(),
             cwd: "/Users/开发者/workspaces/很长的目录名字/YourAI-Harness".into(),
@@ -2095,7 +2796,7 @@ mod regression_tests {
             yolo: true,
         };
         for width in 30..=160 {
-            let lines = footer_lines(width, &v, &m, usize::MAX);
+            let lines = footer_lines(width, &v, &m, usize::MAX, None);
             assert_eq!(lines.len(), 1);
             for line in &lines {
                 assert!(line.width() <= width, "width {width}: {line}");
@@ -2126,7 +2827,7 @@ mod regression_tests {
             .model_metrics
             .requests
             .last_output_tokens_per_second = Some(47.5);
-        let lines = footer_lines(120, &v, &m, 0);
+        let lines = footer_lines(120, &v, &m, 0, None);
         assert_eq!(lines.len(), 1, "footer must always use one row");
         assert!(
             lines[0].to_string().contains(&m.cwd),
@@ -2138,11 +2839,10 @@ mod regression_tests {
         let mut view = View::default();
         view.event(Out::Ask {
             id: "ask".into(),
-            payload: serde_json::json!({"kind":"permission", "tool_name":"shell"}),
+            payload: serde_json::json!({"kind":"permission", "tool_name":"shell", "input":{"command":"cargo test"}, "reason":"Tool permission"}),
         });
-        let ask = view.ask_mut().unwrap();
-        ask.error = Some(ask.answer().unwrap_err());
-        ask.editor.insert("n");
+        // The choice list defaults to "allow once"; deny is two Downs away.
+        view.ask_mut().unwrap().permission_choice = 2;
         let meta = Metadata {
             session: "test".into(),
             cwd: "/workspace".into(),
@@ -2160,15 +2860,37 @@ mod regression_tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(text.contains("Enter y to allow once"), "{text}");
+        // Compact form for tiny terminals: the question and the key hint.
+        assert!(text.contains("Allow shell?"), "{text}");
+        assert!(
+            text.contains("y once") && text.contains("a session") && text.contains("▸n deny"),
+            "{text}"
+        );
         assert!(
             !text.contains("Message"),
             "inactive composer should not displace approval"
         );
+        // Full choice list when the terminal has room.
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal
+            .draw(|f| Renderer::default().draw(f, &mut view, &meta, &SessionStatus::Idle, 0, false))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("command: cargo test"), "{text}");
+        assert!(text.contains("y  Allow once"), "{text}");
+        assert!(text.contains("a  Allow always · this session"), "{text}");
+        assert!(text.contains("n  Deny"), "{text}");
     }
     #[test]
     fn narrow_footer_preserves_permissions_and_all_dashboard_sizes_fit() {
         let mut v = View::default();
+        v.user("Review context pressure", false);
         v.model.label = "provider/model".into();
         v.session.context_usage = Some(yourai_harness::runtime::ContextUsage {
             estimated_tokens: 90000,
@@ -2176,6 +2898,10 @@ mod regression_tests {
             input_budget: Some(90000),
             output_reserve: 8000,
         });
+        v.session
+            .model_metrics
+            .requests
+            .last_output_tokens_per_second = Some(47.5);
         let m = Metadata {
             session: "test".into(),
             cwd: "/workspace".into(),
@@ -2194,7 +2920,7 @@ mod regression_tests {
                 .collect::<String>();
             assert!(footer.contains("YOLO"), "{footer}");
             assert!(footer.contains("ctx 90%"), "{footer}");
-            let footer_rows = footer_lines(width as usize, &v, &m, 0).len() as u16;
+            let footer_rows = footer_lines(width as usize, &v, &m, 0, None).len() as u16;
             let details = (20 - footer_rows..20)
                 .flat_map(|y| (0..width).map(move |x| buffer[(x, y)].symbol()))
                 .collect::<String>();
