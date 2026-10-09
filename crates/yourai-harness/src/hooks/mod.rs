@@ -15,7 +15,7 @@
 //!   └── HookSource, FailurePolicy, HookOutput         (元数据)
 //!
 //! yourai-harness::hooks (实现)
-//!   ├── ConcreteHookRuntime  impl HookRuntime         (运行时)
+//!   ├── DefaultHookRuntime  impl HookRuntime         (运行时)
 //!   ├── CommandHandler       impl HookHandler          (command 执行器)
 //!   ├── HttpHandler          impl HookHandler          (HTTP 执行器)
 //!   ├── NativeHandler        impl HookHandler          (Rust 闭包)
@@ -32,7 +32,7 @@
 //! use yourai_harness::hooks::*;
 //!
 //! # async fn example() {
-//! let runtime = ConcreteHookRuntime::new();
+//! let runtime = DefaultHookRuntime::new();
 //!
 //! // 从 Claude 兼容的 settings.json 注册
 //! let config: HooksConfig = serde_json::from_str(r#"{
@@ -88,13 +88,10 @@ pub use command::{BackgroundHookEvent, CommandHandler};
 pub use config::{
     build_registrations, HandlerConfig, HookMatcherGroup, HookRegistration, HookShell, HooksConfig,
 };
-pub use handler::{
-    handler_from_config, HookHandlerKind, HookModelDecision, HookModelExecutor, HookModelRequest,
-    NativeHandler, UnsupportedHandler,
-};
+pub use handler::{HookEvaluator, HookModelDecision, HookModelRequest, NativeHandler};
 pub use http::{HttpHandler, HttpHookPolicy};
 pub use matcher::CompiledMatcher;
-pub use runtime::{new_runtime, ConcreteHookRuntime};
+pub use runtime::DefaultHookRuntime;
 
 // ── Re-exports：从 yourai-core 透传协议类型 ─────────────────────────
 // 用户只需 `use crate::hooks::*` 即可拿到全部类型，不必同时 depend yourai-core

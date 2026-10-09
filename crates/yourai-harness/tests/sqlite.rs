@@ -9,7 +9,7 @@ fn open(dir: &TempDir) -> SqliteStore {
 async fn append_is_atomic_idempotent_and_cursor_survives_restart() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir);
-    let id = store.create_session("").await.unwrap().id;
+    let id = store.create_session(SessionId::new(), "").await.unwrap().id;
     let a = StoredMessage::new(ChatMessage::user("first"));
     let b = StoredMessage::new(ChatMessage::assistant("second"));
     let rows = store
@@ -70,7 +70,7 @@ fn summary(text: &str) -> StoredMessage {
 async fn compaction_preserves_unselected_messages_and_rolls_back_stale_candidates() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir);
-    let id = store.create_session("").await.unwrap().id;
+    let id = store.create_session(SessionId::new(), "").await.unwrap().id;
     let rows = store
         .append_messages(
             &id,
@@ -156,7 +156,7 @@ async fn compaction_preserves_unselected_messages_and_rolls_back_stale_candidate
 async fn usage_is_deduplicated_and_unknown_counters_stay_null() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir);
-    let id = store.create_session("").await.unwrap().id;
+    let id = store.create_session(SessionId::new(), "").await.unwrap().id;
     let usage = LocalUsage(store);
     let event = UsageEvent::new(
         Some("model".into()),
@@ -188,11 +188,17 @@ async fn usage_is_deduplicated_and_unknown_counters_stay_null() {
 async fn fork_copies_history_with_new_identities_and_delete_cascades() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir);
-    let id = store.create_session("").await.unwrap().id;
-    let original = store
-        .append_messages(&id, vec![StoredMessage::new(ChatMessage::user("hello"))])
-        .await
-        .unwrap();
+    let id = store.create_session(SessionId::new(), "").await.unwrap().id;
+    let input = In::user_text("hello");
+    let mut row = StoredMessage::new(ChatMessage::user("hello"));
+    if let In::UserText {
+        id: Some(input_id), ..
+    } = &input
+    {
+        row.id = input_id.clone();
+    }
+    row.input = Some(input);
+    let original = store.append_messages(&id, vec![row]).await.unwrap();
     let child = store.fork_session(&id).await.unwrap();
     assert_eq!(
         store.load_session(&child).await.unwrap().parent_session_id,
@@ -204,6 +210,13 @@ async fn fork_copies_history_with_new_identities_and_delete_cascades() {
         .unwrap()
         .messages;
     assert_ne!(original[0].id, copied[0].id);
+    assert!(matches!(&copied[0].input,
+        Some(In::UserText { id: Some(input_id), text, .. }) if input_id == &copied[0].id && text == "hello"));
+    store
+        .append_messages(&child, vec![copied[0].clone()])
+        .await
+        .unwrap();
+
     let usage = LocalUsage(store.clone());
     usage
         .record_event(&id, &UsageEvent::new(None, "main", GenaiUsage::default()))
@@ -236,7 +249,13 @@ async fn schema_separates_request_diagnostics_from_history() {
         .unwrap();
     assert_eq!(
         tables,
-        vec!["messages", "model_requests", "sessions", "usage_events"]
+        vec![
+            "messages",
+            "model_requests",
+            "sessions",
+            "tasks",
+            "usage_events"
+        ]
     );
     let ddl: String = db
         .query_row(
@@ -252,7 +271,7 @@ async fn schema_separates_request_diagnostics_from_history() {
 async fn concurrent_writers_allocate_unique_sequence_numbers() {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(open(&dir));
-    let id = store.create_session("").await.unwrap().id;
+    let id = store.create_session(SessionId::new(), "").await.unwrap().id;
     let mut tasks = vec![];
     for i in 0..20 {
         let store = store.clone();
@@ -345,7 +364,7 @@ async fn version_one_migrates_pruning_column_without_changing_original_messages(
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("migrate.sqlite");
     let store = SqliteStore::open(&path).unwrap();
-    let id = store.create_session("").await.unwrap().id;
+    let id = store.create_session(SessionId::new(), "").await.unwrap().id;
     store
         .append_messages(
             &id,
@@ -393,6 +412,123 @@ async fn version_one_migrates_pruning_column_without_changing_original_messages(
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
+}
+
+fn task(id: &str, subject: &str, seq: u64) -> Task {
+    Task {
+        id: id.into(),
+        subject: subject.into(),
+        description: Some("description".into()),
+        owner: Some("worker".into()),
+        completed: false,
+        seq,
+    }
+}
+
+#[tokio::test]
+async fn task_rows_are_session_scoped_durable_and_delete_with_the_session() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let first = store.create_session(SessionId::new(), "").await.unwrap().id;
+    let second = store.create_session(SessionId::new(), "").await.unwrap().id;
+    store
+        .save_tasks(&first, vec![task("same-id", "first", 1)])
+        .unwrap();
+    store
+        .save_tasks(&second, vec![task("same-id", "second", 1)])
+        .unwrap();
+    drop(store);
+    let store = open(&dir);
+    assert_eq!(
+        store.read_tasks(&first).unwrap(),
+        vec![task("same-id", "first", 1)]
+    );
+    assert_eq!(
+        store.read_tasks(&second).unwrap(),
+        vec![task("same-id", "second", 1)]
+    );
+    store.delete_session(&first).await.unwrap();
+    assert!(store.read_tasks(&first).unwrap().is_empty());
+    assert_eq!(store.read_tasks(&second).unwrap().len(), 1);
+    assert!(store
+        .save_tasks(&first, vec![task("orphan", "invalid", 1)])
+        .is_err());
+}
+
+#[tokio::test]
+async fn task_save_retries_preserve_completion_and_conflicting_batches_roll_back() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let id = store.create_session(SessionId::new(), "").await.unwrap().id;
+    let original = task("task", "original", 1);
+    store.save_tasks(&id, vec![original.clone()]).unwrap();
+    let mut completed = original.clone();
+    completed.completed = true;
+    store.save_tasks(&id, vec![completed.clone()]).unwrap();
+    assert_eq!(
+        store.save_tasks(&id, vec![original.clone()]).unwrap(),
+        vec![completed.clone()]
+    );
+    let mut conflict = original;
+    conflict.subject = "changed identity".into();
+    assert!(store
+        .save_tasks(&id, vec![task("new", "must roll back", 2), conflict])
+        .is_err());
+    assert_eq!(store.read_tasks(&id).unwrap(), vec![completed]);
+    // A late invalid row cannot leave part of a legacy import behind.
+    let mut invalid = task("invalid", "overflow", 3);
+    invalid.seq = u64::MAX;
+    assert!(store
+        .save_tasks(&id, vec![task("valid", "must roll back", 2), invalid])
+        .is_err());
+    assert_eq!(store.read_tasks(&id).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn version_four_adds_tasks_without_changing_existing_session_history() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir);
+    let id = store
+        .create_session(SessionId::new(), "system")
+        .await
+        .unwrap()
+        .id;
+    store
+        .append_messages(
+            &id,
+            vec![StoredMessage::new(ChatMessage::user("preserved"))],
+        )
+        .await
+        .unwrap();
+    drop(store);
+    let db = rusqlite::Connection::open(SqliteStore::path(dir.path())).unwrap();
+    db.execute_batch("DROP TABLE tasks; PRAGMA user_version=4;")
+        .unwrap();
+    drop(db);
+    let store = open(&dir);
+    assert_eq!(
+        store
+            .load_session(&id)
+            .await
+            .unwrap()
+            .system_prompt
+            .as_deref(),
+        Some("system")
+    );
+    assert_eq!(
+        store
+            .read_messages(&id, MessageQuery::default())
+            .await
+            .unwrap()
+            .messages[0]
+            .message
+            .content
+            .first_text(),
+        Some("preserved")
+    );
+    assert!(store.read_tasks(&id).unwrap().is_empty());
+    store.save_tasks(&id, vec![task("task", "new", 1)]).unwrap();
+    assert_eq!(store.read_tasks(&id).unwrap().len(), 1);
 }

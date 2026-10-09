@@ -174,7 +174,7 @@ impl HookHandler for HttpHandler {
     fn execute<'a>(
         &'a self,
         invocation: &'a HookInvocation,
-    ) -> crate::hooks::handler::BoxFuture<'a, Result<HookOutput, yourai_core::YourAiError>> {
+    ) -> yourai_core::BoxFuture<'a, Result<HookOutput, yourai_core::YourAiError>> {
         Box::pin(async move {
             let (body, status) = self.run(invocation).await?;
             Ok(HookOutput::Http { body, status })
@@ -193,7 +193,7 @@ fn shared_client(
     let (host, addresses) = match (host, addresses) {
         (Some(host), addresses) => (host, addresses),
         (None, _) => {
-            return Err(yourai_core::ErrorKind::Config("HTTP hook URL has no host".into()).into())
+            return Err(yourai_core::ErrorKind::Config("HTTP hook URL has no host".into()).into());
         }
     };
     let key = match addresses {

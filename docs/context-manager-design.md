@@ -1,6 +1,6 @@
 # ContextManager 设计
 
-状态：已实现。ContextManager 内部完成恢复、追加、清理、摘要及事务协调；SQLite schema v2 保存清理标记。见 [会话存储](./session-storage-design.md)。
+状态：已实现。ContextManager 内部完成恢复、追加、清理、摘要及事务协调；SQLite 从 schema v2 起保存清理标记，当前为 v5。见 [会话存储](./session-storage-design.md)。
 
 ## 1. 整体架构
 
@@ -15,7 +15,9 @@ ContextManager：管理当前上下文及其变更流程
     ├─ restore：恢复
     ├─ append：追加
     ├─ build_request：读取并组装模型请求
-    └─ compact：清理或摘要，保存后更新内存
+    └─ prepare_compaction / job.run：准备与提交，保存后更新内存
+         ▲
+    Compactor.exec：摘要前后 Hook 与提交状态
          │
          ▼
 SessionManager：读取记录、保存消息、清理标记与摘要事务
@@ -26,23 +28,24 @@ SQLite
 
 | 组件 | 唯一职责 |
 |---|---|
-| DefaultLoop | 控制执行顺序、触发维护、管理执行预算与重试 |
+| DefaultLoop | 控制执行顺序；Model 管请求与恢复，Turn 管本轮执行额度 |
 | ContextManager | 决定给模型看什么，并完成上下文变更 |
 | SessionManager | 实现记录读写与事务 |
 
 ContextManager 允许调用 SessionManager，但不实现 SQL、不管理数据库连接。所有修改统一采用“先保存、后更新内存”。Loop 不再手工串联保存、append、reset，也不把 SessionHistory 作为新的顶层组件。
 
-## 2. 四个公共操作
+## 2. 上下文协议与公共压缩
 
 ```text
 restore()                    从 SessionManager 恢复已提交的活跃上下文
 append(messages)             保存新消息，成功后追加到内存
-build_request(system, tools, execution)  只读组装请求，返回用量估算和预算状态
-compact(options, execution, cancel)     内部完成清理/摘要、提交和内存更新
+build_request(tools, model)   只读组装请求，返回用量估算和预算状态
+prepare_compaction(options, model, cancel)  准备业务，返回 Complete / Summary job
+Compactor.exec(options, cancel, hook_timeout)  公共 Hook 流程与结果结算
 ```
 
-- ContextManager 绑定 session_id；构造时只装配 SessionManager 和策略。ContextExecution 从本次执行快照取得 model、hooks、usage 和 Hook 基础信息，不在 ContextManager 内保存第二份 Provider 绑定。
-- system/tools 由调用方提供；compact 使用本次请求的 system/tools 和预算配置进行完整请求估算，不能只估算消息。
+- ContextManager 绑定 session_id；构造时只装配 SessionManager 和策略。Compactor 从本次执行快照取得 context、model、hooks、usage 和 Hook 基础信息，不在 ContextManager 内保存第二份 Provider 绑定。
+- system 由会话冻结并由 ContextManager 持有，tools 由调用方提供；压缩使用完整 system/tools 和预算估算，不能只估算消息。
 - append 的消息 ID 在调用前确定，失败重试复用同一 ID。
 - restore 用于首次加载和故障恢复；普通 append/compact 成功后不要求调用方再次 restore。
 - prune、选区、候选、分块总结、reset 都是内部步骤，不公开为独立接口。
@@ -100,8 +103,8 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
 ### 4.1 单条工具结果限长
 
 ```text
-① 工具返回完整结果，Loop 完成相关 Hook
-② Loop 调 ContextManager.append(result)
+① 工具返回完整结果，Tool.exec 完成相关 Hook
+② Tool.exec 调 ContextManager.append(result)
 ③ ContextManager 调 SessionManager 保存，成功后追加到内存
 ④ build_request 检查单条结果大小
     ├─ 未超限 → 正常内容
@@ -144,7 +147,7 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
 ⑦ 成功后更新内存，触发 PostCompact，返回 Summarized
 ```
 
-来源标识传入摘要 Hook；Hook 由公共 context.compact 包装通过注入的 HookRuntime 调用；ContextManager.prepare_compaction 和 CompactionJob.run 只负责业务准备及提交，Loop/Host 不重复触发。清理方案与摘要方案在内存中计算，失败不留下半应用状态；同一次维护若需两类变更，最终合并在一个数据库事务提交。
+来源标识传入摘要 Hook；Hook 由公共 Compactor.exec通过注入的 HookRuntime 调用；ContextManager.prepare_compaction 和 CompactionJob.run 只负责业务准备及提交，Loop/Host 不重复触发。清理方案与摘要方案在内存中计算，失败不留下半应用状态；同一次维护若需两类变更，最终合并在一个数据库事务提交。
 
 ```text
 压缩前：system | 旧摘要 | 较早消息........ | 最近消息.... | 当前执行片段
@@ -211,7 +214,7 @@ U ≥ T 时考虑摘要；U > B 禁止发送。独立 input limit 按 provider �
 ④ 宿主展示 Summarized / Unchanged / 错误，释放互斥
 ```
 
-正常执行与手动压缩统一调用 AgentLoop.request_system，使用同样的 system、指令和已选技能。
+正常执行与手动压缩使用 ContextManager 的冻结 system 和实际上下文；动态指令通过 Workspace 提交到上下文。
 
 不先单独清理，不自动续写、不自动消费排队输入。取消、截止时间、调用预算和保护规则仍生效。下一次正常执行重新检查请求预算。
 
@@ -229,7 +232,7 @@ SQLite v2 增加 nullable `messages.tool_output_pruned_at`（UTC 毫秒），启
 - 计算或事务提交失败不应用内存变更；SQL 完成状态不确定时，由 ContextManager 恢复已提交视图后才允许继续。
 - PostCompact 发生在提交之后；其失败或停止请求不回滚已提交摘要。错误需区分提交前失败与提交后停止。
 - ContextManager 通过注入的 UsageTracker 记录已发生且已知的模型用量，包括验证/提交失败；不另存一份上下文用量账本。记账失败不得被当作未发生模型调用或未提交摘要。
-- 摘要调用使用调用方传入的剩余调用额度，失败/取消仍计入已尝试调用；默认手动上限 8 次。Harness 的共享 MeteredModel 同时限制主模型、摘要、Hook 模型和子 Agent。摘要 Hook 单次默认 30 秒，并受整次 compact 截止时间约束。
+- 摘要调用使用调用方传入的剩余调用额度，失败/取消仍计入已尝试调用；默认手动上限 8 次。Harness 的共享 MeteredModel 同时限制主模型、摘要、Hook 模型和子 Agent。摘要 Hook 单次使用显式 hook_timeout，默认无额外时限，并受整次 compact 截止时间约束。
 - 自动摘要计算失败但原请求在 B 内时，Loop 可按恢复策略继续；持久化状态不确定时必须先恢复。
 - 压缩期间新到的 steer 留在队列，下一个安全点消费。
 
@@ -254,4 +257,8 @@ SQLite v2 增加 nullable `messages.tool_output_pruned_at`（UTC 毫秒），启
 - `crates/yourai-harness/src/context/compact.rs`：选区、内部清理、分批摘要、Hook 与提交。
 - `crates/yourai-harness/src/tools/result.rs`：会话范围内的原始工具结果分页读取。
 
-TUI 使用 JSON 配置；示例见 `yourai.example.json`。模型容量必须在 `provider.*.models.*.limit.context` 或 `limit.input` 中按实际模型填写，输出预留由 `limit.output` / `options.maxOutputTokens` 解析。MemoryContext::memory 仅用于无持久化需求的临时评估 Agent；正式会话通过 ContextServices 注入 SessionManager 和策略，Loop / Host 从当前 ProviderSnapshot 构造 ContextExecution。
+TUI 使用 JSON 配置；示例见 `yourai.example.json`。模型容量必须在 `provider.*.models.*.limit.context` 或 `limit.input` 中按实际模型填写，输出预留由 `limit.output` / `options.maxOutputTokens` 解析。DefaultContext::memory 仅用于无持久化需求的临时评估 Agent；正式会话通过 ContextServices 注入 SessionManager 和策略，Loop / Host 从当前 ProviderSnapshot 构造 Compactor。
+
+## 提交取消与恢复
+
+Compactor 只管理压缩，build_request 不接收执行对象。CompactionJob 接收所需 model / usage 和共享提交进度，不接收 HookRuntime。Pending / Started / Committed 分别表示未开始、已开始但未确认、已经持久提交；SQLite 在 tx.commit 成功后立即确认。取消不撤销 owned worker，未知状态须 restore。DefaultContext dirty 屏障阻止读取旧视图，会话关闭在恢复屏障结束后才释放租约。

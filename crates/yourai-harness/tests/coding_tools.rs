@@ -4,7 +4,7 @@ mod context_fixture;
 mod support;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
-use support::*;
+use support::{Model, *};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use yourai_core::{context::DiscardSink, prelude::*};
@@ -189,10 +189,13 @@ async fn local_policy_requires_shell_and_external_approval_and_honors_hard_deny(
         ),
         ("shell", json!({"command":"pwd"}), ApprovalDecision::Ask),
     ] {
-        let tool = tools.iter().find(|t| t.name() == name).unwrap();
+        let tool = tools
+            .iter()
+            .find(|t| t.definition().name.as_str() == name)
+            .unwrap();
         assert_eq!(
             policy
-                .check_tool_call(&tool.security_context(&input))
+                .check_tool_call(&tool.security_context(&input, None))
                 .await
                 .unwrap(),
             expected
@@ -250,7 +253,11 @@ async fn child_restore_rebinds_builtin_working_directory() {
     .await
     .unwrap();
     let catalog = SessionCatalog::new(&root).unwrap();
-    let id = catalog.create_session("child").await.unwrap().id;
+    let id = catalog
+        .create_session(SessionId::new(), "child")
+        .await
+        .unwrap()
+        .id;
     let model = Arc::new(Model::new(vec![
         invoke(
             "write-child",
@@ -259,13 +266,15 @@ async fn child_restore_rebinds_builtin_working_directory() {
         ),
         answer("done"),
     ]));
-    let host = SessionHost::restore(
+    let host = yourai_harness::runtime::restore(
         &root,
         id,
         child.path().into(),
         model,
         None,
         Some(h.tools.clone()),
+        None,
+        None,
         ContextPolicy::default(),
         "startup",
     )

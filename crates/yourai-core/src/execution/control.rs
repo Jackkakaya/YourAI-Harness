@@ -1,11 +1,12 @@
-use super::ExecutionState;
+use super::Turn;
+use crate::prelude::*;
+use serde_json::Value;
 use std::{
     future::Future,
     time::{Duration, Instant},
 };
-use yourai_core::prelude::*;
 
-impl ExecutionState<'_> {
+impl Turn<'_> {
     pub(crate) fn op_timeout(&self) -> Option<Duration> {
         self.config.operation_timeout
     }
@@ -53,7 +54,8 @@ impl ExecutionState<'_> {
             message: message.into(),
         })
     }
-    pub(crate) fn route(&mut self, input: In) {
+    pub(crate) fn route(&mut self, mut input: In) {
+        input.ensure_id();
         // Replies are valid only while a particular request is awaiting them.
         if matches!(input, In::UserText { .. }) {
             self.queued.push_back(input);
@@ -79,7 +81,7 @@ impl ExecutionState<'_> {
             )
         })
     }
-    pub(crate) async fn wait<T>(
+    pub(crate) async fn wait_operation<T>(
         &mut self,
         future: impl Future<Output = Result<T, YourAiError>>,
         timeout: Option<Duration>,
@@ -119,7 +121,7 @@ impl ExecutionState<'_> {
                 let marker = format!("[Runtime event {}]", event.id);
                 if !self.history.contains_context_marker(&marker) {
                     let history = self.history.clone();
-                    self.wait(
+                    self.wait_operation(
                         history.append(vec![StoredMessage::runtime_context(format!(
                             "{marker}\n{context}"
                         ))]),
@@ -144,12 +146,12 @@ impl ExecutionState<'_> {
             .as_ref()
             .is_some_and(|e| e.has_context())
     }
-    pub(crate) async fn checkpoint(&mut self) -> Result<(), YourAiError> {
+    pub async fn checkpoint(&mut self) -> Result<(), YourAiError> {
+        self.ensure_active()?;
         self.consume_events().await?;
         self.tc.check_control()?;
         self.drain();
-        let contexts = std::mem::take(&mut self.deferred_context);
-        self.add_context(&contexts).await?;
+        self.flush_context().await?;
         // New arrivals during hooks are deferred to the next checkpoint.
         let mut remaining = self.queued.len();
         let mut index = 0;
@@ -162,7 +164,7 @@ impl ExecutionState<'_> {
                     ..
                 })
             ) {
-                self.accept_input(index, false).await?;
+                self.accept_queued_input(index, false).await?;
             } else {
                 index += 1;
             }
@@ -170,20 +172,25 @@ impl ExecutionState<'_> {
         Ok(())
     }
     pub(crate) async fn add_context(&mut self, contexts: &[String]) -> Result<(), YourAiError> {
-        if contexts.is_empty() {
+        self.defer_context(contexts.to_vec());
+        self.flush_context().await
+    }
+    async fn flush_context(&mut self) -> Result<(), YourAiError> {
+        let count = self.deferred_context.len();
+        if count == 0 {
             return Ok(());
         }
         let history = self.history.clone();
-        self.wait(
-            history.append(vec![StoredMessage::runtime_context(format!(
-                "[Runtime context]\n{}",
-                contexts.join("\n")
-            ))]),
+        self.wait_operation(
+            history.append(self.deferred_context.clone()),
             self.op_timeout(),
             "history",
         )
-        .await
+        .await?;
+        self.deferred_context.drain(..count);
+        Ok(())
     }
+
     pub(crate) async fn record_usage(&mut self, usage: Usage) -> Result<(), YourAiError> {
         let total = self.output.usage.get_or_insert_with(Usage::default);
         total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
@@ -195,33 +202,38 @@ impl ExecutionState<'_> {
     pub(crate) async fn cleanup(&mut self, cause: &YourAiError) {
         let history = self.history.clone();
         let outbox = self.tc.outbox;
-        let unresolved = std::mem::take(&mut self.unresolved);
-        let completed = self.tool_completion.take();
-        let partial = self.partial_message.take();
-        // Optional host policy bounds the batch; tool failure hooks have a separate grace.
         let cleanup = async {
-            if let Some(partial) = partial {
-                history.append(vec![StoredMessage::new(partial)]).await?;
+            if let Some(partial) = self.partial_message.clone() {
+                history.append(vec![partial]).await?;
+                self.partial_message = None;
             }
-            for call in unresolved {
-                let (output, is_error) = completed.as_ref().filter(|(c,_,_)| c.call_id == call.call_id)
-                    .map(|(_,v,e)| (v.clone(),*e)).unwrap_or_else(||
-                        (serde_json::json!({"error": cause.to_string(), "status": "interrupted_or_not_executed"}), true));
-                history
-                    .append(vec![super::tools::result_record(&call, &output, is_error)])
-                    .await?;
+            for record in self.calls.clone() {
+                let (output, is_error) = match &record.state {
+                    super::CallState::Observed { output, is_error } => (output.clone(), *is_error),
+                    _ => (
+                        serde_json::json!({"error":cause.to_string(),"status":"interrupted_or_not_executed"}),
+                        true,
+                    ),
+                };
+                history.append(vec![record.result_record(&output)]).await?;
+                self.calls
+                    .retain(|pending| pending.call.call_id != record.call.call_id);
                 outbox.send(Out::ToolDone {
-                    id: call.call_id,
-                    name: call.fn_name,
+                    id: record.call.call_id,
+                    name: record.call.fn_name,
                     output,
                     is_error,
                 });
+            }
+            if !self.deferred_context.is_empty() {
+                history.append(self.deferred_context.clone()).await?;
+                self.deferred_context.clear();
             }
             Ok::<_, YourAiError>(())
         };
         let failure = match crate::time::timeout(self.config.cleanup_timeout, cleanup).await {
             Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e.to_string()),
+            Ok(Err(error)) => Some(error.to_string()),
             Err(_) => Some("cleanup timed out".into()),
         };
         if let Some(message) = failure {
@@ -231,8 +243,39 @@ impl ExecutionState<'_> {
                     "History cleanup incomplete; do not replay tools automatically: {message}"
                 ),
             });
-            if let Some(obs) = &self.tc.snap.observability {
-                obs.increment("loop.cleanup_failed", &[]);
+            if let Some(observability) = &self.tc.snap.observability {
+                observability.increment("loop.cleanup_failed", &[]);
+            }
+        }
+    }
+}
+
+impl Turn<'_> {
+    pub(crate) async fn ask(
+        &mut self,
+        id: String,
+        payload: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, YourAiError> {
+        self.tc.check_control()?;
+        // Discard pre-sent replies before publishing a new request.
+        self.drain();
+        self.send(Out::Ask {
+            id: id.clone(),
+            payload,
+        })?;
+        let deadline = self.deadline(timeout);
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.tc.cancel.cancelled() => return Err(AbortReason::Cancelled.into()),
+                _ = self.tc.outbox.closed() => return Err(AbortReason::Disconnected.into()),
+                _ = crate::time::sleep_until(deadline) => return Err(self.timeout_error("approval")),
+                input = self.tc.inbox.recv() => match input {
+                    Some(In::Reply { id: reply_id, payload }) if reply_id == id => return Ok(payload),
+                    Some(input) => self.route(input),
+                    None => { self.input_closed = true; return Err(AbortReason::Disconnected.into()); }
+                }
             }
         }
     }

@@ -3,38 +3,9 @@
 use std::time::Duration;
 use yourai_core::prelude::*;
 
-pub(super) const MAX_DELAY: Duration = Duration::from_millis(i32::MAX as u64);
-
-/// OpenCode compatibility policy: header-bearing failures use the global safety
-/// bound; failures without headers also use the configured local backoff cap.
-/// Kept here so callers do not branch on protocol metadata.
-pub(crate) struct Backoff {
-    pub initial: Duration,
-    pub max_without_headers: Duration,
-}
-impl Backoff {
-    pub(crate) fn delay(
-        &self,
-        retries: u32,
-        error: &YourAiError,
-        hint: Option<Duration>,
-        jitter_percent: u32,
-    ) -> Duration {
-        if let Some(hint) = hint {
-            return hint.min(MAX_DELAY);
-        }
-        let base = self
-            .initial
-            .saturating_mul(1u32 << retries.min(31))
-            .min(MAX_DELAY);
-        let delay = base.saturating_add(base / 4 * jitter_percent.min(100) / 100);
-        if super::failure::has_http_headers(error) {
-            delay.min(MAX_DELAY)
-        } else {
-            delay.min(self.max_without_headers).min(MAX_DELAY)
-        }
-    }
-}
+#[cfg(test)]
+use yourai_core::model_error::Backoff;
+pub(super) use yourai_core::model_error::MAX_DELAY;
 
 /// Preserve server timing when the SDK exposes it; do not guess vendor-specific body units.
 pub(super) fn retry_after(error: &YourAiError) -> Option<Duration> {

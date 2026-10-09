@@ -36,15 +36,12 @@ impl Drop for ProcessGroup {
         }
     }
 }
-impl ToolHandler for Shell {
-    fn name(&self) -> &str {
-        "shell"
+impl ToolProvider for Shell {
+    fn definition(&self) -> ToolDefinition {
+        schema("shell","Execute a foreground command in a fresh /bin/sh process. Use for rg, ls, git, builds and tests. No persistent cwd/environment, interactive input, PTY or background sessions. Inspect exit_code, termination and output_complete. timeout_ms defaults to 120000; maximum 600000 (also bounded by the host).",json!({"command":{"type":"string","minLength":1},"cwd":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS}}), &["command"])
     }
-    fn definition(&self) -> Tool {
-        schema(self.name(),"Execute a foreground command in a fresh /bin/sh process. Use for rg, ls, git, builds and tests. No persistent cwd/environment, interactive input, PTY or background sessions. Inspect exit_code, termination and output_complete. timeout_ms defaults to 120000; maximum 600000 (also bounded by the host).",json!({"command":{"type":"string","minLength":1},"cwd":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS}}), &["command"])
-    }
-    fn security_context(&self, input: &Value) -> SecurityContext {
-        security(self.name(), &self.cwd, input, true)
+    fn security_context(&self, input: &Value, cwd: Option<&Path>) -> SecurityContext {
+        security("shell", cwd.unwrap_or(&self.cwd), input, true)
     }
     fn run<'a>(
         &'a self,
@@ -52,15 +49,18 @@ impl ToolHandler for Shell {
         input: Value,
     ) -> BoxFuture<'a, Result<Value, YourAiError>> {
         Box::pin(async move {
-            let i: Input = serde_json::from_value(input).map_err(|e| error(self.name(), e))?;
+            let i: Input = serde_json::from_value(input).map_err(|e| error("shell", e))?;
             let timeout = i.timeout_ms.unwrap_or(SHELL_TIMEOUT_MS);
             if i.command.trim().is_empty() || !(1..=MAX_SHELL_TIMEOUT_MS).contains(&timeout) {
-                return Err(error(self.name(), "invalid command or timeout_ms"));
+                return Err(error("shell", "invalid command or timeout_ms"));
             }
-            let cwd = resolve_path(&self.cwd, Path::new(i.cwd.as_deref().unwrap_or(".")))
-                .map_err(|e| error(self.name(), e))?;
+            let cwd = resolve_path(
+                tc.cwd.unwrap_or(&self.cwd),
+                Path::new(i.cwd.as_deref().unwrap_or(".")),
+            )
+            .map_err(|e| error("shell", e))?;
             if !cwd.is_dir() {
-                return Err(error(self.name(), "cwd must be an existing directory"));
+                return Err(error("shell", "cwd must be an existing directory"));
             }
             check_cancel(&tc)?;
             if let Some(security) = &tc.security {
@@ -68,7 +68,7 @@ impl ToolHandler for Shell {
                     security.check_command(&i.command).await?,
                     PolicyDecision::Allow
                 ) {
-                    return Err(error(self.name(), "command denied by hard policy"));
+                    return Err(error("shell", "command denied by hard policy"));
                 }
             }
             #[cfg(unix)]
@@ -85,10 +85,7 @@ impl ToolHandler for Shell {
             #[cfg(not(unix))]
             {
                 let _ = (tc, cwd);
-                Err(error(
-                    self.name(),
-                    "shell currently requires macOS or Linux",
-                ))
+                Err(error("shell", "shell currently requires macOS or Linux"))
             }
         })
     }

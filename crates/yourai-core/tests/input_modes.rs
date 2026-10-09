@@ -13,10 +13,9 @@ fn input_mode_defaults_for_old_wire_messages_and_survives_round_trip() {
     ));
 
     let wire = serde_json::to_value(In::follow_up("later")).unwrap();
-    assert_eq!(
-        wire,
-        json!({"UserText": {"text": "later", "mode": "follow_up"}})
-    );
+    assert_eq!(wire["UserText"]["text"], "later");
+    assert_eq!(wire["UserText"]["mode"], "follow_up");
+    assert!(wire["UserText"]["id"].as_str().is_some());
     let restored: In = serde_json::from_value(wire).unwrap();
     assert!(
         matches!(restored, In::UserText { text, mode: InputMode::FollowUp, .. } if text == "later")
@@ -36,7 +35,7 @@ fn attachments_round_trip_and_default_empty_for_old_wire() {
 
     // A message with an inline base64 attachment round-trips through the wire
     // format — the untagged AttachmentData::Base64 serializes as a plain
-    // string, so the wire shape is byte-identical to the pre-FileRef format.
+    // string; identity is the only addition to the pre-FileRef message.
     let msg = In::user_text_with_attachments(
         "what is this?",
         vec![UserAttachment::base64(
@@ -50,6 +49,7 @@ fn attachments_round_trip_and_default_empty_for_old_wire() {
         wire,
         json!({
             "UserText": {
+                "id": wire["UserText"]["id"].clone(),
                 "text": "what is this?",
                 "mode": "steer",
                 "attachments": [{
@@ -73,11 +73,11 @@ fn attachments_round_trip_and_default_empty_for_old_wire() {
     );
 
     // Empty attachments are omitted from the wire (skip_serializing_if),
-    // keeping the format identical to pre-attachment messages.
+    // retaining the original shape apart from the stable identity.
     let wire2 = serde_json::to_value(In::user_text("plain")).unwrap();
     assert_eq!(
         wire2,
-        json!({"UserText": {"text": "plain", "mode": "steer"}})
+        json!({"UserText": {"id": wire2["UserText"]["id"].clone(), "text": "plain", "mode": "steer"}})
     );
 }
 
@@ -95,6 +95,7 @@ fn file_ref_attachments_round_trip_and_parse_from_wire() {
         wire,
         json!({
             "UserText": {
+                "id": wire["UserText"]["id"].clone(),
                 "text": "review this",
                 "mode": "steer",
                 "attachments": [{ "data": { "path": "src/main.rs" }, "name": null }]

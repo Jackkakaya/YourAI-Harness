@@ -1,6 +1,6 @@
 //! Default scheduling policy. Hooks belong to the business operation wrappers.
 mod config;
-use crate::execution::{Completion, ModelOptions, TurnExecution};
+use crate::execution::{Completion, ModelOptions, Turn};
 pub use config::{AttachmentImageConfig, LoopConfig};
 use yourai_core::prelude::*;
 // Verbatim from opencode `packages/core/src/session/runner/max-steps.ts`.
@@ -47,7 +47,7 @@ impl AgentLoop for DefaultLoop {
                 ),
                 None => self.config.steps,
             };
-            let mut execution = TurnExecution::open(tc, (&self.config).into()).await?;
+            let mut execution = Turn::open(tc, self.config.execution.clone()).await?;
             let result = async {
                 if !execution.input_accepted() {
                     return Ok(());
@@ -63,11 +63,14 @@ impl AgentLoop for DefaultLoop {
                     step = step.saturating_add(1);
                     forced_final |= steps.is_some_and(|max| step >= max);
                     let response = execution
-                        .model()
-                        .exec_with(ModelOptions {
-                            tools_enabled: !forced_final,
-                            prefill: forced_final.then(|| MAX_STEPS_PROMPT.into()),
-                        })
+                        .model()?
+                        .exec(
+                            &mut execution,
+                            ModelOptions {
+                                tools_enabled: !forced_final,
+                                prefill: forced_final.then(|| MAX_STEPS_PROMPT.into()),
+                            },
+                        )
                         .await?;
                     if response.calls.is_empty() {
                         if execution.complete(response.text).await? == Completion::Completed {
@@ -75,8 +78,9 @@ impl AgentLoop for DefaultLoop {
                         }
                     } else if forced_final {
                         execution
-                            .tools()
-                            .reject_pending("Tools are disabled after the maximum agent steps")
+                            .reject_pending_tools(
+                                "Tools are disabled after the maximum agent steps",
+                            )
                             .await?;
                         if continuations >= MAX_FORCED_FINAL_CONTINUATIONS
                             && execution.complete(response.text).await? == Completion::Completed
@@ -85,7 +89,12 @@ impl AgentLoop for DefaultLoop {
                         }
                         continuations += 1;
                     } else {
-                        execution.tools().exec_pending().await?;
+                        for call in execution.pending_tools() {
+                            execution
+                                .tool(&call.call_id)?
+                                .exec(&mut execution, &call.call_id)
+                                .await?;
+                        }
                     }
                     tokio::task::yield_now().await;
                 }

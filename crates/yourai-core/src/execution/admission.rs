@@ -1,11 +1,11 @@
 //! User-input admission owns preparation, explicit rejection and history commit.
 //! No input leaves the pending queue until either rejection is delivered or the
 //! history write succeeds. Transient provider/storage failures retain ownership.
-use super::{attachment, ExecutionState};
-use yourai_core::prelude::*;
+use super::{attachment, Turn};
+use crate::prelude::*;
 
-impl ExecutionState<'_> {
-    pub(crate) async fn accept_input(
+impl Turn<'_> {
+    pub(crate) async fn accept_queued_input(
         &mut self,
         index: usize,
         initial: bool,
@@ -14,6 +14,38 @@ impl ExecutionState<'_> {
             In::UserText { text, .. } => text.clone(),
             _ => return Ok(false),
         };
+        let id = match &self.queued[index] {
+            In::UserText { id: Some(id), .. } if !id.is_empty() => id.clone(),
+            _ => return Err(ErrorKind::Config("missing input identity".into()).into()),
+        };
+        // Settle a previous write before deciding whether this is a retry.
+        if !initial {
+            let history = self.history.clone();
+            self.wait_operation(history.restore(), self.op_timeout(), "history")
+                .await?;
+        }
+        if let Some(record) = self.history.records().into_iter().find(|r| r.id == id) {
+            if record.runtime_context
+                || record.summary
+                || record.message.role != ChatRole::User
+                || record
+                    .input
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|e| ErrorKind::Loop(e.to_string()))?
+                    != Some(
+                        serde_json::to_value(&self.queued[index])
+                            .map_err(|e| ErrorKind::Loop(e.to_string()))?,
+                    )
+            {
+                return Err(ErrorKind::Loop("input identity conflict".into()).into());
+            }
+            // The user and hook contexts were already committed atomically.
+            self.queued.remove(index);
+            self.repeated_tool = None;
+            return Ok(true);
+        }
         let hook = self
             .hook(HookEvent::UserPromptSubmit {
                 prompt: text.clone(),
@@ -21,15 +53,17 @@ impl ExecutionState<'_> {
             .await?;
         self.apply_common(&hook)?;
         if !hook.common.blocking_errors.is_empty() {
-            return self.reject_input(index, super::hooks::feedback(&hook).join("\n"));
+            return self.reject_input(index, hook.blocking_messages().join("\n"));
         }
-        let accepted = self.run_accept_input(index, initial).await?;
-        if accepted {
-            self.add_context(&super::hooks::additional(&hook)).await?;
-        }
-        Ok(accepted)
+        self.run_accept_input(index, initial, hook.additional_contexts())
+            .await
     }
-    async fn run_accept_input(&mut self, index: usize, initial: bool) -> Result<bool, YourAiError> {
+    async fn run_accept_input(
+        &mut self,
+        index: usize,
+        initial: bool,
+        contexts: &[String],
+    ) -> Result<bool, YourAiError> {
         let (text, attachments) = match &self.queued[index] {
             In::UserText {
                 text, attachments, ..
@@ -45,7 +79,7 @@ impl ExecutionState<'_> {
             let prompt = text.clone();
             // File I/O and image decoding must not block control handling.
             // A cancelled worker may finish its read, but cannot commit history.
-            self.wait(
+            self.wait_operation(
                 async move {
                     tokio::task::spawn_blocking(move || {
                         attachment::message(&prompt, &attachments, &config, cwd.as_deref())
@@ -72,6 +106,10 @@ impl ExecutionState<'_> {
             Err(attachment::ResolveError::Unavailable(error)) => return Err(error),
         };
         let mut record = StoredMessage::new(message);
+        record.input = Some(self.queued[index].clone());
+        if let In::UserText { id: Some(id), .. } = &self.queued[index] {
+            record.id = id.clone();
+        }
         if initial && self.config.memory_search_limit > 0 && !text.trim().is_empty() {
             if let Some(memory) = self.tc.snap.memory.clone() {
                 let cancel = self.tc.cancel.clone();
@@ -81,7 +119,7 @@ impl ExecutionState<'_> {
                     max_chars: self.config.memory_max_chars,
                 };
                 match self
-                    .wait(memory.recall(query, &cancel), self.op_timeout(), "memory")
+                    .wait_operation(memory.recall(query, &cancel), self.op_timeout(), "memory")
                     .await
                 {
                     Ok(entries) => {
@@ -132,7 +170,7 @@ impl ExecutionState<'_> {
                 .into_parts();
             for id in &self.config.skill_ids.clone() {
                 let skill = self
-                    .wait(skills.load(id), self.op_timeout(), "skill")
+                    .wait_operation(skills.load(id), self.op_timeout(), "skill")
                     .await?;
                 parts.push(ContentPart::from_text(format!(
                     "<skill id={id:?}>\n{}\n</skill>",
@@ -141,7 +179,16 @@ impl ExecutionState<'_> {
             }
             record.api_content = Some(parts.into());
         }
-        self.wait(history.append(vec![record]), self.op_timeout(), "history")
+        let mut records = vec![record];
+        if !contexts.is_empty() {
+            let mut context = StoredMessage::runtime_context(format!(
+                "[Runtime context]\n{}",
+                contexts.join("\n")
+            ));
+            context.id = format!("{}:admission-context", records[0].id);
+            records.push(context);
+        }
+        self.wait_operation(history.append(records), self.op_timeout(), "history")
             .await?;
         self.queued.remove(index); // Transfer only after a successful commit.
         self.repeated_tool = None;

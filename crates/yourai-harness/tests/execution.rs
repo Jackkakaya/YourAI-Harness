@@ -8,7 +8,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use support::*;
+use support::{Model, *};
 use yourai_core::{
     hooks::{PermissionRequestBehavior, PermissionRequestDecision},
     prelude::*,
@@ -392,18 +392,13 @@ async fn replacement_context_summary_gets_hooks_and_preserves_commit_after_post_
         .hooks(hooks.clone())
         .build();
     let snapshot = agent.ctx().snapshot().unwrap();
-    let execution = ContextExecution::from_snapshot(&snapshot, history.session_id(), None).unwrap();
+    let execution = Compactor::from_snapshot(&snapshot, None).unwrap();
     let mut request = CompactionRequest::new(CompactionTrigger::Manual);
     request.custom_instructions = Some("original instructions".into());
-    let result = yourai_harness::context::compact(
-        history.as_ref(),
-        request,
-        &execution,
-        &tokio_util::sync::CancellationToken::new(),
-        None,
-    )
-    .await
-    .unwrap();
+    let result = execution
+        .exec(request, &tokio_util::sync::CancellationToken::new(), None)
+        .await
+        .unwrap();
     assert_eq!(result.action, CompactAction::Summarized);
     assert_eq!(result.stop_reason.as_deref(), Some("stop after commit"));
     assert_eq!(history.tokens.load(Ordering::SeqCst), 1);
@@ -587,9 +582,7 @@ async fn public_registry_binding_exec_uses_framework_lifecycle_and_rejects_repla
         }
     }));
     let agent = Agent::builder()
-        .agent_loop(Arc::new(custom::BoundLoop {
-            replacement: Arc::new(Handler::new("tool", Mode::Fail)),
-        }))
+        .agent_loop(Arc::new(custom::BoundLoop))
         .context_manager(Arc::new(History::default()))
         .tools(registry)
         .hooks(hooks.clone())
@@ -620,4 +613,276 @@ async fn unresolved_tool_calls_block_dependent_operations() {
         .model(Arc::new(Model::new(vec![calls(&["tool"]), answer("done")])))
         .build();
     assert_eq!(agent.run(In::user_text("go")).await.unwrap().text, "done");
+}
+
+#[tokio::test]
+async fn yolo_keeps_pre_tool_denial_and_never_runs_the_provider() {
+    let history = Arc::new(History::default());
+    let handler = Arc::new(Handler::new("tool", Mode::Return));
+    let registry = Arc::new(Registry::default());
+    registry.register(handler.clone());
+    let hooks = Arc::new(Hooks::new(|invocation, result| {
+        if invocation.event.kind() == HookEventKind::PreToolUse {
+            if let HookPointOutcome::PreToolUse(outcome) = &mut result.outcome {
+                outcome.permission = HookPermission::Deny {
+                    reason: "blocked by hook".into(),
+                };
+            }
+        }
+    }));
+    let agent = Agent::builder()
+        .agent_loop(direct_program())
+        .context_manager(history)
+        .tools(registry)
+        .hooks(hooks.clone())
+        .security(Arc::new(yourai_harness::security::YoloSecurity))
+        .build();
+    agent.run(In::user_text("go")).await.unwrap();
+    assert!(handler.inputs.lock().unwrap().is_empty());
+    assert!(hooks
+        .seen
+        .lock()
+        .unwrap()
+        .contains(&HookEventKind::PermissionDenied));
+}
+
+#[tokio::test]
+async fn failed_result_saves_keep_each_call_result_and_prevent_replay() {
+    struct RecoverLoop;
+    impl AgentLoop for RecoverLoop {
+        fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
+            Box::pin(async move {
+                let mut turn =
+                    Turn::open(tc, yourai_core::execution::ExecutionConfig::default()).await?;
+                let response = turn
+                    .model()?
+                    .exec(&mut turn, ModelOptions::default())
+                    .await?;
+                for call in response.calls {
+                    let tool = turn.tool(&call.call_id)?;
+                    assert!(tool.exec(&mut turn, &call.call_id).await.is_err());
+                    assert!(tool.exec(&mut turn, &call.call_id).await.is_err());
+                }
+                turn.finish(Err(ErrorKind::Loop("exercise recovery".into()).into()))
+                    .await
+            })
+        }
+    }
+    let history = Arc::new(History::default());
+    let fails = history.clone();
+    let hooks = Arc::new(Hooks::new(move |invocation, _| {
+        if invocation.event.kind() == HookEventKind::PostToolUse {
+            fails.append_failures.store(1, Ordering::SeqCst);
+        }
+    }));
+    let first = Arc::new(Handler::new("first", Mode::Return));
+    let second = Arc::new(Handler::new("second", Mode::Return));
+    let registry = Arc::new(Registry::default());
+    registry.register(first.clone());
+    registry.register(second.clone());
+    let agent = Agent::builder()
+        .agent_loop(Arc::new(RecoverLoop))
+        .context_manager(history.clone())
+        .model(Arc::new(Model::new(vec![calls(&["first", "second"])])))
+        .tools(registry)
+        .hooks(hooks)
+        .build();
+    assert!(agent.run(In::user_text("go")).await.is_err());
+    assert_eq!(first.inputs.lock().unwrap().len(), 1);
+    assert_eq!(second.inputs.lock().unwrap().len(), 1);
+    let results: Vec<_> = history
+        .messages()
+        .iter()
+        .flat_map(|message| {
+            message
+                .content
+                .tool_responses()
+                .iter()
+                .map(|response| (response.call_id.clone(), response.content.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(
+        |(_, content)| serde_json::from_str::<serde_json::Value>(content).unwrap()
+            == json!({"value":1})
+    ));
+}
+
+#[tokio::test]
+async fn completion_is_terminal_for_new_model_tool_and_input_operations() {
+    struct FinishedLoop;
+    impl AgentLoop for FinishedLoop {
+        fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
+            Box::pin(async move {
+                let mut turn =
+                    Turn::open(tc, yourai_core::execution::ExecutionConfig::default()).await?;
+                let result = async {
+                    assert_eq!(turn.complete("done").await?, Completion::Completed);
+                    assert!(turn
+                        .model()?
+                        .exec(&mut turn, ModelOptions::default())
+                        .await
+                        .is_err());
+                    assert!(turn.enqueue("tool", json!({"value":1})).await.is_err());
+                    assert!(turn.accept_input(In::user_text("late")).await.is_err());
+                    Ok(())
+                }
+                .await;
+                turn.finish(result).await
+            })
+        }
+    }
+    let model = Arc::new(Model::new(vec![answer("must remain unused")]));
+    let agent = Agent::builder()
+        .agent_loop(Arc::new(FinishedLoop))
+        .context_manager(Arc::new(History::default()))
+        .model(model.clone())
+        .build();
+    assert_eq!(agent.run(In::user_text("go")).await.unwrap().text, "done");
+    assert!(model.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dropping_a_model_execution_future_keeps_the_visible_partial_message() {
+    struct PartialLoop;
+    impl AgentLoop for PartialLoop {
+        fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
+            Box::pin(async move {
+                let mut turn =
+                    Turn::open(tc, yourai_core::execution::ExecutionConfig::default()).await?;
+                let model = turn.model()?;
+                assert!(tokio::time::timeout(
+                    std::time::Duration::from_millis(20),
+                    model.exec(&mut turn, ModelOptions::default())
+                )
+                .await
+                .is_err());
+                turn.finish(Err(AbortReason::Cancelled.into())).await
+            })
+        }
+    }
+    let history = Arc::new(History::default());
+    let agent = Agent::builder()
+        .agent_loop(Arc::new(PartialLoop))
+        .context_manager(history.clone())
+        .model(Arc::new(Model::new(vec![hangs_after("visible partial")])))
+        .build();
+    assert!(agent.run(In::user_text("go")).await.is_err());
+    assert!(history
+        .messages()
+        .iter()
+        .any(|message| message.content.first_text() == Some("visible partial")));
+}
+
+#[tokio::test]
+async fn failed_checkpoint_keeps_deferred_hook_context_for_cleanup() {
+    struct ContextLoop(Arc<History>);
+    impl AgentLoop for ContextLoop {
+        fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
+            Box::pin(async move {
+                let mut turn =
+                    Turn::open(tc, yourai_core::execution::ExecutionConfig::default()).await?;
+                let result = async {
+                    let call = turn.enqueue("tool", json!({"value":1})).await?;
+                    turn.tool(&call.call_id)?
+                        .exec(&mut turn, &call.call_id)
+                        .await?;
+                    self.0.append_failures.store(1, Ordering::SeqCst);
+                    turn.checkpoint().await
+                }
+                .await;
+                turn.finish(result).await
+            })
+        }
+    }
+    let history = Arc::new(History::default());
+    let registry = Arc::new(Registry::default());
+    registry.register(Arc::new(Handler::new("tool", Mode::Return)));
+    let hooks = Arc::new(Hooks::new(|_, result| {
+        if let HookPointOutcome::PostToolUse(outcome) = &mut result.outcome {
+            outcome
+                .additional_contexts
+                .push("must survive failed save".into());
+        }
+    }));
+    let agent = Agent::builder()
+        .agent_loop(Arc::new(ContextLoop(history.clone())))
+        .context_manager(history.clone())
+        .tools(registry)
+        .hooks(hooks)
+        .build();
+    assert!(agent.run(In::user_text("go")).await.is_err());
+    assert!(history.messages().iter().any(|message| message
+        .content
+        .first_text()
+        .is_some_and(|text| text.contains("must survive failed save"))));
+}
+
+#[tokio::test]
+async fn registration_freezes_the_definition_used_by_the_model_and_execution() {
+    struct MutableTool(std::sync::Mutex<ToolDefinition>, AtomicUsize);
+    impl ToolProvider for MutableTool {
+        fn definition(&self) -> ToolDefinition {
+            self.0.lock().unwrap().clone()
+        }
+        fn security_context(
+            &self,
+            input: &serde_json::Value,
+            _cwd: Option<&std::path::Path>,
+        ) -> SecurityContext {
+            SecurityContext {
+                action: "tool".into(),
+                input: input.clone(),
+                is_destructive: false,
+                is_network: false,
+            }
+        }
+        fn run<'a>(
+            &'a self,
+            _: ToolContext<'a>,
+            input: serde_json::Value,
+        ) -> BoxFuture<'a, Result<serde_json::Value, YourAiError>> {
+            Box::pin(async move {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                Ok(input)
+            })
+        }
+    }
+    let definition = |name, value| {
+        ToolDefinition::new(name).with_schema(
+            json!({"type":"object","properties":{"value":{"const":value}},"required":["value"]}),
+        )
+    };
+    let provider = Arc::new(MutableTool(
+        std::sync::Mutex::new(definition("tool", 1)),
+        AtomicUsize::new(0),
+    ));
+    let registry = Arc::new(yourai_harness::ToolSet::default());
+    registry.register(provider.clone());
+    *provider.0.lock().unwrap() = definition("changed-name", 2);
+    assert!(registry.resolve("changed-name").is_err());
+    let model = Arc::new(Model::new(vec![calls(&["tool"]), answer("done")]));
+    let agent = Agent::builder()
+        .agent_loop(Arc::new(
+            yourai_harness::default_loop::DefaultLoop::default(),
+        ))
+        .context_manager(Arc::new(History::default()))
+        .model(model.clone())
+        .tools(registry)
+        .build();
+    agent.run(In::user_text("go")).await.unwrap();
+    assert_eq!(provider.1.load(Ordering::SeqCst), 1);
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(
+        requests[0].request.tools.as_ref().unwrap()[0].name.as_str(),
+        "tool"
+    );
+    assert_eq!(
+        requests[0].request.tools.as_ref().unwrap()[0]
+            .schema
+            .as_ref()
+            .unwrap()["properties"]["value"]["const"],
+        json!(1)
+    );
 }

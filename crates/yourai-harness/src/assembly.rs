@@ -1,11 +1,11 @@
 //! One assembly path used equally by terminal and web drivers.
 pub mod model_hooks;
-use crate::hooks::{ConcreteHookRuntime, HooksConfig};
+use crate::hooks::{DefaultHookRuntime, HooksConfig};
 use crate::{
     collaboration::*, memory::LocalMemory, skills::LocalSkills, storage::LocalUsage,
     workspace::Workspace, *,
 };
-use model_hooks::DefaultHookModelExecutor;
+use model_hooks::DefaultHookEvaluator;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -81,11 +81,11 @@ pub struct Harness {
     pub sessions: Arc<dyn SessionManager>,
     pub host: Arc<SessionHost>,
     pub tools: Arc<ToolSet>,
-    pub hooks: Arc<ConcreteHookRuntime>,
+    pub hooks: Arc<DefaultHookRuntime>,
     pub budget: Arc<ModelBudget>,
     pub workspace: Option<Arc<Workspace>>,
-    pub tasks: Option<Arc<TaskBoard>>,
-    pub subagents: Option<Arc<SubagentTool>>,
+    pub tasks: Option<Arc<TaskManager>>,
+    pub subagents: Option<Arc<Subagent>>,
     pub memory: Option<Arc<LocalMemory>>,
     pub skills: Option<Arc<LocalSkills>>,
     pub usage: Arc<LocalUsage>,
@@ -121,6 +121,7 @@ impl Harness {
             None => None,
         };
         let mut prompt_notices = vec![];
+        let mut initial_instructions = Default::default();
         let prepared = if existing.as_ref().is_none_or(|m| m.system_prompt.is_none()) {
             let prepared = crate::context::prompt::prepare(
                 &config.prompt,
@@ -134,6 +135,7 @@ impl Harness {
             )
             .await?;
             prompt_notices = prepared.notices;
+            initial_instructions = prepared.instructions;
             Some(prepared.system)
         } else {
             None
@@ -147,7 +149,10 @@ impl Harness {
             }
             None => {
                 catalog
-                    .create_session(prepared.as_deref().expect("new session prompt"))
+                    .create_session(
+                        SessionId::new(),
+                        prepared.as_deref().expect("new session prompt"),
+                    )
                     .await?
                     .id
             }
@@ -167,8 +172,8 @@ impl Harness {
             budget: budget.clone(),
         });
         let usage = Arc::new(LocalUsage((*catalog.store).clone()));
-        let hooks = Arc::new(ConcreteHookRuntime::new().with_model_executor(Arc::new(
-            DefaultHookModelExecutor {
+        let hooks = Arc::new(DefaultHookRuntime::new().with_evaluator(Arc::new(
+            DefaultHookEvaluator {
                 model: Arc::new(crate::model::SourceModel {
                     inner: model.clone(),
                     source: "hook",
@@ -232,6 +237,7 @@ impl Harness {
         }
         let mut context = SessionContext::new(id, config.cwd);
         context.transcript_path = Some(crate::SqliteStore::path(&config.root));
+        context.instructions = initial_instructions;
         let host = SessionHost::open_owned(
             lease,
             context,
@@ -251,58 +257,65 @@ impl Harness {
             source,
         )
         .await?;
-        for notice in prompt_notices {
-            host.post_event_async(yourai_core::runtime_event::RuntimeEvent {
-                id: uuid::Uuid::new_v4().to_string(),
-                context: None,
-                notice: Some(notice),
-                wake: false,
+        let ready = async {
+            for notice in prompt_notices {
+                host.post_event_async(yourai_core::runtime_event::RuntimeEvent {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    context: None,
+                    notice: Some(notice),
+                    wake: false,
+                })
+                .await?;
+            }
+            let workspace = if config.extensions {
+                Some(host.workspace()?)
+            } else {
+                None
+            };
+            // Task progress is a basic coding capability, independent of workspace/subagents.
+            let tasks = Some(host.task_manager("default")?);
+            let subagents = if config.extensions {
+                Some(subagent(&host, model, None))
+            } else {
+                None
+            };
+            if let Some(tasks) = &tasks {
+                tools.register(tasks.clone());
+            }
+            if let Some(subagents) = &subagents {
+                tools.register(subagents.clone());
+            }
+            Ok(Self {
+                normal_security,
+                provider_budgets: Mutex::new(HashMap::from([(
+                    (config.model_provider, config.request_policy),
+                    budget.clone(),
+                )])),
+                current_budget: Mutex::new(budget.clone()),
+                sessions: catalog,
+                host: host.clone(),
+                tools,
+                hooks,
+                budget,
+                workspace,
+                tasks,
+                subagents,
+                memory,
+                skills,
+                usage,
             })
-            .await?;
         }
-        let workspace = if config.extensions {
-            Some(host.workspace()?)
-        } else {
-            None
-        };
-        // Task progress is a basic coding capability, independent of workspace/subagents.
-        let tasks = Some(TaskBoard::new(&host, "default")?);
-        let subagents = if config.extensions {
-            Some(SubagentTool::new(&host, model, None))
-        } else {
-            None
-        };
-        if let Some(tasks) = &tasks {
-            tools.register(tasks.clone());
+        .await;
+        if ready.is_err() {
+            let _ = host.finish_close(None).await;
         }
-        if let Some(subagents) = &subagents {
-            tools.register(subagents.clone());
-        }
-        Ok(Self {
-            normal_security,
-            provider_budgets: Mutex::new(HashMap::from([(
-                (config.model_provider, config.request_policy),
-                budget.clone(),
-            )])),
-            current_budget: Mutex::new(budget.clone()),
-            sessions: catalog,
-            host,
-            tools,
-            hooks,
-            budget,
-            workspace,
-            tasks,
-            subagents,
-            memory,
-            skills,
-            usage,
-        })
+        ready
     }
     /// Change permissions only between turns, preserving the original policy.
     /// In-flight tool snapshots and approval questions must finish or be cancelled first.
     pub fn set_yolo(&self, enabled: bool) -> Result<(), YourAiError> {
         let _gate = self.host.try_operation()?;
-        self.host.agent.ctx().set_security(if enabled {
+        self.host.agent().ctx().set_security(if enabled {
             Arc::new(crate::security::YoloSecurity)
         } else {
             self.normal_security.clone()
@@ -374,7 +387,7 @@ impl Harness {
             self.current_budget.lock().unwrap().clone()
         };
         let id = self.host.context().id;
-        let history = MemoryContext::new(
+        let history = DefaultContext::new(
             id.clone(),
             crate::context::ContextServices {
                 store: Some(self.sessions.clone()),
@@ -398,8 +411,8 @@ impl Harness {
             );
         }
         *self.current_budget.lock().unwrap() = selected_budget;
-        self.host.agent.ctx().set_context_manager(history);
-        self.host.agent.ctx().set_model(model);
+        self.host.agent().ctx().set_context_manager(history);
+        self.host.agent().ctx().set_model(model);
         Ok(())
     }
 
@@ -426,14 +439,16 @@ pub(crate) async fn assemble(
     policy: ContextPolicy,
 ) -> Result<(Arc<Agent>, Arc<ToolSet>), YourAiError> {
     let dir = catalog.directory(id)?;
-    let registry = Arc::new(ToolSet::default());
-    if let Some(tools) = inherited {
-        for definition in tools.definitions() {
-            if !crate::tools::BUILTIN_TOOL_NAMES.contains(&definition.name.as_str()) {
-                registry.register_binding(tools.resolve(definition.name.as_str())?);
-            }
-        }
-    }
+    let inherited = inherited
+        .map(|registry| {
+            registry
+                .snapshot()
+                .into_iter()
+                .filter(|tool| !crate::tools::BUILTIN_TOOL_NAMES.contains(&tool.name()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let registry = Arc::new(ToolSet::new(inherited));
     registry.extend(crate::tools::coding_tools_with_output(
         cwd,
         Some(catalog.tool_output.clone()),
@@ -443,11 +458,14 @@ pub(crate) async fn assemble(
         policy,
         ..Default::default()
     };
-    let history = MemoryContext::new(id.clone(), services);
+    let history = DefaultContext::new(id.clone(), services);
     let mut builder = Agent::builder()
         .agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
             crate::default_loop::LoopConfig {
-                tool_output: Some(catalog.tool_output.clone()),
+                execution: yourai_core::execution::ExecutionConfig {
+                    tool_output: Some(catalog.tool_output.clone()),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )))

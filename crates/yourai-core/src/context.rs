@@ -1,6 +1,6 @@
-//! Context 容器 + Agent + turn 运输机制。
+//! Providers 容器 + Agent + turn 运输机制。
 //!
-//! - [`Context`]：12 个 provider 插槽，`RwLock<Option<Arc<dyn>>>`，
+//! - [`Providers`]：12 个 provider 插槽，`RwLock<Option<Arc<dyn>>>`，
 //!   turn 级热替换（决策 5.2）；读取缺失报 `Config`（决策 5.8），
 //!   可选读取用 `try_*`（供 DefaultLoop 依赖矩阵使用）
 //! - [`Agent`]：组装产物；[`Agent::start`] 是**全局唯一 spawn 点**
@@ -34,9 +34,9 @@ use crate::turn::{TurnInfo, TurnOptions};
 use crate::ui::OutSink;
 use crate::usage::UsageTracker;
 
-// region:    --- Context ---
+// region:    --- Providers ---
 
-/// 单一处声明全部 provider 插槽，生成 Context / ProviderSnapshot / AgentBuilder
+/// 单一处声明全部 provider 插槽，生成 Providers / ProviderSnapshot / AgentBuilder
 /// 与三组访问器（读取/可选读取/热替换）——新增插槽只改这份清单。
 /// 第一行是必需槽（ProviderSnapshot 中非 Option），其余为可选槽。
 macro_rules! provider_slots {
@@ -47,14 +47,14 @@ macro_rules! provider_slots {
     ) => {
         /// 所有 provider 的容器——纯粹的 provider 容器，交互管道不在这里
         ///（每次 turn 由 [`Agent::start`] 装配进 [`TurnContext`]，决策 5.5）。
-        pub struct Context {
+        pub struct Providers {
             $req: RwLock<Option<Arc<dyn $req_trait>>>,
             $( $field: RwLock<Option<Arc<dyn $trait>>> ),*
         }
 
         // 必需读取器：缺失报 Config 错——缺什么在使用点报（决策 5.8）。
         // 锁中毒视为可恢复：provider slot 的数据仍然一致。
-        impl Context {
+        impl Providers {
             $(
                 #[doc = concat!("读取 provider `", stringify!($field), "`；未装配时返回 `Config` 错误（决策 5.8）")]
                 pub fn $field(&self) -> Result<Arc<dyn $trait>, YourAiError> {
@@ -153,7 +153,7 @@ macro_rules! provider_slots {
 
             /// 组装 Agent（不做完整性检查，决策 5.8）
             pub fn build(self) -> Arc<Agent> {
-                let ctx = Context {
+                let ctx = Providers {
                     $req: RwLock::new(self.$req),
                     $( $field: RwLock::new(self.$field), )*
                 };
@@ -181,10 +181,10 @@ provider_slots! {
 
 // region:    --- Agent ---
 
-/// 组装产物：轻量、可 Clone（Clone 共享同一 Context）。
+/// 组装产物：轻量、可 Clone（Clone 共享同一 Providers）。
 #[derive(Clone)]
 pub struct Agent {
-    ctx: Arc<Context>,
+    ctx: Arc<Providers>,
 }
 
 impl Agent {
@@ -192,8 +192,8 @@ impl Agent {
         AgentBuilder::default()
     }
 
-    /// 读取 Context（运行期热注册/热替换入口，见 8.4）
-    pub fn ctx(&self) -> &Context {
+    /// 读取 Providers（运行期热注册/热替换入口，见 8.4）
+    pub fn ctx(&self) -> &Providers {
         &self.ctx
     }
 
@@ -211,12 +211,13 @@ impl Agent {
     /// 启动前失败尚未转移到后台，调用方应保留首条输入以便重试。
     pub fn start_with(
         self: &Arc<Self>,
-        first: In,
+        mut first: In,
         options: TurnOptions,
     ) -> Result<TurnHandle, YourAiError> {
         // 快照同时完成 loop 的 Config 检查，是本 turn 的恒定视图。
         let snap = self.ctx.snapshot()?;
         validate_session_binding(&snap, &options)?;
+        first.ensure_id();
         let info = TurnInfo::new(options);
 
         let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel();

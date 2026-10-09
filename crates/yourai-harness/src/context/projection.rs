@@ -62,25 +62,25 @@ pub(crate) fn preview(
         take /= 2;
     }
 }
-impl MemoryContext {
+impl DefaultContext {
     pub(super) fn estimate_raw(
         &self,
         request: &ChatRequest,
-        execution: &ContextExecution,
+        model: &dyn ModelProvider,
     ) -> Result<u64, YourAiError> {
-        estimate(request, execution.model.as_ref())
+        estimate(request, model)
     }
 
     pub(super) fn estimate(
         &self,
         request: &ChatRequest,
-        execution: &ContextExecution,
+        model: &dyn ModelProvider,
     ) -> Result<u64, YourAiError> {
-        let raw = self.estimate_raw(request, execution)?;
+        let raw = self.estimate_raw(request, model)?;
         let view = self.view.lock().unwrap();
         if let Some(o) = &view.observation {
             let n = o.request.messages.len();
-            if o.model == execution.model.model_iden()
+            if o.model == model.model_iden()
                 && n <= request.messages.len()
                 && o.request.system == request.system
                 && serde_json::to_value(&o.request.tools).ok()
@@ -88,9 +88,9 @@ impl MemoryContext {
                 && serde_json::to_value(&o.request.messages).ok()
                     == serde_json::to_value(&request.messages[..n]).ok()
             {
-                return Ok(o.input_tokens.saturating_add(
-                    raw.saturating_sub(self.estimate_raw(&o.request, execution)?),
-                ));
+                return Ok(o
+                    .input_tokens
+                    .saturating_add(raw.saturating_sub(self.estimate_raw(&o.request, model)?)));
             }
         }
         Ok(raw)
@@ -100,7 +100,7 @@ impl MemoryContext {
         &self,
         records: &[StoredMessage],
         system: Option<&str>,
-        tools: &[Tool],
+        tools: &[ToolDefinition],
     ) -> Result<ChatRequest, YourAiError> {
         let messages = self.project_messages(records, true)?;
         let mut request = ChatRequest::new(messages);

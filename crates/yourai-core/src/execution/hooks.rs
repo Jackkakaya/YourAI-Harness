@@ -1,24 +1,7 @@
-use super::ExecutionState;
-use yourai_core::prelude::*;
+use super::Turn;
+use crate::prelude::*;
 
-pub(crate) fn feedback(result: &HookDispatchResult) -> Vec<String> {
-    result
-        .common
-        .blocking_errors
-        .iter()
-        .map(|e| e.message.clone())
-        .collect()
-}
-pub(crate) fn additional(result: &HookDispatchResult) -> Vec<String> {
-    match &result.outcome {
-        HookPointOutcome::UserPromptSubmit(o) => o.additional_contexts.clone(),
-        HookPointOutcome::PreToolUse(o) => o.additional_contexts.clone(),
-        HookPointOutcome::PostToolUse(o) => o.additional_contexts.clone(),
-        HookPointOutcome::Generic(o) => o.additional_contexts.clone(),
-        _ => vec![],
-    }
-}
-impl ExecutionState<'_> {
+impl Turn<'_> {
     pub(crate) fn invocation(&self, event: HookEvent) -> HookInvocation {
         let mut base = BaseInput::new(self.history.session_id().as_str(), "");
         if let Some(session) = &self.tc.info.options.session {
@@ -48,7 +31,7 @@ impl ExecutionState<'_> {
             .hook_timeout
             .or(self.config.hook_timeout);
         let result = self
-            .wait(hooks.dispatch(&invocation), timeout, "hook")
+            .wait_operation(hooks.dispatch(&invocation), timeout, "hook")
             .await?;
         result.validate_for(kind)?;
         if let Some(obs) = &self.tc.snap.observability {
@@ -76,27 +59,6 @@ impl ExecutionState<'_> {
                 &message.content,
             )?;
         }
-        if result.common.prevent_continuation {
-            return Err(AbortReason::HookStopped(
-                result
-                    .common
-                    .stop_reason
-                    .clone()
-                    .unwrap_or_else(|| "hook requested stop".into()),
-            )
-            .into());
-        }
-        Ok(())
-    }
-    pub(crate) async fn stop_failure(&mut self, cause: &YourAiError) {
-        // A reporting hook cannot overwrite the model error or block cleanup forever.
-        let event = HookEvent::StopFailure {
-            error: "model_error".into(),
-            error_details: Some(cause.to_string()),
-            last_assistant_message: Some(self.output.text.clone()),
-        };
-        if let Ok(result) = self.hook(event).await {
-            let _ = self.apply_common(&result);
-        }
+        result.ensure_continuation()
     }
 }

@@ -20,10 +20,8 @@ pub(crate) type BackgroundTasks = std::sync::Arc<
 
 #[derive(Clone)]
 pub(crate) struct BackgroundCommandContext {
-    pub session_id: String,
     pub tasks: BackgroundTasks,
     pub hook_id: String,
-    pub event_name: String,
     pub rewake: bool,
     pub timeout: Option<std::time::Duration>,
     pub force_background: bool,
@@ -34,6 +32,7 @@ pub(crate) struct BackgroundCommandContext {
 struct OwnedChild {
     child: Option<tokio::process::Child>,
     group: Option<u32>,
+    stdin_tasks: tokio::task::JoinSet<std::io::Result<()>>,
 }
 impl std::ops::Deref for OwnedChild {
     type Target = tokio::process::Child;
@@ -51,9 +50,22 @@ impl OwnedChild {
     async fn read_output(&mut self) -> std::io::Result<(String, String, std::process::ExitStatus)> {
         let mut stdout = self.stdout.take().ok_or_else(|| pipe_error("stdout"))?;
         let mut stderr = self.stderr.take().ok_or_else(|| pipe_error("stderr"))?;
-        let (stdout, stderr) = tokio::join!(read_capped(&mut stdout), read_capped(&mut stderr));
+        let (stdout, stderr, input) = tokio::join!(
+            read_capped(&mut stdout),
+            read_capped(&mut stderr),
+            finish_stdin(&mut self.stdin_tasks),
+        );
         let status = self.wait().await?;
+        input?;
         Ok((stdout?, stderr?, status))
+    }
+}
+async fn finish_stdin(
+    tasks: &mut tokio::task::JoinSet<std::io::Result<()>>,
+) -> std::io::Result<()> {
+    match tasks.join_next().await {
+        Some(result) => result.map_err(std::io::Error::other)?,
+        None => Ok(()),
     }
 }
 fn pipe_error(which: &str) -> std::io::Error {
@@ -199,27 +211,29 @@ impl CommandHandler {
         let mut child = OwnedChild {
             group: child.id(),
             child: Some(child),
+            stdin_tasks: tokio::task::JoinSet::new(),
         };
         if let Some(mut stdin) = child.stdin.take() {
-            let write = async {
-                stdin
-                    .write_all(format!("{json_input}\n").as_bytes())
-                    .await?;
-                stdin.flush().await
-            }
-            .await;
-            // Hooks may decide without reading stdin. An early close must not
-            // discard their stdout or exit-2 denial; still reap and interpret
-            // the process below. Other I/O failures remain errors.
-            if let Err(e) = write {
-                if e.kind() != std::io::ErrorKind::BrokenPipe {
-                    return Err(yourai_core::ErrorKind::Provider {
-                        name: "hook",
-                        message: format!("stdin write: {e}"),
-                    }
-                    .into());
+            // Keep this writer owned by the process while stdout/stderr drain.
+            // Awaiting it here can deadlock against a hook echoing a large input.
+            child.stdin_tasks.spawn(async move {
+                let write = async {
+                    stdin
+                        .write_all(format!("{json_input}\n").as_bytes())
+                        .await?;
+                    stdin.flush().await
                 }
-            }
+                .await;
+                // Hooks may decide without reading stdin. An early close must not
+                // discard their stdout or exit-2 denial; still reap and interpret
+                // the process below. Other I/O failures remain errors.
+                if let Err(e) = write {
+                    if e.kind() != std::io::ErrorKind::BrokenPipe {
+                        return Err(e);
+                    }
+                }
+                Ok(())
+            });
         }
 
         Ok(child)
@@ -248,7 +262,7 @@ impl CommandHandler {
     ) -> Result<HookOutput, yourai_core::YourAiError> {
         if background.force_background {
             let child = self.spawn(invocation).await?;
-            return Ok(background_child(child, background, None));
+            return Ok(background_child(child, background, invocation, None));
         }
 
         let mut child = self.spawn(invocation).await?;
@@ -287,7 +301,9 @@ impl CommandHandler {
                 .map(std::time::Duration::from_millis);
             let task_id = format!("async_hook_{}", uuid::Uuid::new_v4());
             let event_task_id = task_id.clone();
-            let owner = background.session_id.clone();
+            let session_id = invocation.base.session_id.clone();
+            let event_name = invocation.event_kind().as_str().to_owned();
+            let owner = session_id.clone();
             let tasks = background.tasks.clone();
             let task = tokio::spawn(async move {
                 let stdout_task = tokio::spawn(async move {
@@ -305,7 +321,9 @@ impl CommandHandler {
                     },
                     None => child.wait().await.map(Some),
                 };
+                let mut stdin_tasks = std::mem::take(&mut child.stdin_tasks);
                 drop(child); // End the owned process group before joining pipe readers.
+                let input_result = finish_stdin(&mut stdin_tasks).await;
                 let (read_result, remaining) = match stdout_task.await {
                     Ok(Ok(text)) => (Ok(()), text),
                     Ok(Err(error)) => (Err(error), String::new()),
@@ -316,6 +334,9 @@ impl CommandHandler {
                     Ok(Err(error)) => format!("failed reading stderr: {error}"),
                     Err(error) => format!("failed reading stderr: {error}"),
                 };
+                if let Err(error) = input_result {
+                    stderr.push_str(&format!("\nstdin write: {error}"));
+                }
                 if let Err(error) = read_result {
                     stderr.push_str(&format!("\nfailed reading stdout: {error}"));
                 }
@@ -328,10 +349,10 @@ impl CommandHandler {
                     stderr.push_str(&format!("\n{error}"));
                 }
                 let _ = background.sender.send(BackgroundHookEvent {
-                    session_id: background.session_id.clone(),
+                    session_id,
                     task_id: event_task_id,
                     hook_id: background.hook_id,
-                    event_name: background.event_name,
+                    event_name,
                     stdout: remaining,
                     stderr,
                     exit_code,
@@ -364,6 +385,12 @@ impl CommandHandler {
                 name: "hook",
                 message: format!("failed waiting for hook: {error}"),
             })?;
+        finish_stdin(&mut child.stdin_tasks)
+            .await
+            .map_err(|error| yourai_core::ErrorKind::Provider {
+                name: "hook",
+                message: format!("stdin write: {error}"),
+            })?;
         let stderr = stderr_task
             .await
             .map_err(|error| yourai_core::ErrorKind::Provider {
@@ -386,11 +413,14 @@ impl CommandHandler {
 fn background_child(
     child: OwnedChild,
     background: BackgroundCommandContext,
+    invocation: &HookInvocation,
     timeout_override: Option<std::time::Duration>,
 ) -> HookOutput {
     let task_id = format!("async_hook_{}", uuid::Uuid::new_v4());
     let event_task_id = task_id.clone();
-    let owner = background.session_id.clone();
+    let session_id = invocation.base.session_id.clone();
+    let event_name = invocation.event_kind().as_str().to_owned();
+    let owner = session_id.clone();
     let tasks = background.tasks.clone();
     let task = tokio::spawn(async move {
         let mut child = child;
@@ -404,10 +434,10 @@ fn background_child(
         };
         let event = match result {
             Ok(Some((stdout, stderr, status))) => BackgroundHookEvent {
-                session_id: background.session_id.clone(),
+                session_id,
                 task_id: event_task_id,
                 hook_id: background.hook_id,
-                event_name: background.event_name,
+                event_name,
                 stdout,
                 stderr,
                 exit_code: status.code().unwrap_or(-1),
@@ -415,10 +445,10 @@ fn background_child(
                 rewake: background.rewake,
             },
             Ok(None) => BackgroundHookEvent {
-                session_id: background.session_id.clone(),
+                session_id,
                 task_id: event_task_id,
                 hook_id: background.hook_id,
-                event_name: background.event_name,
+                event_name,
                 stdout: String::new(),
                 stderr: "background hook timed out".to_string(),
                 exit_code: -1,
@@ -426,10 +456,10 @@ fn background_child(
                 rewake: background.rewake,
             },
             Err(error) => BackgroundHookEvent {
-                session_id: background.session_id.clone(),
+                session_id,
                 task_id: event_task_id,
                 hook_id: background.hook_id,
-                event_name: background.event_name,
+                event_name,
                 stdout: String::new(),
                 stderr: error.to_string(),
                 exit_code: -1,
@@ -452,7 +482,7 @@ impl HookHandler for CommandHandler {
     fn execute<'a>(
         &'a self,
         invocation: &'a HookInvocation,
-    ) -> crate::hooks::handler::BoxFuture<'a, Result<HookOutput, yourai_core::YourAiError>> {
+    ) -> yourai_core::BoxFuture<'a, Result<HookOutput, yourai_core::YourAiError>> {
         Box::pin(async move {
             if let Some(background) = self.background.clone() {
                 return self.run_with_async_detection(invocation, background).await;
@@ -551,6 +581,89 @@ mod tests {
                 assert!(stdout.contains("Bash"));
             }
             _ => panic!("expected command output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn large_input_and_output_are_drained_concurrently() {
+        let inv = HookInvocation::new(
+            BaseInput::new("sess", "/tmp"),
+            HookEvent::UserPromptSubmit {
+                prompt: "x".repeat(262_144),
+            },
+        );
+        let expected = format!("{}\n", to_wire_json(&inv));
+        for command in ["cat", "cat >&2"] {
+            let handler = CommandHandler::new(command.into(), None);
+            match tokio::time::timeout(std::time::Duration::from_secs(2), handler.execute(&inv))
+                .await
+                .expect("writing stdin must not block output drainage")
+                .unwrap()
+            {
+                HookOutput::Command {
+                    stdout,
+                    stderr,
+                    exit_code,
+                } => {
+                    assert_eq!(exit_code, 0);
+                    assert_eq!(if command == "cat" { stdout } else { stderr }, expected);
+                }
+                _ => panic!("expected foreground output"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn large_input_survives_async_detection_and_handoff() {
+        let inv = HookInvocation::new(
+            BaseInput::new("sess", "/tmp"),
+            HookEvent::UserPromptSubmit {
+                prompt: "x".repeat(262_144),
+            },
+        );
+        let expected = format!("{}\n", to_wire_json(&inv));
+        for command in ["cat >&2", "printf '{\"async\":true}\\n'; cat >&2"] {
+            let (sender, mut events) = tokio::sync::broadcast::channel(4);
+            let tasks = BackgroundTasks::default();
+            let handler = CommandHandler::new(command.into(), None).with_background(
+                BackgroundCommandContext {
+                    tasks: tasks.clone(),
+                    hook_id: "large-input".into(),
+                    rewake: false,
+                    timeout: Some(std::time::Duration::from_secs(2)),
+                    force_background: false,
+                    sender,
+                },
+            );
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(2), handler.execute(&inv))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if command == "cat >&2" {
+                match output {
+                    HookOutput::Command {
+                        stderr, exit_code, ..
+                    } => {
+                        assert_eq!(exit_code, 0);
+                        assert_eq!(stderr, expected);
+                    }
+                    _ => panic!("expected foreground output"),
+                }
+            } else {
+                assert!(matches!(output, HookOutput::Backgrounded { .. }));
+                let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(event.exit_code, 0);
+                assert!(!event.timed_out);
+                assert_eq!(event.stderr, expected);
+                let handles = tasks.lock().unwrap().remove("sess").unwrap();
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+            }
         }
     }
 

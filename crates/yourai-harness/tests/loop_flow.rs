@@ -8,7 +8,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use support::*;
+use support::{Model, *};
 use yourai_core::{hooks::*, model::ModelRecovery, prelude::*};
 use yourai_harness::default_loop::LoopConfig;
 
@@ -370,7 +370,10 @@ async fn stop_can_continue_but_not_forever() {
         model.clone(),
         Arc::new(History::default()),
         LoopConfig {
-            max_stop_continuations: 1,
+            execution: yourai_core::execution::ExecutionConfig {
+                max_stop_continuations: 1,
+                ..Default::default()
+            },
             ..Default::default()
         },
     )
@@ -586,7 +589,10 @@ async fn invisible_failure_announces_structured_retry_status() {
         Arc::new(m),
         Arc::new(History::default()),
         LoopConfig {
-            retry_delay: Duration::ZERO,
+            execution: yourai_core::execution::ExecutionConfig {
+                retry_delay: Duration::ZERO,
+                ..Default::default()
+            },
             ..Default::default()
         },
     )
@@ -724,8 +730,11 @@ async fn invisible_failure_retries_only_up_to_policy_limit() {
     m.recovery = ModelRecovery::Retry;
     let model = Arc::new(m);
     let config = LoopConfig {
-        max_model_retries: 1,
-        retry_delay: Duration::ZERO,
+        execution: yourai_core::execution::ExecutionConfig {
+            max_model_retries: 1,
+            retry_delay: Duration::ZERO,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let agent = builder(model.clone(), Arc::new(History::default()), config).build();
@@ -858,7 +867,7 @@ async fn real_hook_runtime_registration_effect_is_consumed_by_loop() {
             })
         }
     }
-    let runtime = Arc::new(yourai_harness::hooks::runtime::ConcreteHookRuntime::new());
+    let runtime = Arc::new(yourai_harness::hooks::runtime::DefaultHookRuntime::new());
     runtime
         .register(NativeHookRegistration {
             id: "context".into(),
@@ -1007,8 +1016,11 @@ async fn retry_respects_max_retries_limit() {
         model.clone(),
         Arc::new(History::default()),
         LoopConfig {
-            retry_delay: Duration::ZERO,
-            max_model_retries: 0,
+            execution: yourai_core::execution::ExecutionConfig {
+                retry_delay: Duration::ZERO,
+                max_model_retries: 0,
+                ..Default::default()
+            },
             ..Default::default()
         },
     )
@@ -1351,14 +1363,15 @@ async fn explicit_deadline_still_cancels_an_unlimited_question() {
 #[tokio::test(start_paused = true)]
 async fn cancelled_tool_can_finish_within_grace_and_preserves_actual_result() {
     struct SettlingTool;
-    impl ToolHandler for SettlingTool {
-        fn name(&self) -> &str {
-            "tool"
+    impl ToolProvider for SettlingTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::new("tool")
         }
-        fn definition(&self) -> Tool {
-            Tool::new("tool")
-        }
-        fn security_context(&self, input: &serde_json::Value) -> SecurityContext {
+        fn security_context(
+            &self,
+            input: &serde_json::Value,
+            _cwd: Option<&std::path::Path>,
+        ) -> SecurityContext {
             SecurityContext {
                 action: "tool".into(),
                 input: input.clone(),
@@ -1524,7 +1537,10 @@ async fn managed_output_bounds_post_hook_mcp_results_and_preserves_original_file
         Arc::new(Model::new(vec![calls(&["mcp__large"]), answer("done")])),
         history.clone(),
         LoopConfig {
-            tool_output: Some(store),
+            execution: yourai_core::execution::ExecutionConfig {
+                tool_output: Some(store),
+                ..Default::default()
+            },
             ..Default::default()
         },
     )

@@ -1,17 +1,17 @@
-use crate::hooks::{HookModelDecision, HookModelExecutor, HookModelRequest};
-use crate::{error, MemoryContext};
+use crate::hooks::{HookEvaluator, HookModelDecision, HookModelRequest};
+use crate::{error, DefaultContext};
 use std::{sync::Arc, time::Duration};
 use yourai_core::prelude::*;
 /// Both prompt and agent hooks use the supplied (optionally shared-metered) model.
 /// Evaluator agents deliberately have no HookRuntime, preventing recursive evaluation.
-pub struct DefaultHookModelExecutor {
+pub struct DefaultHookEvaluator {
     pub model: Arc<dyn ModelProvider>,
     pub tools: Option<Arc<dyn ToolRegistry>>,
     pub usage: Option<Arc<dyn UsageTracker>>,
     pub timeout: Duration,
     pub steps: u32,
 }
-impl HookModelExecutor for DefaultHookModelExecutor {
+impl HookEvaluator for DefaultHookEvaluator {
     fn evaluate<'a>(
         &'a self,
         request: HookModelRequest,
@@ -27,7 +27,7 @@ impl HookModelExecutor for DefaultHookModelExecutor {
             let instructions="Evaluate the condition. Return exactly JSON {\"ok\":true} or {\"ok\":false,\"reason\":\"...\"}.";
             let work = async {
                 let text = if request.agentic {
-                    let history = MemoryContext::new(
+                    let history = DefaultContext::new(
                         SessionId::from(request.invocation.base.session_id.clone()),
                         crate::context::ContextServices {
                             system_prompt: instructions.into(),

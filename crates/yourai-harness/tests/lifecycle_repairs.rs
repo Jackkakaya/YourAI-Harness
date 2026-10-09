@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use yourai_core::{context::DiscardSink, model::ModelEventStream, prelude::*};
-use yourai_harness::{Harness, HarnessConfig, HostConfig, MemoryContext, SessionHost};
+use yourai_harness::{DefaultContext, Harness, HarnessConfig, HostConfig, SessionHost};
 
 struct BrokenLoop {
     panic: bool,
@@ -30,7 +30,7 @@ async fn loop_host(dir: &std::path::Path, loop_: Arc<dyn AgentLoop>) -> Arc<Sess
     let id = SessionId::new();
     let agent = Agent::builder()
         .agent_loop(loop_)
-        .context_manager(MemoryContext::memory(id.clone()))
+        .context_manager(DefaultContext::memory(id.clone()))
         .build();
     SessionHost::open(
         dir,
@@ -197,11 +197,13 @@ async fn rejected_resume_and_restore_do_not_change_active_session_metadata() {
             .as_deref(),
         Some("first")
     );
-    assert!(SessionHost::restore(
+    assert!(yourai_harness::runtime::restore(
         &root,
         id.clone(),
         dir.path().into(),
         NamedModel::new("third"),
+        None,
+        None,
         None,
         None,
         ContextPolicy::default(),
@@ -241,7 +243,7 @@ async fn rejected_resume_and_restore_do_not_change_active_session_metadata() {
 #[tokio::test]
 async fn oversized_hook_first_line_and_combined_stdout_are_rejected() {
     use yourai_core::hooks::{BaseInput, HookEvent, HookInvocation, HookRunStatus, HookSource};
-    use yourai_harness::hooks::{ConcreteHookRuntime, HooksConfig};
+    use yourai_harness::hooks::{DefaultHookRuntime, HooksConfig};
     for (command, failure_policy, stopped) in [
         ("head -c 2097152 /dev/zero | tr '\\0' x", "open", false),
         (
@@ -250,7 +252,7 @@ async fn oversized_hook_first_line_and_combined_stdout_are_rejected() {
             true,
         ),
     ] {
-        let runtime = ConcreteHookRuntime::new();
+        let runtime = DefaultHookRuntime::new();
         let config: HooksConfig = serde_json::from_value(serde_json::json!({
             "hooks": {"UserPromptSubmit": [{"hooks": [{"type":"command", "command":command, "failurePolicy":failure_policy}]}]}
         }))
@@ -282,8 +284,8 @@ async fn oversized_hook_first_line_and_combined_stdout_are_rejected() {
 #[tokio::test]
 async fn hook_stdout_exactly_at_shared_limit_is_preserved() {
     use yourai_core::hooks::{BaseInput, HookEvent, HookInvocation, HookRunStatus, HookSource};
-    use yourai_harness::hooks::{ConcreteHookRuntime, HooksConfig};
-    let runtime = ConcreteHookRuntime::new();
+    use yourai_harness::hooks::{DefaultHookRuntime, HooksConfig};
+    let runtime = DefaultHookRuntime::new();
     let config: HooksConfig = serde_json::from_value(serde_json::json!({
         "hooks": {"UserPromptSubmit": [{"hooks": [{
             "type":"command", "command":"printf 'hi\\n'; head -c 1048573 /dev/zero | tr '\\0' x"
@@ -329,11 +331,13 @@ async fn failed_assembly_releases_execution_lease_for_the_next_open() {
     assert!(Harness::open(config, NamedModel::new("failed"))
         .await
         .is_err());
-    let host = SessionHost::restore(
+    let host = yourai_harness::runtime::restore(
         &root,
         id,
         dir.path().into(),
         NamedModel::new("restored"),
+        None,
+        None,
         None,
         None,
         ContextPolicy::default(),

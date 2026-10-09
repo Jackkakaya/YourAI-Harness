@@ -7,51 +7,14 @@ pub use sqlite::SqliteStore;
 pub use usage::LocalUsage;
 
 use fs2::FileExt;
-use serde::Serialize;
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use yourai_core::prelude::*;
 
-pub(crate) fn atomic_write(path: &Path, value: &impl Serialize) -> Result<(), YourAiError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| error("storage", "missing parent"))?;
-    fs::create_dir_all(parent).map_err(|e| error("storage", e))?;
-    let tmp = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut f = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp)
-            .map_err(|e| error("storage", e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|e| error("storage", e))?;
-        }
-        f.write_all(&serde_json::to_vec(value).map_err(|e| error("storage", e))?)
-            .map_err(|e| error("storage", e))?;
-        f.sync_all().map_err(|e| error("storage", e))?;
-        fs::rename(&tmp, path).map_err(|e| error("storage", e))?;
-        File::open(parent)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| error("storage", e))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(tmp);
-    }
-    result
-}
-pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, YourAiError> {
-    serde_json::from_slice(&fs::read(path).map_err(|e| error("storage", e))?)
-        .map_err(|e| error("storage", e))
-}
+pub(crate) use yourai_core::file_store::{atomic_write, read_json};
 fn lock(path: &Path) -> Result<File, YourAiError> {
     let f = OpenOptions::new()
         .create(true)
@@ -121,6 +84,13 @@ impl SessionCatalog {
     }
 }
 impl SessionManager for SessionCatalog {
+    fn read_tasks(&self, id: &SessionId) -> Result<Vec<Task>, YourAiError> {
+        self.store.read_tasks(id)
+    }
+    fn save_tasks(&self, id: &SessionId, tasks: Vec<Task>) -> Result<Vec<Task>, YourAiError> {
+        self.store.save_tasks(id, tasks)
+    }
+
     fn initialize_system<'a>(
         &'a self,
         id: &'a SessionId,
@@ -131,9 +101,10 @@ impl SessionManager for SessionCatalog {
 
     fn create_session<'a>(
         &'a self,
+        id: SessionId,
         system: &'a str,
     ) -> BoxFuture<'a, Result<SessionMeta, YourAiError>> {
-        self.store.create_session(system)
+        self.store.create_session(id, system)
     }
     fn load_session<'a>(
         &'a self,

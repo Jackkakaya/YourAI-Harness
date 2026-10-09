@@ -24,11 +24,11 @@ impl Default for AttachmentImageConfig {
     }
 }
 
-/// Policy defaults, not additional Providers. TurnLimits can impose stricter limits.
+/// Policy defaults, not additional context. TurnLimits can impose stricter limits.
 #[derive(Debug, Clone)]
 pub struct ExecutionConfig {
     /// Managed output storage; assembled harnesses share their catalog store.
-    pub tool_output: Option<Arc<crate::tools::ToolOutputStore>>,
+    pub tool_output: Option<Arc<crate::tool_output::ToolOutputStore>>,
     /// Explicitly selected skills; listing a skill does not activate it.
     pub skill_ids: Vec<String>,
     pub memory_search_limit: usize,

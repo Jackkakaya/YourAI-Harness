@@ -19,45 +19,49 @@ impl ContextServices {
         }
     }
 }
-pub struct MemoryContext {
-    pub inner: Arc<yourai_harness::MemoryContext>,
-    pub execution: ContextExecution,
+pub struct DefaultContext {
+    pub inner: Arc<yourai_harness::DefaultContext>,
+    pub execution: Compactor,
+    model: Arc<dyn ModelProvider>,
 }
-impl std::ops::Deref for MemoryContext {
-    type Target = yourai_harness::MemoryContext;
+impl std::ops::Deref for DefaultContext {
+    type Target = yourai_harness::DefaultContext;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
-impl MemoryContext {
+impl DefaultContext {
     pub fn new(id: SessionId, model: Arc<dyn ModelProvider>, s: ContextServices) -> Arc<Self> {
         let services = yourai_harness::context::ContextServices {
             store: s.store,
             policy: s.policy,
             ..Default::default()
         };
+        let inner = yourai_harness::DefaultContext::new(id.clone(), services);
         Arc::new(Self {
-            execution: ContextExecution {
-                model,
-                hooks: s.hooks,
-                usage: s.usage,
-                hook_base: BaseInput::new(id.as_str(), ""),
-            },
-            inner: yourai_harness::MemoryContext::new(id, services),
+            execution: Compactor::new(
+                inner.clone(),
+                model.clone(),
+                s.hooks,
+                s.usage,
+                BaseInput::new(id.as_str(), ""),
+            ),
+            inner,
+            model,
         })
     }
-    pub fn build_request(&self, tools: &[Tool]) -> Result<ContextRequest, YourAiError> {
-        self.inner.build_request(tools, &self.execution)
+    pub fn build_request(&self, tools: &[ToolDefinition]) -> Result<ContextRequest, YourAiError> {
+        self.inner.build_request(tools, self.model.as_ref())
     }
     pub fn compact<'a>(
         &'a self,
         r: CompactionRequest,
         c: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>> {
-        self.inner.compact(r, &self.execution, c)
+        Box::pin(self.execution.exec(r, c, None))
     }
 }
-impl ContextManager for MemoryContext {
+impl ContextManager for DefaultContext {
     fn last_sequence(&self) -> i64 {
         self.inner.last_sequence()
     }
@@ -90,15 +94,15 @@ impl ContextManager for MemoryContext {
     }
     fn build_request(
         &self,
-        t: &[Tool],
-        e: &ContextExecution,
+        t: &[ToolDefinition],
+        e: &dyn ModelProvider,
     ) -> Result<ContextRequest, YourAiError> {
         self.inner.build_request(t, e)
     }
     fn prepare_compaction<'a>(
         &'a self,
         r: &'a CompactionRequest,
-        e: &'a ContextExecution,
+        e: &'a dyn ModelProvider,
         c: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
         self.inner.prepare_compaction(r, e, c)

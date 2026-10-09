@@ -19,7 +19,6 @@ pub struct ContextServices {
     /// Used only for ephemeral contexts; durable contexts restore their snapshot.
     pub system_prompt: String,
     pub store: Option<Arc<dyn SessionManager>>,
-    pub hook_timeout: Option<std::time::Duration>,
     pub policy: ContextPolicy,
 }
 #[derive(Default)]
@@ -34,7 +33,7 @@ struct View {
     last_prune_tokens: u64,
     observation: Option<RequestObservation>,
 }
-pub struct MemoryContext {
+pub struct DefaultContext {
     id: SessionId,
     view: Mutex<View>,
     system: Mutex<String>,
@@ -42,7 +41,7 @@ pub struct MemoryContext {
     dirty: AtomicBool,
     services: ContextServices,
 }
-impl MemoryContext {
+impl DefaultContext {
     pub fn memory(id: SessionId) -> Arc<Self> {
         let services = ContextServices::default();
         Self::new(id, services)
@@ -126,6 +125,9 @@ impl MemoryContext {
         Ok(())
     }
     async fn commit(&self, change: ContextChange) -> Result<(), YourAiError> {
+        change
+            .progress
+            .store(CommitStatus::Started as u8, Ordering::Release);
         if let Some(store) = &self.services.store {
             // If the future is dropped during SQLite work, the next mutation reloads
             // after the adapter's transaction gate. Reads reject the uncertain view.
@@ -147,6 +149,9 @@ impl MemoryContext {
             let mut view = self.view.lock().unwrap();
             records.sort_by_key(|m| (!m.summary, m.seq));
             view.records = records;
+            change
+                .progress
+                .store(CommitStatus::Committed as u8, Ordering::Release);
             Ok(())
         }
     }
@@ -176,7 +181,7 @@ impl MemoryContext {
                             .map(|r| r.call_id.clone()),
                     );
                 }
-                // Tool completion is keyed by call_id across summaries/restarts.
+                // ToolDefinition completion is keyed by call_id across summaries/restarts.
                 if m.message
                     .content
                     .tool_responses()
@@ -241,7 +246,7 @@ impl MemoryContext {
     fn fingerprint(
         records: &[StoredMessage],
         system: Option<&str>,
-        tools: &[Tool],
+        tools: &[ToolDefinition],
         model: &str,
     ) -> String {
         format!(
@@ -254,7 +259,7 @@ impl MemoryContext {
         )
     }
 }
-impl ContextManager for MemoryContext {
+impl ContextManager for DefaultContext {
     fn last_sequence(&self) -> i64 {
         self.view.lock().unwrap().last_seq
     }
@@ -299,8 +304,8 @@ impl ContextManager for MemoryContext {
     }
     fn build_request(
         &self,
-        tools: &[Tool],
-        execution: &ContextExecution,
+        tools: &[ToolDefinition],
+        model: &dyn ModelProvider,
     ) -> Result<ContextRequest, YourAiError> {
         self.services.policy.validate()?;
         if self.dirty.load(Ordering::Acquire) {
@@ -313,14 +318,14 @@ impl ContextManager for MemoryContext {
         let system = Some(owned_system.as_str());
         let records = self.records();
         let request = self.project(&records, system, tools)?;
-        let estimated_tokens = self.estimate(&request, execution)?;
+        let estimated_tokens = self.estimate(&request, model)?;
         let input_budget = self.services.policy.input_budget();
         let unchanged = self.view.lock().unwrap().last_maintenance.as_ref()
             == Some(&Self::fingerprint(
                 &records,
                 system,
                 tools,
-                execution.model.model_iden(),
+                model.model_iden(),
             ));
         let maintenance_needed = !unchanged
             && input_budget.is_some_and(|b| {
@@ -336,31 +341,9 @@ impl ContextManager for MemoryContext {
     fn prepare_compaction<'a>(
         &'a self,
         options: &'a CompactionRequest,
-        execution: &'a ContextExecution,
+        model: &'a dyn ModelProvider,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
-        Box::pin(async move { self.prepare(options, execution, cancel).await })
+        Box::pin(async move { self.prepare(options, model, cancel).await })
     }
 }
-
-impl MemoryContext {
-    /// Convenience forwarding to the fixed public operation in
-    /// [`yourai_core::context_manager::compact`], shared with every
-    /// replacement ContextManager.
-    pub fn compact<'a>(
-        &'a self,
-        request: CompactionRequest,
-        execution: &'a ContextExecution,
-        cancel: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<CompactionResult, YourAiError>> {
-        Box::pin(crate::context::compact(
-            self,
-            request,
-            execution,
-            cancel,
-            self.services.hook_timeout,
-        ))
-    }
-}
-/// Fixed public compaction operation; the hook lifecycle lives in core.
-pub use yourai_core::context_manager::compact;

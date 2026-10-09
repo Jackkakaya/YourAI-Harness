@@ -11,7 +11,6 @@
 //! }
 //! ```
 
-use crate::hooks::handler::HookHandlerKind;
 use crate::hooks::matcher::CompiledMatcher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -183,15 +182,6 @@ impl HandlerConfig {
         secs.map(Duration::from_secs_f64)
     }
 
-    pub fn handler_kind(&self) -> HookHandlerKind {
-        match self {
-            HandlerConfig::Command { .. } => HookHandlerKind::Command,
-            HandlerConfig::Http { .. } => HookHandlerKind::Http,
-            HandlerConfig::Prompt { .. } => HookHandlerKind::Prompt,
-            HandlerConfig::Agent { .. } => HookHandlerKind::Agent,
-        }
-    }
-
     pub fn if_condition(&self) -> Option<&str> {
         match self {
             HandlerConfig::Command { if_condition, .. }
@@ -245,14 +235,6 @@ impl HandlerConfig {
             | HandlerConfig::Prompt { status_message, .. }
             | HandlerConfig::Agent { status_message, .. } => status_message.as_deref(),
         }
-    }
-
-    /// 该 handler 是否要求宿主注入模型执行能力。
-    pub fn requires_model_executor(&self) -> bool {
-        matches!(
-            self,
-            HandlerConfig::Prompt { .. } | HandlerConfig::Agent { .. }
-        )
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -415,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_timeout_url_and_marks_model_handlers() {
+    fn validates_timeout_url_and_model_configuration() {
         let bad_timeout: HandlerConfig =
             serde_json::from_str(r#"{"type":"command","command":"check","timeout":0}"#).unwrap();
         assert!(bad_timeout.validate().is_err());
@@ -427,7 +409,6 @@ mod tests {
         let prompt: HandlerConfig =
             serde_json::from_str(r#"{"type":"prompt","prompt":"review"}"#).unwrap();
         assert!(prompt.validate().is_ok());
-        assert!(prompt.requires_model_executor());
     }
 
     #[test]

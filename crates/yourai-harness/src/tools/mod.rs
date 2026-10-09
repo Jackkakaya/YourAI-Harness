@@ -1,4 +1,4 @@
-//! Built-in tools implement Core's existing ToolHandler; no loop or storage dependency.
+//! Built-in tools implement Core's existing ToolProvider; no loop or storage dependency.
 mod files;
 mod output;
 pub use output::ToolOutputStore;
@@ -27,14 +27,14 @@ pub const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
 pub const BUILTIN_TOOL_NAMES: &[&str] =
     &["read", "write", "edit", "shell", "webfetch", "websearch"];
 
-pub fn coding_tools(cwd: &Path) -> Result<Vec<Arc<dyn ToolHandler>>, YourAiError> {
+pub fn coding_tools(cwd: &Path) -> Result<Vec<Arc<dyn ToolProvider>>, YourAiError> {
     coding_tools_with_output(cwd, None)
 }
 
 pub(crate) fn coding_tools_with_output(
     cwd: &Path,
     output: Option<Arc<ToolOutputStore>>,
-) -> Result<Vec<Arc<dyn ToolHandler>>, YourAiError> {
+) -> Result<Vec<Arc<dyn ToolProvider>>, YourAiError> {
     let cwd = std::fs::canonicalize(cwd).map_err(|e| error("tools", e))?;
     if !cwd.is_dir() {
         return Err(error("tools", "cwd must be a directory"));
@@ -64,13 +64,18 @@ pub(crate) fn check_cancel(tc: &ToolContext<'_>) -> Result<(), YourAiError> {
     }
 }
 /// serde_json cannot serialize non-UTF-8 paths (`json!` unwraps internally and
-/// would panic). Tool result JSON must only embed checked display strings.
+/// would panic). ToolDefinition result JSON must only embed checked display strings.
 pub(crate) fn utf8_path<'a>(path: &'a Path, name: &str) -> Result<&'a str, YourAiError> {
     path.to_str()
         .ok_or_else(|| error(name, "path is not UTF-8"))
 }
-pub(crate) fn schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Tool {
-    Tool::new(name).with_description(description).with_schema(json!({
+pub(crate) fn schema(
+    name: &str,
+    description: &str,
+    properties: Value,
+    required: &[&str],
+) -> ToolDefinition {
+    ToolDefinition::new(name).with_description(description).with_schema(json!({
         "type":"object", "properties":properties,"required":required,"additionalProperties":false
     }))
 }

@@ -37,7 +37,7 @@ impl SqliteStore {
         let version: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(sql)?;
-        if version > 4 {
+        if version > 5 {
             return Err(sql("database schema is newer than this application"));
         }
         if version < 1 {
@@ -60,6 +60,22 @@ impl SqliteStore {
                 );
                 CREATE INDEX IF NOT EXISTS model_requests_session ON model_requests(session_id, started_at);
                 PRAGMA user_version=4; COMMIT;").map_err(sql)?;
+        }
+        if version < 5 {
+            c.execute_batch(
+                "BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS tasks (
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    task_id TEXT NOT NULL CHECK(length(task_id)>0),
+                    subject TEXT NOT NULL, description TEXT, owner TEXT,
+                    completed INTEGER NOT NULL CHECK(completed IN (0,1)),
+                    seq INTEGER NOT NULL CHECK(seq>=0),
+                    PRIMARY KEY(session_id,task_id)
+                );
+                CREATE INDEX IF NOT EXISTS session_tasks ON tasks(session_id,seq,task_id);
+                PRAGMA user_version=5; COMMIT;",
+            )
+            .map_err(sql)?;
         }
         Ok(Self {
             connection: Arc::new(Mutex::new(c)),
@@ -148,11 +164,20 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
             rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
         })?
         .unwrap_or_default();
+    let input = value
+        .get("yourai_input")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+        })?;
     let message = serde_json::from_value(value).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let status: String = r.get(4)?;
     Ok(StoredMessage {
+        input,
         id: r.get(0)?,
         seq: r.get(1)?,
         message,
@@ -172,6 +197,16 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
 }
 const MESSAGE_COLUMNS: &str =
     "message_id,seq,content_json,kind,status,format_version,tool_output_pruned_at";
+fn task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    Ok(Task {
+        id: r.get(0)?,
+        subject: r.get(1)?,
+        description: r.get(2)?,
+        owner: r.get(3)?,
+        completed: r.get(4)?,
+        seq: r.get(5)?,
+    })
+}
 fn meta_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
     Ok(SessionMeta {
         id: SessionId::from(r.get::<_, String>(0)?),
@@ -186,6 +221,15 @@ fn meta_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
 }
 fn stored_json(m: &StoredMessage) -> Result<String, YourAiError> {
     let mut value = serde_json::to_value(&m.message).map_err(sql)?;
+    if let Some(input) = &m.input {
+        if m.message.role != ChatRole::User || m.runtime_context || m.summary {
+            return Err(sql("only admitted user messages may carry input identity"));
+        }
+        if !matches!(input, In::UserText { id: Some(id), .. } if id == &m.id) {
+            return Err(sql("input identity differs from message identity"));
+        }
+        value["yourai_input"] = serde_json::to_value(input).map_err(sql)?;
+    }
     if m.runtime_context {
         value["yourai_runtime_context"] = true.into();
     }
@@ -248,6 +292,42 @@ fn insert(
     Ok(m)
 }
 impl SessionManager for SqliteStore {
+    fn read_tasks(&self, id: &SessionId) -> Result<Vec<Task>, YourAiError> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT task_id,subject,description,owner,completed,seq FROM tasks WHERE session_id=?1 ORDER BY seq,task_id").map_err(sql)?;
+            let rows = stmt.query_map([id.as_str()], task_row).map_err(sql)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql)
+        })
+    }
+    fn save_tasks(&self, id: &SessionId, tasks: Vec<Task>) -> Result<Vec<Task>, YourAiError> {
+        self.with(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+            let mut saved = Vec::with_capacity(tasks.len());
+            for mut task in tasks {
+                let seq = i64::try_from(task.seq).map_err(sql)?;
+                let existing = tx.query_row(
+                    "SELECT task_id,subject,description,owner,completed,seq FROM tasks WHERE session_id=?1 AND task_id=?2",
+                    params![id.as_str(), task.id], task_row,
+                ).optional().map_err(sql)?;
+                if let Some(previous) = existing {
+                    if previous.subject != task.subject || previous.description != task.description
+                        || previous.owner != task.owner || previous.seq != task.seq {
+                        return Err(sql("task identity conflict"));
+                    }
+                    // Completion is monotonic, including a retry of an older create.
+                    task.completed |= previous.completed;
+                }
+                tx.execute(
+                    "INSERT INTO tasks(session_id,task_id,subject,description,owner,completed,seq) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(session_id,task_id) DO UPDATE SET completed=excluded.completed",
+                    params![id.as_str(), task.id, task.subject, task.description, task.owner, task.completed, seq],
+                ).map_err(sql)?;
+                saved.push(task);
+            }
+            tx.commit().map_err(sql)?;
+            Ok(saved)
+        })
+    }
+
     fn initialize_system<'a>(
         &'a self,
         id: &'a SessionId,
@@ -265,11 +345,11 @@ impl SessionManager for SqliteStore {
 
     fn create_session<'a>(
         &'a self,
+        id: SessionId,
         system: &'a str,
     ) -> BoxFuture<'a, Result<SessionMeta, YourAiError>> {
         Box::pin(async move {
             let system = system.to_owned();
-            let id = SessionId::new();
             let sid = id.clone();
             self.run(move |c| {
                 c.execute(
@@ -316,6 +396,8 @@ impl SessionManager for SqliteStore {
             let n=tx.execute("INSERT INTO sessions(session_id,parent_session_id,title,model,provider,created_at,updated_at,system_prompt) SELECT ?2,session_id,title,model,provider,?3,?3,system_prompt FROM sessions WHERE session_id=?1",params![id.as_str(),child.as_str(),now()]).map_err(sql)?;
             if n==0 { return Err(sql("unknown parent session")); }
             tx.execute("INSERT INTO messages SELECT lower(hex(randomblob(16))),?2,seq,kind,role,content_json,format_version,tool_call_id,token_count,status,created_at,tool_output_pruned_at FROM messages WHERE session_id=?1",params![id.as_str(),child.as_str()]).map_err(sql)?;
+            // Forked admissions use the same new identity as their copied message.
+            tx.execute("UPDATE messages SET content_json=json_set(content_json,'$.yourai_input.UserText.id',message_id) WHERE session_id=?1 AND json_type(content_json,'$.yourai_input.UserText')='object'",[child.as_str()]).map_err(sql)?;
             tx.commit().map_err(sql)?; Ok(child)
         }))
     }
@@ -360,7 +442,9 @@ impl SessionManager for SqliteStore {
         change: ContextChange,
     ) -> BoxFuture<'a, Result<(), YourAiError>> {
         let id = id.clone();
+        let progress = change.progress.clone();
         Box::pin(self.run(move |c| {
+            progress.store(CommitStatus::Started as u8, std::sync::atomic::Ordering::Release);
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
             let is_retry = if let Some(summary) = &change.compaction {
                 tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE message_id=?1 AND session_id=?2)",params![summary.summary.id,id.as_str()],|r|r.get::<_,bool>(0)).map_err(sql)?
@@ -372,6 +456,7 @@ impl SessionManager for SqliteStore {
             tx.execute("UPDATE sessions SET updated_at=?2 WHERE session_id=?1",params![id.as_str(),now()]).map_err(sql)?;
             let Some(change) = change.compaction else {
                 tx.commit().map_err(sql)?;
+                progress.store(CommitStatus::Committed as u8, std::sync::atomic::Ordering::Release);
                 return Ok(());
             };
             if !change.summary.summary || change.summary.status != MessageStatus::Active || change.sources.is_empty() { return Err(sql("invalid compaction candidate")); }
@@ -420,6 +505,7 @@ impl SessionManager for SqliteStore {
                 insert(&tx, &id, change.summary)?;
             }
             tx.commit().map_err(sql)?;
+                progress.store(CommitStatus::Committed as u8, std::sync::atomic::Ordering::Release);
             Ok(())
         }))
     }

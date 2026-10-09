@@ -1,6 +1,6 @@
 //! Attachment intake: one [`UserAttachment`] in → one genai [`ContentPart`] out.
 //!
-//! Two source forms (see [`yourai_core::protocol::AttachmentData`]):
+//! Two source forms (see [`crate::protocol::AttachmentData`]):
 //! - **Base64** media: images are normalized first (opencode `image.ts`:
 //!   5 MB base64 / 2000×2000 ceilings, auto-resize before rejection), audio
 //!   and PDF pass through — their sizes are provider-side concerns.
@@ -10,8 +10,8 @@
 //!   same normalization ladder, directories expand to a first-level listing,
 //!   audio/PDF become Binary parts.
 
+use crate::prelude::*;
 use std::path::{Path, PathBuf};
-use yourai_core::prelude::*;
 
 use base64::{
     engine::{
@@ -34,7 +34,7 @@ const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
 /// Invalid input requires user correction; unavailable infrastructure remains
 /// an execution failure so the original input can be retried unchanged.
 #[derive(Debug)]
-pub(super) enum ResolveError {
+pub(crate) enum ResolveError {
     Invalid(String),
     Unavailable(YourAiError),
 }
@@ -59,7 +59,7 @@ fn io_error(object: &str, path: &str, error: std::io::Error) -> ResolveError {
         | ErrorKind::InvalidData
         | ErrorKind::InvalidInput => ResolveError::Invalid(reason),
         _ => ResolveError::Unavailable(
-            yourai_core::ErrorKind::Provider {
+            crate::ErrorKind::Provider {
                 name: "attachment",
                 message: reason,
             }
@@ -79,7 +79,7 @@ fn encode_error(error: image::ImageError) -> ResolveError {
 
 /// Prepare all content before committing any user history. Relative references
 /// resolve against the execution's session cwd, never a frontend's process cwd.
-pub(super) fn message(
+pub(crate) fn message(
     text: &str,
     attachments: &[UserAttachment],
     config: &super::ExecutionConfig,
@@ -104,7 +104,7 @@ pub(super) fn message(
 }
 
 /// Resolve one attachment into a model-visible content part.
-pub(super) fn resolve_attachment(
+pub(crate) fn resolve_attachment(
     att: &UserAttachment,
     config: &super::ExecutionConfig,
 ) -> Result<ContentPart, ResolveError> {

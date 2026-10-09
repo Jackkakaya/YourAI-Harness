@@ -1,3 +1,7 @@
+> 2026-10-09 更新：当前业务执行采用 [Hook 最终实现](hook-template-design.md)：Tool / Model / Compactor 的公共 exec 直接拥有流程，Turn 只管理本轮状态。Providers 是注册容器，ContextManager / SessionManager 保留原领域名。本文保留早期调研与运输示例；正常业务调用使用 [execution.md](execution.md)，完整协议以当前源码为准。
+
+> Hook 执行采用模板方法模式：core 的具体执行对象固定公共 exec/操作流程，内部业务步骤私有；插件只实现业务 Provider。全部 28 个 Hook 的触发与结果处理在 core。Harness 负责默认 Loop、具体 Provider 和装配。历史“core 只含 trait”的表述以此更新为准。
+
 > 工具与调度的当前调用接口见 [公共执行层](./execution.md)。业务 Loop 使用 AgentLoop；Hook、审批和执行不再放在 DefaultLoop。下文保留早期架构讨论。
 
 # YourAI 架构设计文档
@@ -34,9 +38,9 @@ YourAI 是一个"乐高积木"式的 agent 框架。`yourai-core` 定义接口�
 
 ### 核心原则
 
-1. **Core 只定义 trait，不含任何实现** —— 所有默认实现在细粒度的 crate 中
+1. **Core 定义业务接口并实现固定执行模板** —— Hook、权限、取消和生命周期规则由 core 保证；具体模型、工具和存储 Provider 在 Harness 或外部插件中
 2. **机制与词汇分离** —— 词汇（In/Out 消息）定义在独立叶子 crate `yourai-protocol`（零依赖），core 依赖它并以**具体类型**签名；改词汇不碰 core 源码，`#[non_exhaustive]` 保证加变体不炸下游插件
-3. **Context 容器模式** —— 全局 `Context` 持有所有 provider，明确字段，类型安全
+3. **Providers 容器模式** —— 全局 `Providers` 持有所有 provider，明确字段，类型安全
 4. **AgentLoop 最小签名** —— 只给 `TurnContext`（providers 引用 + inbox/outbox/cancel）；loop 是 inbox 的**独占拉取消费者**，用户完全自由编排
 5. **全部可热替换** —— 所有 provider 是 `Arc<dyn Trait>`，运行时可替换
 6. **复用 genai** —— 模型层直接使用 [rust-genai](https://github.com/jeremychone/rust-genai) 的类型（ChatRequest/ChatResponse/ChatMessage/Tool/Usage 等），不重新造轮子
@@ -128,7 +132,7 @@ YourAI 是一个"乐高积木"式的 agent 框架。`yourai-core` 定义接口�
  ┌─────────────────────────────────────────────────────────────────┐
  │  yourai-core（trait + turn 运输机制，零业务 Provider 实现）                                 │
  │  ┌───────────────┐  ┌─────────────────┐  ┌────────────────────┐ │
- │  │ Agent + Builder│─►│ TurnHandle      │  │ Context            │ │
+ │  │ Agent + Builder│─►│ TurnHandle      │  │ Providers            │ │
  │  │ start()/run()  │  │ inbox / outbox  │  │ 12 个 provider     │ │
  │  │ 唯一 spawn 点   │  │ cancel / join() │  │ trait 的句柄容器    │ │
  │  └───────────────┘  └────────┬────────┘  └─────────┬──────────┘ │
@@ -212,14 +216,14 @@ YourAI 是一个"乐高积木"式的 agent 框架。`yourai-core` 定义接口�
 | `yourai-core` | 机制/运输 | start 唯一 spawn；TurnHandle/TurnContext；RwLock 热替换；两级错误；genai 0.6.5 re-export | §4、§5.5–5.7 |
 | `yourai-loop-default` | 编排/解释 | ReAct；工具错误消化为 is_error；SteerMode；唯一 loop | §7 |
 | `yourai-tui / web` | 节奏/渲染 | 双层循环（pi 外层 + codex 内层）；渲染 registry；adapter | §6.5 |
-| 实现 crate × N | 能力 | 全部 `Arc<dyn>` 可热换（一个 trait 可多实现）；MCP=ToolHandler；ContextManager 持 session_id | §4.2–4.12 |
+| 实现 crate × N | 能力 | 全部 `Arc<dyn>` 可热换（一个 trait 可多实现）；MCP=ToolProvider；ContextManager 持 session_id | §4.2–4.12 |
 | `yourai-cli` | 装配策略 | toml → 类型化直调 → builder；core 不读文件、impl crate 不读文件 | §5.8 |
 
 ### 3.4 Crate 结构
 
 > **现状（v0.1 漂移说明）**：下表是目标形态。当前 workspace 实际为 3 个
 > crate——`yourai-core`（trait + 运输机制）、`yourai-harness`（全部默认实现：
-> DefaultLoop / GenaiModel / MemoryContext / SqliteStore / 内置工具 / hooks /
+> DefaultLoop / GenaiModel / DefaultContext / SqliteStore / 内置工具 / hooks /
 > SessionHost 宿主）、`apps/yourai-tui`（前端）。目标拆分等外部使用者出现再做。
 
 ```
@@ -228,13 +232,13 @@ yourai/                              # workspace root
 ├── yourai-core/                     # 接口 + 运输机制（零业务 Provider 实现）
 │   └── src/
 │       ├── lib.rs                   # 入口 + prelude
-│       ├── context.rs               # Context 容器 + Agent + AgentBuilder
+│       ├── context.rs               # Providers 容器 + Agent + AgentBuilder
 │       ├── agent_loop.rs            # AgentLoop trait
 │       ├── model.rs                 # ModelProvider trait
 │       ├── context_manager.rs       # ContextManager trait
 │       ├── session.rs               # SessionManager trait
 │       ├── memory.rs                # MemoryManager trait
-│       ├── tool.rs                  # ToolHandler + ToolRegistry trait
+│       ├── tool.rs                  # ToolProvider + ToolRegistry trait
 │       ├── skill.rs                 # SkillProvider trait
 │       ├── sandbox.rs               # SandboxProvider trait + SandboxPolicy
 │       ├── security.rs              # SecurityProvider trait
@@ -272,13 +276,13 @@ yourai/                              # workspace root
 每个实现 crate 只依赖 `yourai-core` + 自己需要的第三方库，互不依赖。
 用户按需选择 crate 组装，不要的就不引入。
 
-### 3.5 Context 容器
+### 3.5 Providers 容器
 
-`Context` 是所有 provider 的容器。AgentLoop 从 Context 取所需 provider 来编排。
+`Providers` 是所有 provider 的容器。AgentLoop 从 Providers 取所需 provider 来编排。
 
 ```
-Context (容器)                          TurnContext (每次 turn 的交互参数)
-├── agent_loop:      AgentLoop          ├── ctx:    &Context
+Providers (容器)                          TurnContext (每次 turn 的交互参数)
+├── agent_loop:      AgentLoop          ├── ctx:    &Providers
 ├── model:           ModelProvider      ├── outbox: &dyn OutSink       ← send(Out)
 ├── context_manager: ContextManager     ├── inbox:  &mut Receiver<In>  ← 外界 → loop
 ├── session:         SessionManager     └── cancel: &CancellationToken ← 控制面
@@ -292,9 +296,9 @@ Context (容器)                          TurnContext (每次 turn 的交互参�
 └── hooks:           HookRegistry
 ```
 
-**命名澄清：** `Context`（容器）和 `ContextManager`（对话历史管理）是两个不同的东西。
+**命名澄清：** `Providers`（容器）和 `ContextManager`（对话历史管理）是两个不同的东西。
 
-**Context 是纯粹的 provider 容器**——交互管道（inbox/outbox/cancel）不在 Context 里，而是每次 turn 由 `Agent::start()` 装配进 `TurnContext` 传入（见第 6 章，借鉴 pi 的"交互管道是 run 的参数"）。消息类型是 `yourai-protocol` 的具体 `In`/`Out`（4.13）——core 依赖协议 crate 但不拥有词汇。
+**Providers 是纯粹的 provider 容器**——交互管道（inbox/outbox/cancel）不在 Providers 里，而是每次 turn 由 `Agent::start()` 装配进 `TurnContext` 传入（见第 6 章，借鉴 pi 的"交互管道是 run 的参数"）。消息类型是 `yourai-protocol` 的具体 `In`/`Out`（4.13）——core 依赖协议 crate 但不拥有词汇。
 
 ### 3.6 数据流
 
@@ -326,7 +330,7 @@ TurnOutput { text, usage, pending }  → join() 交付；pending 非空由调用
 
 **职责：** 编排 turn 流程（模型调用 → 工具执行 → 重复直到完成）
 
-**设计决策：最小签名，最大自由。** 只给 TurnContext（providers 快照 + inbox/outbox/cancel），用户完全自己编排。启动输入不是特殊参数——**它是 inbox 的第一条消息**，loop 只有一条读路径。live Context 不进入 TurnContext，避免自定义 loop 绕过 turn 级快照。
+**设计决策：最小签名，最大自由。** 只给 TurnContext（providers 快照 + inbox/outbox/cancel），用户完全自己编排。启动输入不是特殊参数——**它是 inbox 的第一条消息**，loop 只有一条读路径。live Providers 不进入 TurnContext，避免自定义 loop 绕过 turn 级快照。
 
 ```rust
 pub trait AgentLoop: Send + Sync {
@@ -406,21 +410,21 @@ pub trait ModelProvider: Send + Sync {
 
 **职责：** 管理对话历史（发给模型的消息序列）
 
-**注意：** 这不是 Context 容器，而是管理模型上下文窗口的 provider。
+**注意：** 这不是 Providers 容器，而是管理模型上下文窗口的 provider。
 
 ```rust
+// 完整签名见 core/context_manager.rs，以下列出当前协议。
 pub trait ContextManager: Send + Sync {
-    fn messages(&self) -> Vec<ChatMessage>;
-    fn add_user_message(&self, text: &str) -> BoxFuture<'_, Result<()>>;
-    fn add_assistant_message(&self, text: &str) -> BoxFuture<'_, Result<()>>;
-    fn add_tool_result(&self, response: ToolResponse) -> BoxFuture<'_, Result<()>>;  // call_id 贯穿
-    fn add_message(&self, message: ChatMessage) -> BoxFuture<'_, Result<()>>;
-    fn build_request(&self) -> ChatRequest;
-    fn build_request_with(&self, tools: &[Tool], system: Option<&str>) -> ChatRequest;
-    fn compact(&self) -> BoxFuture<'_, Result<()>>;
-    fn token_count(&self) -> u64;
-    fn clear(&self) -> BoxFuture<'_, Result<()>>;
-    fn record_usage(&self, usage: &Usage) -> BoxFuture<'_, Result<()>>;
+    fn system_prompt(&self) -> String;
+    fn session_id(&self) -> &SessionId;
+    fn restore(&self) -> BoxFuture<'_, Result<(), YourAiError>>;
+    fn append(&self, rows: Vec<StoredMessage>) -> BoxFuture<'_, Result<(), YourAiError>>;
+    fn build_request(&self, tools: &[ToolDefinition], model: &dyn ModelProvider)
+        -> Result<ContextRequest, YourAiError>;
+    fn prepare_compaction<'a>(&'a self, request: &'a CompactionRequest,
+        model: &'a dyn ModelProvider, cancel: &'a CancellationToken)
+        -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>>;
+    fn records(&self) -> Vec<StoredMessage>;
 }
 ```
 
@@ -471,13 +475,13 @@ pub trait MemoryManager: Send + Sync {
 }
 ```
 
-### 4.6 ToolRegistry + ToolHandler
+### 4.6 Tool / ToolRegistry / ToolProvider
 
 **职责：** 工具注册与执行
 
 **设计：** 分离定义侧（给模型看的 schema）和执行侧（实际运行的代码）。执行签名带 `ToolContext`——**工具有身份（call_id）、能发进度、能被取消、能拿两层审批能力**。shell 流 stdout、browser 发截图、subagent 转发子事件都靠 `tc.emit_progress()`（id 自动取 call_id）；ESC 打断长工具靠 `tc.cancel`。工具仍然不知道 UI 存在——只对 outbox 讲协议。
 
-**两层审批**：第一层 `check_tool_call` 由 loop 在调度前统一问，允许 `Ask`；工具通过 `security_context(input)` 显式描述破坏性和网络属性，loop 不猜工具语义。第二层 `check_command`/`check_file_access` 与 `sandbox.apply(&mut Command)` 只有具体工具自己知道 Command/路径——经 ToolContext 注入的能力由工具自调。第二层只能 Allow/Deny，不能 Ask：此时 loop 正在等待工具，工具没有 inbox 消费权，交互会形成循环等待。
+**两层审批**：第一层 `check_tool_call` 由 Tool.exec 中的授权函数统一问，允许 `Ask`；工具通过 `security_context(input)` 显式描述破坏性和网络属性，loop 不猜工具语义。第二层 `check_command`/`check_file_access` 与 `sandbox.apply(&mut Command)` 只有具体工具自己知道 Command/路径——经 ToolContext 注入的能力由工具自调。第二层只能 Allow/Deny，不能 Ask：此时 loop 正在等待工具，工具没有 inbox 消费权，交互会形成循环等待。
 
 ```rust
 pub struct ToolContext<'a> {
@@ -492,22 +496,18 @@ impl ToolContext<'_> {
     pub fn emit_progress(&self, payload: Value) -> bool;  // id 自动 = call_id
 }
 
-pub trait ToolHandler: Send + Sync {
-    fn name(&self) -> &str;
-    fn definition(&self) -> Tool;                    // genai::chat::Tool
-    fn security_context(&self, input: &Value) -> SecurityContext;
-    fn run<'a>(&'a self, tc: ToolContext<'a>, input: Value) -> BoxFuture<'a, Result<Value, YourAiError>>;
+pub trait ToolProvider: Send + Sync {
+    fn definition(&self) -> ToolDefinition;
+    fn security_context(&self, input: &Value, cwd: Option<&Path>) -> SecurityContext;
+    fn run<'a>(&'a self, tc: ToolContext<'a>, input: Value)
+        -> BoxFuture<'a, Result<Value, YourAiError>>;
 }
 
 pub trait ToolRegistry: Send + Sync {
-    fn register(&self, handler: Arc<dyn ToolHandler>);          // 委托 register_binding
-    fn register_binding(&self, binding: ToolBinding);            // 注册侧协议入口
+    fn register(&self, provider: Arc<dyn ToolProvider>);
     fn unregister(&self, name: &str);
-    fn has(&self, name: &str) -> bool;
-    fn definitions(&self) -> Vec<Tool>;              // 所有工具的 schema
-    fn security_context(&self, name: &str, input: &Value) -> Result<SecurityContext>;
-    fn resolve(&self, name: &str) -> Result<ToolBinding, YourAiError>; // 返回私有持有 backend 的执行绑定
-    fn count(&self) -> usize;
+    fn snapshot(&self) -> Vec<Tool>;  // 一次原子读取固定定义与执行对象
+    // resolve / definitions / has / count / extend 复用默认实现。
 }
 ```
 
@@ -726,7 +726,7 @@ pub enum Out {
 **语义约定：**
 
 - **Ask/Reply 是唯一的一问一答机制**：审批、提问、多选、表单、计划确认、MCP elicitation 全是 payload 约定，机制只有一对。审批 = `Ask{payload: 审批描述}` + `Reply{payload: approve/deny}`
-- **取消不走 In**（cancel token，控制面）；SetModel/Compact/Shutdown 不是 turn 消息，是 Agent 方法（热替换走 Context 的 RwLock，见 5.2 / 8.4）
+- **取消不走 In**（cancel token，控制面）；SetModel/Compact/Shutdown 不是 turn 消息，是 Agent 方法（热替换走 Providers 的 RwLock，见 5.2 / 8.4）
 - **协议不携带任何工具的专属变体**：工具三段式（Started/Progress/Done）是骨架，input/output/payload 是结构化 Value；browser 截图、subagent 事件树、shell stdout 都走 ToolProgress 载荷
 - **渲染知识在前端**：前端按 tool name 注册 renderer，新工具出现协议零改动
 
@@ -754,13 +754,13 @@ YourAI 是开箱即用的 agent，用户可以零定制直接跑，也可以替�
 
 **决策：** `RwLock<Option<Arc<dyn Trait>>>` 够用，不引入 `arc-swap`。
 
-**语义（收敛修订：由"读取时取最新"收紧为 **turn 开始时快照**）：** `start()/run()` 在启动时把 12 个插槽快照成 `ProviderSnapshot` 装进 `TurnContext`——一个 turn 内所有 provider 读取都走快照，**热替换必然只影响下一 turn**。live Context 不进入 TurnContext；管理方经 `Agent::ctx()` 调 `set_*`/registry API。替换后旧 Arc 由快照持有，进行中的调用安全完成。agent 瓶颈在 IO，锁竞争可忽略；未来如需优化，换 `arc-swap` 是实现细节，不影响 trait 定义。
+**语义（收敛修订：由"读取时取最新"收紧为 **turn 开始时快照**）：** `start()/run()` 在启动时把 12 个插槽快照成 `ProviderSnapshot` 装进 `TurnContext`——一个 turn 内所有 provider 读取都走快照，**热替换必然只影响下一 turn**。live Providers 不进入 TurnContext；管理方经 `Agent::ctx()` 调 `set_*`/registry API。替换后旧 Arc 由快照持有，进行中的调用安全完成。agent 瓶颈在 IO，锁竞争可忽略；未来如需优化，换 `arc-swap` 是实现细节，不影响 trait 定义。
 
 ### 5.3 MCP 集成 ✅ 已决策
 
-**决策：** 方案 B——MCP 工具作为 `ToolHandler` 注册到现有 `ToolRegistry`。
+**决策：** 方案 B——MCP 工具作为 `ToolProvider` 注册到现有 `ToolRegistry`。
 
-- `yourai-tools-mcp` 只提供 `McpClient::connect() → Vec<Arc<dyn ToolHandler>>`
+- `yourai-tools-mcp` 只提供 `McpClient::connect() → Vec<Arc<dyn ToolProvider>>`
 - 用户自然混用内置工具和 MCP 工具，都注册到同一个 registry
 - MCP server 生命周期管理（进程启动/重启/健康检查）是 `yourai-tools-mcp` 内部事务
 - core 零新增 trait
@@ -781,10 +781,10 @@ YourAI 是开箱即用的 agent，用户可以零定制直接跑，也可以替�
 
 - **词汇在 `yourai-protocol`**（独立叶子 crate，零依赖，core 依赖它）：In 2 变体（UserText/Reply）+ Out 9 变体；Ask/Reply 是唯一的一问一答机制（审批/提问/表单/计划确认全是 payload 约定）
 - **不用类型擦除**（`dyn Any` 曾被考虑后否决）：生态需要一门共同语言而不是 N 门；具体类型带来编译期安全 + 无装箱噪音；加变体改 protocol crate，core 源码不动；`#[non_exhaustive]` 保证演化不炸下游。这正是 codex 的真实结构（`codex-protocol` 叶子 crate，`codex-core` 依赖它）
-- **交互管道是 run 的参数**（借鉴 pi）：由 `Agent::start()` 每次 turn 装配进 TurnContext，不放 Context
+- **交互管道是 run 的参数**（借鉴 pi）：由 `Agent::start()` 每次 turn 装配进 TurnContext，不放 Providers
 - **`start()` 是唯一 spawn 点**（对应 pi 低层 fire-and-forget）→ 返回 TurnHandle；`run()` 是丢弃 outbox 的阻塞变体（不建 channel，避免无人消费堆积）
 - **双路径**：取消走 CancellationToken 快路径（绕过 inbox 立即生效，能打断"正在等消息的 loop"本身）；其余一切消息走 inbox 慢路径（loop 独占拉取，消费时机是 loop 的自由）
-- **工具可发消息、可被取消**：`ToolHandler::run(tc: ToolContext, input)`——subagent/browser/长任务可显示的先决条件
+- **工具可发消息、可被取消**：`ToolProvider::run(tc: ToolContext, input)`——subagent/browser/长任务可显示的先决条件
 - **生命周期不用消息表达**：开始 = start 返回；结束 = outbox 关闭；失败 = join 的 Err
 - **丢弃 TurnHandle 即取消**（drop → cancel token）：消费端离开（SSE 断开、客户端丢失句柄）后 turn 不再继续耗模型/工具资源；要 fire-and-forget 就把句柄存进任务表，不要丢弃
 - **`OutSink::send` 返回 `bool`**（false = 消费端已关闭）：loop 在每个 emit 点都能检测对端死亡，立即以 `Aborted(Disconnected)` 中止，不必等到下一个 recv 点
@@ -855,7 +855,7 @@ agent.ctx().tools()?.extend(handlers);    // 批量（MCP connect → Vec 一批
 ```
 
 - **build() 不做必需性检查**——缺什么在使用点报 `Config` 错。原则：只有 loop 知道自己需要什么，装配点猜"必需/可选"必然猜错（trivial loop 不要 tools，headless loop 可没有 model）。typestate builder（编译期强制完整性）因此否决
-- **Context 双读法**：`model()/tools()/...` 缺失报 `Config` 错；`try_model()/try_tools()/...` 缺失返回 `None`——loop 按下面的依赖矩阵自选读法
+- **Providers 双读法**：`model()/tools()/...` 缺失报 `Config` 错；`try_model()/try_tools()/...` 缺失返回 `None`——loop 按下面的依赖矩阵自选读法
 - **turn 开始时快照**（见 5.2）：`ProviderSnapshot` 里必需项直接是字段，可选项是 `Option<Arc<dyn>>`
 
 **DefaultLoop 依赖矩阵：**
@@ -868,7 +868,7 @@ agent.ctx().tools()?.extend(handlers);    // 批量（MCP connect → Vec 一批
 | security | 可选 | 缺省 = 不拦截，直接执行 |
 | sandbox | 可选 | 缺省 = 不施加沙箱 |
 | session / memory / skills / usage / observability / hooks | 可选 | 缺省 = 跳过对应职责 |
-- **安装期零依赖**：插件 install 时不给任何依赖，所有协作推迟到运行期经 Context 解决——消掉注册顺序问题
+- **安装期零依赖**：插件 install 时不给任何依赖，所有协作推迟到运行期经 Providers 解决——消掉注册顺序问题
 
 **策略层（CLI）：类型化直调，不做通用 from_config**
 
@@ -1064,45 +1064,16 @@ pi 的做法：故意什么都不带，官方答案 = subagent 扩展（工具�
 | 不同配置（coder + researcher） | 2 个 session | 不同配置的 builder，各自 start |
 | 子 agent | 一个 Tool 调用产生的独立 run | 见下 |
 
-**子 agent = 一个 Tool 实现**，core 零改动：
+**子 agent 是具体工具能力**：Subagent 直接实现 ToolProvider，生命周期由 core Subagent.exec 执行。
 
-```rust
-struct SubagentTool { /* 子 agent 配置 */ }
-
-impl ToolHandler for SubagentTool {
-    fn name(&self) -> &str { "subagent" }
-    fn definition(&self) -> Tool { /* ... */ }
-    fn security_context(&self, input: &Value) -> SecurityContext {
-        SecurityContext {
-            action: self.name().into(), input: input.clone(),
-            is_destructive: false, is_network: true,
-        }
-    }
-
-    fn run<'a>(&'a self, tc: ToolContext<'a>, input: Value) -> BoxFuture<'a, Result<Value, YourAiError>> {
-        Box::pin(async move {
-            let child = Agent::builder()
-                .context_manager(Arc::new(
-                    SqliteContextManager::open(db, SessionId::new())?  // 新 session
-                ))
-                // ...
-                .build();
-            let mut handle = child.start(In::UserText { text: task_prompt })?;
-            // 子 agent 的 outbox 逐条 Out → 序列化进 ToolProgress.payload 转发
-            while let Some(out) = handle.outbox.recv().await {
-                let payload = serde_json::to_value(&out)?;
-                if !tc.emit_progress(payload) {            // id 自动 = tc.call_id
-                    return Err(YourAiError::Aborted(AbortReason::Disconnected));
-                }
-            }
-            let output = handle.join().await?;
-            Ok(serde_json::json!({ "result": output.text }))
-        })
-    }
-}
+```text
+Tool.exec("subagent")
+  → Subagent.run（ToolProvider 参数入口）
+  → Subagent.exec：分配 ID → SubagentStart → Factory.create
+  → private run 驱动同一个 child → SubagentStop → 关闭
 ```
 
-真正的多 agent 协作工具面（spawn/wait/send_message，参照 codex multi_agents）是后续阶段，做成 `yourai-tools-subagent` crate，不在第一期。
+Host 只登记一份 children；关闭确认后移除，失败或未知状态继续保留所有权。ChildFactory 提供 Harness 实际装配，SubagentFactory 只创建子会话，不再额外包装 SubagentTool。
 
 ### 6.8 与同类 agent 的对比
 
@@ -1316,12 +1287,10 @@ let agent = Agent::builder()
 ```rust
 struct WeatherTool;
 
-impl ToolHandler for WeatherTool {
-    fn name(&self) -> &str { "get_weather" }
-
-    fn definition(&self) -> Tool {
-        // genai 0.6.5 API：Tool::new(name) + with_description / with_schema
-        Tool::new("get_weather")
+impl ToolProvider for WeatherTool {
+    fn definition(&self) -> ToolDefinition {
+        // ToolDefinition 是 genai::chat::Tool 的数据类型别名 + with_description / with_schema
+        ToolDefinition::new("get_weather")
             .with_description("Get current weather for a city")
             .with_schema(serde_json::json!({
                 "type": "object",
@@ -1330,9 +1299,9 @@ impl ToolHandler for WeatherTool {
             }))
     }
 
-    fn security_context(&self, input: &Value) -> SecurityContext {
+    fn security_context(&self, input: &Value, _cwd: Option<&Path>) -> SecurityContext {
         SecurityContext {
-            action: self.name().into(),
+            action: "get_weather".into(),
             input: input.clone(),
             is_destructive: false,
             is_network: true,

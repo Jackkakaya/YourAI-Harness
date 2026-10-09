@@ -1,28 +1,28 @@
 # Core 组件接口契约
 
-普通自定义调度使用 Harness 的 [AgentLoop 与公共执行层](./execution.md)。Core AgentLoop 保留为底层运输接口。
+普通自定义调度使用 core 的 [AgentLoop 与公共执行层](./execution.md)。Core AgentLoop 保留为底层运输接口。
 
 
 运行时补充接口：`TurnOptions.events` 绑定内部事件队列；ContextManager 内部协调持久化并维护归档身份索引；`SecurityProvider::update_permissions` 消费权限变更；`HookRuntime::subscribe_background / shutdown_session` 提供按会话订阅和后台回收。`TurnHandle::abort` 用于协作取消超时后的任务回收，宿主必须记录被强制中止执行的不确定状态。
 
 Core 的 deadline watchdog（截止时间后 60 秒宽限）强制丢弃 Loop，或 Loop 在构造/执行 future 时 panic，统一返回 `ErrorKind::LoopTerminated` 并取消 turn token。它表示执行状态未知，与正常协作收尾的 `Aborted(DeadlineExceeded)` 区分。宿主必须隔离会话并保留活动输入供检查；不得自动重放。Core 仍回收 inbox 中未消费的输入，但无法恢复 Loop 已消费的局部状态。
 
-对应 [完整流程图](./default-loop-flow.md)。本文定义公共边界和运输机制。DefaultLoop、会话宿主、compact 摘要和业务扩展现已统一实现在 `yourai-harness`，见 [实现文档](./default-loop-implementation.md) 与 [Runtime 文档](./runtime-implementation.md)。下文出现的 `yourai-loop` / `yourai-runtime` 是合并前的历史包名。
+对应 [完整流程图](./default-loop-flow.md)。本文定义公共边界和运输机制。DefaultLoop、具体摘要 Provider 和业务扩展在 `yourai-harness`；公共执行模板、会话宿主与工作区操作在 `yourai-core`，见 [实现文档](./default-loop-implementation.md) 与 [Runtime 文档](./runtime-implementation.md)。下文出现的 `yourai-loop` / `yourai-runtime` 是合并前的历史包名。
 
 ## 图与代码的对应
 
 | 流程 | 已定义的接口/类型 | 实现边界 |
 |---|---|---|
-| 图 1：会话宿主 | `SessionRuntime`、`SessionContext`、`SessionStatus`、`SessionTurn`、`InputRejected` | trait 在 core，具体宿主在外部实现；不是 Context 的新 Provider 插槽 |
-| 图 2：主循环 | `AgentLoop`、`TurnResult`、`TurnFailure`、`TurnInfo`、`TurnOptions`、`TurnLimits` | core 传递环境与结果；AgentLoop 自主管理调度；公共业务操作管理超时、恢复、提交与 Hook |
-| 图 2：compact | `CompactionRequest`、`CompactionResult`、`CompactionTrigger`；更新 `ContextManager::prepare_compaction` | 公共 context.compact 触发 Hook；ContextManager 准备业务计划，CompactionJob 生成并提交摘要 |
-| 图 3：工具 | `ToolRegistry::resolve`；`ToolInteraction`、`InteractionRequest`、`InteractionKind`；`ToolContext::ask` | ToolExecutor 位于公共 execution 模块；AgentLoop 只获得包装能力，交互桥和回复路由归公共执行层 |
-| 图 4：可选扩展 | 复用 ToolHandler、HookRuntime、SessionRuntime | 不预先增加工作区、多 Agent、协作任务的公共 Provider |
+| 图 1：会话宿主 | `SessionHost`、`SessionContext`、`SessionStatus`、`SessionTurn`、`InputRejected` | 具体宿主 SessionHost 在 core；不是 Context 的新 Provider 插槽 |
+| 图 2：主循环 | `AgentLoop`、`TurnResult`、`TurnFailure`、`TurnInfo`、`TurnOptions`、`TurnLimits` | core 传递环境与结果；AgentLoop 自主管理调度；Tool / Model / Compactor 管理各自执行流程 |
+| 图 2：compact | `CompactionRequest`、`CompactionResult`、`CompactionTrigger`；更新 `ContextManager::prepare_compaction` | Compactor::exec 触发 Hook；ContextManager 准备业务计划，CompactionJob 生成并提交摘要 |
+| 图 3：工具 | `ToolRegistry::resolve`；`ToolInteraction`、`InteractionRequest`、`InteractionKind`；`ToolContext::ask` | Tool::exec 位于 core tool 模块；AgentLoop 调用固定公共操作，交互桥和回复路由归公共执行层 |
+| 图 4：可选扩展 | 复用 ToolProvider、HookRuntime、SessionHost | 不预先增加工作区、多 Agent、协作任务的公共 Provider |
 | 图 5：Hook | 复用现有 HookRuntime / HookRegistry / HookHandler | 保持 Hook wire 协议；公共业务入口自动触发并消费 Hook，Core 底层运输接口不代替业务包装 |
 
 ## 1. 会话宿主
 
-`SessionRuntime` 定义对象安全的会话控制接口。创建/恢复由具体实现的构造入口负责，完成历史绑定、Agent 装配及 SessionStart 后才暴露实例。
+`SessionHost` 直接实现会话控制流程。创建/恢复由具体实现的构造入口负责，完成历史绑定、Agent 装配及 SessionStart 后才暴露实例。
 
 ```text
 submit(In)
@@ -42,6 +42,7 @@ run_next(limits, outbox, cancel)
 
 - 明确拒绝（无效附件、UserPromptSubmit 阻止）：发布 `Out::InputRejected { rejection: InputRejected { input, reason } }`，并记录到 `TurnOutput.rejected`；原输入不写历史、不调用模型，也不进入 `pending` 自动重试。`InputRejected` 统一定义于 protocol，原 `session_runtime::InputRejected` 路径继续重导出。
 - 暂时执行失败（存储失败、暂时 I/O 故障、超时或取消）：保留原输入到 `TurnFailure.output.pending`，沿用已有重试约定。
+- UserText 的可选 id 对旧 wire 保持兼容，入口在转移所有权前补齐。重试必须复用 pending 中的身份；StoredMessage.input 保存原输入，恢复已确认提交后不重复追加或准备附件。用户消息与该次 Hook 附加上下文须由 ContextManager.append 原子保存。
 - `Out::InputRejected` 与 `TurnOutput.rejected` 是同一拒绝的实时通知与最终报告；消费者选择一种恢复渠道，不能当成两次拒绝。非流式 `Agent::run` 调用方需要检查 `rejected`，成功完成接纳判定不等于输入已提交给模型。
 - 附件读取和解码在阻塞工作线程准备；主循环继续响应取消与 deadline。取消后的只读工作可以自行结束，但不提交历史。相对 FileRef 路径基于 `SessionContext.cwd` 解析。
 
@@ -58,7 +59,7 @@ run_next(limits, outbox, cancel)
 - `compact(request, cancel)`：手动压缩，与 Turn 写历史互斥；ContextManager 的摘要生命周期包装负责前后 Hook。
 - `close(timeout: Option<Duration>)`：拒绝新输入、清理当前执行、SessionEnd、释放资源，成功时归还剩余输入；None 等待清理完成，Some 显式限制整个关闭过程。
 
-`SessionManager` 继续负责元数据；`ContextManager` 负责历史；SessionRuntime 不通过监听 Out 重复保存历史。状态机、互斥、后台事件与恢复策略是未来具体宿主的实现责任。
+`SessionManager` 继续负责元数据；`ContextManager` 负责历史；SessionHost 不通过监听 Out 重复保存历史。状态机、互斥、后台事件与恢复策略由 core SessionHost 实现。
 
 ## 2. Turn 身份、环境和限制
 
@@ -114,34 +115,26 @@ Core 在 Loop 返回后，无论 Ok/Err，都先关闭 inbox，再把未接收�
 ## 4. ContextManager
 
 ```text
-restore()                         恢复已提交视图
-append(Vec<StoredMessage>)         保存消息，成功后更新内存
-build_request(system, tools, execution)      返回 ChatRequest、估算、可用输入预算及维护标志
-compact(CompactionRequest, execution, cancel) 返回已完成的 CompactionResult
+restore()                              同步已开始写入并恢复已提交视图
+append(Vec<StoredMessage>)              保存消息，成功后更新内存
+build_request(tools, model)             只读构造模型请求和用量估算
+prepare_compaction(request, model, cancel)  准备业务，返回 Complete / Summary job
 ```
 
-ContextExecution 由当前执行快照生成，携带 model/hooks/usage/Hook 基础信息；ContextManager 不持有第二份运行时依赖。ModelProvider 统一使用 complete / stream_events，UsageTracker 统一使用 record_event。
+Compactor 持有选定的 context / model / hooks / usage 和 Hook 基础信息，exec 直接拥有 prepare → PreCompact → private run → PostCompact。ContextManager 的业务算法只接收需要的模型和计量能力，不接收 HookRuntime。它持有已冻结的基础 system prompt，不把 system 放入普通消息。
 
-保留 session_id、records/messages、归档身份等只读查询；无公开 reset/prune/候选提交接口。system 只能经 build_request 传入。
+CompactionJob 保留必要的锁与事务，PreCompact 通过后才调用 run 生成并提交摘要。不变和只剪枝的 Complete 路径不触发摘要 Hook。摘要提交进度由持久化实现立即确认；取消时区分未提交、未知提交和已提交后中断，未知状态须 restore，不能重放。PostCompact 的失败不撤销摘要。完整流程见 [ContextManager 设计](context-manager-design.md)。
 
-CompactionRequest 包含 Threshold/Overflow/Manual、请求环境、摘要要求、截止时间、剩余调用额度。共享调用计数和已知 usage 在失败/取消后仍可结算。CompactionResult.action 为 Unchanged / Pruned / Summarized，包含前后估算、原因与提交后 Hook 状态，不返回待提交候选。
+## 5. 工具与交互
 
-```text
-Loop / Host → ContextManager.compact
-                → 清理
-                → 必要时 PreCompact → 模型摘要
-                → SessionManager.save_context（事务）→ 更新内存
-                → PostCompact
-            ← 已提交结果
+ToolProvider 提供 definition、security_context、run；没有第二份 name。ToolRegistry 注册时构造 Tool 并固定定义，resolve 返回持有私有 backend 的 Tool。调用者使用 Tool.exec；ToolContext 由其私有 run 装配。
+
+```rust
+let call = turn.enqueue("my_tool", serde_json::json!({})).await?;
+turn.tool(&call.call_id)?.exec(&mut turn, &call.call_id).await?;
 ```
 
-ContextManager 内部记录 UsageTracker；Loop 只汇总 Turn 用量，不重复写账。PostCompact 的失败/停止不回滚已提交摘要。完整流程见 [ContextManager 设计](./context-manager-design.md)。
-
-## 5. 工具绑定与执行期交互
-
-`ToolRegistry::resolve(name)` 返回 Arc<dyn ToolHandler>。一次调用解析一次，Loop 用同一个 handler 描述权限并执行。现有 security_context/execute 保留为便捷方法，默认委托 resolve；分开调用便捷方法不保证跨调用目标相同。
-
-ToolContext 新增可选的 `interaction: Option<&dyn ToolInteraction>`。
+一次模型请求的 schema 和对应待执行 Tool 来自同一 snapshot。执行前认领身份，真实结果进入本调用记录后再执行 post。开始后不能重放，保存失败时稳定身份用于结算。
 
 ```rust
 let answer = tc.ask(
@@ -150,21 +143,9 @@ let answer = tc.ask(
 ).await?;
 ```
 
-ask 自动生成独立 request_id 并关联 call_id，缺少交互实现立即报 Config，等待时响应取消。InteractionKind::McpElicitation 携带服务端和 elicitation 身份，完整表单等仍由 payload 表达。
+ToolContext.ask 生成独立 request_id，关联 call_id；未配置交互立即报 Config。Tool 私有 run 等待业务时同时服务交互通道，interaction::elicit 负责 MCP 前后事件与答案校验。Turn 负责唯一 inbox 和 Ask / Reply 路由，普通提问不触发 MCP Hook。
 
-```text
-ToolContext.ask
-    -> ToolInteraction.request
-    -> Loop 的内部请求通道（yourai-loop）
-    -> 对 MCP 调用 Elicitation Hook
-    -> Out::Ask / In::Reply
-    -> 对 MCP 调用 ElicitationResult Hook
-    -> 校验并经专属回复通道返回工具
-```
-
-只有 Loop 读取 inbox。交互桥处理时间限制、非交互运行、请求注销与迟到回复；Loop 等待工具时同时服务桥接通道。该流程已在 yourai-loop 实现。
-
-第二层 Security 检查仍仅 Allow/Deny；MCP 或普通业务提问不能变成绕过硬性权限的另一个审批入口。
+第二层 Security 仍仅 Allow / Deny；提问不能绕过硬策略。
 
 ## 6. 输入模式与迁移
 
@@ -182,11 +163,11 @@ In::follow_up("稍后执行")    // mode = FollowUp
 1. Loop 实现改为返回 TurnResult；构造 YourAiError 后用 `.into()` 转为 TurnFailure，或显式提供部分输出。
 2. 错误消费者通过 `failure.error` 检查原因，通过 `failure.output` 读取部分结果。
 3. UserText 模式匹配使用 `{ text, .. }` 或显式处理 mode；构造优先使用 helper。
-4. ContextManager 实现新增 session_id，更新 compact 签名与返回值。
-5. ToolRegistry 实现新增 resolve；手工构造 ToolContext 需提供 interaction。
+4. ContextManager 实现 session_id、restore、append、build_request 与 prepare_compaction；摘要任务经 Compactor 执行。
+5. ToolRegistry 实现 register / unregister / snapshot；其余查询复用默认实现；ToolProvider 以 definition 作为唯一名字。
 6. 手工构造 TurnContext 需传入 info；正常使用 Agent 启动时由 core 完成装配。
 
-core 没有新增 DefaultLoop、ToolExecutor、工作区或协作任务 Provider。yourai-loop 已接入这些契约；SessionHost 已实现具体会话宿主。
+core 直接实现执行、会话、工作区、任务和子会话的固定流程；Harness 提供默认 Loop、业务 Provider、存储及装配。
 
 ## DefaultLoop 接入时的补充
 
@@ -194,7 +175,7 @@ core 没有新增 DefaultLoop、ToolExecutor、工作区或协作任务 Provider
 - ModelProvider::classify_error() 提供中立错误分类，默认 Unclassified；core 不解析厂商错误码。默认 recovery() 映射模型分类，Adapter 可独立覆盖。RateLimited 显式启用共享冷却，使用模型的 retry_after 或配置回退；其他分类不会触发共享冷却。GenaiModel 自行解释结构化 HTTP 错误。
 - OutSink::closed 默认保持 pending，core 通道实现提供真实关闭信号。
 - AbortReason::HookStopped 表示 Hook 通用停止请求。
-- ContextManager/SessionManager 工具结果提交按 call_id 防重复；ToolHandler 执行 future 须 cancellation-safe。
+- ContextManager/SessionManager 工具结果提交按 call_id 防重复；ToolProvider 执行 future 须 cancellation-safe。
 
 ### 模型传输层超时
 

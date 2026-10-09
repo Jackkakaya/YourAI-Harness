@@ -3590,11 +3590,16 @@ dependencies = [
 name = "yourai-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "fs2",
  "futures-core",
  "futures-util",
  "genai",
+ "image",
+ "jsonschema",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -3613,7 +3618,6 @@ dependencies = [
  "html2md",
  "httpdate",
  "image",
- "jsonschema",
  "libc",
  "pulldown-cmark",
  "regex",

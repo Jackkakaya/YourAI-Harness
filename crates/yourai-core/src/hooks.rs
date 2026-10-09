@@ -531,6 +531,45 @@ impl HookDispatchResult {
         }
         Ok(())
     }
+    /// Structured context has the same meaning at every hook entry.
+    pub fn additional_contexts(&self) -> &[String] {
+        match &self.outcome {
+            HookPointOutcome::SessionStart(o) => &o.additional_contexts,
+            HookPointOutcome::UserPromptSubmit(o) => &o.additional_contexts,
+            HookPointOutcome::PreToolUse(o) => &o.additional_contexts,
+            HookPointOutcome::PostToolUse(o) => &o.additional_contexts,
+            HookPointOutcome::Generic(o) => &o.additional_contexts,
+            _ => &[],
+        }
+    }
+    pub fn blocking_messages(&self) -> Vec<String> {
+        self.common
+            .blocking_errors
+            .iter()
+            .map(|e| e.message.clone())
+            .collect()
+    }
+    pub fn ensure_continuation(&self) -> Result<(), YourAiError> {
+        if self.common.prevent_continuation {
+            return Err(crate::AbortReason::HookStopped(
+                self.common
+                    .stop_reason
+                    .clone()
+                    .unwrap_or_else(|| "hook requested stop".into()),
+            )
+            .into());
+        }
+        Ok(())
+    }
+    pub fn ensure_allowed(&self) -> Result<(), YourAiError> {
+        self.ensure_continuation()?;
+        if !self.common.blocking_errors.is_empty() {
+            return Err(
+                crate::AbortReason::HookStopped(self.blocking_messages().join("\n")).into(),
+            );
+        }
+        Ok(())
+    }
     pub fn visible_messages(&self) -> impl Iterator<Item = &HookMessage> {
         self.common.messages.iter().filter(|m| {
             !self
@@ -652,7 +691,7 @@ pub enum FailurePolicy {
 
 /// Hook 运行时接口。
 ///
-/// 实现方在 `yourai-harness::hooks` crate（`ConcreteHookRuntime`）。
+/// 实现方在 `yourai-harness::hooks` crate（`DefaultHookRuntime`）。
 /// 业务操作的框架包装通过此 trait 分发 Hook 调用并消费类型化结果。
 ///
 /// ## 职责边界
@@ -767,30 +806,6 @@ pub enum HookOutput {
     /// Handler 已转入后台执行。
     Backgrounded { task_id: String },
 }
-
-// region:    --- 宿主回调（core 操作模板的注入点） ---
-
-/// Host-side callbacks for core-owned operation templates.
-///
-/// 运行时宿主实现本 trait：`dispatch_hook` 用宿主的 hook runtime 派发事件；
-/// `consume_hook_result` 应用结果（阻断语义 + 通知/附加上下文进入宿主事件队列）。
-/// core 公共操作模板（任务、工作区等）通过它把 hook 结果交还宿主；
-/// 模板自身固定事件顺序与各操作的 `deny_block` 语义。
-pub trait HookHost: Send + Sync {
-    /// Dispatch one hook event with the host's hook runtime and timeout.
-    fn dispatch_hook(
-        &self,
-        event: HookEvent,
-    ) -> BoxFuture<'_, Result<HookDispatchResult, YourAiError>>;
-    /// Consume a dispatch result; `deny_block` marks operations whose
-    /// blocking errors abort the call site.
-    fn consume_hook_result<'a>(
-        &'a self,
-        result: &'a HookDispatchResult,
-        deny_block: bool,
-    ) -> BoxFuture<'a, Result<(), YourAiError>>;
-}
-// endregion: --- 宿主回调（core 操作模板的注入点） ---
 
 #[cfg(test)]
 mod tests {

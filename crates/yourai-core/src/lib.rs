@@ -1,7 +1,7 @@
 //! # yourai-core
 //!
-//! YourAI 机制层：**接口定义（trait）+ turn 运输机制，零业务 Provider 实现。**
-//! （机制实现——spawn、channel、句柄、SessionId 等——属于本 crate 职责；
+//! YourAI 机制层：**业务接口 + 固定执行模板 + turn 运输机制。**
+//! （机制实现——执行、Hook、会话/工作区生命周期、spawn、channel 等——属于本 crate 职责；
 //! 业务 Provider 一律在外部 crate。）
 //!
 //! 分工（三权分立，见 docs/architecture.md §3.1）：
@@ -56,24 +56,29 @@ pub mod completion;
 pub mod context;
 pub mod context_manager;
 pub mod error;
+pub mod execution;
+pub mod file_store;
 pub mod future;
 pub mod hooks;
-pub mod inputs;
 pub mod interaction;
 pub mod memory;
 pub mod model;
+pub mod model_error;
 pub mod observability;
+pub mod permission;
 pub mod protocol;
+pub mod runtime;
 pub mod runtime_event;
 pub mod sandbox;
 pub mod security;
 pub mod session;
-pub mod session_ops;
 pub mod session_runtime;
 pub mod skill;
 pub mod subagent;
 pub mod tasks;
+mod time;
 pub mod tool;
+pub mod tool_output;
 pub mod turn;
 pub mod ui;
 pub mod usage;
@@ -84,7 +89,7 @@ pub mod chat {
     pub use genai::chat::{
         Binary, BinarySource, ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatRole,
         ChatStreamEvent, ChatStreamResponse, ContentPart, MessageContent, StopReason, StreamChunk,
-        StreamEnd, Tool, ToolCall, ToolChoice, ToolResponse, Usage as GenaiUsage,
+        StreamEnd, Tool as ToolDefinition, ToolCall, ToolChoice, ToolResponse, Usage as GenaiUsage,
     };
 }
 
@@ -101,31 +106,30 @@ pub mod prelude {
     pub use crate::compaction::{
         CompactAction, CompactionRequest, CompactionResult, CompactionTrigger, ContextPolicy,
     };
-    pub use crate::completion::{Completion, CompletionOperation};
+    pub use crate::completion::Completion;
     pub use crate::context::{
-        Agent, AgentBuilder, Context, ProviderSnapshot, TurnContext, TurnHandle,
+        Agent, AgentBuilder, ProviderSnapshot, Providers, TurnContext, TurnHandle,
     };
     pub use crate::context_manager::{
-        compact, CompactionCommit, CompactionJob, CompactionPlan, ContextExecution, ContextManager,
-        ContextRequest,
+        CompactionJob, CompactionPlan, Compactor, ContextManager, ContextRequest,
     };
     pub use crate::error::{AbortReason, ErrorKind, YourAiError};
+    pub use crate::execution::Turn;
     pub use crate::future::BoxFuture;
     pub use crate::hooks::{
         BaseInput, FailurePolicy, HookBlockingError, HookCommonOutcome, HookDispatchResult,
-        HookEvent, HookEventKind, HookHandler, HookHost, HookInvocation, HookMessage,
-        HookMessageKind, HookOutput, HookPermission, HookPointOutcome, HookRegistry, HookRun,
-        HookRunStatus, HookRuntime, HookSource, NativeHookRegistration,
+        HookEvent, HookEventKind, HookHandler, HookInvocation, HookMessage, HookMessageKind,
+        HookOutput, HookPermission, HookPointOutcome, HookRegistry, HookRun, HookRunStatus,
+        HookRuntime, HookSource, NativeHookRegistration,
     };
-    pub use crate::inputs::InputOperation;
     pub use crate::interaction::{InteractionKind, InteractionRequest, ToolInteraction};
     pub use crate::memory::{
         CompletedMemoryTurn, MemoryEntry, MemoryManager, MemoryProvider, MemorySession,
         RecallRequest, RecalledMemory,
     };
     pub use crate::model::{
-        ModelErrorClass, ModelEventStream, ModelOperation, ModelOptions, ModelOutput,
-        ModelProvider, ModelRecovery, ModelRequest, ModelTimeouts,
+        Model, ModelErrorClass, ModelEventStream, ModelOptions, ModelOutput, ModelProvider,
+        ModelRecovery, ModelRequest, ModelTimeouts,
     };
     pub use crate::observability::{ObservabilityProvider, Span};
     pub use crate::protocol::{
@@ -136,22 +140,22 @@ pub mod prelude {
         ApprovalDecision, PolicyDecision, SecurityContext, SecurityProvider,
     };
     pub use crate::session::{
-        CompactionChange, ContextChange, MessagePage, MessageQuery, MessageStatus,
+        CommitStatus, CompactionChange, ContextChange, MessagePage, MessageQuery, MessageStatus,
         RequestObservation, SessionId, SessionManager, SessionMeta, StoredMessage,
     };
-    pub use crate::session_ops::{session_end, session_start, turn_completed, SessionStartSink};
-    pub use crate::session_runtime::{
-        InputRejected, SessionContext, SessionRuntime, SessionStatus, SessionTurn,
-    };
+    pub use crate::session_runtime::{InputRejected, SessionContext, SessionStatus, SessionTurn};
     pub use crate::skill::{SkillContent, SkillInfo, SkillProvider};
-    pub use crate::tasks::{
-        complete_task, create_task, teammate_idle, Task, TaskBoardProvider, TaskCompletePlan,
-        TaskCreatePlan,
-    };
-    pub use crate::tool::{
-        ExecutedTool, ToolBinding, ToolContext, ToolHandler, ToolOperation, ToolRegistry,
-    };
+    pub use crate::tasks::{Task, TaskManager};
+    pub use crate::tool::{ExecutedTool, Tool, ToolContext, ToolProvider, ToolRegistry};
     pub use crate::turn::{InputOptions, TurnId, TurnInfo, TurnLimits, TurnOptions};
     pub use crate::ui::OutSink;
     pub use crate::usage::{UsageEvent, UsageStats, UsageTracker};
+}
+
+pub(crate) fn error(name: &'static str, e: impl std::fmt::Display) -> YourAiError {
+    ErrorKind::Provider {
+        name,
+        message: e.to_string(),
+    }
+    .into()
 }

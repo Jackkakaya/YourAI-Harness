@@ -5,10 +5,11 @@ use tokio_util::sync::CancellationToken;
 use yourai_core::{context::DiscardSink, prelude::*};
 use yourai_harness::tools::*;
 
-async fn call(tool: &dyn ToolHandler, input: Value) -> Result<Value, YourAiError> {
+async fn call(tool: &dyn ToolProvider, input: Value) -> Result<Value, YourAiError> {
     let cancel = CancellationToken::new();
     tool.run(
         ToolContext {
+            cwd: None,
             call_id: "test".into(),
             emit: &DiscardSink,
             cancel: &cancel,
@@ -118,6 +119,7 @@ async fn symlinks_permissions_line_endings_and_cancelled_write() {
     assert!(write
         .run(
             ToolContext {
+                cwd: None,
                 call_id: "cancel".into(),
                 emit: &DiscardSink,
                 cancel: &cancel,
@@ -195,6 +197,7 @@ async fn dropping_shell_future_kills_descendants() {
         shell
             .run(
                 ToolContext {
+                    cwd: None,
                     call_id: "drop".into(),
                     emit: &DiscardSink,
                     cancel: &cancel,
@@ -251,6 +254,7 @@ async fn hard_denial_prevents_side_effects() {
     assert!(write
         .run(
             ToolContext {
+                cwd: None,
                 call_id: "deny".into(),
                 emit: &DiscardSink,
                 cancel: &cancel,
@@ -279,11 +283,14 @@ async fn oversized_writes_leave_original_unchanged_and_tools_have_unique_schemas
     .is_err());
     assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "original");
     let tools = coding_tools(&root).unwrap();
-    let names: std::collections::HashSet<_> = tools.iter().map(|t| t.name()).collect();
+    let names: std::collections::HashSet<_> = tools
+        .iter()
+        .map(|t| t.definition().name.as_str().to_owned())
+        .collect();
     assert_eq!(names.len(), 6);
     assert!(names.contains("webfetch") && names.contains("websearch"));
     for t in &tools {
-        assert_eq!(t.name(), t.definition().name.as_str());
+        assert!(!t.definition().name.as_str().is_empty());
     }
 }
 #[cfg(unix)]
@@ -298,6 +305,7 @@ async fn cancellation_token_stops_shell_and_sandbox_denial_prevents_spawn() {
         shell
             .run(
                 ToolContext {
+                    cwd: None,
                     call_id: "cancel".into(),
                     emit: &DiscardSink,
                     cancel: &token,
@@ -348,6 +356,7 @@ async fn cancellation_token_stops_shell_and_sandbox_denial_prevents_spawn() {
     assert!(shell
         .run(
             ToolContext {
+                cwd: None,
                 call_id: "sandbox".into(),
                 emit: &DiscardSink,
                 cancel: &cancel,

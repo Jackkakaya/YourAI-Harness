@@ -177,7 +177,7 @@ pub(super) fn diff_line(line: &str, width: usize, prefix: &str) -> Vec<Line<'sta
     wrap_bg(line, Style::default().fg(fg).bg(bg), width, prefix)
 }
 
-/// Width budget above which diffs render side-by-side (opencode's <diff>
+/// Width budget above which diffs render side-by-side (opencode's `<diff>`
 /// component uses the same 120-column threshold).
 const SPLIT_DIFF_MIN_WIDTH: usize = 120;
 

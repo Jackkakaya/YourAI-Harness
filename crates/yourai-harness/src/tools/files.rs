@@ -192,15 +192,12 @@ macro_rules! constructor {
 constructor!(Read);
 constructor!(Write);
 constructor!(Edit);
-impl ToolHandler for Read {
-    fn name(&self) -> &str {
-        "read"
+impl ToolProvider for Read {
+    fn definition(&self) -> ToolDefinition {
+        schema("read","Read a UTF-8 text file with line numbers. offset is 1-based; use next_offset for subsequent pages. No images or binary files.",json!({"path":{"type":"string","minLength":1},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":2000}}), &["path"])
     }
-    fn definition(&self) -> Tool {
-        schema(self.name(),"Read a UTF-8 text file with line numbers. offset is 1-based; use next_offset for subsequent pages. No images or binary files.",json!({"path":{"type":"string","minLength":1},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":2000}}), &["path"])
-    }
-    fn security_context(&self, input: &Value) -> SecurityContext {
-        security(self.name(), &self.cwd, input, false)
+    fn security_context(&self, input: &Value, cwd: Option<&Path>) -> SecurityContext {
+        security("read", cwd.unwrap_or(&self.cwd), input, false)
     }
     fn run<'a>(
         &'a self,
@@ -208,19 +205,19 @@ impl ToolHandler for Read {
         input: Value,
     ) -> BoxFuture<'a, Result<Value, YourAiError>> {
         Box::pin(async move {
-            let i: ReadInput = serde_json::from_value(input).map_err(|e| error(self.name(), e))?;
+            let i: ReadInput = serde_json::from_value(input).map_err(|e| error("read", e))?;
             if i.path.is_empty() || i.offset == 0 || !(1..=2000).contains(&i.limit) {
-                return Err(error(self.name(), "invalid path, offset or limit"));
+                return Err(error("read", "invalid path, offset or limit"));
             }
-            let cwd = self.cwd.clone();
+            let cwd = tc.cwd.unwrap_or(&self.cwd).to_owned();
             let raw = i.path.clone();
-            let tool = self.name().to_owned();
+            let tool = "read".to_owned();
             let path =
                 blocking(move || resolve_path(&cwd, Path::new(&raw)).map_err(|e| error(&tool, e)))
                     .await?;
-            let path_str = utf8_path(&path, self.name())?.to_owned();
-            file_permission(&tc, &path, false, self.name()).await?;
-            let tool = self.name().to_owned();
+            let path_str = utf8_path(&path, "read")?.to_owned();
+            file_permission(&tc, &path, false, "read").await?;
+            let tool = "read".to_owned();
             let path = path.clone();
             let cancel = tc.cancel.clone();
             let offset = i.offset;
@@ -263,15 +260,12 @@ impl ToolHandler for Read {
         })
     }
 }
-impl ToolHandler for Write {
-    fn name(&self) -> &str {
-        "write"
+impl ToolProvider for Write {
+    fn definition(&self) -> ToolDefinition {
+        schema("write","Create a UTF-8 file or OVERWRITE its entire content. Creates parent directories. Use edit for targeted changes.",json!({"path":{"type":"string","minLength":1},"content":{"type":"string"}}), &["path","content"])
     }
-    fn definition(&self) -> Tool {
-        schema(self.name(),"Create a UTF-8 file or OVERWRITE its entire content. Creates parent directories. Use edit for targeted changes.",json!({"path":{"type":"string","minLength":1},"content":{"type":"string"}}), &["path","content"])
-    }
-    fn security_context(&self, input: &Value) -> SecurityContext {
-        security(self.name(), &self.cwd, input, true)
+    fn security_context(&self, input: &Value, cwd: Option<&Path>) -> SecurityContext {
+        security("write", cwd.unwrap_or(&self.cwd), input, true)
     }
     fn run<'a>(
         &'a self,
@@ -279,14 +273,14 @@ impl ToolHandler for Write {
         input: Value,
     ) -> BoxFuture<'a, Result<Value, YourAiError>> {
         Box::pin(async move {
-            let i: WriteInput = serde_json::from_value(input).map_err(|e| error(self.name(), e))?;
-            let cwd = self.cwd.clone();
+            let i: WriteInput = serde_json::from_value(input).map_err(|e| error("write", e))?;
+            let cwd = tc.cwd.unwrap_or(&self.cwd).to_owned();
             let raw = i.path.clone();
-            let tool = self.name().to_owned();
+            let tool = "write".to_owned();
             let path = blocking(move || target(&cwd, &raw, &tool)).await?;
-            let path_str = utf8_path(&path, self.name())?.to_owned();
-            file_permission(&tc, &path, true, self.name()).await?;
-            let tool = self.name().to_owned();
+            let path_str = utf8_path(&path, "write")?.to_owned();
+            file_permission(&tc, &path, true, "write").await?;
+            let tool = "write".to_owned();
             let content = i.content.clone();
             let cancel = tc.cancel.clone();
             let bytes = content.len();
@@ -298,15 +292,12 @@ impl ToolHandler for Write {
         })
     }
 }
-impl ToolHandler for Edit {
-    fn name(&self) -> &str {
-        "edit"
+impl ToolProvider for Edit {
+    fn definition(&self) -> ToolDefinition {
+        schema("edit","Replace one exact, unique occurrence of old_text in an existing UTF-8 file. Include enough context to make the match unique. No fuzzy matching; new_text may be empty to delete text. Returns a diff.",json!({"path":{"type":"string","minLength":1},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"}}), &["path","old_text","new_text"])
     }
-    fn definition(&self) -> Tool {
-        schema(self.name(),"Replace one exact, unique occurrence of old_text in an existing UTF-8 file. Include enough context to make the match unique. No fuzzy matching; new_text may be empty to delete text. Returns a diff.",json!({"path":{"type":"string","minLength":1},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"}}), &["path","old_text","new_text"])
-    }
-    fn security_context(&self, input: &Value) -> SecurityContext {
-        security(self.name(), &self.cwd, input, true)
+    fn security_context(&self, input: &Value, cwd: Option<&Path>) -> SecurityContext {
+        security("edit", cwd.unwrap_or(&self.cwd), input, true)
     }
     fn run<'a>(
         &'a self,
@@ -314,17 +305,17 @@ impl ToolHandler for Edit {
         input: Value,
     ) -> BoxFuture<'a, Result<Value, YourAiError>> {
         Box::pin(async move {
-            let i: EditInput = serde_json::from_value(input).map_err(|e| error(self.name(), e))?;
+            let i: EditInput = serde_json::from_value(input).map_err(|e| error("edit", e))?;
             if i.old_text.is_empty() {
-                return Err(error(self.name(), "old_text must be nonempty"));
+                return Err(error("edit", "old_text must be nonempty"));
             }
-            let cwd = self.cwd.clone();
+            let cwd = tc.cwd.unwrap_or(&self.cwd).to_owned();
             let raw = i.path.clone();
-            let tool = self.name().to_owned();
+            let tool = "edit".to_owned();
             let path = blocking(move || target(&cwd, &raw, &tool)).await?;
-            let path_str = utf8_path(&path, self.name())?.to_owned();
-            file_permission(&tc, &path, true, self.name()).await?;
-            let tool = self.name().to_owned();
+            let path_str = utf8_path(&path, "edit")?.to_owned();
+            file_permission(&tc, &path, true, "edit").await?;
+            let tool = "edit".to_owned();
             let old_text = i.old_text.clone();
             let new_text = i.new_text.clone();
             let cancel = tc.cancel.clone();

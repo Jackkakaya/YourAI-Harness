@@ -568,7 +568,7 @@ Wire JSON (camelCase)           YourAI Rust 类型
 | `agent` | `prompt` | `timeout`、`model`、`if`、`statusMessage`、`once` |
 
 YourAI Runtime 内建 `command` 和 `http` capability。`prompt` / `agent` 通过
-`HookModelExecutor` 由宿主注入；未注入时配置在注册阶段明确失败，不允许延迟到首次
+`HookEvaluator` 由宿主注入；未注入时配置在注册阶段明确失败，不允许延迟到首次
 dispatch 才报错。
 
 Runtime 不自行判断 workspace 是否可信。宿主配置层只能把已经通过 trust policy 的
@@ -612,7 +612,7 @@ Loop 调用 HookRuntime::dispatch(invocation)
   ├── 4. 并行执行所有匹配 handler（JoinSet + timeout）
   │      ├── CommandHandler: spawn → stdin JSON+\n → 读 stdout/stderr → exit code
   │      ├── HttpHandler: POST JSON → 读 response body → status code
-  │      ├── Prompt/Agent: 调用宿主注入的 HookModelExecutor
+  │      ├── Prompt/Agent: 调用宿主注入的 HookEvaluator
   │      └── NativeHandler: 直接调用 Rust handler
   ├── 5. 解析每个 handler 输出
   │      ├── exit 0 + JSON → parse_hook_json → Contribution
@@ -829,7 +829,7 @@ permission: HookPermission::Deny { reason: "no rm -rf" }
 | 并行执行 | 是，按完成顺序产生结果 | 相同，保留 registration 身份 | 已对齐 |
 | 同来源重复 Handler | 执行前去重 | 相同 | 已对齐 |
 | async/asyncRewake | 后台执行 + 完成事件 | 后台执行 + 完成事件；宿主按会话路由并唤醒 | 已接入并测试 |
-| prompt/agent handler | 内置模型能力 | 宿主注入 `HookModelExecutor`；缺失时注册失败 | 部分对齐 |
+| prompt/agent handler | 内置模型能力 | 宿主注入 `HookEvaluator`；缺失时注册失败 | 部分对齐 |
 | Workspace trust | 未信任项目 Hook 不执行 | 注册前由宿主策略层检查 | 待宿主验收 |
 | 事件数量 | 27 | 27 个兼容事件 + TurnCompleted 扩展 | 共 28 个 |
 | hookSpecificOutput 变体 | 15 | 15 | 已对齐 |

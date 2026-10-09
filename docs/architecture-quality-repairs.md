@@ -1,7 +1,7 @@
 # 代码质量整改：策略归属与持久化
 
 本次保留 core / harness / TUI 三个包，以及 SessionHost / DefaultLoop /
-MemoryContext / SQLite 的分工。整理的单位是职责和不变量，不按文件行数新增公共 trait。
+DefaultContext / SQLite 的分工。整理的单位是职责和不变量，不按文件行数新增公共 trait。
 
 ## 模型执行策略
 

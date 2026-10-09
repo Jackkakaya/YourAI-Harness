@@ -1,40 +1,33 @@
-use crate::error;
 use std::{collections::HashMap, sync::RwLock};
 use yourai_core::prelude::*;
 #[derive(Default)]
 pub struct ToolSet {
-    handlers: RwLock<HashMap<String, ToolBinding>>,
+    tools: RwLock<HashMap<String, Tool>>,
 }
 impl ToolRegistry for ToolSet {
-    fn register_binding(&self, h: ToolBinding) {
-        self.handlers.write().unwrap().insert(h.name().into(), h);
+    fn register(&self, provider: std::sync::Arc<dyn ToolProvider>) {
+        let tool = Tool::new(provider);
+        self.tools.write().unwrap().insert(tool.name().into(), tool);
     }
-    fn unregister(&self, n: &str) {
-        self.handlers.write().unwrap().remove(n);
+    fn unregister(&self, name: &str) {
+        self.tools.write().unwrap().remove(name);
     }
-    fn has(&self, n: &str) -> bool {
-        self.handlers.read().unwrap().contains_key(n)
+    fn snapshot(&self) -> Vec<Tool> {
+        let mut tools: Vec<_> = self.tools.read().unwrap().values().cloned().collect();
+        tools.sort_by(|a, b| a.name().cmp(b.name()));
+        tools
     }
-    fn definitions(&self) -> Vec<Tool> {
-        let mut v: Vec<_> = self
-            .handlers
-            .read()
-            .unwrap()
-            .values()
-            .map(|h| h.definition())
-            .collect();
-        v.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-        v
-    }
-    fn resolve(&self, n: &str) -> Result<ToolBinding, YourAiError> {
-        self.handlers
-            .read()
-            .unwrap()
-            .get(n)
-            .cloned()
-            .ok_or_else(|| error("tools", format!("unknown tool: {n}")))
-    }
-    fn count(&self) -> usize {
-        self.handlers.read().unwrap().len()
+}
+
+impl ToolSet {
+    pub fn new(tools: Vec<Tool>) -> Self {
+        Self {
+            tools: RwLock::new(
+                tools
+                    .into_iter()
+                    .map(|tool| (tool.name().to_owned(), tool))
+                    .collect(),
+            ),
+        }
     }
 }

@@ -65,7 +65,7 @@ impl SessionHost {
         }
     }
     /// Once started, an owned durable transition finishes even if its waiter leaves.
-    pub(super) async fn blocking<T: Send + 'static>(
+    pub(crate) async fn blocking<T: Send + 'static>(
         &self,
         work: impl FnOnce(Arc<Self>) -> T + Send + 'static,
     ) -> Result<T, YourAiError> {
@@ -95,9 +95,6 @@ impl SessionHost {
     pub async fn watch_path_async(&self, path: PathBuf) -> Result<(), YourAiError> {
         self.blocking(move |host| host.watch_path(path)).await?
     }
-    pub(crate) async fn set_cwd_async(&self, cwd: PathBuf) -> Result<(), YourAiError> {
-        self.blocking(move |host| host.set_cwd(cwd)).await?
-    }
     pub(super) async fn persist(&self) -> Result<(), YourAiError> {
         self.blocking(|host| host.journal().commit()).await?
     }
@@ -106,31 +103,13 @@ impl SessionHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Model;
-    impl ModelProvider for Model {
-        fn model_iden(&self) -> &str {
-            "test"
-        }
-        fn complete<'a>(
-            &'a self,
-            _: ModelRequest,
-        ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
-            Box::pin(async { unreachable!() })
-        }
-        fn stream_events<'a>(
-            &'a self,
-            _: ModelRequest,
-        ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
-            Box::pin(async { std::future::pending().await })
+    struct Sink;
+    impl OutSink for Sink {
+        fn send(&self, _: Out) -> bool {
+            true
         }
     }
-    async fn fixture() -> (tempfile::TempDir, crate::Harness) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
-        config.system_prompt = Some("test".into());
-        let harness = crate::Harness::open(config, Arc::new(Model)).await.unwrap();
-        (dir, harness)
-    }
+    use crate::runtime::test_support::fixture;
     #[tokio::test]
     async fn closed_host_cannot_overwrite_reopened_session() {
         let (_dir, harness) = fixture().await;
@@ -153,7 +132,9 @@ mod tests {
         let saved = std::fs::read(&path).unwrap();
 
         assert!(old.watch_path_async(old.dir.join("stale")).await.is_err());
-        assert!(old.set_cwd_async(old.dir.join("stale")).await.is_err());
+        assert!(old
+            .set_cwd_with_watch(old.dir.join("stale"), vec![])
+            .is_err());
         // Internal persistence must also reject a late write, independently
         // of the public mutation entry points' lifecycle checks.
         assert!(old.persist().await.is_err());
@@ -208,7 +189,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let saved: Journal = read_json(&host.dir.join("host.json")).unwrap();
+        let saved: Journal = read_json(&host.directory().join("host.json")).unwrap();
         assert_eq!(saved.queue.len(), 1);
         assert_eq!(harness.close().await.unwrap().len(), 1);
     }
@@ -221,11 +202,7 @@ mod tests {
         let running = host.clone();
         let waiter = tokio::spawn(async move {
             running
-                .run_next(
-                    TurnLimits::default(),
-                    &yourai_core::context::DiscardSink,
-                    &CancellationToken::new(),
-                )
+                .run_next(TurnLimits::default(), &Sink, &CancellationToken::new())
                 .await
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -259,38 +236,6 @@ mod tests {
         assert_eq!(harness.close().await.unwrap().len(), 1);
         assert!(harness.close().await.unwrap().is_empty());
     }
-    #[tokio::test]
-    async fn diagnostic_flush_failure_does_not_swallow_closed_inputs() {
-        use futures_util::FutureExt;
-        let (_dir, harness) = fixture().await;
-        harness
-            .host
-            .submit_async(In::user_text("kept"))
-            .await
-            .unwrap();
-        let connection =
-            rusqlite::Connection::open(harness.host.context().transcript_path.unwrap()).unwrap();
-        connection.execute("DROP TABLE model_requests", []).unwrap();
-        let metered = crate::MeteredModel {
-            inner: Arc::new(Model),
-            budget: harness.budget.clone(),
-        };
-        assert!(metered
-            .stream_events(ModelRequest::new(
-                ChatRequest::from_user("test"),
-                ChatOptions::default()
-            ))
-            .now_or_never()
-            .is_none());
-        assert_eq!(harness.close().await.unwrap().len(), 1);
-        assert!(harness.budget.snapshot().requests.journal_errors > 0);
-        assert!(harness
-            .host
-            .last_error()
-            .unwrap()
-            .contains("model_requests"));
-        assert!(harness.close().await.unwrap().is_empty());
-    }
     struct PendingLoop {
         entered: Notify,
         finish: Notify,
@@ -320,15 +265,11 @@ mod tests {
         let running = host.clone();
         let task = tokio::spawn(async move {
             running
-                .run_next(
-                    TurnLimits::default(),
-                    &yourai_core::context::DiscardSink,
-                    &CancellationToken::new(),
-                )
+                .run_next(TurnLimits::default(), &Sink, &CancellationToken::new())
                 .await
         });
         agent_loop.entered.notified().await;
-        let path = host.dir.join("host.json");
+        let path = host.directory().join("host.json");
         let backup = path.with_extension("backup");
         std::fs::rename(&path, &backup).unwrap();
         std::fs::create_dir(&path).unwrap();
@@ -346,7 +287,7 @@ mod tests {
         let (_dir, harness) = fixture().await;
         let host = harness.host.clone();
         host.submit_async(In::user_text("unstarted")).await.unwrap();
-        let path = host.dir.join("host.json");
+        let path = host.directory().join("host.json");
         let backup = path.with_extension("backup");
         {
             let mut transaction = host.journal();

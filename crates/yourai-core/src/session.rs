@@ -1,4 +1,4 @@
-//! SessionManager：会话元数据与历史持久化；不负责执行调度。
+//! SessionManager：会话元数据、历史与任务持久化；不负责执行调度。
 
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
@@ -58,6 +58,16 @@ pub struct SessionMeta {
 }
 
 pub trait SessionManager: Send + Sync {
+    /// Task rows belong to the session's existing persistence connection.
+    /// Initialization reads synchronously; runtime writes use the host's owned blocking worker.
+    fn read_tasks(&self, id: &SessionId) -> Result<Vec<crate::tasks::Task>, YourAiError>;
+    /// Commit the whole batch atomically and return the durable task values.
+    fn save_tasks(
+        &self,
+        id: &SessionId,
+        tasks: Vec<crate::tasks::Task>,
+    ) -> Result<Vec<crate::tasks::Task>, YourAiError>;
+
     /// Only fills a legacy NULL prompt. Returns the committed value on races/retry.
     fn initialize_system<'a>(
         &'a self,
@@ -81,8 +91,10 @@ pub trait SessionManager: Send + Sync {
         change: ContextChange,
     ) -> BoxFuture<'a, Result<(), YourAiError>>;
 
+    /// Persist a session under the caller's identity; allocation itself has no side effects.
     fn create_session<'a>(
         &'a self,
+        id: SessionId,
         system: &'a str,
     ) -> BoxFuture<'a, Result<SessionMeta, YourAiError>>;
     fn load_session<'a>(
@@ -104,6 +116,8 @@ pub trait SessionManager: Send + Sync {
 /// A message identity is allocated before submitting it; retries reuse the identity.
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
+    /// Original admitted input, retained to reconcile an uncertain append by identity.
+    pub input: Option<crate::protocol::In>,
     /// Immutable model-facing content, committed with the clean user message.
     pub api_content: Option<crate::chat::MessageContent>,
     pub recall: Vec<crate::memory::RecalledMemory>,
@@ -157,6 +171,7 @@ impl StoredMessage {
         Self {
             id: Uuid::new_v4().to_string(),
             seq: 0,
+            input: None,
             message,
             api_content: None,
             recall: vec![],
@@ -200,6 +215,8 @@ pub struct CompactionChange {
 /// One transaction: pruning alone, or pruning plus a replacement summary.
 #[derive(Debug, Clone, Default)]
 pub struct ContextChange {
+    /// Transient durable acknowledgement, never stored in the database.
+    pub progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
     pub compaction: Option<CompactionChange>,
     pub pruned: Vec<String>,
 }
@@ -208,6 +225,7 @@ impl From<CompactionChange> for ContextChange {
         Self {
             compaction: Some(compaction),
             pruned: vec![],
+            ..Default::default()
         }
     }
 }
@@ -218,4 +236,13 @@ pub struct RequestObservation {
     pub model: String,
     pub request: crate::chat::ChatRequest,
     pub input_tokens: u64,
+}
+
+/// One commit's observable phase, including cancellation of its waiting future.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum CommitStatus {
+    Pending = 0,
+    Started = 1,
+    Committed = 2,
 }

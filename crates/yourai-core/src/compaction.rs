@@ -1,5 +1,5 @@
 //! Context maintenance policy and committed outcomes.
-use crate::chat::{GenaiUsage, Tool};
+use crate::chat::{GenaiUsage, ToolDefinition};
 use std::{
     sync::{atomic::AtomicU32, Arc},
     time::Instant,
@@ -78,7 +78,7 @@ pub struct CompactionRequest {
     pub custom_instructions: Option<String>,
     pub target_tokens: Option<u64>,
     pub deadline: Option<Instant>,
-    pub tools: Vec<Tool>,
+    pub tools: Vec<ToolDefinition>,
     /// Shared counter survives errors/cancellation so the caller charges attempted calls.
     pub calls: Arc<AtomicU32>,
     pub max_model_calls: u32,

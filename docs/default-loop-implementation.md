@@ -2,14 +2,14 @@
 
 > 会话存储与统一提交路径已经落地，当前行为以 [会话存储设计](./session-storage-design.md) 和源码为准。
 
-`yourai_harness::DefaultLoop` 只实现默认调度。流程图 2、3 的执行契约现归独立 `execution` 模块，默认与自定义 Loop 共用。自定义接口和迁移说明见 [公共执行层](./execution.md)。实现依赖 `yourai-core`，core 不反向依赖 Loop。图 1、4 及具体 Provider 也统一位于 `yourai-harness`，见 [Runtime 实现与验收](./runtime-implementation.md)。
+`yourai_harness::DefaultLoop` 只实现默认调度。流程图 2、3 的执行契约现归独立 `execution` 模块，默认与自定义 Loop 共用。自定义接口和迁移说明见 [公共执行层](./execution.md)。实现依赖 `yourai-core`，core 不反向依赖 Loop。会话和工作区模板位于 core，具体 Provider 与装配位于 `yourai-harness`，见 [Runtime 实现与验收](./runtime-implementation.md)。
 
 ## 入口和模块
 
 ```text
 Agent.start / run
     -> DefaultLoop.run_turn
-       -> TurnExecution 公共操作
+       -> Turn 公共操作
        -> 首条输入 + UserPromptSubmit
        -> checkpoint：取消、steer、延迟上下文
        -> compact（需要时）
@@ -23,17 +23,18 @@ Agent.start / run
 
 | 文件 | 职责 |
 |---|---|
-| `default_loop/mod.rs` | DefaultLoop：调用公共模型和工具入口，提交候选完成 |
-| `execution/mod.rs` | TurnExecution、共享操作状态、业务能力与完成操作 |
-| `execution/config.rs` | ExecutionConfig 业务操作策略；default_loop/config.rs 保留原 LoopConfig 字段和 steps |
-| `execution/control.rs` | 可取消等待、唯一 inbox 消费、历史、用量与清理 |
-| `execution/admission.rs` | 输入 Hook、附件准备、拒绝与提交 |
-| `execution/model.rs` | 请求装配、工具绑定、流式事件、完整消息与工具 ID 校验 |
-| `execution/tools.rs` | 工具 Hook、校验、审批、执行与结果提交 |
-| `execution/interaction.rs` | 工具提问、回复路由、MCP Hook 与回复校验 |
-| `execution/hooks.rs` | 私有 Hook 调用和结果应用 |
+| Harness `default_loop/mod.rs` | 调度 Model / Tool，提交候选完成 |
+| Harness `default_loop/config.rs` | steps 和一个 ExecutionConfig |
+| core `execution/mod.rs` | Turn、唯一输入路由、调用账本、完成与收尾 |
+| core `execution/config.rs` | 业务执行配置及唯一默认值 |
+| core `execution/control.rs` | 可取消等待、输入路由和延迟上下文 |
+| core `execution/admission.rs` | 输入 Hook、附件准备和接纳 |
+| core `model.rs` | Model.exec 的请求、流、恢复和响应提交 |
+| core `tool.rs` | Tool.exec 的 Hook、授权、业务 run 与结果保存 |
+| core `permission.rs` / `interaction.rs` | 授权与 MCP 交互的实际普通函数 |
+| core `context_manager.rs` | Compactor.exec 的摘要前后事件与提交状态 |
 
-公共 ToolExecutor/ModelExecutor/ContextExecutor/InputExecutor/PermissionExecutor/InteractionExecutor 隐藏内部状态和 Hook 协议。DefaultLoop 不再直接 dispatch Hook。
+Turn 持有共享控制和账本。DefaultLoop 用 turn.model()?.exec、turn.tool(id)?.exec、accept_input、compact、complete；不 dispatch Hook，也不创建子执行器。完整用法见 [公共执行入口](execution.md)。
 
 ## 装配
 
@@ -55,7 +56,7 @@ fn assemble(model: Arc<dyn ModelProvider>, history: Arc<dyn ContextManager>) -> 
 }
 ```
 
-必需 ModelProvider、ContextManager。工具、安全、Hook、记忆、技能、用量及可观测性均按需装配。默认不检索记忆、不自动激活所有技能；配置 `memory_search_limit` 和 `skill_ids` 后才使用相应能力。
+必需 ModelProvider、ContextManager。工具、安全、Hook、记忆、技能、用量及可观测性均按需装配。默认不检索记忆、不自动激活所有技能；配置 `LoopConfig.execution.memory_search_limit` 和 `LoopConfig.execution.skill_ids` 后才使用相应能力。
 
 模型通过 `ModelProvider::stream_events` 获取事件流。测试和其他适配器可以直接构造事件流。`ModelProvider::recovery` 默认映射 provider 的 `classify_error`；未分类错误默认不可恢复。GenaiModel 自行分类结构化 HTTP 错误，其他适配器可独立实现分类和恢复策略，不能靠字符串猜测后无限重试。
 
@@ -75,7 +76,7 @@ fn assemble(model: Arc<dyn ModelProvider>, history: Arc<dyn ContextManager>) -> 
 
 ## 超时、预算和收尾
 
-agentic iteration 默认不限（steps=None）；达到第 N 步时要求模型仅文本总结、不再提供工具。steps=0 是配置错误。默认 5 次请求重试、1 次连续溢出恢复、3 次 Stop 继续、1 次权限重审。重试时间由 `model/retry.rs` 集中管理：初始 2 秒逐次倍增，附加至多 25% 抖动；无响应头时默认封顶 30 秒，有响应头时使用全局安全上限（`i32::MAX` 毫秒）。provider 返回的重试提示优先且不追加抖动；GenaiModel 从 Retry-After 解析提示，MeteredModel 与剩余共享冷却取较长者。
+agentic iteration 默认不限（steps=None）；达到第 N 步时要求模型仅文本总结、不再提供工具。steps=0 是配置错误。默认 5 次请求重试、1 次连续溢出恢复、3 次 Stop 继续、1 次权限重审。重试时间由 core `model_error.rs` 集中管理：初始 2 秒逐次倍增，附加至多 25% 抖动；无响应头时默认封顶 30 秒，有响应头时使用全局安全上限（`i32::MAX` 毫秒）。provider 返回的重试提示优先且不追加抖动；GenaiModel 从 Retry-After 解析提示，MeteredModel 与剩余共享冷却取较长者。
 
 总截止时间不因重试、审批或压缩重置。模型默认响应头等待与原始数据读取时限各 300 秒，不含整段响应总时长；心跳和未完整事件的原始数据会重置读取等待。GenaiModel 在传输层执行这两个时限，Loop 不重复添加事件空闲计时。普通操作、工具、审批、Hook 和收尾时限默认 None，可显式配置；工具单次时限覆盖执行及内部提问。
 
@@ -95,15 +96,15 @@ MCP 请求依次经过 Elicitation、用户回复（或 Hook 答复）、Elicita
 
 ## Hook 职责划分
 
-公共 execution 模块接入 10 个操作 Hook，DefaultLoop 和自定义 AgentLoop 无需触发或消费：UserPromptSubmit、Stop、StopFailure、PreToolUse、PostToolUse、PostToolUseFailure、PermissionRequest、PermissionDenied、Elicitation、ElicitationResult。
+core 的 Turn / Model / Tool 及授权、交互函数接入 10 个操作 Hook，DefaultLoop 和自定义 AgentLoop 无需触发或消费：UserPromptSubmit、Stop、StopFailure、PreToolUse、PostToolUse、PostToolUseFailure、PermissionRequest、PermissionDenied、Elicitation、ElicitationResult。
 
-SessionStart/SessionEnd、工作区、配置、指令文件、子 Agent、协作任务等事件仍归会话宿主或对应扩展。ConcreteHookRuntime 自主管理后台 Hook；宿主订阅其完成事件与唤醒策略不属于 DefaultLoop。Loop 的内部 Notice 不递归触发 Notification。
+SessionStart/SessionEnd、工作区、配置、指令文件、子 Agent、协作任务等事件仍归会话宿主或对应扩展。DefaultHookRuntime 自主管理后台 Hook；宿主订阅其完成事件与唤醒策略不属于 DefaultLoop。Loop 的内部 Notice 不递归触发 Notification。
 
-`yourai-harness` 还提供 SessionHost、GenaiModel、SQLite 持久化、模型摘要、宿主后台事件订阅和扩展。它们与 DefaultLoop 在模块层分离，完整装配入口是 `Harness::open`。
+core 提供 SessionHost 与宿主后台事件订阅；`yourai-harness` 提供 GenaiModel、SQLite、默认摘要算法和装配。它们与 DefaultLoop 在模块层分离，完整装配入口是 `Harness::open`。
 
 ## 验证
 
-`crates/yourai-harness/tests/loop_flow.rs` 使用可控制事件流和内存历史验证完整主链，覆盖审批、Hook 参数修改、硬拒绝、JSON Schema、普通/MCP 交互、压缩、有限重试、Stop、steer/follow-up、取消、断开、超时、预算以及批次收尾；包含真实 ConcreteHookRuntime 注册与效果消费测试。不依赖在线模型或 API Key。
+`crates/yourai-harness/tests/loop_flow.rs` 使用可控制事件流和内存历史验证完整主链，覆盖审批、Hook 参数修改、硬拒绝、JSON Schema、普通/MCP 交互、压缩、有限重试、Stop、steer/follow-up、取消、断开、超时、预算以及批次收尾；包含真实 DefaultHookRuntime 注册与效果消费测试。不依赖在线模型或 API Key。
 
 
 ## 工具输出存储与重复调用保护
@@ -112,8 +113,8 @@ Harness 装配为同一 SessionCatalog 的会话共享不可变的 ToolOutputSto
 `<root>/tool-output`。每次落盘使用独立 UUID 文件并排他创建，不依赖模型 call_id；
 不同 Harness root 不共享可变配置。后台每小时清理超过七天的受管理普通文件。
 
-DefaultLoop 在 PostToolUse（含 MCP 输出改写）之后统一处理超长结果：默认 2000 行、
-50 KiB，完整 JSON 落盘，头尾预览带 `output_paths`。MemoryContext 仍独立执行请求的
+Tool.exec 在 PostToolUse（含 MCP 输出改写）之后统一处理超长结果：默认 2000 行、
+50 KiB，完整 JSON 落盘，头尾预览带 `output_paths`。DefaultContext 仍独立执行请求的
 `tool_output_chars` 限额，但缩减及 prune 都保留文件路径和状态，不裁掉回看入口。
 过期文件不再保证可读；无需额外的 read_tool_result 工具。
 

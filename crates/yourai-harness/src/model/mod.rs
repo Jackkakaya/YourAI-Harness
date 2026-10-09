@@ -14,9 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use yourai_core::prelude::*;
 
-/// Provider label for model-step errors; matched as a contract by the loop.
-pub(crate) const MODEL_NAME: &str = "model";
-
 pub fn usage(u: &GenaiUsage) -> Usage {
     let input = u.prompt_tokens.unwrap_or(0).max(0) as u64;
     let output = u.completion_tokens.unwrap_or(0).max(0) as u64;
@@ -110,7 +107,7 @@ impl ModelProvider for GenaiModel {
     ///
     /// opencode estimates everything by content length (`util/token.ts`,
     /// `length / 4`) because it has no pre-flight input gate — overflows are
-    /// detected from provider errors and real usage. Our `MemoryContext`
+    /// detected from provider errors and real usage. Our `DefaultContext`
     /// refuses to send a request whose estimate exceeds the input budget, so
     /// a base64-length estimate (a 5 MB image ≈ 1.25 M "tokens") would hard-
     /// fail every image turn. Instead we estimate what providers actually

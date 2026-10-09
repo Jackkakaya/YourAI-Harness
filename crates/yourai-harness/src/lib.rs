@@ -11,12 +11,11 @@ pub mod runtime;
 pub mod security;
 pub mod skills;
 pub mod storage;
-mod time;
 pub mod tools;
 pub mod workspace;
 
 pub use assembly::{Harness, HarnessConfig};
-pub use context::{prompt::PromptConfig, MemoryContext};
+pub use context::{prompt::PromptConfig, DefaultContext};
 pub use model::{GenaiModel, MeteredModel, ModelBudget};
 pub use runtime::{HostConfig, SessionHost};
 pub use security::PolicySecurity;

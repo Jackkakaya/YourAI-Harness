@@ -36,7 +36,7 @@ pub(super) struct App {
     meta: Metadata,
     renderer: Renderer,
     clipboard_task: Option<JoinHandle<std::io::Result<()>>>,
-    /// The TaskBoard version already reflected in `view.session.todos`; None means
+    /// The TaskManager version already reflected in `view.session.todos`; None means
     /// the next sync must run (also reset on session switch).
     synced_todos: Option<u64>,
 }

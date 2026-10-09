@@ -83,6 +83,9 @@ impl UserAttachment {
 pub enum In {
     /// 对话输入 & steer（同一条路：首条 = 用户输入，后续 = mid-turn 注入）
     UserText {
+        /// Stable admission identity. Old wire messages receive one at the entry point.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         text: String,
         /// 仅影响运行中追加输入；作为首条输入时直接开始本次 Turn。
         /// 旧 wire 消息缺省为 Steer。
@@ -99,9 +102,18 @@ pub enum In {
 }
 
 impl In {
+    pub(crate) fn ensure_id(&mut self) {
+        if let Self::UserText { id, .. } = self {
+            if id.is_none() {
+                *id = Some(uuid::Uuid::new_v4().to_string());
+            }
+        }
+    }
+
     /// 便捷构造：用户输入
     pub fn user_text(text: impl Into<String>) -> Self {
         In::UserText {
+            id: Some(uuid::Uuid::new_v4().to_string()),
             text: text.into(),
             mode: InputMode::Steer,
             attachments: vec![],
@@ -113,6 +125,7 @@ impl In {
     /// 用户输入消费；Steer 会在下一个决策点立即生效并改写当前步骤走向。
     pub fn follow_up(text: impl Into<String>) -> Self {
         In::UserText {
+            id: Some(uuid::Uuid::new_v4().to_string()),
             text: text.into(),
             mode: InputMode::FollowUp,
             attachments: vec![],
@@ -125,6 +138,7 @@ impl In {
         attachments: Vec<UserAttachment>,
     ) -> Self {
         In::UserText {
+            id: Some(uuid::Uuid::new_v4().to_string()),
             text: text.into(),
             mode: InputMode::Steer,
             attachments,

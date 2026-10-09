@@ -256,7 +256,10 @@ async fn raw_byte_progress_keeps_compaction_and_metered_main_loop_alive() {
                     .model(model)
                     .context_manager(Arc::new(support::History::default()))
                     .agent_loop(Arc::new(DefaultLoop::new(LoopConfig {
-                        max_model_retries: 0,
+                        execution: yourai_core::execution::ExecutionConfig {
+                            max_model_retries: 0,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     })))
                     .build();
@@ -317,7 +320,10 @@ async fn per_turn_model_limit_is_forwarded_to_transport() {
         }))
         .context_manager(Arc::new(support::History::default()))
         .agent_loop(Arc::new(DefaultLoop::new(LoopConfig {
-            max_model_retries: 0,
+            execution: yourai_core::execution::ExecutionConfig {
+                max_model_retries: 0,
+                ..Default::default()
+            },
             ..Default::default()
         })))
         .build();

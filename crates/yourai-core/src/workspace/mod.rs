@@ -7,14 +7,13 @@ mod backend;
 mod operations;
 use crate::{
     error,
-    storage::{atomic_write, read_json},
-    SessionHost,
+    file_store::{atomic_write, read_json},
+    runtime::SessionHost,
 };
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
-    pub system_prompt: Option<String>,
     pub skill_ids: Vec<String>,
     pub memory_search_limit: usize,
 }
@@ -23,6 +22,7 @@ impl RuntimeConfig {
         host.configure_input(self.skill_ids, self.memory_search_limit);
     }
 }
+use crate::{prelude::*, runtime_event::RuntimeEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -32,19 +32,38 @@ use std::{
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
-use yourai_core::{prelude::*, runtime_event::RuntimeEvent};
 
 type WatchSnapshots = HashMap<PathBuf, HashMap<PathBuf, (u64, std::time::SystemTime)>>;
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum WorktreeRegistration {
+    Known { path: PathBuf, repository: PathBuf },
+    Legacy(PathBuf),
+}
+impl WorktreeRegistration {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Known { path, .. } | Self::Legacy(path) => path,
+        }
+    }
+    fn repository(&self) -> Option<&Path> {
+        match self {
+            Self::Known { repository, .. } => Some(repository),
+            Self::Legacy(_) => None,
+        }
+    }
+}
+
 pub struct Workspace {
     host: Weak<SessionHost>,
-    worktrees: Mutex<HashMap<String, PathBuf>>,
+    worktrees: Mutex<HashMap<String, WorktreeRegistration>>,
     watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stop: CancellationToken,
     snapshots: Mutex<WatchSnapshots>,
 }
 impl Workspace {
-    pub fn new(host: &Arc<SessionHost>) -> Result<Arc<Self>, YourAiError> {
+    pub(crate) fn new(host: &Arc<SessionHost>) -> Result<Arc<Self>, YourAiError> {
         let p = host.dir.join("worktrees.json");
         let worktrees = if p.exists() {
             read_json(&p)?
@@ -137,7 +156,7 @@ impl Workspace {
                                 "modified"
                             };
                             // 固定公共入口：FileChanged 生命周期在框架操作内。
-                            yourai_core::workspace::file_changed(ws.as_ref(), &path, event).await;
+                            ws.file_changed(&host, &path, event).await;
                         }
                     }
                 }
@@ -145,7 +164,7 @@ impl Workspace {
         }));
         Ok(())
     }
-    pub async fn stop_watching(&self) {
+    pub(crate) async fn stop_watching(&self) {
         self.stop.cancel();
         let task = self.watcher.lock().unwrap().take();
         if let Some(t) = task {
@@ -195,7 +214,7 @@ fn resolve(cwd: &Path, path: &Path) -> Result<PathBuf, YourAiError> {
     };
     p.canonicalize().map_err(|e| error("workspace", e))
 }
-async fn git(cwd: &Path, args: &[&str]) -> Result<(), YourAiError> {
+async fn git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, YourAiError> {
     let mut c = tokio::process::Command::new("git");
     c.current_dir(cwd).args(args).kill_on_drop(true);
     let out = tokio::time::timeout(Duration::from_secs(30), c.output())
@@ -205,5 +224,5 @@ async fn git(cwd: &Path, args: &[&str]) -> Result<(), YourAiError> {
     if !out.status.success() {
         return Err(error("git", String::from_utf8_lossy(&out.stderr)));
     }
-    Ok(())
+    Ok(out.stdout)
 }

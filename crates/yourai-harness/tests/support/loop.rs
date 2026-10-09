@@ -74,8 +74,8 @@ impl ContextManager for History {
     }
     fn build_request(
         &self,
-        tools: &[Tool],
-        _: &ContextExecution,
+        tools: &[ToolDefinition],
+        _: &dyn ModelProvider,
     ) -> Result<ContextRequest, YourAiError> {
         let mut request = ChatRequest::new(self.messages());
         request.system = Some(self.system_prompt());
@@ -90,7 +90,7 @@ impl ContextManager for History {
     fn prepare_compaction<'a>(
         &'a self,
         req: &'a CompactionRequest,
-        _: &'a ContextExecution,
+        _: &'a dyn ModelProvider,
         _: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
         Box::pin(async move {
@@ -120,10 +120,11 @@ impl CompactionJob for HistorySummary<'_> {
     fn run<'a>(
         self: Box<Self>,
         req: CompactionRequest,
-        _: &'a ContextExecution,
+        _: &'a dyn ModelProvider,
+        _: Option<&'a dyn UsageTracker>,
         _: &'a CancellationToken,
-        committed: &'a std::sync::atomic::AtomicBool,
-    ) -> BoxFuture<'a, Result<CompactionCommit, YourAiError>>
+        committed: Arc<std::sync::atomic::AtomicU8>,
+    ) -> BoxFuture<'a, Result<(CompactionResult, String), YourAiError>>
     where
         Self: 'a,
     {
@@ -149,11 +150,8 @@ impl CompactionJob for HistorySummary<'_> {
                 output_tokens: 1,
                 total_tokens: 4,
             });
-            committed.store(true, Ordering::Release);
-            Ok(CompactionCommit {
-                result: r,
-                summary: "test summary".into(),
-            })
+            committed.store(CommitStatus::Committed as u8, Ordering::Release);
+            Ok((r, "test summary".into()))
         })
     }
 }
@@ -276,14 +274,11 @@ impl Handler {
         }
     }
 }
-impl ToolHandler for Handler {
-    fn name(&self) -> &str {
-        &self.name
+impl ToolProvider for Handler {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(&self.name).with_schema(json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}))
     }
-    fn definition(&self) -> Tool {
-        Tool::new(&self.name).with_schema(json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}))
-    }
-    fn security_context(&self, input: &Value) -> SecurityContext {
+    fn security_context(&self, input: &Value, _cwd: Option<&std::path::Path>) -> SecurityContext {
         SecurityContext {
             action: self.name.clone(),
             input: input.clone(),
@@ -309,36 +304,17 @@ impl ToolHandler for Handler {
     }
 }
 #[derive(Default)]
-pub struct Registry(pub Mutex<HashMap<String, ToolBinding>>);
+pub struct Registry(pub Mutex<HashMap<String, Tool>>);
 impl ToolRegistry for Registry {
-    fn register_binding(&self, h: ToolBinding) {
-        self.0.lock().unwrap().insert(h.name().into(), h);
+    fn register(&self, provider: Arc<dyn ToolProvider>) {
+        let tool = Tool::new(provider);
+        self.0.lock().unwrap().insert(tool.name().into(), tool);
     }
-    fn unregister(&self, n: &str) {
-        self.0.lock().unwrap().remove(n);
+    fn unregister(&self, name: &str) {
+        self.0.lock().unwrap().remove(name);
     }
-    fn has(&self, n: &str) -> bool {
-        self.0.lock().unwrap().contains_key(n)
-    }
-    fn definitions(&self) -> Vec<Tool> {
-        self.0
-            .lock()
-            .unwrap()
-            .values()
-            .map(|h| h.definition())
-            .collect()
-    }
-    fn resolve(&self, n: &str) -> Result<ToolBinding, YourAiError> {
-        self.0.lock().unwrap().get(n).cloned().ok_or_else(|| {
-            ErrorKind::Tool {
-                name: n.into(),
-                message: "unknown".into(),
-            }
-            .into()
-        })
-    }
-    fn count(&self) -> usize {
-        self.0.lock().unwrap().len()
+    fn snapshot(&self) -> Vec<Tool> {
+        self.0.lock().unwrap().values().cloned().collect()
     }
 }
 pub struct Security {

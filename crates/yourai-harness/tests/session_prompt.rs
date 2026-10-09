@@ -255,11 +255,11 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
     let d = TempDir::new().unwrap();
     let store = Arc::new(SqliteStore::open(&d.path().join("db")).unwrap());
     let id = store
-        .create_session("FROZEN-DO-NOT-SUMMARIZE")
+        .create_session(SessionId::new(), "FROZEN-DO-NOT-SUMMARIZE")
         .await
         .unwrap()
         .id;
-    let c = MemoryContext::new(
+    let c = DefaultContext::new(
         id.clone(),
         yourai_harness::context::ContextServices {
             store: Some(store.clone()),
@@ -288,19 +288,20 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
     .await
     .unwrap();
     let model = Arc::new(SummaryCapture(Mutex::new(vec![])));
-    let execution = ContextExecution {
-        model: model.clone(),
-        hooks: None,
-        usage: None,
-        hook_base: BaseInput::new(id.as_str(), ""),
-    };
-    let before = c.build_request(&[], &execution).unwrap();
+    let execution = Compactor::new(
+        c.clone(),
+        model.clone(),
+        None,
+        None,
+        BaseInput::new(id.as_str(), ""),
+    );
+    let before = c.build_request(&[], model.as_ref()).unwrap();
     assert!(before.estimated_tokens > 2000);
-    let result = c
-        .compact(
+    let result = execution
+        .exec(
             CompactionRequest::new(CompactionTrigger::Manual),
-            &execution,
             &CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -309,7 +310,7 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
     assert!(requests.contains("IMPORTANT-RECALL"));
     assert!(!requests.contains("FROZEN-DO-NOT-SUMMARIZE"));
     assert_eq!(
-        c.build_request(&[], &execution)
+        c.build_request(&[], model.as_ref())
             .unwrap()
             .request
             .system
@@ -333,7 +334,11 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
 async fn multimodal_content_and_recall_are_committed_and_replayed_together() {
     let d = TempDir::new().unwrap();
     let store = SqliteStore::open(&d.path().join("db")).unwrap();
-    let id = store.create_session("fixed").await.unwrap().id;
+    let id = store
+        .create_session(SessionId::new(), "fixed")
+        .await
+        .unwrap()
+        .id;
     // Multiple original content blocks must retain their order and identity.
     let original = MessageContent::from_parts(vec![
         ContentPart::from_text("question"),

@@ -67,12 +67,13 @@ fn reply(mime: &str, body: &str) -> Vec<u8> {
     format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
 }
 async fn call(
-    tool: &dyn ToolHandler,
+    tool: &dyn ToolProvider,
     input: Value,
     cancel: &CancellationToken,
 ) -> Result<Value, YourAiError> {
     tool.run(
         ToolContext {
+            cwd: None,
             call_id: "test".into(),
             emit: &DiscardSink,
             cancel,
@@ -268,8 +269,8 @@ async fn invalid_inputs_and_precancelled_calls_never_send_and_require_network_ap
         Err(YourAiError::Aborted(_))
     ));
     assert!(server.requests.lock().unwrap().is_empty());
-    for tool in [&fetch as &dyn ToolHandler, &search] {
-        let context = tool.security_context(&json!({}));
+    for tool in [&fetch as &dyn ToolProvider, &search] {
+        let context = tool.security_context(&json!({}), None);
         assert!(context.is_network && !context.is_destructive);
     }
 }

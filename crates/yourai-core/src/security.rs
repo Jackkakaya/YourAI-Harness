@@ -79,36 +79,3 @@ pub trait SecurityProvider: Send + Sync {
         write: bool,
     ) -> BoxFuture<'a, Result<PolicyDecision, YourAiError>>;
 }
-
-// region:    --- 公共授权入口（固定缝） ---
-
-/// Infrastructure bridge between the Core entry and a runtime's execution.
-/// Permission policies implement [`SecurityProvider`]; ordinary callers use
-/// [`ToolBinding::authorize`], which owns the PermissionRequest/PermissionDenied
-/// lifecycle, approval interaction and bounded re-checks.
-#[doc(hidden)]
-pub trait SecurityOperation: Send {
-    fn authorize_bound<'a>(
-        &'a mut self,
-        call: &'a mut crate::chat::ToolCall,
-        binding: &'a crate::tool::ToolBinding,
-        hook_permission: crate::hooks::HookPermission,
-        doom_loop: bool,
-    ) -> BoxFuture<'a, Result<(), YourAiError>>;
-}
-
-impl crate::tool::ToolBinding {
-    /// Fixed public permission entry; always delegates to the supplied
-    /// framework operation. Approved input (possibly hook-rewritten) lands in
-    /// `call.fn_arguments`; denial surfaces as a tool error.
-    pub fn authorize<'a>(
-        &'a self,
-        operation: &'a mut dyn SecurityOperation,
-        call: &'a mut crate::chat::ToolCall,
-        hook_permission: crate::hooks::HookPermission,
-        doom_loop: bool,
-    ) -> BoxFuture<'a, Result<(), YourAiError>> {
-        operation.authorize_bound(call, self, hook_permission, doom_loop)
-    }
-}
-// endregion: --- 公共授权入口（固定缝） ---

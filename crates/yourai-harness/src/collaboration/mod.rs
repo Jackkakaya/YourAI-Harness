@@ -1,4 +1,3 @@
 mod subagents;
-mod tasks;
-pub use subagents::SubagentTool;
-pub use tasks::{Task, TaskBoard};
+pub use subagents::{subagent, Subagent};
+pub use yourai_core::tasks::{Task, TaskManager};

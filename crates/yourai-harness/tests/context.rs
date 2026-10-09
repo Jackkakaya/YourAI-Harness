@@ -1,6 +1,6 @@
 #[path = "support/context.rs"]
 mod context_fixture;
-use context_fixture::{ContextServices, MemoryContext};
+use context_fixture::{ContextServices, DefaultContext};
 #[path = "support/execution.rs"]
 mod custom;
 #[path = "support/loop.rs"]
@@ -78,20 +78,20 @@ async fn setup(
     p: ContextPolicy,
     model: Arc<dyn ModelProvider>,
     hooks: Option<Arc<dyn HookRuntime>>,
-) -> (TempDir, Arc<SqliteStore>, Arc<MemoryContext>) {
+) -> (TempDir, Arc<SqliteStore>, Arc<DefaultContext>) {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(SqliteStore::open(&dir.path().join("db.sqlite")).unwrap());
-    let id = store.create_session("").await.unwrap().id;
+    let id = store.create_session(SessionId::new(), "").await.unwrap().id;
     let mut services = ContextServices::new(&id);
     services.store = Some(store.clone());
     services.policy = p;
     services.hooks = hooks;
     services.usage = Some(Arc::new(LocalUsage((*store).clone())));
-    let context = MemoryContext::new(id, model, services);
+    let context = DefaultContext::new(id, model, services);
     context.restore().await.unwrap();
     (dir, store, context)
 }
-async fn append(c: &MemoryContext, messages: Vec<ChatMessage>) {
+async fn append(c: &DefaultContext, messages: Vec<ChatMessage>) {
     c.append(messages.into_iter().map(StoredMessage::new).collect())
         .await
         .unwrap();
@@ -110,7 +110,7 @@ fn call(id: &str) -> ToolCall {
 fn tool(id: &str, content: String) -> ChatMessage {
     ToolResponse::new(id, content).into()
 }
-async fn seed_tools(c: &MemoryContext) {
+async fn seed_tools(c: &DefaultContext) {
     append(
         c,
         vec![
@@ -250,7 +250,7 @@ async fn prune_only_avoids_model_hooks_and_survives_restore_and_fork() {
     let mut services = ContextServices::new(&child);
     services.policy = p;
     services.store = Some(store);
-    let fork = MemoryContext::new(child, model, services);
+    let fork = DefaultContext::new(child, model, services);
     fork.restore().await.unwrap();
     assert_eq!(
         expected,
@@ -462,6 +462,92 @@ async fn post_hook_stop_reports_committed_state_and_is_not_dispatched_twice() {
         1
     );
 }
+
+#[tokio::test]
+async fn committed_summary_survives_reload_failure_and_still_runs_post_hook() {
+    let hooks = Arc::new(support::Hooks::new(|invocation, result| {
+        if invocation.event.kind() == HookEventKind::PostCompact {
+            result.common.prevent_continuation = true;
+            result.common.stop_reason = Some("another post-hook reason".into());
+        }
+    }));
+    let (dir, store, context) = setup(policy(), Summarizer::new(), Some(hooks.clone())).await;
+    append(
+        &context,
+        vec![
+            ChatMessage::user("x".repeat(2000)),
+            ChatMessage::user("latest"),
+        ],
+    )
+    .await;
+    // The transaction succeeds, but the immediately following reload reads an
+    // invalid frozen prompt. This exercises the real SQLite acknowledgement.
+    let db = rusqlite::Connection::open(dir.path().join("db.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER break_reload AFTER INSERT ON messages WHEN NEW.kind='summary' BEGIN UPDATE sessions SET system_prompt=NULL WHERE session_id=NEW.session_id; END;").unwrap();
+    let result = context
+        .compact(manual(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(result.action, CompactAction::Summarized);
+    assert!(result
+        .stop_reason
+        .as_deref()
+        .unwrap()
+        .contains("active context restore failed"));
+    assert!(context.build_request(&[]).is_err());
+    assert_eq!(
+        hooks
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|kind| **kind == HookEventKind::PostCompact)
+            .count(),
+        1
+    );
+    let persisted = store
+        .read_messages(context.session_id(), MessageQuery::default())
+        .await
+        .unwrap();
+    let summaries: Vec<_> = persisted
+        .messages
+        .iter()
+        .filter(|message| message.summary)
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries[0]
+        .message
+        .content
+        .first_text()
+        .unwrap()
+        .contains("Decisions and completed work."));
+    db.execute_batch("DROP TRIGGER break_reload; UPDATE sessions SET system_prompt='';")
+        .unwrap();
+    context.restore().await.unwrap();
+    assert!(context.records()[0].summary);
+    assert!(context.build_request(&[]).is_ok());
+    assert_eq!(
+        context
+            .compact(
+                CompactionRequest::new(CompactionTrigger::Threshold),
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap()
+            .action,
+        CompactAction::Unchanged
+    );
+    assert_eq!(
+        hooks
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|kind| **kind == HookEventKind::PostCompact)
+            .count(),
+        1
+    );
+}
 #[tokio::test]
 async fn observed_usage_is_invalidated_by_tools_projection() {
     let (_, _, c) = setup(policy(), Summarizer::new(), None).await;
@@ -478,7 +564,7 @@ async fn observed_usage_is_invalidated_by_tools_projection() {
     let calibrated = c.build_request(&[]).unwrap().estimated_tokens;
     assert!(calibrated < 200);
     assert!(
-        c.build_request(&[Tool::new("different")])
+        c.build_request(&[ToolDefinition::new("different")])
             .unwrap()
             .estimated_tokens
             > 600
@@ -550,6 +636,13 @@ struct UncertainStore {
     reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl SessionManager for UncertainStore {
+    fn read_tasks(&self, id: &SessionId) -> Result<Vec<Task>, YourAiError> {
+        self.inner.read_tasks(id)
+    }
+    fn save_tasks(&self, id: &SessionId, tasks: Vec<Task>) -> Result<Vec<Task>, YourAiError> {
+        self.inner.save_tasks(id, tasks)
+    }
+
     fn initialize_system<'a>(
         &'a self,
         id: &'a SessionId,
@@ -586,9 +679,10 @@ impl SessionManager for UncertainStore {
     }
     fn create_session<'a>(
         &'a self,
+        id: SessionId,
         system: &'a str,
     ) -> BoxFuture<'a, Result<SessionMeta, YourAiError>> {
-        self.inner.create_session(system)
+        self.inner.create_session(id, system)
     }
     fn load_session<'a>(
         &'a self,
@@ -632,7 +726,7 @@ async fn cancelled_uncertain_commit_blocks_reads_and_next_append_recovers_first(
         committed: committed.clone(),
         reads: Default::default(),
     }));
-    let c = MemoryContext::new(id, Summarizer::new(), services);
+    let c = DefaultContext::new(id, Summarizer::new(), services);
     c.restore().await.unwrap();
     let cancel = CancellationToken::new();
     let ctx = c.clone();
@@ -640,7 +734,8 @@ async fn cancelled_uncertain_commit_blocks_reads_and_next_append_recovers_first(
     let work = tokio::spawn(async move { ctx.compact(manual(), &token).await });
     committed.notified().await;
     cancel.cancel();
-    assert!(work.await.unwrap().is_err());
+    let error = work.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("summary committed"), "{error}");
     assert!(c.build_request(&[]).is_err());
     append(&c, vec![ChatMessage::user("after cancellation")]).await;
     assert!(c.records()[0].summary);
@@ -686,7 +781,7 @@ async fn successful_append_uses_committed_rows_without_reloading_history() {
         committed: Default::default(),
         reads: reads.clone(),
     }));
-    let c = MemoryContext::new(id, Summarizer::new(), services);
+    let c = DefaultContext::new(id, Summarizer::new(), services);
     c.restore().await.unwrap();
     let baseline = reads.load(Ordering::SeqCst);
     let row = StoredMessage::new(ChatMessage::user("one"));
@@ -773,7 +868,7 @@ async fn compact_uses_message_content_without_opening_media_locations() {
 
 /// Regression for the attachment feature: `GenaiModel` must implement
 /// `media_tokens`. Before it did, the fail-closed trait default made
-/// `MemoryContext::build_request` reject every request whose history
+/// `DefaultContext::build_request` reject every request whose history
 /// contained a Binary part ("media budgeting/capability is not configured").
 #[tokio::test]
 async fn binary_attachment_builds_request_with_genai_model() {
@@ -837,7 +932,7 @@ async fn compaction_has_no_implicit_deadline_but_honors_explicit_deadline_and_ca
         let mut services = ContextServices::new(&id);
         services.policy = policy();
         services.hooks = Some(Arc::new(SlowPreCompact));
-        let context = MemoryContext::new(id, Summarizer::new(), services);
+        let context = DefaultContext::new(id, Summarizer::new(), services);
         append(
             &context,
             vec![

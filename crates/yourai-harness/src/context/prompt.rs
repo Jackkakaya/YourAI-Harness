@@ -2,7 +2,7 @@
 use crate::error;
 use serde::Deserialize;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -36,6 +36,7 @@ impl Default for PromptConfig {
 pub struct PreparedPrompt {
     pub system: String,
     pub notices: Vec<String>,
+    pub instructions: BTreeMap<PathBuf, String>,
 }
 fn file(
     cwd: &Path,
@@ -128,15 +129,21 @@ pub async fn prepare(
         .collect::<Result<Vec<_>, _>>()?;
     paths.sort_by_key(|p| (p.components().count(), p.clone()));
     paths.dedup();
+    let mut loaded_instructions = BTreeMap::new();
+    for source in [&soul, &memory_file, &profile].into_iter().flatten() {
+        loaded_instructions.insert(source.0.clone(), source.1.clone());
+    }
     for path in paths {
         if excluded.contains(&path) {
             continue;
         }
+        let content = std::fs::read_to_string(&path).map_err(|e| error("prompt", e))?;
         block(
             &mut out,
             &format!("Project instructions: {}", path.display()),
-            &std::fs::read_to_string(path).map_err(|e| error("prompt", e))?,
+            &content,
         );
+        loaded_instructions.insert(path, content);
     }
     block(
         &mut out,
@@ -209,5 +216,9 @@ pub async fn prepare(
             "fixed prompt exceeds budget reserved for prompt, messages and output",
         ));
     }
-    Ok(PreparedPrompt { system, notices })
+    Ok(PreparedPrompt {
+        system,
+        notices,
+        instructions: loaded_instructions,
+    })
 }

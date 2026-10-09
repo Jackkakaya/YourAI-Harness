@@ -3,23 +3,10 @@
 //! `HookHandler` trait 在 `yourai-core` 定义；本模块提供具体实现和工厂函数。
 
 use crate::hooks::wire_output::HookJsonOutput;
-use std::future::Future;
-use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use yourai_core::hooks::{HookHandler, HookInvocation, HookOutput};
-
-/// Boxed future（与 core 的 BoxFuture 一致）。
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-/// Handler 分类。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HookHandlerKind {
-    Native,
-    Command,
-    Http,
-    Prompt,
-    Agent,
-}
+use yourai_core::BoxFuture;
 
 #[derive(Debug, Clone)]
 pub struct HookModelRequest {
@@ -36,7 +23,7 @@ pub struct HookModelDecision {
 }
 
 /// Prompt/Agent Hook 所需的宿主模型能力。具体模型与多轮 Agent 实现在独立 crate 注入。
-pub trait HookModelExecutor: Send + Sync {
+pub trait HookEvaluator: Send + Sync {
     fn evaluate<'a>(
         &'a self,
         request: HookModelRequest,
@@ -47,7 +34,7 @@ struct ModelHookHandler {
     prompt: String,
     model: Option<String>,
     agentic: bool,
-    executor: std::sync::Arc<dyn HookModelExecutor>,
+    executor: std::sync::Arc<dyn HookEvaluator>,
 }
 
 impl HookHandler for ModelHookHandler {
@@ -134,30 +121,24 @@ where
     }
 }
 
-/// 从配置创建对应的 handler。
-pub fn handler_from_config(config: &crate::hooks::config::HandlerConfig) -> Box<dyn HookHandler> {
-    handler_from_config_with_http_policy(
-        config,
-        crate::hooks::http::HttpHookPolicy::default(),
-        None,
-    )
-}
-
-pub(crate) fn handler_from_config_with_http_policy(
+/// Compile a validated registration once; missing dependencies fail before registration.
+pub(crate) fn handler_from_config(
     config: &crate::hooks::config::HandlerConfig,
     http_policy: crate::hooks::http::HttpHookPolicy,
-    model_executor: Option<std::sync::Arc<dyn HookModelExecutor>>,
-) -> Box<dyn HookHandler> {
-    match config {
-        crate::hooks::config::HandlerConfig::Command { command, shell, .. } => Box::new(
-            crate::hooks::command::CommandHandler::new(command.clone(), *shell),
+    evaluator: Option<Arc<dyn HookEvaluator>>,
+    background: crate::hooks::command::BackgroundCommandContext,
+) -> Result<Arc<dyn HookHandler>, yourai_core::YourAiError> {
+    let handler: Arc<dyn HookHandler> = match config {
+        crate::hooks::config::HandlerConfig::Command { command, shell, .. } => Arc::new(
+            crate::hooks::command::CommandHandler::new(command.clone(), *shell)
+                .with_background(background),
         ),
         crate::hooks::config::HandlerConfig::Http {
             url,
             headers,
             allowed_env_vars,
             ..
-        } => Box::new(
+        } => Arc::new(
             crate::hooks::http::HttpHandler::new(
                 url.clone(),
                 headers.clone(),
@@ -165,56 +146,20 @@ pub(crate) fn handler_from_config_with_http_policy(
             )
             .with_policy(http_policy),
         ),
-        crate::hooks::config::HandlerConfig::Prompt { prompt, model, .. } => match model_executor {
-            Some(executor) => Box::new(ModelHookHandler {
+        crate::hooks::config::HandlerConfig::Prompt { prompt, model, .. }
+        | crate::hooks::config::HandlerConfig::Agent { prompt, model, .. } => {
+            let executor = evaluator.ok_or_else(|| {
+                yourai_core::ErrorKind::Config("prompt/agent hook requires a HookEvaluator".into())
+            })?;
+            Arc::new(ModelHookHandler {
                 prompt: prompt.clone(),
                 model: model.clone(),
-                agentic: false,
+                agentic: matches!(config, crate::hooks::config::HandlerConfig::Agent { .. }),
                 executor,
-            }),
-            None => Box::new(UnsupportedHandler::new("prompt", prompt.clone())),
-        },
-        crate::hooks::config::HandlerConfig::Agent { prompt, model, .. } => match model_executor {
-            Some(executor) => Box::new(ModelHookHandler {
-                prompt: prompt.clone(),
-                model: model.clone(),
-                agentic: true,
-                executor,
-            }),
-            None => Box::new(UnsupportedHandler::new("agent", prompt.clone())),
-        },
-    }
-}
-
-/// 未安装可选执行能力时使用的占位 handler。
-pub struct UnsupportedHandler {
-    kind: String,
-    detail: String,
-}
-
-impl UnsupportedHandler {
-    pub fn new(kind: impl Into<String>, detail: String) -> Self {
-        Self {
-            kind: kind.into(),
-            detail,
+            })
         }
-    }
-}
-
-impl HookHandler for UnsupportedHandler {
-    fn execute<'a>(
-        &'a self,
-        _invocation: &'a HookInvocation,
-    ) -> BoxFuture<'a, Result<HookOutput, yourai_core::YourAiError>> {
-        let kind = self.kind.clone();
-        let detail = self.detail.clone();
-        Box::pin(async move {
-            Err(yourai_core::ErrorKind::Config(format!(
-                "handler type '{kind}' not yet implemented (detail: {detail})"
-            ))
-            .into())
-        })
-    }
+    };
+    Ok(handler)
 }
 
 /// 对 handler 执行应用超时；未配置时使用默认上限，防止 hook 无限期挂起会话。
