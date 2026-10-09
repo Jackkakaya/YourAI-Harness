@@ -256,6 +256,65 @@ async fn approval_routes_replies_steer_and_follow_up_without_losing_input() {
         .iter()
         .any(|m| m.content.first_text() == Some("steer")));
 }
+
+#[tokio::test]
+async fn session_approval_is_owned_by_security_and_does_not_bypass_hook_asks() {
+    for force_ask in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let policy = yourai_harness::security::PolicySecurity::open(path.clone(), vec![]).unwrap();
+        let registry = Arc::new(Registry::default());
+        let handler = Arc::new(Handler::new("tool", Mode::Return));
+        registry.register(handler.clone());
+        let hooks = Arc::new(Hooks::new(move |_, result| {
+            if force_ask {
+                if let HookPointOutcome::PreToolUse(outcome) = &mut result.outcome {
+                    outcome.permission = HookPermission::Ask {
+                        reason: "explicit hook confirmation".into(),
+                    };
+                }
+            }
+        }));
+        let agent = builder(
+            Arc::new(Model::new(vec![calls(&["tool", "tool"]), answer("done")])),
+            Arc::new(History::default()),
+            LoopConfig::default(),
+        )
+        .tools(registry)
+        .security(policy.clone())
+        .hooks(hooks)
+        .build();
+        let mut handle = agent.start(In::user_text("go")).unwrap();
+        let mut asks = 0;
+        while let Some(event) = handle.outbox.recv().await {
+            if let Out::Ask { id, payload } = event {
+                assert_eq!(payload["tool_name"], "tool");
+                asks += 1;
+                handle.inbox.send(In::Reply {
+                    id,
+                    payload: json!({"behavior":"allow", "scope":"session", "tool_name":"other", "updated_input":{"value":999}}),
+                }).unwrap();
+            }
+        }
+        handle.join().await.unwrap();
+        assert_eq!(asks, if force_ask { 2 } else { 1 });
+        assert_eq!(
+            *handler.inputs.lock().unwrap(),
+            [json!({"value":1}), json!({"value":1})]
+        );
+        assert!(!path.exists());
+        let context = SecurityContext {
+            action: "other".into(),
+            input: json!({}),
+            is_destructive: false,
+            is_network: false,
+        };
+        assert_eq!(
+            policy.check_tool_call(&context).await.unwrap(),
+            ApprovalDecision::Ask
+        );
+    }
+}
 #[tokio::test]
 async fn repeated_tool_questions_have_distinct_ids_and_no_deadlock() {
     let registry = Arc::new(Registry::default());

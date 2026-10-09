@@ -9,7 +9,7 @@ use super::{
     presentation::Canvas,
     render::{Hit, Metadata, Renderer},
     session::{Controller, Reply, Target},
-    state::{self, View},
+    state::{self, PermissionChoice, View},
     theme,
 };
 use crate::config::Error;
@@ -17,17 +17,20 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::prelude::{Position, Rect};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use yourai_core::prelude::*;
 
-/// What the loop should do after one event. Quit is the only control flow
-/// the loop cannot express locally: it drops the rest of the burst, skips
-/// the frame tail and returns from the UI future.
+/// What the loop should do after one event. Quit and Editor are the only
+/// control flows the loop cannot express locally: Quit drops the rest of the
+/// burst, skips the frame tail and returns from the UI future; Editor hands
+/// the terminal to `$VISUAL`/`$EDITOR`, which needs the loop's reader and
+/// terminal handles.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Flow {
     Continue,
     Quit,
+    Editor,
 }
 
 pub(super) struct App {
@@ -36,9 +39,18 @@ pub(super) struct App {
     meta: Metadata,
     renderer: Renderer,
     clipboard_task: Option<JoinHandle<std::io::Result<()>>>,
+    /// In-flight git-context refresh; results land in `view.git`.
+    git_task: Option<JoinHandle<crate::git::GitContext>>,
+    /// When the git context was last refreshed; None spawns immediately.
+    git_refreshed: Option<Instant>,
     /// The TaskManager version already reflected in `view.session.todos`; None means
     /// the next sync must run (also reset on session switch).
     synced_todos: Option<u64>,
+    /// Terminal focus from crossterm focus events; assumed focused until a
+    /// FocusLost arrives. Attention bells only fire while unfocused.
+    focused: bool,
+    /// A bell the loop should ring at the next frame tail.
+    attention: bool,
 }
 
 impl App {
@@ -50,7 +62,11 @@ impl App {
             view,
             meta,
             clipboard_task: None,
+            git_task: None,
+            git_refreshed: None,
             synced_todos: None,
+            focused: true,
+            attention: false,
         }
     }
 
@@ -64,6 +80,11 @@ impl App {
     /// renderer. Runs once per wake, before the event batch: the harness
     /// identity cannot change mid-burst.
     pub(super) async fn poll(&mut self, first: Option<Out>) {
+        // Attention signals: an approval/reply request that just appeared, or
+        // a turn that just finished. Only announced while the terminal is
+        // unfocused; the visible UI is its own notification otherwise.
+        let had_ask = !self.view.asks_empty();
+        let was_active = self.view.session.active;
         if self.controller.poll(&mut self.view, first).await {
             let context = self.controller.harness().host.context();
             self.meta.session = context.id.as_str().to_owned();
@@ -72,6 +93,18 @@ impl App {
             self.renderer = Renderer::default();
             self.synced_todos = None;
         }
+        if !self.focused
+            && ((!had_ask && !self.view.asks_empty())
+                || (was_active && !self.view.session.active && self.view.asks_empty()))
+        {
+            self.attention = true;
+        }
+    }
+
+    /// Consume a pending attention bell request. The loop rings it in the
+    /// frame tail so it never interleaves with a frame write.
+    pub(super) fn take_attention(&mut self) -> bool {
+        std::mem::take(&mut self.attention)
     }
 
     /// Interpret one terminal event and apply every resulting mutation.
@@ -81,6 +114,14 @@ impl App {
     pub(super) fn handle(&mut self, event: Event) -> Flow {
         match event {
             Event::Resize(_, _) => Flow::Continue,
+            Event::FocusGained => {
+                self.focused = true;
+                Flow::Continue
+            }
+            Event::FocusLost => {
+                self.focused = false;
+                Flow::Continue
+            }
             Event::Mouse(e) if !self.view.overlay.is_open() => {
                 self.mouse(e);
                 Flow::Continue
@@ -136,6 +177,29 @@ impl App {
         }
     }
 
+    /// Keep `view.git` current: reap a finished detection and, at a bounded
+    /// cadence, start the next one from the live session cwd (the agent may
+    /// switch branches or enter a worktree mid-session). Cheap on every wake:
+    /// one finished-task check plus a time gate.
+    pub(super) async fn settle_git(&mut self) {
+        if self.git_task.as_ref().is_some_and(|t| t.is_finished()) {
+            if let Ok(ctx) = self.git_task.take().unwrap().await {
+                self.view.git = ctx;
+            }
+        }
+        const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+        let due = self
+            .git_refreshed
+            .is_none_or(|at| at.elapsed() >= GIT_REFRESH_INTERVAL);
+        if self.git_task.is_none() && due {
+            let cwd = self.controller.harness().host.context().cwd.clone();
+            self.git_task = Some(tokio::spawn(async move {
+                crate::git::GitContext::detect(&cwd).await
+            }));
+            self.git_refreshed = Some(Instant::now());
+        }
+    }
+
     pub(super) async fn settle_draft(&mut self) {
         if let Some((level, message)) = self.view.draft.poll().await {
             self.view.notice(level, message);
@@ -167,10 +231,13 @@ impl App {
 
     // ───────────────────────── shutdown ─────────────────────────
 
-    /// Abort an in-flight clipboard copy, then close the session (finishing
+    /// Abort clipboard and git work, then close the session (finishing
     /// any pending operation rather than dropping its handle).
     pub(super) async fn close(mut self) -> Result<(String, Vec<In>), Error> {
         if let Some(task) = self.clipboard_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.git_task.take() {
             task.abort();
         }
         drop(self.view); // Cancel draft-owned work before waiting for session shutdown.
@@ -201,6 +268,43 @@ impl App {
         if let Some(action) = self.view.overlay.key(key, self.view.model_choices.len()) {
             self.overlay_action(action);
             return Flow::Continue;
+        }
+        // Permission asks are a choice list, not free text: y/a/n answer
+        // directly, arrows move, Enter confirms the selection. Everything
+        // else falls through (Esc/Ctrl-C still interrupt the turn).
+        if !self.view.asks_empty()
+            && self.view.ask().is_some_and(|a| a.permission())
+            && !ctrl
+            && !alt
+        {
+            match key.code {
+                KeyCode::Char('y') => return self.permission_submit(PermissionChoice::Once),
+                KeyCode::Char('a') => return self.permission_submit(PermissionChoice::Always),
+                KeyCode::Char('n') => return self.permission_submit(PermissionChoice::Deny),
+                KeyCode::Up | KeyCode::Down => {
+                    if let Some(ask) = self.view.ask_mut() {
+                        let next = ask.permission_choice;
+                        ask.permission_choice = match (key.code, next) {
+                            (KeyCode::Up, 0) | (KeyCode::Down, 2) => next,
+                            (KeyCode::Up, _) => next - 1,
+                            (KeyCode::Down, _) => next + 1,
+                            _ => next,
+                        };
+                    }
+                    return Flow::Continue;
+                }
+                KeyCode::Enter => {
+                    let choice = self
+                        .view
+                        .ask()
+                        .map(|a| a.permission_selection())
+                        .unwrap_or(PermissionChoice::Once);
+                    return self.permission_submit(choice);
+                }
+                // Other plain keys would land in an invisible editor.
+                KeyCode::Char(_) => return Flow::Continue,
+                _ => {}
+            }
         }
         if self.view.asks_empty() && self.view.draft.intercept(key) {
             return Flow::Continue;
@@ -245,6 +349,7 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::F(1) => self.view.overlay = Overlay::Help { scroll: 0 },
+            KeyCode::F(2) => self.cycle_model(),
             KeyCode::F(6) => {
                 self.view
                     .select_next(key.modifiers.contains(KeyModifiers::SHIFT));
@@ -263,6 +368,10 @@ impl App {
             }
             KeyCode::Char('b') if ctrl => self.view.overlay = Overlay::Stats { scroll: 0 },
             KeyCode::Char('y') if ctrl => self.view.theme = self.view.theme.next(),
+            // Hand the draft to $VISUAL/$EDITOR. Only while no ask is pending:
+            // the ask's own reply editor must keep the keyboard then. The
+            // readline association (bash's Ctrl-X Ctrl-E) carries the intent.
+            KeyCode::Char('x') if ctrl && self.view.asks_empty() => return Flow::Editor,
             KeyCode::Home if ctrl => self.renderer.latest_turn(&mut self.view),
             KeyCode::Up if ctrl => {
                 self.renderer.jump_turn(&mut self.view, true);
@@ -363,6 +472,12 @@ impl App {
     /// draft. `/quit` is the only path returning Quit.
     fn submit(&mut self) -> Flow {
         if let Some(ask) = self.view.ask_mut() {
+            // Permission asks were answered by key selection before reaching
+            // the editor path; a stray Enter confirms the selected row.
+            if ask.permission() {
+                let choice = ask.permission_selection();
+                return self.permission_submit(choice);
+            }
             match ask.answer() {
                 Ok(payload) => {
                     let id = ask.id.clone();
@@ -399,6 +514,8 @@ impl App {
                 self.view.draft.set_text("");
                 return Flow::Continue;
             }
+            // The draft is the editor's buffer; it must survive dispatch.
+            Some(commands::Parsed::Editor) => return Flow::Editor,
             Some(commands::Parsed::Status) => {
                 self.view.overlay = Overlay::Stats { scroll: 0 };
                 self.view.draft.set_text("");
@@ -456,7 +573,8 @@ impl App {
                 match id {
                     None => self.view.overlay = Overlay::Models(0),
                     Some(model_id) => {
-                        self.controller.model(model_id, variant, &mut self.view);
+                        self.controller
+                            .model(model_id, variant, None, &mut self.view);
                     }
                 }
                 return Flow::Continue;
@@ -544,9 +662,44 @@ impl App {
                     self.controller.model(
                         choice.id.clone(),
                         choice.variant.clone(),
+                        None,
                         &mut self.view,
                     );
                 }
+            }
+            OverlayAction::PickEffort(index) => {
+                // Preselect the entry's effective effort; "default" when unset.
+                let Some(choice) = self.view.model_choices.get(index) else {
+                    return;
+                };
+                let selected = choice
+                    .effort
+                    .as_deref()
+                    .and_then(|effort| {
+                        crate::models::EFFORT_CHOICES
+                            .iter()
+                            .position(|level| *level == Some(effort))
+                    })
+                    .unwrap_or(0);
+                self.view.overlay = Overlay::Effort {
+                    model: index,
+                    selected,
+                };
+            }
+            OverlayAction::Effort { model, effort } => {
+                let Some(choice) = self.view.model_choices.get(model) else {
+                    return;
+                };
+                let selection = match effort {
+                    Some(effort) => crate::models::EffortChoice::Set(effort),
+                    None => crate::models::EffortChoice::Config,
+                };
+                self.controller.model(
+                    choice.id.clone(),
+                    choice.variant.clone(),
+                    Some(selection),
+                    &mut self.view,
+                );
             }
             OverlayAction::Theme(theme) => self.view.theme = theme,
             OverlayAction::Session(id) => {
@@ -568,6 +721,73 @@ impl App {
             }
             self.clipboard_task = Some(tokio::spawn(clipboard::copy(text)));
         }
+    }
+
+    /// Switch to the model after the current one in picker order (F2).
+    fn cycle_model(&mut self) {
+        if let Some(at) = self.view.next_model() {
+            let choice = self.view.model_choices[at].clone();
+            self.controller
+                .model(choice.id, choice.variant, None, &mut self.view);
+        }
+    }
+
+    /// The text the external editor starts from.
+    pub(super) fn draft_text(&self) -> &str {
+        self.view.draft.text()
+    }
+
+    /// Apply the external editor's result: the saved text, or a warning that
+    /// the draft is unchanged. Editors terminate files with a newline; it is
+    /// not part of the text. `set_text` keeps explicitly staged attachments
+    /// and drops mention references whose markers are gone.
+    pub(super) fn editor_finished(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(text) => self
+                .view
+                .draft
+                .set_text(text.trim_end_matches(['\n', '\r'])),
+            Err(message) => self.view.notice(Level::Warning, message),
+        }
+    }
+
+    /// Submit an approval choice. Security records session-scoped approvals
+    /// after accepting the reply; the UI owns no permission rules.
+    fn permission_submit(&mut self, choice: PermissionChoice) -> Flow {
+        let Some(ask) = self.view.ask() else {
+            return Flow::Continue;
+        };
+        if !ask.permission() {
+            return Flow::Continue;
+        }
+        let id = ask.id.clone();
+        let tool = ask.payload["tool_name"]
+            .as_str()
+            .unwrap_or("tool")
+            .to_owned();
+        match self.controller.reply(id, choice.reply(), &mut self.view) {
+            Reply::Sent => {
+                self.view.dismiss_ask();
+                self.view.notice(
+                    Level::Info,
+                    match choice {
+                        PermissionChoice::Always => {
+                            format!("Session approval submitted for {tool}.")
+                        }
+                        PermissionChoice::Deny => format!("Denial submitted for {tool}."),
+                        PermissionChoice::Once => format!("Approval submitted for {tool}."),
+                    },
+                );
+            }
+            Reply::Rejected(e) => {
+                self.view.dismiss_ask();
+                self.view
+                    .notice(Level::Warning, format!("Reply was not accepted: {e}"));
+            }
+            // A session operation is in flight; the ask stays for retry.
+            Reply::Deferred => {}
+        }
+        Flow::Continue
     }
 
     fn set_yolo(&mut self, enabled: bool) {
@@ -708,6 +928,89 @@ mod tests {
         })
         .await
         .expect("session operation did not complete");
+    }
+
+    #[tokio::test]
+    async fn ctrl_x_and_editor_command_hand_the_draft_to_the_editor() {
+        let (_dir, mut app) = fixture().await;
+        type_text(&mut app, "long draft");
+        // Ctrl-X is the readline "edit command line" convention; the draft is
+        // the editor's buffer and must survive dispatch.
+        assert_eq!(app.handle(ctrl(KeyCode::Char('x'))), Flow::Editor);
+        assert_eq!(app.view.draft.text(), "long draft");
+        // A saved result replaces the text (trailing editor newline trimmed);
+        // a cancelled run keeps it.
+        app.editor_finished(Ok("edited in vi\n".into()));
+        assert_eq!(app.view.draft.text(), "edited in vi");
+        app.editor_finished(Err("Editor exited with 1; draft unchanged.".into()));
+        assert_eq!(app.view.draft.text(), "edited in vi");
+        // /editor takes the same path.
+        app.view.draft.set_text("");
+        type_text(&mut app, "/editor");
+        assert_eq!(app.handle(key(KeyCode::Enter)), Flow::Editor);
+        app.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn f2_cycles_models() {
+        let (_dir, mut app) = fixture().await;
+        // One choice only: F2 has nowhere to go and starts no operation.
+        app.view.model_choices = vec![crate::models::ModelChoice {
+            id: "mock/test".into(),
+            variant: None,
+            label: "mock/test".into(),
+            effort: None,
+        }];
+        app.handle(key(KeyCode::F(2)));
+        assert!(!app.controller.busy());
+        // Two choices: F2 starts a switch to the next one in picker order.
+        app.view.model_choices.push(crate::models::ModelChoice {
+            id: "mock/other".into(),
+            variant: None,
+            label: "mock/other".into(),
+            effort: None,
+        });
+        app.handle(key(KeyCode::F(2)));
+        assert!(app.controller.busy());
+        finish(&mut app).await;
+        app.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permission_asks_answer_by_key() {
+        let (_dir, mut app) = fixture().await;
+        fn ask(app: &mut App, tool: &str) {
+            app.view.event(Out::Ask {
+                id: format!("ask-{tool}"),
+                payload: serde_json::json!({
+                    "kind":"permission", "tool_name":tool,
+                    "reason":"Tool permission", "input":{"command":"cargo test"}
+                }),
+            });
+        }
+        // 'a' approves and remembers the tool for this session.
+        ask(&mut app, "shell");
+        assert_eq!(app.handle(key(KeyCode::Char('a'))), Flow::Continue);
+        assert!(app.view.asks_empty(), "answered ask is dismissed");
+        // 'y' approves once and remembers nothing.
+        ask(&mut app, "edit");
+        app.handle(key(KeyCode::Char('y')));
+        assert!(app.view.asks_empty());
+        // 'n' denies.
+        ask(&mut app, "write");
+        app.handle(key(KeyCode::Char('n')));
+        assert!(app.view.asks_empty());
+        // Arrows move the selection; Enter confirms the selected row.
+        ask(&mut app, "webfetch");
+        app.handle(key(KeyCode::Down));
+        app.handle(key(KeyCode::Down));
+        assert_eq!(
+            app.view.ask().unwrap().permission_selection(),
+            crate::ui::state::PermissionChoice::Deny
+        );
+        app.handle(key(KeyCode::Enter));
+        assert!(app.view.asks_empty());
+        app.close().await.unwrap();
     }
 
     #[tokio::test]

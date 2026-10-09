@@ -5,6 +5,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -14,6 +15,8 @@ struct Policy {
     allow: Vec<String>,
     deny: Vec<String>,
     ask: Vec<String>,
+    #[serde(skip)]
+    session_allow: HashSet<String>,
 }
 
 /// Explicit per-run local permission bypass. Never rewrites persisted rules.
@@ -84,6 +87,27 @@ impl PolicySecurity {
     }
 }
 impl SecurityProvider for PolicySecurity {
+    fn remember_tool_approval<'a>(
+        &'a self,
+        tool: &'a str,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(async move {
+            let mut rules = self.rules.lock().unwrap();
+            if self
+                .hard_deny
+                .iter()
+                .chain(&rules.deny)
+                .any(|name| name == tool)
+            {
+                return Err(error(
+                    "security",
+                    "cannot remember approval for a denied tool",
+                ));
+            }
+            rules.session_allow.insert(tool.to_owned());
+            Ok(())
+        })
+    }
     fn update_permissions<'a>(
         &'a self,
         updates: &'a [Value],
@@ -150,6 +174,8 @@ impl SecurityProvider for PolicySecurity {
             Ok(
                 if self.hard_deny.contains(&c.action) || p.deny.contains(&c.action) {
                     ApprovalDecision::Deny
+                } else if p.session_allow.contains(&c.action) {
+                    ApprovalDecision::Allow
                 } else if p.ask.contains(&c.action) {
                     ApprovalDecision::Ask
                 } else if p.allow.contains(&c.action) {

@@ -146,7 +146,10 @@ impl Controller {
     }
     /// Reply to a pending ask under the same input guard as `submit`. The
     /// host stays authoritative for acceptance (a rejected reply dismisses
-    /// the ask with a warning, as before).
+    /// the ask with a warning, as before). Replies submit directly rather
+    /// than through the ordered input channel: they address an ask by id,
+    /// so overtaking queued user text — which the host holds for the next
+    /// turn either way — cannot reorder anything the host observes.
     pub fn reply(&mut self, id: String, payload: Value, view: &mut View) -> Reply {
         if !self.accepting(view) {
             return Reply::Deferred;
@@ -207,14 +210,20 @@ impl Controller {
             Effect::Deleted(id, result)
         }));
     }
-    pub fn model(&mut self, id: String, variant: Option<String>, view: &mut View) {
+    pub fn model(
+        &mut self,
+        id: String,
+        variant: Option<String>,
+        effort: Option<crate::models::EffortChoice>,
+        view: &mut View,
+    ) {
         if !self.idle(view) {
             return;
         }
         let h = self.harness();
         let config = self.config.clone();
         self.operation = Some(tokio::spawn(async move {
-            Effect::Model(setup::switch_model(&config, &h, &id, variant).await)
+            Effect::Model(setup::switch_model(&config, &h, &id, variant, effort).await)
         }));
     }
     pub fn switch(&mut self, target: Target, view: &mut View) {
@@ -318,7 +327,15 @@ impl Controller {
             },
             Effect::Model(result) => match result {
                 Ok(selected) => {
-                    view.notice(Level::Info, format!("Model switched to {}", selected.label));
+                    let mut message = format!("Model switched to {}", selected.label);
+                    if let Some(effort) = &selected.effort {
+                        message.push_str(&format!(" · thinking {effort}"));
+                    }
+                    view.notice(Level::Info, message);
+                    // Model-level changes also affect variants inheriting its effort.
+                    if let Ok(config) = self.config.lock() {
+                        view.model_choices = crate::models::model_choices(&config);
+                    }
                     view.model = selected;
                 }
                 Err(e) => view.notice(Level::Error, format!("Model switch failed: {e}")),
@@ -489,6 +506,7 @@ mod tests {
             id: "mock/test".into(),
             variant: Some("fast".into()),
             label: "mock/test · fast".into(),
+            effort: None,
         }];
         view.user("belongs to the old session", false);
         view.session.title = Some("old title".into());
@@ -501,7 +519,7 @@ mod tests {
             1,
         );
         // A second operation cannot supersede the first or mutate its settings.
-        controller.model("missing/model".into(), None, &mut view);
+        controller.model("missing/model".into(), None, None, &mut view);
         finish(&mut controller, &mut view).await;
         assert_ne!(controller.harness().host.context().id, id);
         assert_eq!(old.host.status(), SessionStatus::Closed);

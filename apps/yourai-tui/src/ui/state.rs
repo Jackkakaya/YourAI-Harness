@@ -102,6 +102,28 @@ impl DiffRow {
         usize::from(self.old.is_some()) + usize::from(self.new.is_some())
     }
 }
+/// One answer to a permission ask: the y/a/n rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PermissionChoice {
+    /// y: approve this call only.
+    Once,
+    /// a: approve this call and auto-approve the same tool for the rest of
+    /// the session (never persisted; a new session asks again).
+    Always,
+    /// n: reject.
+    Deny,
+}
+
+impl PermissionChoice {
+    pub fn reply(self) -> Value {
+        let mut reply = json!({"behavior": if self == Self::Deny { "deny" } else { "allow" }});
+        if self == Self::Always {
+            reply["scope"] = json!("session");
+        }
+        reply
+    }
+}
+
 pub enum Item {
     Text {
         role: Role,
@@ -121,19 +143,26 @@ pub struct Ask {
     pub editor: Editor,
     pub error: Option<String>,
     pub scroll: usize,
+    /// Permission asks only: selected row of the y/a/n choice list.
+    pub permission_choice: usize,
 }
 impl Ask {
     pub fn permission(&self) -> bool {
         self.payload["kind"] == "permission"
     }
+    /// The selected permission choice (y allow once / a always / n deny).
+    pub fn permission_selection(&self) -> PermissionChoice {
+        match self.permission_choice.min(2) {
+            0 => PermissionChoice::Once,
+            1 => PermissionChoice::Always,
+            _ => PermissionChoice::Deny,
+        }
+    }
     pub fn answer(&self) -> Result<Value, String> {
         let text = self.editor.text.trim();
         if self.permission() {
-            return match text.to_lowercase().as_str() {
-                "y" | "yes" => Ok(json!({"behavior":"allow"})),
-                "n" | "no" => Ok(json!({"behavior":"deny"})),
-                _ => Err("Enter y to allow once, or n to deny.".into()),
-            };
+            // Permissions answer from the choice list, never typed text.
+            return Ok(self.permission_selection().reply());
         }
         if text.is_empty() {
             return Err("Enter a reply.".into());
@@ -185,6 +214,9 @@ pub struct View {
     pub overlay: super::overlay::Overlay,
     pub model_choices: Vec<crate::models::ModelChoice>,
     pub model: ModelInfo,
+    /// Live workspace/worktree/branch of the session cwd; refreshed by the
+    /// app loop, quiet (all None) outside a git repository.
+    pub git: crate::git::GitContext,
 }
 
 /// State belonging to one conversation; replaced together on a session switch.
@@ -266,6 +298,8 @@ impl Todos {
 pub struct ModelInfo {
     pub label: String,
     pub pricing: Option<(f64, f64)>,
+    /// Effective reasoning effort for the current entry, when set.
+    pub effort: Option<String>,
 }
 impl View {
     pub fn model_activity(&self) -> &'static str {
@@ -276,6 +310,18 @@ impl View {
         } else {
             "Waiting for model"
         }
+    }
+
+    /// Cycle the stable picker order, including variants and the current model.
+    pub fn next_model(&self) -> Option<usize> {
+        if self.model_choices.len() < 2 {
+            return None;
+        }
+        let at = self
+            .model_choices
+            .iter()
+            .position(|choice| choice.label == self.model.label)?;
+        Some((at + 1) % self.model_choices.len())
     }
 
     /// Whether the item at `index` is the currently streaming thinking block.
@@ -723,6 +769,7 @@ impl View {
                         editor: Editor::default(),
                         error: None,
                         scroll: 0,
+                        permission_choice: 0,
                     });
                 }
                 self.touch();
@@ -809,6 +856,40 @@ impl View {
 mod tests {
     #[allow(clippy::wildcard_imports)]
     use super::*;
+    #[test]
+    fn model_cycle_reaches_every_entry_and_wraps_without_reordering() {
+        let mut v = View {
+            model_choices: ["a", "b", "c · variant"]
+                .into_iter()
+                .map(|label| crate::models::ModelChoice {
+                    id: label.into(),
+                    variant: None,
+                    label: label.into(),
+                    effort: None,
+                })
+                .collect(),
+            ..View::default()
+        };
+        v.model.label = "a".into();
+        let mut visited = vec![];
+        for _ in 0..4 {
+            let i = v.next_model().unwrap();
+            v.model.label = v.model_choices[i].label.clone();
+            visited.push(v.model.label.clone());
+        }
+        assert_eq!(visited, ["b", "c · variant", "a", "b"]);
+        v.model_choices.truncate(1);
+        assert_eq!(v.next_model(), None);
+    }
+    #[test]
+    fn permission_choice_only_requests_session_scope_for_always() {
+        assert_eq!(PermissionChoice::Once.reply(), json!({"behavior":"allow"}));
+        assert_eq!(
+            PermissionChoice::Always.reply(),
+            json!({"behavior":"allow","scope":"session"})
+        );
+        assert_eq!(PermissionChoice::Deny.reply(), json!({"behavior":"deny"}));
+    }
     #[test]
     fn usage_writers_use_three_named_semantics() {
         let mut v = View::default();
@@ -1015,15 +1096,24 @@ mod tests {
         assert_eq!(v.tool_mut("a").unwrap().status, ToolStatus::Interrupted);
     }
     #[test]
-    fn permissions_require_explicit_answer_and_drafts_are_separate() {
+    fn permissions_answer_from_the_choice_list_and_drafts_are_separate() {
         let mut v = View::default();
         v.draft.insert("draft");
         v.event(Out::Ask {
             id: "a".into(),
-            payload: json!({"kind":"permission"}),
+            payload: json!({"kind":"permission", "tool_name":"shell"}),
         });
-        assert!(v.session.asks[0].answer().is_err());
-        v.session.asks[0].editor.insert("n");
+        // Default selection is "allow once"; the list, not typed text, answers.
+        assert_eq!(
+            v.session.asks[0].answer().unwrap(),
+            json!({"behavior":"allow"})
+        );
+        v.session.asks[0].permission_choice = 1;
+        assert_eq!(
+            v.session.asks[0].permission_selection(),
+            super::PermissionChoice::Always
+        );
+        v.session.asks[0].permission_choice = 2;
         assert_eq!(
             v.session.asks[0].answer().unwrap(),
             json!({"behavior":"deny"})

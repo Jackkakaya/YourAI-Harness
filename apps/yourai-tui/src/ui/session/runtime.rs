@@ -9,6 +9,37 @@ use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
 use yourai_harness::Harness;
 
+/// Keep the provider's diagnosis while removing transport JSON decoration.
+fn summarize_error(text: &str) -> String {
+    const MARKER: &str = "Response body:";
+    let Some((head, body)) = text.split_once(MARKER) else {
+        return text.to_owned();
+    };
+    let head = head.trim_end().trim_end_matches('.');
+    let body = body.trim();
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let message = parsed.as_ref().and_then(|value| {
+        value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .or_else(|| {
+                value
+                    .pointer("/error/message")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|message| !message.trim().is_empty())
+            })
+    });
+    let detail = message
+        .map(str::to_owned)
+        .unwrap_or_else(|| body.split_whitespace().collect::<Vec<_>>().join(" "));
+    if detail.is_empty() {
+        head.to_owned()
+    } else {
+        format!("{head}: {}", crate::text::elide(&detail, 512))
+    }
+}
+
 type Stats = (
     Option<yourai_harness::runtime::ContextUsage>,
     Option<u64>,
@@ -155,7 +186,10 @@ impl Runtime {
                 ),
                 Ok(Err(e)) => view.notice(
                     Level::Error,
-                    format!("Execution failed: {e}. /continue retries pending inputs."),
+                    format!(
+                        "Execution failed: {}. /continue retries pending inputs.",
+                        summarize_error(&e.to_string())
+                    ),
                 ),
                 Err(e) => view.notice(Level::Error, format!("Driver failed: {e}")),
                 _ => {}
@@ -247,10 +281,34 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::Runtime;
+    use super::{summarize_error, Runtime};
     use crate::ui::{session, state::View};
     use std::time::{Duration, Instant};
     use yourai_core::prelude::*;
+    #[test]
+    fn error_summary_preserves_nested_flat_and_unstructured_diagnoses() {
+        for body in [
+            r#"{"error":{"message":"maximum context length exceeded"}}"#,
+            r#"{"message":"maximum context length exceeded"}"#,
+            r#"{"message":null,"error":{"message":"maximum context length exceeded"}}"#,
+            "maximum context length exceeded",
+        ] {
+            for separator in [" ", "\n"] {
+                let raw = format!("HTTP 400. Response body:{separator}{body}");
+                let summary = summarize_error(&raw);
+                assert!(
+                    summary.contains("maximum context length exceeded"),
+                    "{summary}"
+                );
+                assert!(!summary.contains("Response body:"));
+            }
+        }
+        assert!(
+            summarize_error(r#"HTTP 400. Response body: {"detail":"invalid parameter"}"#)
+                .contains("invalid parameter")
+        );
+        assert_eq!(summarize_error("plain failure"), "plain failure");
+    }
 
     async fn refresh(runtime: &mut Runtime, view: &mut View) {
         runtime.stats_at = Instant::now() - Duration::from_secs(2);

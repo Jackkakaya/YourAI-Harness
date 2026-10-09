@@ -290,18 +290,15 @@ impl Draft {
         if !self.current.image.as_ref().is_some_and(|t| t.is_finished()) {
             return None;
         }
-        Some(match self.current.image.take().unwrap().await {
+        match self.current.image.take().unwrap().await {
             Ok(Ok(Some(img))) => {
                 self.stage_image(img);
-                (
-                    Level::Info,
-                    "Image attached. Enter to send, Esc to clear.".into(),
-                )
+                None
             }
-            Ok(Ok(None)) => (Level::Info, "No image in clipboard.".into()),
-            Ok(Err(e)) => (Level::Error, format!("Clipboard read failed: {e}")),
-            Err(e) => (Level::Error, format!("Clipboard read failed: {e}")),
-        })
+            Ok(Ok(None)) => Some((Level::Info, "No image in clipboard.".into())),
+            Ok(Err(e)) => Some((Level::Error, format!("Clipboard read failed: {e}"))),
+            Err(e) => Some((Level::Error, format!("Clipboard read failed: {e}"))),
+        }
     }
     fn changed(&mut self) {
         let text = &self.current.editor.text;

@@ -60,7 +60,9 @@ with tempfile.TemporaryDirectory() as tmp:
             "options": {"baseURL": f"http://127.0.0.1:{server.server_port}/v1", "apiKey": "x"},
             "models": {
                 "smoke": {"id": "smoke-model", "limit": {"context": 16000, "output": 4096}},
-                "alt": {"id": "alt-model", "limit": {"context": 16000, "output": 4096}}
+                "alt": {"id": "alt-model", "limit": {"context": 16000, "output": 4096},
+                        "options": {"reasoningEffort": "low"}},
+                "third": {"id": "third-model", "limit": {"context": 16000, "output": 4096}}
             }
         }},
         "context": {"keep_recent_tokens": 0, "summary_min_savings": 1}
@@ -106,11 +108,65 @@ with tempfile.TemporaryDirectory() as tmp:
         stream_reqs = [r for r in requests if r[1].get('stream')]
         assert len(stream_reqs) >= 2, f'expected 2 stream requests, got {len(stream_reqs)}'
         assert stream_reqs[1][1]['model'] == 'alt-model', f'expected alt-model, got {stream_reqs[1][1]["model"]}'
+        assert stream_reqs[1][1].get('reasoning_effort') == 'low'
+        # Set thinking effort via the /models picker's Tab sub-picker.
+        wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 2)
+        os.write(master, b'/models\r')
+        wait_for(b'Tab effort')
+        os.write(master, b'\t')
+        wait_for(b'config default')
+        for _ in range(2):  # configured low -> medium -> high
+            os.write(master, b'\x1b[B')
+            time.sleep(0.05)
+        os.write(master, b'\r')
+        wait_for(b'thinking high')
+        # The override rides on the next request as reasoning_effort.
+        captured.clear()
+        os.write(master, b'third message\r')
+        wait_for(b'MODELS_OK')
+        stream_reqs = [r for r in requests if r[1].get('stream')]
+        assert len(stream_reqs) >= 3, f'expected 3 stream requests, got {len(stream_reqs)}'
+        assert stream_reqs[2][1]['model'] == 'alt-model', f'expected alt-model, got {stream_reqs[2][1]["model"]}'
+        assert stream_reqs[2][1].get('reasoning_effort') == 'high', \
+            f'expected reasoning_effort high, got {stream_reqs[2][1].get("reasoning_effort")}'
+        wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 3)
+        captured.clear()
+        os.write(master, b'/models\r')
+        wait_for(b'Tab effort')
+        os.write(master, b'\t')
+        wait_for(b'config default')
+        for _ in range(5):  # high -> config default
+            os.write(master, b'\x1b[A')
+            time.sleep(0.05)
+        os.write(master, b'\r')
+        wait_for(b'thinking low')
+        captured.clear()
+        os.write(master, b'fourth message\r')
+        wait_for(b'MODELS_OK')
+        stream_reqs = [r for r in requests if r[1].get('stream')]
+        assert stream_reqs[3][1].get('reasoning_effort') == 'low', \
+            'config default must restore the original configured effort'
+        wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 4)
+        # F2 follows the stable picker order: all three models, then wrap.
+        for turn, (label, api_model) in enumerate([
+            ('mock/smoke', 'smoke-model'),
+            ('mock/third', 'third-model'),
+            ('mock/alt', 'alt-model'),
+        ], start=5):
+            captured.clear()
+            os.write(master, b'\x1bOQ')
+            wait_for(('Model switched to ' + label).encode())
+            captured.clear()
+            os.write(master, f'cycle {turn}\r'.encode())
+            wait_for(b'MODELS_OK')
+            stream_reqs = [r for r in requests if r[1].get('stream')]
+            assert stream_reqs[-1][1]['model'] == api_model
+            wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', turn)
         os.write(master, b'\x11')  # Ctrl-Q
         wait_exit(child, master)
         assert child.returncode == 0
         assert termios.tcgetattr(slave) == original, 'terminal mode was not restored'
-        print('PASS: /models switch — first request smoke-model, second request alt-model')
+        print('PASS: model switch, effort restoration and F2 three-model cycle verified in HTTP requests')
     finally:
         if child.poll() is None:
             child.kill()
