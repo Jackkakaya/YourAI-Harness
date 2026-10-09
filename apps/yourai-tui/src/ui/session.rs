@@ -236,7 +236,8 @@ impl Controller {
             Target::Resume(id) => Some(id),
         };
         let config = self.config.clone();
-        let template = self.template.clone();
+        let mut template = self.template.clone();
+        template.cwd = self.runtime.h.host.context().cwd;
         let yolo = self.yolo;
         self.operation = Some(tokio::spawn(async move {
             Effect::Opened(

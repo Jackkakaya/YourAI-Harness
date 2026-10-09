@@ -85,13 +85,24 @@ impl App {
         // unfocused; the visible UI is its own notification otherwise.
         let had_ask = !self.view.asks_empty();
         let was_active = self.view.session.active;
-        if self.controller.poll(&mut self.view, first).await {
-            let context = self.controller.harness().host.context();
+        let switched = self.controller.poll(&mut self.view, first).await;
+        let context = self.controller.harness().host.context();
+        if switched {
             self.meta.session = context.id.as_str().to_owned();
-            self.meta.cwd = context.cwd.to_string_lossy().into();
-            self.view.draft.set_cwd(&context.cwd);
             self.renderer = Renderer::default();
             self.synced_todos = None;
+        }
+        // Workspace changes can happen within a session, not just on switch.
+        // Footer, file completion and git must observe the same live cwd.
+        let cwd = context.cwd.to_string_lossy().into_owned();
+        self.view.draft.set_cwd(&context.cwd);
+        if self.meta.cwd != cwd {
+            self.meta.cwd = cwd;
+            if let Some(task) = self.git_task.take() {
+                task.abort();
+            }
+            self.git_refreshed = None;
+            self.view.git = Default::default();
         }
         if !self.focused
             && ((!had_ask && !self.view.asks_empty())
@@ -1318,5 +1329,71 @@ mod tests {
         app.handle(key(KeyCode::Down));
         assert_eq!(app.view.draft.text(), "");
         app.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn regression_cwd_change_refreshes_footer_and_file_completion() {
+        let (dir, mut app) = fixture().await;
+        let host = app.controller.harness().host.clone();
+        let original = host.context().cwd;
+        app.meta.cwd = original.to_string_lossy().into_owned();
+        let next = dir.path().join("next-workspace");
+        std::fs::create_dir(&next).unwrap();
+        std::fs::write(original.join("old-only.rs"), "old").unwrap();
+        std::fs::write(next.join("new-only.rs"), "new").unwrap();
+        host.workspace().unwrap().change_cwd(&next).await.unwrap();
+        app.poll(None).await;
+        app.view.draft.insert("@");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while app.view.draft.mention().entries.is_empty() {
+                app.settle_draft().await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let entries: Vec<_> = app
+            .view
+            .draft
+            .mention()
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        let displayed = app.meta.cwd.clone();
+        let expected = host.context().cwd;
+        app.close().await.unwrap();
+        assert_eq!(
+            displayed,
+            expected.to_string_lossy(),
+            "completion entries: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|path| path == &expected.join("new-only.rs")),
+            "{entries:?}"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|path| path == &original.join("old-only.rs")),
+            "{entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_new_session_preserves_live_working_directory() {
+        let (dir, mut app) = fixture().await;
+        let host = app.controller.harness().host.clone();
+        let next = dir.path().join("next-workspace");
+        std::fs::create_dir(&next).unwrap();
+        host.workspace().unwrap().change_cwd(&next).await.unwrap();
+        let expected = host.context().cwd;
+        app.poll(None).await;
+        app.controller.switch(super::Target::New, &mut app.view);
+        finish(&mut app).await;
+        let actual = app.controller.harness().host.context().cwd;
+        app.close().await.unwrap();
+        assert_eq!(actual, expected);
     }
 }

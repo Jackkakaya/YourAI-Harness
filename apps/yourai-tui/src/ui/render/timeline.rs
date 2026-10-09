@@ -7,11 +7,7 @@ use crate::ui::theme::{
     Theme, ACCENT, CODE_SURFACE, FAINT, MUTED, RED, TEXT, USER_SURFACE, YELLOW,
 };
 use ratatui::prelude::*;
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Range,
-    sync::Arc,
-};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 use yourai_core::prelude::Level;
 #[derive(PartialEq, Eq)]
 struct Key {
@@ -123,21 +119,7 @@ impl TimelineCache {
             .retain(|id, _| *id >= first && *id < first + v.items().len() as u64);
         let mut collapsed_until = 0;
         let mut expanded_until = 0;
-        let mut approval_notices = HashSet::new();
         for (index, item) in v.items().iter().enumerate() {
-            // Keep the first explanation of remembered permission; repeated
-            // approvals remain in session state without interrupting reading.
-            if let Item::Notice {
-                level: Level::Info,
-                text,
-            } = item
-            {
-                if text.ends_with(" auto-approved (always allowed this session).")
-                    && !approval_notices.insert(text.as_str())
-                {
-                    continue;
-                }
-            }
             if index < collapsed_until {
                 continue;
             }
@@ -368,32 +350,6 @@ mod tests {
     use crate::ui::theme::DIFF_ADD_BG;
     use serde_json::json;
     use yourai_core::prelude::Out;
-    #[test]
-    fn repeated_permission_notices_do_not_interrupt_the_transcript() {
-        let mut view = View::default();
-        let notice = "shell auto-approved (always allowed this session).";
-        view.notice(Level::Info, notice);
-        view.notice(Level::Info, notice);
-        view.notice(
-            Level::Info,
-            "edit auto-approved (always allowed this session).",
-        );
-        view.notice(Level::Warning, notice);
-        let (rows, _) = TimelineCache::default().layout(&view, 100, 3, 0);
-        let text = rows
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(
-            text.matches(notice).count(),
-            2,
-            "first info and warning survive"
-        );
-        assert!(text.contains("edit auto-approved"));
-        assert_eq!(view.items().len(), 4, "session state retains every notice");
-    }
-
     #[test]
     fn substantial_tools_have_surfaces_while_reads_stay_inline() {
         let mut view = View::default();

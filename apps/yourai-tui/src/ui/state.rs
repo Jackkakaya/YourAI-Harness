@@ -721,8 +721,15 @@ impl View {
                     t.stderr = result.stderr;
                     t.brief = result.brief;
                     t.exit_code = result.exit_code;
-                    // Result-side previews win; started-side ones (write
-                    // content, highlighted while running) survive a None.
+                    // A failed operation must not retain the planned change
+                    // as if it were completed. Result-side diagnostics win.
+                    if failed {
+                        t.adds = None;
+                        t.dels = None;
+                        t.content_hl = None;
+                        t.content_format = None;
+                        t.diff_rows = None;
+                    }
                     t.adds = result.adds.or(t.adds);
                     t.dels = result.dels.or(t.dels);
                     t.content_hl = result.content_hl.or_else(|| t.content_hl.take());

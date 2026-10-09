@@ -61,12 +61,11 @@ impl ReaderGate {
     fn mark_unparked(&self) {
         self.parked.store(false, Ordering::Relaxed);
     }
-    /// Wait until the reader parks, so stdin belongs to the child alone.
-    /// Bounded: the reader's poll is short, and a dead reader (which can no
-    /// longer steal keystrokes anyway) falls through on timeout.
-    async fn wait_parked(&self) {
+    /// Wait for the reader to acknowledge either side of the stdin handoff.
+    /// Bounded: a dead reader can no longer consume keystrokes.
+    async fn wait_parked(&self, parked: bool) {
         let deadline = Instant::now() + Duration::from_millis(500);
-        while !self.is_parked() && Instant::now() < deadline {
+        while self.is_parked() != parked && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -254,7 +253,13 @@ pub async fn run(
                             &mut screen.terminal,
                             &mut presentation,
                         )
-                        .await
+                        .await?;
+                        if crate::TERMINATED.load(Ordering::Relaxed) != 0 {
+                            return Ok::<(), Error>(());
+                        }
+                        // The editor handoff consumes the rest of this input burst.
+                        // Those events belong to the screen we just suspended.
+                        break;
                     }
                     Flow::Continue => {}
                 }
@@ -292,70 +297,238 @@ async fn external_editor(
         crate::terminal::SizedBackend<crate::terminal::ScrollBackend<crate::terminal::SyncWriter>>,
     >,
     presentation: &mut presentation::Presentation,
-) {
+) -> Result<(), Error> {
     gate.set_paused(true);
     // No in-flight poll may remain: keystrokes typed as the editor starts
     // must reach the child, not be consumed by our reader. The reader parks
     // and acknowledges; whatever it delivered before parking is ours, not
     // the editor's, so drain it once the park is confirmed.
-    gate.wait_parked().await;
+    gate.wait_parked(true).await;
     while input_rx.try_recv().is_ok() {}
     let text = app.draft_text().to_owned();
     crate::terminal::suspend();
-    let outcome = run_editor(&text).await;
-    let resumed = crate::terminal::resume();
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let outcome = run_editor(&text, &editor, async {
+        let shutdown = crate::SHUTDOWN.notified();
+        tokio::pin!(shutdown);
+        // Register before checking: notify_waiters does not store a permit.
+        shutdown.as_mut().enable();
+        if crate::TERMINATED.load(Ordering::Relaxed) == 0 {
+            shutdown.await;
+        }
+    })
+    .await;
+    let resumed = if crate::TERMINATED.load(Ordering::Relaxed) == 0 {
+        crate::terminal::resume()
+    } else {
+        Ok(())
+    };
     // Keystrokes raced at editor exit land here, never in the draft.
     while input_rx.try_recv().is_ok() {}
     gate.set_paused(false);
-    if resumed.is_err() {
-        return; // Fatal only for the screen; the guard's drop restores.
+    // Complete the return handoff before another editor can reuse the gate.
+    gate.wait_parked(false).await;
+    resumed?;
+    if crate::TERMINATED.load(Ordering::Relaxed) != 0 {
+        return Ok(());
     }
     // The alternate screen round-trip left the physical screen blank; the
     // backend's cell model and the presentation's last canvas must forget it.
-    let _ = terminal.clear();
+    terminal.clear()?;
     *presentation = presentation::Presentation::default();
     app.editor_finished(outcome);
+    Ok(())
 }
 
 /// Run `$VISUAL`/`$EDITOR` (fallback `vi`) on a temp file seeded with `text`.
 /// A non-zero exit means cancel (vim's `:cq` convention): the draft is kept.
-async fn run_editor(text: &str) -> Result<String, String> {
-    let seed = text.to_owned();
-    tokio::task::spawn_blocking(move || -> Result<String, String> {
-        // Private (0600) and unpredictable: drafts can be sensitive and the
-        // temp dir is world-writable, so a predictable `yourai-prompt-{pid}.md`
-        // name was a symlink-hijack vector on shared machines. Drop removes
-        // the file on every path, editor crashes included. The `.md` suffix
-        // lets editors pick markdown mode like the old fixed name did.
-        let mut file = tempfile::Builder::new()
-            .prefix("yourai-prompt-")
-            .suffix(".md")
-            .tempfile()
-            .map_err(|e| format!("Could not create editor file: {e}"))?;
-        std::io::Write::write_all(&mut file, seed.as_bytes())
-            .map_err(|e| format!("Could not write editor file: {e}"))?;
-        let path = file.path().to_owned();
-        let editor = std::env::var("VISUAL")
-            .or_else(|_| std::env::var("EDITOR"))
-            .unwrap_or_else(|_| "vi".into());
-        let mut parts = editor.split_whitespace();
-        let program = parts.next().unwrap_or("vi");
-        let status = std::process::Command::new(program)
-            .args(parts)
-            .arg(&path)
-            .status()
+async fn run_editor(
+    text: &str,
+    editor: &str,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<String, String> {
+    // Own a private temp file for the entire child lifetime, including shutdown.
+    let mut file = tempfile::Builder::new()
+        .prefix("yourai-prompt-")
+        .suffix(".md")
+        .tempfile()
+        .map_err(|e| format!("Could not create editor file: {e}"))?;
+    std::io::Write::write_all(&mut file, text.as_bytes())
+        .map_err(|e| format!("Could not write editor file: {e}"))?;
+    // Parse quoting without a shell: paths and arguments may contain spaces,
+    // but user configuration is not interpreted as a shell script.
+    let parts = shlex::split(editor)
+        .ok_or_else(|| "Invalid editor quoting; draft unchanged.".to_owned())?;
+    let (program, args) = parts
+        .split_first()
+        .ok_or_else(|| "Empty editor command; draft unchanged.".to_owned())?;
+    let mut command = tokio::process::Command::new(program);
+    command.args(args).arg(file.path()).kill_on_drop(true);
+    #[cfg(unix)]
+    let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+    #[cfg(unix)]
+    {
+        // A separate group lets shutdown stop the editor and its children.
+        // Give it the foreground terminal before exec, so interactive editors
+        // can read stdin without being stopped by SIGTTIN.
+        command.process_group(0);
+        if foreground > 0 {
+            unsafe {
+                command.pre_exec(|| foreground_process(libc::getpid()));
+            }
+        }
+    }
+    let outcome = async {
+        let mut child = command
+            .spawn()
             .map_err(|e| format!("Could not start editor {editor:?}: {e}"))?;
+        #[cfg(unix)]
+        let pid = child.id();
+        let status = tokio::select! {
+            biased;
+            _ = shutdown => {
+                #[cfg(unix)]
+                if let Some(pid) = pid {
+                    unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
+                }
+                // Also kill/reap the direct child on platforms without groups.
+                let _ = child.start_kill();
+                child.wait().await.map_err(|e| format!("Could not reap editor: {e}"))?;
+                return Err("Editor interrupted; draft unchanged.".into());
+            }
+            result = child.wait() => result.map_err(|e| format!("Could not wait for editor: {e}"))?,
+        };
         if !status.success() {
             return Err(format!("Editor exited with {status}; draft unchanged."));
         }
-        // Editors that replace the file (rename/backup) are covered too: the
-        // content is read back through the path, and Drop removes whatever
-        // currently sits there.
-        let edited = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Could not read editor file: {e}"))?;
-        Ok(edited)
-        // `file` drops here and removes the temp file.
-    })
-    .await
-    .map_err(|e| e.to_string())?
+        // Read through the path: editors may save by replacing the file.
+        std::fs::read_to_string(file.path()).map_err(|e| format!("Could not read editor file: {e}"))
+    }
+    .await;
+    #[cfg(unix)]
+    if foreground > 0 {
+        foreground_process(foreground)
+            .map_err(|e| format!("Could not restore terminal foreground: {e}"))?;
+    }
+    outcome
+}
+
+/// tcsetpgrp from a background group normally raises SIGTTOU. Block it only
+/// for the handoff, then restore this thread's original signal mask.
+#[cfg(unix)]
+fn foreground_process(group: libc::pid_t) -> std::io::Result<()> {
+    unsafe {
+        let mut mask = std::mem::zeroed();
+        let mut previous = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGTTOU);
+        let code = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut previous);
+        if code != 0 {
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
+        let result = libc::tcsetpgrp(libc::STDIN_FILENO, group);
+        let error = std::io::Error::last_os_error();
+        libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod editor_tests {
+    use super::run_editor;
+    use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
+
+    fn script(dir: &Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("editor with spaces");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn quoted_editor_and_arguments_save_and_remove_private_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("file path");
+        let editor = script(dir.path(), "[ \"$1\" = 'argument with spaces' ] || exit 9\nprintf '%s' \"$3\" > \"$2\"\nprintf 'edited draft\\n' > \"$3\"");
+        let command = format!("{editor:?} 'argument with spaces' {record:?}");
+        let result = run_editor("original draft", &command, std::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(result, "edited draft\n");
+        let temporary = std::fs::read_to_string(record).unwrap();
+        assert!(!Path::new(&temporary).exists());
+        // A cancelled edit does not admit the file's modified contents.
+        let editor = script(dir.path(), "printf 'cancelled changes' > \"$1\"\nexit 1");
+        assert!(run_editor(
+            "original draft",
+            &format!("{editor:?}"),
+            std::future::pending()
+        )
+        .await
+        .unwrap_err()
+        .contains("draft unchanged"));
+        assert!(
+            run_editor("original draft", "'unterminated", std::future::pending())
+                .await
+                .unwrap_err()
+                .contains("quoting")
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_terminates_editor_and_descendants_and_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("pids");
+        let editor = script(
+            dir.path(),
+            "sleep 60 &\nprintf '%s %s %s' \"$$\" \"$!\" \"$2\" > \"$1\"\nwait",
+        );
+        let command = format!("{editor:?} {record:?}");
+        let shutdown = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while tokio::time::Instant::now() < deadline {
+                if std::fs::read_to_string(&record).is_ok_and(|s| s.split_whitespace().count() >= 3)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        let result = run_editor("original draft", &command, shutdown).await;
+        assert!(result.unwrap_err().contains("interrupted"));
+        let recorded = std::fs::read_to_string(record).unwrap();
+        let mut fields = recorded.splitn(3, ' ');
+        let parent: i32 = fields.next().unwrap().parse().unwrap();
+        let descendant: i32 = fields.next().unwrap().parse().unwrap();
+        assert!(!Path::new(fields.next().unwrap()).exists());
+        assert_eq!(
+            unsafe { libc::kill(parent, 0) },
+            -1,
+            "direct child was reaped"
+        );
+        // An orphan may briefly be a zombie before init reaps it; either state
+        // means the descendant has stopped executing.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let output = tokio::process::Command::new("ps")
+                    .args(["-o", "stat=", "-p", &descendant.to_string()])
+                    .output()
+                    .await
+                    .unwrap();
+                let state = String::from_utf8_lossy(&output.stdout);
+                if state.trim().is_empty() || state.trim_start().starts_with('Z') {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("editor descendant remained alive after shutdown");
+    }
 }

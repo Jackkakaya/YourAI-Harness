@@ -417,6 +417,9 @@ pub(super) fn tool_expanded(
     theme: Theme,
 ) {
     let prefix = "    ";
+    if tool_failure(t, lines, width, usize::MAX) {
+        return;
+    }
     // edit/write/webfetch already have fully structured bodies; repeating their
     // often-large JSON arguments before the useful content only adds noise.
     if !matches!(t.name.as_str(), "edit" | "write" | "webfetch") {
@@ -526,6 +529,9 @@ pub(super) fn tool_preview(
     edit_preview_rows: usize,
 ) {
     let prefix = "    ";
+    if tool_failure(t, lines, width, 5) {
+        return;
+    }
     match t.name.as_str() {
         "shell" if t.status == ToolStatus::Running => {
             // Last 3 progress lines, following scroll.
@@ -548,53 +554,20 @@ pub(super) fn tool_preview(
             }
         }
         "shell" => {
-            let failed = t.status == ToolStatus::Failed || t.exit_code.is_some_and(|c| c != 0);
-            // Diagnostics commonly go to stderr while stdout contains build progress.
-            let use_stderr = !t.stderr.trim().is_empty() && (failed || t.output.trim().is_empty());
-            let out: Vec<&str> = if use_stderr {
+            let out: Vec<&str> = if t.output.trim().is_empty() {
                 t.stderr.lines().collect()
             } else {
                 t.output.lines().collect()
             };
-            if failed {
-                let start = out.len().saturating_sub(5);
-                let source = if use_stderr { "stderr" } else { "stdout" };
-                lines.extend(wrap_text(
-                    &if start > 0 {
-                        format!("{source} · last 5 lines · Ctrl-O to expand")
-                    } else {
-                        source.to_owned()
-                    },
-                    Style::default().fg(MUTED),
-                    width,
-                    prefix,
-                ));
-                push_wrapped(
-                    lines,
-                    &out[start..],
-                    Style::default().fg(RED),
-                    width,
-                    prefix,
-                );
-                if out.is_empty() {
-                    lines.extend(wrap_text(
-                        "No diagnostic output",
-                        Style::default().fg(RED),
-                        width,
-                        prefix,
-                    ));
-                }
-            } else {
-                let start = out.len().saturating_sub(1);
-                push_wrapped(
-                    lines,
-                    &out[start..],
-                    Style::default().fg(MUTED),
-                    width,
-                    prefix,
-                );
-                more_hint(lines, start, width);
-            }
+            let start = out.len().saturating_sub(1);
+            push_wrapped(
+                lines,
+                &out[start..],
+                Style::default().fg(MUTED),
+                width,
+                prefix,
+            );
+            more_hint(lines, start, width);
         }
         "edit" if t.status != ToolStatus::Running => match &t.diff_rows {
             Some(rows) if !rows.is_empty() => {
@@ -685,6 +658,49 @@ pub(super) fn tool_preview(
             }
         }
     }
+}
+
+/// Failed execution always shows its diagnostic before any success preview.
+/// The folded card keeps a short tail; expansion retains both output streams.
+fn tool_failure(t: &ToolView, lines: &mut Vec<Line<'static>>, width: usize, limit: usize) -> bool {
+    if t.status != ToolStatus::Failed {
+        return false;
+    }
+    let mut shown = false;
+    for (label, text) in [("output", &t.output), ("stderr", &t.stderr)] {
+        if text.trim().is_empty()
+            || (limit != usize::MAX && label == "output" && !t.stderr.trim().is_empty())
+        {
+            continue;
+        }
+        let rows: Vec<_> = text.lines().collect();
+        let start = rows.len().saturating_sub(limit);
+        if !t.stderr.trim().is_empty() || start > 0 {
+            let label = if start > 0 {
+                format!("{label} · last {limit} lines · Ctrl-O to expand")
+            } else {
+                label.to_owned()
+            };
+            lines.extend(wrap_text(&label, Style::default().fg(MUTED), width, "    "));
+        }
+        push_wrapped(
+            lines,
+            &rows[start..],
+            Style::default().fg(RED),
+            width,
+            "    ",
+        );
+        shown = true;
+    }
+    if !shown {
+        lines.extend(wrap_text(
+            "No diagnostic output",
+            Style::default().fg(RED),
+            width,
+            "    ",
+        ));
+    }
+    true
 }
 
 /// Wrap each row of `rows` and append to `lines`.

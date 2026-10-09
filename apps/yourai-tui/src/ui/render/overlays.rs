@@ -12,7 +12,7 @@ use ratatui::{
 };
 use serde_json::Value;
 /// ^B dashboard overlay (replaces the old sidebar content).
-pub(super) fn stats_overlay(f: &mut Canvas, area: Rect, v: &View, m: &Metadata) {
+pub(super) fn stats_overlay(f: &mut Canvas, area: Rect, v: &mut View, m: &Metadata) {
     let width = area.width.min(64);
     let mut lines: Vec<Line<'static>> = vec![];
     // Session section.
@@ -192,12 +192,15 @@ pub(super) fn stats_overlay(f: &mut Canvas, area: Rect, v: &View, m: &Metadata) 
         height,
     );
     f.render_widget(Clear, rect);
-    let scroll = match v.overlay {
-        Overlay::Stats { scroll } => usize::from(scroll).min(
-            lines
-                .len()
-                .saturating_sub(rect.height.saturating_sub(2) as usize),
-        ) as u16,
+    let scroll = match &mut v.overlay {
+        Overlay::Stats { scroll } => {
+            *scroll = usize::from(*scroll).min(
+                lines
+                    .len()
+                    .saturating_sub(rect.height.saturating_sub(2) as usize),
+            ) as u16;
+            *scroll
+        }
         _ => 0,
     };
     f.render_widget(
@@ -478,10 +481,11 @@ pub(super) fn theme_picker_overlay(f: &mut Canvas, area: Rect, v: &View) {
 
 /// Ask/reply panel: permission prompts and structured replies. Rendered
 /// above the input editor while the harness is waiting on the user.
-pub(super) fn ask_overlay(f: &mut Canvas, area: Rect, v: &View) {
-    let Some(ask) = v.ask() else { return };
+pub(super) fn ask_overlay(f: &mut Canvas, area: Rect, v: &mut View) {
+    let overlay_open = v.overlay.is_open();
+    let Some(ask) = v.ask_mut() else { return };
     if ask.permission() {
-        permission_overlay(f, area, v, ask);
+        permission_overlay(f, area, ask);
         return;
     }
     let block = Block::default()
@@ -509,6 +513,7 @@ pub(super) fn ask_overlay(f: &mut Canvas, area: Rect, v: &View) {
     let offset = ask
         .scroll
         .min(lines.len().saturating_sub(parts[0].height as usize));
+    ask.scroll = offset;
     f.render_widget(
         Paragraph::new(
             lines
@@ -537,7 +542,7 @@ pub(super) fn ask_overlay(f: &mut Canvas, area: Rect, v: &View) {
         Paragraph::new(line).style(Style::default().fg(TEXT)),
         parts[2],
     );
-    if parts[2].width > 0 && parts[2].height > 0 && !v.overlay.is_open() {
+    if parts[2].width > 0 && parts[2].height > 0 && !overlay_open {
         f.set_cursor_position((
             parts[2].x + col.min(parts[2].width.saturating_sub(1) as usize) as u16,
             parts[2].y,
@@ -549,7 +554,7 @@ pub(super) fn ask_overlay(f: &mut Canvas, area: Rect, v: &View) {
 /// Free-text editing is intentionally absent — one keypress answers. Terminals
 /// too short for the full list fall back to a compact one-line form; the
 /// y/a/n keys work identically either way.
-fn permission_overlay(f: &mut Canvas, area: Rect, _v: &View, ask: &Ask) {
+fn permission_overlay(f: &mut Canvas, area: Rect, ask: &mut Ask) {
     let tool = ask.payload["tool_name"].as_str().unwrap_or("tool");
     let block = Block::default()
         .borders(Borders::ALL)
@@ -577,28 +582,23 @@ fn permission_overlay(f: &mut Canvas, area: Rect, _v: &View, ask: &Ask) {
         format!("Allow {tool}?"),
         Style::default().fg(ACCENT).bold(),
     ))];
-    if !compact {
-        // The default reason carries no information; only unusual ones (e.g.
-        // doom-loop repeats) earn a row.
-        if let Some(reason) = ask.payload["reason"]
-            .as_str()
-            .filter(|r| !r.is_empty() && *r != "Tool permission")
-        {
-            lines.push(Line::from(Span::styled(reason, Style::default().fg(MUTED))));
-        }
+    // Unusual reasons remain accessible even in a compact approval panel.
+    if let Some(reason) = ask.payload["reason"]
+        .as_str()
+        .filter(|r| !r.is_empty() && *r != "Tool permission")
+    {
+        lines.extend(wrap_text(
+            &crate::text::bounded(reason),
+            Style::default().fg(MUTED),
+            width,
+            "  ",
+        ));
     }
     // The tool's arguments as compact key: value rows — not raw JSON.
     if let Some(input) = ask.payload.get("input").and_then(Value::as_object) {
-        let budget = parts[0].height.saturating_sub(lines.len() as u16) as usize;
-        let mut shown = 0;
         for (key, value) in input {
-            if shown >= budget {
-                lines.push(Line::from(Span::styled("…", Style::default().fg(MUTED))));
-                break;
-            }
             let text = match value {
-                Value::String(s) => s.clone(),
-                Value::Null => continue,
+                Value::String(s) if !s.is_empty() => crate::text::bounded(s),
                 other => {
                     let compact = serde_json::to_string(other).unwrap_or_default();
                     if compact.len() > 160 {
@@ -608,21 +608,18 @@ fn permission_overlay(f: &mut Canvas, area: Rect, _v: &View, ask: &Ask) {
                     }
                 }
             };
-            if text.trim().is_empty() {
-                continue;
-            }
             lines.extend(wrap_text(
                 &format!("{key}: {text}"),
                 Style::default().fg(TEXT),
                 width,
                 "  ",
             ));
-            shown += 1;
         }
     }
     let offset = ask
         .scroll
         .min(lines.len().saturating_sub(parts[0].height as usize));
+    ask.scroll = offset;
     f.render_widget(
         Paragraph::new(
             lines
@@ -633,14 +630,32 @@ fn permission_overlay(f: &mut Canvas, area: Rect, _v: &View, ask: &Ask) {
         ),
         parts[0],
     );
+    let selected = ask.permission_choice.min(2);
     if compact {
-        f.render_widget(
-            Paragraph::new("y once · a always · n deny").style(Style::default().fg(MUTED)),
-            parts[1],
-        );
+        let rows = ["y once", "a session", "n deny"];
+        let spans = rows
+            .iter()
+            .enumerate()
+            .flat_map(|(index, label)| {
+                let at = selected == index;
+                [
+                    Span::styled(
+                        format!("{}{}", if at { "▸" } else { " " }, label),
+                        Style::default()
+                            .fg(if at { ACCENT } else { MUTED })
+                            .add_modifier(if at {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::raw(" "),
+                ]
+            })
+            .collect::<Vec<_>>();
+        f.render_widget(Paragraph::new(Line::from(spans)), parts[1]);
         return;
     }
-    let selected = ask.permission_choice.min(2);
     let rows = [
         ("y", "Allow once"),
         ("a", "Allow always · this session"),
@@ -869,7 +884,7 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(70, 26)).unwrap();
         t.draw(|f| {
             let mut canvas = Canvas::new(f.area());
-            stats_overlay(&mut canvas, f.area(), &v, &m);
+            stats_overlay(&mut canvas, f.area(), &mut v, &m);
             canvas.paint(f);
         })
         .unwrap();
@@ -888,7 +903,7 @@ mod tests {
         v.git = crate::git::GitContext::default();
         t.draw(|f| {
             let mut canvas = Canvas::new(f.area());
-            stats_overlay(&mut canvas, f.area(), &v, &m);
+            stats_overlay(&mut canvas, f.area(), &mut v, &m);
             canvas.paint(f);
         })
         .unwrap();
@@ -1001,5 +1016,173 @@ mod tests {
         // Current theme (Nord) is marked with ●.
         let nord_line = text.lines().find(|l| l.contains("nord")).unwrap();
         assert!(nord_line.contains("●"));
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    #[allow(clippy::wildcard_imports)]
+    use super::*;
+    use crate::ui::frame_time::FrameTime;
+    use crate::ui::render::Renderer;
+    use crate::ui::state::View;
+    use serde_json::json;
+    use yourai_core::prelude::Out;
+    fn view() -> View {
+        let mut v = View::default();
+        v.event(Out::Ask {
+            id: "approval".into(),
+            payload: json!({
+                "kind": "permission", "tool_name": "write", "input": {
+                    "content": "test replacement body", "path": "/tmp/important-file.rs"
+                }
+            }),
+        });
+        v
+    }
+    fn visible(mut c: Canvas) -> String {
+        let b = c.buffer_mut();
+        (b.area.y..b.area.bottom())
+            .map(|y| {
+                (b.area.x..b.area.right())
+                    .map(|x| b[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    #[test]
+    fn permission_scroll_should_reach_path() {
+        let mut v = view();
+        let mut r = Renderer::default();
+        let m = Metadata {
+            session: "test".into(),
+            cwd: "/tmp".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        let mut accumulated = String::new();
+        for scroll in [0, 1, 5, 100] {
+            v.ask_mut().unwrap().scroll = scroll;
+            let text = visible(r.prepare(
+                Rect::new(0, 0, 30, 10),
+                &mut v,
+                &m,
+                FrameTime::now(),
+                0,
+                false,
+            ));
+            accumulated.push_str(&text);
+        }
+        assert!(
+            accumulated
+                .replace([' ', '\n', '│'], "")
+                .contains("important-file.rs"),
+            "Permission path remains unreachable after scrolling"
+        );
+    }
+    #[test]
+    fn compact_permission_should_show_selected_choice() {
+        let mut v = view();
+        let mut r = Renderer::default();
+        let m = Metadata {
+            session: "test".into(),
+            cwd: "/tmp".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        let now = FrameTime::now();
+        let mut before = r.prepare(Rect::new(0, 0, 30, 10), &mut v, &m, now, 0, false);
+        let before = before.buffer_mut().clone();
+        v.ask_mut().unwrap().permission_choice = 2;
+        let mut after = r.prepare(Rect::new(0, 0, 30, 10), &mut v, &m, now, 0, false);
+        let after = after.buffer_mut().clone();
+        assert!(before != after, "Full Buffer including styles is identical, although Enter selection changed from Allow once to Deny");
+    }
+    #[test]
+    fn failed_write_should_show_diagnostic_when_expanded() {
+        let mut v = View::default();
+        v.event(Out::ToolStarted {
+            id: "write-1".into(),
+            name: "write".into(),
+            input: json!({"path":"/readonly/a.rs", "content":"fn replacement() {}"}),
+        });
+        v.event(Out::ToolDone {
+            id: "write-1".into(),
+            name: "write".into(),
+            output: json!({"error":"Permission denied (os error 13)"}),
+            is_error: true,
+        });
+        let mut r = Renderer::default();
+        let m = Metadata {
+            session: "test".into(),
+            cwd: "/tmp".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        let collapsed = visible(r.prepare(
+            Rect::new(0, 0, 80, 24),
+            &mut v,
+            &m,
+            FrameTime::now(),
+            0,
+            false,
+        ));
+        assert!(collapsed.contains("Permission denied"), "{collapsed}");
+        assert!(
+            !collapsed.contains("replacement"),
+            "planned content must not appear as completed"
+        );
+        v.toggle(v.item_id(0));
+        let text = visible(r.prepare(
+            Rect::new(0, 0, 80, 24),
+            &mut v,
+            &m,
+            FrameTime::now(),
+            0,
+            false,
+        ));
+        assert!(
+            text.contains("Permission denied"),
+            "Write failure body is discarded by the input content preview even on expansion"
+        );
+    }
+
+    #[test]
+    fn help_should_scroll_up_after_reaching_bottom() {
+        let mut v = View::default();
+        v.overlay = Overlay::Help { scroll: 0 };
+        for _ in 0..20 {
+            v.overlay.key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::PageDown,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                0,
+            );
+        }
+        let mut r = Renderer::default();
+        let m = Metadata {
+            session: "test".into(),
+            cwd: "/tmp".into(),
+            trusted_shell: false,
+            yolo: false,
+        };
+        let now = FrameTime::now();
+        let mut before = r.prepare(Rect::new(0, 0, 80, 24), &mut v, &m, now, 0, false);
+        let before = before.buffer_mut().clone();
+        v.overlay.key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Up,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            0,
+        );
+        let mut after = r.prepare(Rect::new(0, 0, 80, 24), &mut v, &m, now, 0, false);
+        let after = after.buffer_mut().clone();
+        assert!(
+            before != after,
+            "Up at the bottom should move one row, but unbounded stored scroll leaves it stuck"
+        );
     }
 }

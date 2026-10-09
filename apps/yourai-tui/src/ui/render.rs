@@ -735,7 +735,7 @@ impl Renderer {
             layout.todo_hit = hits.0;
             layout.todo_area = hits.1;
         }
-        match &v.overlay {
+        match &mut v.overlay {
             Overlay::None => {}
             Overlay::Stats { .. } => stats_overlay(f, area, v, m),
             Overlay::Models(_) => model_picker_overlay(f, area, v),
@@ -751,7 +751,7 @@ impl Renderer {
             }
             Overlay::Sessions(_) => sessions_overlay(f, area, v, time.unix_seconds),
             Overlay::Themes(_) => theme_picker_overlay(f, area, v),
-            Overlay::Help { scroll } => help(f, area, *scroll),
+            Overlay::Help { scroll } => help(f, area, scroll),
         }
         v.theme.apply(f.buffer_mut());
         self.selection
@@ -1333,11 +1333,10 @@ fn draw_narrow_todo_dock(f: &mut Canvas, area: Rect, v: &View) {
     );
 }
 
-/// One full-width row. Drop optional metrics before clipping a value or its unit.
-/// Truncated labels and the overflow mark point to the full details in Ctrl-B.
-fn help(f: &mut Canvas, area: Rect, scroll: u16) {
+/// Wrapped help with one stored offset matching the visible scroll position.
+fn help(f: &mut Canvas, area: Rect, scroll: &mut u16) {
     let rect = crate::picker::centered(area, 78, area.height.saturating_sub(2) as usize);
-    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\nF2              Cycle recent models\nCtrl-X          Edit prompt in $VISUAL/$EDITOR\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nCtrl-V          Paste image from clipboard (Esc clears)\n@               Reference a file (text inlined; images/PDF attached)\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/continue       Retry pending execution failures\n/editor         Edit the draft in $VISUAL/$EDITOR\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker; Tab sets thinking effort)\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y allow once · a always this session · n deny (YOLO skips approvals).";
+    let text="Enter          Send / steer; confirm reply\nCtrl-J/Alt-Enter  Newline (paste preserves newlines)\nArrows/Home/End  Move cursor; Backspace/Delete\nCtrl-A/E/B/F   Line start/end · char back/fwd\nCtrl-W/U/K     Del word · to line start/end\nAlt-B/F/D·Ctrl-Left/Right  Word move · del word\nUp/Down·Ctrl-P/N  History (or row move in multiline)\nPgUp / PgDn     Scroll conversation\nCtrl-End        Follow newest output\nCtrl-Home       Jump to latest question\nCtrl-Up/Down    Previous / next question\nCtrl-G          Toggle YOLO between turns\nF2              Cycle configured models\nCtrl-X          Edit prompt in $VISUAL/$EDITOR\n/               Command menu · Up/Down · Tab/Enter\nF6/Shift-F6·Click  Select next/prev · expand block\nCtrl-O / Ctrl-R  Toggle selected block / thinking\nCtrl-T          Toggle Todo panel\nCtrl-B          Toggle stats dashboard overlay\nCtrl-Y          Cycle color theme\nCtrl-V          Paste image from clipboard (Esc clears)\n@               Reference a file (text inlined; images/PDF attached)\nMouse drag      Release to copy automatically\nEsc / Ctrl-C    Cancel exec / clear selection / close\nAlt-PgUp/PgDn   Scroll approval details\nCtrl-Q          Quit\n\n/queue TEXT     Schedule a follow-up turn\n/continue       Retry pending execution failures\n/editor         Edit the draft in $VISUAL/$EDITOR\n/compact        Compact idle conversation\n/new · /clear   Fresh context; previous session saved\n/yolo [on|off]   Change permissions between turns\n/theme          Theme picker (or /theme NAME)\n/models         Switch model (picker; Tab sets thinking effort)\n/sessions       Switch sessions (Ctrl-D asks to delete)\n/status         Same as Ctrl-B dashboard\n/help           This help · Esc closes\n\nApprovals: y allow once · a always this session · n deny (YOLO skips approvals).";
     let lines: Vec<_> = text
         .lines()
         .flat_map(|line| {
@@ -1348,11 +1347,12 @@ fn help(f: &mut Canvas, area: Rect, scroll: u16) {
             )
         })
         .collect();
-    let offset = (scroll as usize).min(
+    let offset = (*scroll as usize).min(
         lines
             .len()
             .saturating_sub(rect.height.saturating_sub(2) as usize),
     ) as u16;
+    *scroll = offset;
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines)
@@ -2841,7 +2841,7 @@ mod regression_tests {
             id: "ask".into(),
             payload: serde_json::json!({"kind":"permission", "tool_name":"shell", "input":{"command":"cargo test"}, "reason":"Tool permission"}),
         });
-        // The choice list defaults to "allow once"; deny is one Down away.
+        // The choice list defaults to "allow once"; deny is two Downs away.
         view.ask_mut().unwrap().permission_choice = 2;
         let meta = Metadata {
             session: "test".into(),
@@ -2862,7 +2862,10 @@ mod regression_tests {
             .collect::<String>();
         // Compact form for tiny terminals: the question and the key hint.
         assert!(text.contains("Allow shell?"), "{text}");
-        assert!(text.contains("y once · a always · n deny"), "{text}");
+        assert!(
+            text.contains("y once") && text.contains("a session") && text.contains("▸n deny"),
+            "{text}"
+        );
         assert!(
             !text.contains("Message"),
             "inactive composer should not displace approval"
