@@ -120,7 +120,19 @@ with tempfile.TemporaryDirectory() as tmp:
         assert len(added) == 1, added
         session_id = added.pop()
         assert all(old[:8] != session_id[:8] for old in previous_ids)
-        os.write(master, b'\x02')  # dashboard is available while opening
+        # The new database row precedes the UI replacement. Its predecessor's
+        # durable close starts only after that replacement, so wait for it
+        # before opening a dashboard that the replacement would dismiss.
+        while True:
+            try:
+                closed = all(json.loads((db_path.parent / old / 'host.json').read_text())['closed']
+                             for old in previous_ids)
+            except (OSError, ValueError, KeyError):
+                closed = False
+            if closed: break
+            if time.monotonic() >= deadline: raise AssertionError('previous session did not close')
+            read_output(0.1)
+        os.write(master, b'\x02')
         wait_for(('session ' + session_id[:8]).encode(), current=True)
         os.write(master, b'\x1b')
         while 'Session · Esc' in screen.text():
