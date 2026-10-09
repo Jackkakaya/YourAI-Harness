@@ -149,8 +149,9 @@ impl ContextManager for FailingCompaction {
         &self,
         tools: &[ToolDefinition],
         model: &dyn ModelProvider,
+        suffix: &[ChatMessage],
     ) -> Result<ContextRequest, YourAiError> {
-        self.history.build_request(tools, model)
+        self.history.build_request(tools, model, suffix)
     }
     fn prepare_compaction<'a>(
         &'a self,

@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod input_tests;
 mod journal;
 mod lifecycle;
 #[cfg(test)]
@@ -179,20 +181,17 @@ impl SessionHost {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let request = history.build_request(
-            &tools,
-            snapshot
-                .model
-                .as_ref()
-                .ok_or_else(|| error("context", "model not configured"))?
-                .as_ref(),
-        )?;
-        let policy = history.policy();
+        let model = snapshot
+            .model
+            .as_ref()
+            .ok_or_else(|| error("context", "model not configured"))?;
+        let request = history.build_request(&tools, model.as_ref(), &[])?;
+        let budget = model.token_budget();
         Ok(ContextUsage {
             estimated_tokens: request.estimated_tokens,
-            context_window: policy.context_window,
+            context_window: budget.limits().context,
             input_budget: request.input_budget,
-            output_reserve: policy.output_reserve,
+            output_reserve: u64::from(budget.max_output_tokens()),
         })
     }
 
@@ -232,6 +231,9 @@ impl SessionHost {
                 ..Default::default()
             }
         };
+        for input in &mut journal.queue {
+            input.ensure_id();
+        }
         let was_interrupted = !journal.active.is_empty();
         journal.interrupted.append(&mut journal.active);
         journal.closed = false;
@@ -370,6 +372,59 @@ impl SessionHost {
     }
     pub fn queued(&self) -> usize {
         self.live.lock().unwrap().journal.queue.len()
+    }
+    pub fn pending_inputs(&self) -> Vec<In> {
+        self.live
+            .lock()
+            .unwrap()
+            .journal
+            .queue
+            .iter()
+            .cloned()
+            .collect()
+    }
+    /// Transfer exactly one queued message into the active turn, keeping its ID and attachments.
+    pub async fn steer_pending(&self, id: String) -> Result<bool, YourAiError> {
+        self.blocking(move |host| {
+            let mut journal = host.journal();
+            host.ensure_open()?;
+            let Some(index) = journal
+                .queue
+                .iter()
+                .position(|input| input.id() == Some(id.as_str()))
+            else {
+                return Ok(false);
+            };
+            let inbox = {
+                let live = host.live.lock().unwrap();
+                if !matches!(live.status, SessionStatus::Running { .. }) {
+                    return Ok(false);
+                }
+                let Some(inbox) = live.inbox.clone() else {
+                    return Ok(false);
+                };
+                inbox
+            };
+            let original = journal.queue.remove(index).unwrap();
+            let mut input = original.clone();
+            let In::UserText { mode, .. } = &mut input else {
+                return Ok(false);
+            };
+            *mode = InputMode::Steer;
+            journal.active.push(input.clone());
+            journal.commit()?;
+            if inbox.send(input).is_err() {
+                journal.active.pop();
+                journal.queue.insert(index, original);
+                if let Err(error) = journal.commit() {
+                    journal.retain_for_recovery(&error);
+                    return Err(error);
+                }
+                return Ok(false);
+            }
+            Ok(true)
+        })
+        .await?
     }
     pub fn last_error(&self) -> Option<String> {
         self.live.lock().unwrap().journal.last_error.clone()
@@ -572,6 +627,14 @@ impl SessionHost {
         let mut journal = self.journal();
         if self.closing.is_cancelled() {
             return Err(reject("session closing".into()));
+        }
+        if journal
+            .queue
+            .iter()
+            .chain(journal.active.iter())
+            .any(|old| old.id() == input.id())
+        {
+            return Err(reject("message ID is already pending or active".into()));
         }
         let inbox = self.live.lock().unwrap().inbox.clone();
         let steer = matches!(
@@ -877,7 +940,7 @@ impl SessionHost {
     }
     /// 幂等关闭：拒绝新输入，取消并清理当前执行，触发 SessionEnd，释放资源。
     /// timeout 为 Some 时限制整个关闭过程，None 等待清理完成；失败时不得伪报 Closed。
-    /// 成功时移交未执行用户输入；调用方决定保存还是丢弃，不能静默丢失。
+    /// 成功时返回未执行输入的快照；队列仍保存在原会话，重开后可继续。
     pub async fn close(&self, timeout: Option<Duration>) -> Result<Vec<In>, YourAiError> {
         self.finish_close(timeout).await?;
         Ok(self.take_closed_inputs())
@@ -928,15 +991,11 @@ impl SessionHost {
             if let Some(error) = hook_error {
                 journal.last_error = Some(error);
             }
-            let pending: Vec<_> = journal.queue.drain(..).collect();
+            let pending: Vec<_> = journal.queue.iter().cloned().collect();
             journal.closed = true;
-            if let Err(e) = journal.commit() {
-                journal.queue.extend(pending);
-                journal.closed = false;
-                return Err(e);
-            }
-            // Retain the handoff before any fallible/cancellable step.
-            host.live.lock().unwrap().closed_pending.extend(pending);
+            journal.commit()?;
+            // Keep the durable queue in its session; callers receive only a snapshot.
+            host.live.lock().unwrap().closed_pending = pending;
             FileExt::unlock(&host._lock).map_err(|e| error("host", e))?;
             host.live.lock().unwrap().status = SessionStatus::Closed;
             Ok(())

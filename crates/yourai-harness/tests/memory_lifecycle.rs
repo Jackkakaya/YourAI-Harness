@@ -221,11 +221,22 @@ async fn compact_callback_uses_clean_active_history_without_rebuilding_system() 
     let provider = Arc::new(Provider::default());
     let mut config = HarnessConfig::new(root.clone(), d.path().into());
     config.memory_provider = Some(provider.clone());
-    config.context_policy.context_window = Some(32000);
     config.context_policy.keep_recent_tokens = 0;
-    let h = Harness::open(config, Arc::new(Model::new(vec![])))
-        .await
-        .unwrap();
+    let model = yourai_harness::model::ConfiguredModel::new(
+        Arc::new(Model::new(vec![])),
+        ModelTokenBudget::resolve(
+            ModelLimits {
+                context: Some(32000),
+                output: Some(4096),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap(),
+        ModelTimeouts::default(),
+    )
+    .unwrap();
+    let h = Harness::open(config, model).await.unwrap();
     let store = SessionCatalog::new(root).unwrap();
     let id = h.host.context().id;
     let mut user = StoredMessage::new(ChatMessage::user("CLEAN ".repeat(1000)));
@@ -307,7 +318,8 @@ async fn cancelling_hook_dispatch_cancels_provider_callback_token() {
             source: "test-timeout".into(),
             model: None,
         },
-    );
+    )
+    .with_providers(&h.host.agent().ctx().snapshot().unwrap());
     assert!(tokio::time::timeout(
         std::time::Duration::from_millis(40),
         h.hooks.dispatch(&event)

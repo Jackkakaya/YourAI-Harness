@@ -1,4 +1,4 @@
-from smoke_support import wait_completed, wait_exit
+from smoke_support import DEFAULT_BIN, wait_completed, wait_exit
 from pty_probe import Screen
 """UI regression flows: modal isolation, model defaults, deletion, narrow stats and launcher quit."""
 import fcntl
@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory() as tmp:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
     original = termios.tcgetattr(slave)
-    binary = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
+    binary = DEFAULT_BIN
     child = subprocess.Popen([str(binary), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, XDG_DATA_HOME=str(Path(tmp) / 'xdg-data')))
     captured = bytearray()
     screen = Screen(120, 35)
@@ -126,6 +126,9 @@ with tempfile.TemporaryDirectory() as tmp:
         while 'Session · Esc' in screen.text():
             if time.monotonic() >= deadline: raise AssertionError('dashboard did not close')
             read_output(0.1)
+        # Permission changes wait for the old host's close as well as the new
+        # identity. The dashboard can already show that identity during cleanup.
+        wait_for(b'Session ready.', current=True)
         return session_id
 
     try:

@@ -264,7 +264,6 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
         yourai_harness::context::ContextServices {
             store: Some(store.clone()),
             policy: ContextPolicy {
-                context_window: Some(32000),
                 keep_recent_tokens: 0,
                 summary_min_savings: 1,
                 ..Default::default()
@@ -288,14 +287,30 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
     .await
     .unwrap();
     let model = Arc::new(SummaryCapture(Mutex::new(vec![])));
+    let configured_model = yourai_harness::model::ConfiguredModel::new(
+        model.clone(),
+        ModelTokenBudget::resolve(
+            ModelLimits {
+                context: Some(32000),
+                output: Some(4096),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap(),
+        ModelTimeouts::default(),
+    )
+    .unwrap();
     let execution = Compactor::new(
         c.clone(),
-        model.clone(),
+        configured_model.clone(),
         None,
         None,
         BaseInput::new(id.as_str(), ""),
     );
-    let before = c.build_request(&[], model.as_ref()).unwrap();
+    let before = c
+        .build_request(&[], configured_model.as_ref(), &[])
+        .unwrap();
     assert!(before.estimated_tokens > 2000);
     let result = execution
         .exec(
@@ -310,7 +325,7 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
     assert!(requests.contains("IMPORTANT-RECALL"));
     assert!(!requests.contains("FROZEN-DO-NOT-SUMMARIZE"));
     assert_eq!(
-        c.build_request(&[], model.as_ref())
+        c.build_request(&[], configured_model.as_ref(), &[])
             .unwrap()
             .request
             .system

@@ -124,7 +124,7 @@ async fn run() -> Result<(), Error> {
             "--yolo" => yolo = true,
             "--import-json-sessions" => import_json = true,
             "--help" | "-h" => {
-                println!("yourai-tui [--config PATH] [--resume [SESSION_ID]] [--check-config] [--import-json-sessions] [--yolo] [--model PROVIDER/MODEL] [--variant NAME]\n--resume with no ID opens a session picker; Esc starts a fresh session.\nEnter send/reply | Ctrl-J newline | Up/Down·Ctrl-P/N history | Ctrl-A/E/W/U/K line edit | Click tool/thinking to expand | F6 select | Ctrl-O toggle | Ctrl-T todo panel | Ctrl-B stats\nEsc cancel/overlay | Ctrl-Q quit | PgUp/PgDn scroll | Ctrl-End follow | Ctrl-Home latest question | Ctrl-Up/Down browse questions | Ctrl-G YOLO | F2 cycle configured models | Ctrl-X edit draft in $VISUAL/$EDITOR\n/new | /clear (fresh context, saved history retained) | /yolo [on|off] | /queue TEXT | /compact | /continue | /editor | /theme NAME | /models | /sessions | /status | /help");
+                println!("yourai-tui [--config PATH] [--resume [SESSION_ID]] [--check-config] [--import-json-sessions] [--yolo] [--model PROVIDER/MODEL] [--variant NAME]\n--resume with no ID opens a session picker; Esc starts a fresh session.\nEnter send/queue/reply | Click Steer to guide the current task | Ctrl-J newline | Up/Down·Ctrl-P/N history | Ctrl-A/E/W/U/K line edit | Click tool/thinking to expand | F6 select | Ctrl-O toggle | Ctrl-T todo panel | Ctrl-B stats\nEsc cancel/overlay | Ctrl-Q quit | PgUp/PgDn scroll | Ctrl-End follow | Ctrl-Home latest question | Ctrl-Up/Down browse questions | Ctrl-G YOLO | F2 cycle configured models | Ctrl-X edit draft in $VISUAL/$EDITOR\n/new | /clear (fresh context, saved history retained) | /yolo [on|off] | /compact | /editor | /theme NAME | /models | /sessions | /status | /help");
                 return Ok(());
             }
             _ => return Err(format!("Unknown argument: {arg}").into()),
@@ -153,9 +153,8 @@ async fn run() -> Result<(), Error> {
     }
     let selection = config.resolve(variant.as_deref())?;
     let model = selection.model.clone();
-    config.context = selection.context.clone();
     config.selected_variant = variant;
-    if config.context.input_budget().is_none() {
+    if config.context.input_budget(model.token_budget()).is_none() {
         eprintln!("Context window unknown: configure provider.<id>.models.<id>.limit.context to enable automatic/manual summarization.");
     }
     if check {
@@ -184,6 +183,7 @@ async fn run() -> Result<(), Error> {
     hc.resume = resume.take();
     hc.system_prompt = config.system_prompt.clone();
     hc.prompt = config.prompt.clone();
+    hc.context_policy = config.context.clone();
     hc.memory_search_limit = config.memory_search_limit;
     hc.extensions = config.extensions;
     hc.trusted_shell = config.trusted_shell;
@@ -215,7 +215,7 @@ async fn run() -> Result<(), Error> {
     eprintln!("Session: {session_id}");
     if !pending.is_empty() {
         eprintln!(
-            "Unprocessed inputs returned on close: {}",
+            "Queued inputs saved in session: {}",
             serde_json::to_string(&pending)?
         );
     }

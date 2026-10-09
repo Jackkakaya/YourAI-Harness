@@ -27,6 +27,7 @@ fn tool_context<'a>(
     interaction: Option<&'a dyn ToolInteraction>,
 ) -> ToolContext<'a> {
     ToolContext {
+        providers: None,
         cwd: None,
         call_id: "tool-1".into(),
         emit: &DiscardSink,

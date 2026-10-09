@@ -139,6 +139,7 @@ mod tests {
     }
     fn http_error_with_status(status: u16, body: &str) -> YourAiError {
         let error = genai::Error::HttpError {
+            headers: Default::default(),
             status: status.to_string().parse().unwrap(),
             canonical_reason: "Too Many Requests".into(),
             body: body.into(),
@@ -219,7 +220,7 @@ mod tests {
         budget.reserve();
         let model = super::super::MeteredModel {
             inner: Arc::new(super::super::GenaiModel::new(
-                genai::Client::default(),
+                genai::Client::builder().build().unwrap(),
                 "test",
             )),
             budget: budget.clone(),
@@ -239,7 +240,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn recovery_and_cooldown_agree_on_structured_error_classification() {
         let provider = Arc::new(super::super::GenaiModel::new(
-            genai::Client::default(),
+            genai::Client::builder().build().unwrap(),
             "test",
         ));
         for (status, body, recovery, cooldown) in [

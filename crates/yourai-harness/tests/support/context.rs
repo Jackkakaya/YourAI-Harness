@@ -51,7 +51,7 @@ impl DefaultContext {
         })
     }
     pub fn build_request(&self, tools: &[ToolDefinition]) -> Result<ContextRequest, YourAiError> {
-        self.inner.build_request(tools, self.model.as_ref())
+        self.inner.build_request(tools, self.model.as_ref(), &[])
     }
     pub fn compact<'a>(
         &'a self,
@@ -86,9 +86,6 @@ impl ContextManager for DefaultContext {
     fn contains_context_marker(&self, id: &str) -> bool {
         self.inner.contains_context_marker(id)
     }
-    fn default_options(&self) -> ChatOptions {
-        self.inner.default_options()
-    }
     fn policy(&self) -> ContextPolicy {
         self.inner.policy()
     }
@@ -96,8 +93,9 @@ impl ContextManager for DefaultContext {
         &self,
         t: &[ToolDefinition],
         e: &dyn ModelProvider,
+        suffix: &[ChatMessage],
     ) -> Result<ContextRequest, YourAiError> {
-        self.inner.build_request(t, e)
+        self.inner.build_request(t, e, suffix)
     }
     fn prepare_compaction<'a>(
         &'a self,
@@ -107,4 +105,26 @@ impl ContextManager for DefaultContext {
     ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
         self.inner.prepare_compaction(r, e, c)
     }
+}
+
+/// Set model capacity independently from context maintenance policy.
+pub fn configured(
+    model: Arc<dyn ModelProvider>,
+    context: Option<u64>,
+    output: u32,
+) -> Arc<dyn ModelProvider> {
+    yourai_harness::model::ConfiguredModel::new(
+        model,
+        ModelTokenBudget::resolve(
+            ModelLimits {
+                context,
+                output: Some(output),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap(),
+        ModelTimeouts::default(),
+    )
+    .unwrap()
 }

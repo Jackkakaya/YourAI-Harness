@@ -138,7 +138,8 @@ async fn server(mode: &'static str) -> (GenaiModel, tokio::task::JoinHandle<()>)
             target.endpoint = endpoint.clone();
             Ok(target)
         })
-        .build();
+        .build()
+        .unwrap();
     (
         GenaiModel::new(client, "test").with_timeouts(
             Some(Duration::from_millis(200)),
@@ -380,10 +381,13 @@ async fn real_stream_errors_preserve_status_headers_and_retry_hint() {
 async fn configured_model_defaults_reach_collected_and_default_loop_requests() {
     for collected in [false, true] {
         let (model, task) = server("headers").await;
-        let model = yourai_harness::model::ConfiguredModel::wrap(
+        let model = yourai_harness::model::ConfiguredModel::new(
             Arc::new(model),
-            Some(Duration::from_millis(40)),
-            Some(Duration::from_millis(70)),
+            ModelTokenBudget::default(),
+            ModelTimeouts {
+                headers: Duration::from_millis(40),
+                read: Duration::from_millis(70),
+            },
         )
         .unwrap();
         let model = Arc::new(MeteredModel {

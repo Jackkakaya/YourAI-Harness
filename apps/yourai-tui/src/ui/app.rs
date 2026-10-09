@@ -339,10 +339,7 @@ impl App {
                     let command = commands[self.view.menu().selected.min(commands.len() - 1)];
                     self.view.draft.set_text("");
                     self.view.draft.insert(command.text);
-                    if command.argument {
-                        self.view.draft.insert(" ");
-                    }
-                    if key.code == KeyCode::Tab || command.argument {
+                    if key.code == KeyCode::Tab {
                         return Flow::Continue;
                     }
                     self.view.menu().dismiss();
@@ -412,7 +409,7 @@ impl App {
             KeyCode::PageUp => self.renderer.scroll(&mut self.view, 10, true),
             KeyCode::PageDown => self.renderer.scroll(&mut self.view, 10, false),
             KeyCode::Esc | KeyCode::Char('c') if key.code == KeyCode::Esc || ctrl => {
-                self.controller.harness().host.interrupt();
+                self.controller.interrupt();
                 self.view.dismiss_asks();
                 self.view.notice(Level::Info, "Cancellation requested.");
             }
@@ -516,9 +513,7 @@ impl App {
             return Flow::Continue;
         }
         // Command dispatch: parse in commands.rs, side effects here.
-        // `queued_body` carries /queue's body; plain user text falls through
-        // as None.
-        let queued_body = match commands::parse(&text) {
+        match commands::parse(&text) {
             Some(commands::Parsed::Quit) => return Flow::Quit,
             Some(commands::Parsed::Help) => {
                 self.view.overlay = Overlay::Help { scroll: 0 };
@@ -551,11 +546,6 @@ impl App {
                 };
                 self.view.draft.set_text("");
                 self.set_yolo(enabled);
-                return Flow::Continue;
-            }
-            Some(commands::Parsed::Continue) => {
-                self.controller.resume(&mut self.view);
-                self.view.draft.set_text("");
                 return Flow::Continue;
             }
             Some(commands::Parsed::Theme(name)) => {
@@ -600,23 +590,14 @@ impl App {
                 self.controller.compact(&mut self.view);
                 return Flow::Continue;
             }
-            Some(commands::Parsed::Queue(body)) => {
-                if body.trim().is_empty() {
-                    return Flow::Continue;
-                }
-                Some(body)
-            }
             None if text.starts_with('/') => {
                 self.view
                     .notice(Level::Warning, "Unknown command. /help lists commands.");
                 return Flow::Continue;
             }
-            None => None,
+            None => {}
         };
-        let (queued, body) = match queued_body {
-            Some(body) => (true, body),
-            None => (false, text.clone()),
-        };
+        let body = text;
         if self.view.draft.reading_image() {
             self.view
                 .notice(Level::Info, "Reading clipboard image; wait before sending.");
@@ -628,25 +609,15 @@ impl App {
             .filter(|a| matches!(a.data, AttachmentData::Base64(_)))
             .count();
         let n_refs = atts.len() - n_images;
-        // /queue is a mid-turn steer; it cannot carry attachments (images or
-        // file references).
-        if queued && !atts.is_empty() {
-            self.view.notice(
-                Level::Warning,
-                "Attachments cannot be queued. Send without /queue, or press Esc to clear them.",
-            );
-            return Flow::Continue;
-        }
         // Allow image-only messages (no text body).
         if body.trim().is_empty() && atts.is_empty() {
             return Flow::Continue;
         }
-        let input = if queued {
-            In::follow_up(&body)
-        } else if atts.is_empty() {
-            In::user_text(&body)
-        } else {
-            In::user_text_with_attachments(&body, atts)
+        let input = In::UserText {
+            id: None,
+            text: body.clone(),
+            mode: InputMode::FollowUp,
+            attachments: atts,
         };
         if self.controller.submit(input, &mut self.view) {
             // Clear attachments only after a successful submit, so a failure
@@ -659,7 +630,7 @@ impl App {
             if n_refs > 0 {
                 display.push_str(&format!(" [ref×{n_refs}]"));
             }
-            self.view.user(&display, queued);
+            self.view.user(&display);
             self.view.follow();
         }
         Flow::Continue
@@ -817,7 +788,11 @@ impl App {
     }
 
     fn click_dispatch(&mut self, x: u16, y: u16) {
-        click_dispatch(&mut self.renderer, &mut self.view, x, y);
+        if let Some(Hit::Steer(id)) = self.renderer.hit_test(x, y) {
+            self.controller.steer_pending(id.to_owned(), &mut self.view);
+        } else {
+            click_dispatch(&mut self.renderer, &mut self.view, x, y);
+        }
     }
 
     fn wheel_dispatch(&mut self, x: u16, y: u16, up: bool) {
@@ -836,9 +811,6 @@ pub(super) fn click_dispatch(renderer: &mut Renderer, view: &mut View, x: u16, y
         Some(Hit::Command(command)) => {
             view.draft.set_text("");
             view.draft.insert(command.text);
-            if command.argument {
-                view.draft.insert(" ");
-            }
         }
         Some(Hit::Mention(index)) => view.draft.accept_mention(index),
         Some(Hit::TodoToggle) => view.session.todos.panel = !view.session.todos.panel,
@@ -846,14 +818,21 @@ pub(super) fn click_dispatch(renderer: &mut Renderer, view: &mut View, x: u16, y
             renderer.anchor(view, id, y);
             view.toggle(id);
         }
-        None => {}
+        Some(Hit::Steer(_)) | None => {}
     }
 }
 
 /// Route a wheel event: the Todo panel scrolls its own list (when visible),
 /// everything else scrolls the transcript; reaching the bottom re-follows.
 pub(super) fn wheel_dispatch(renderer: &mut Renderer, view: &mut View, x: u16, y: u16, up: bool) {
-    if renderer.wheel_on_todo(x, y, view.session.todos.panel) {
+    if renderer.wheel_on_pending(x, y) {
+        view.session.pending_offset = if up {
+            view.session.pending_offset.saturating_sub(1)
+        } else {
+            (view.session.pending_offset + 1)
+                .min(view.session.pending_inputs.len().saturating_sub(1))
+        };
+    } else if renderer.wheel_on_todo(x, y, view.session.todos.panel) {
         view.session.todos.nudge(1, up);
     } else {
         renderer.scroll(view, 3, up);
@@ -935,6 +914,91 @@ mod tests {
         })
         .await
         .expect("session operation did not complete");
+    }
+
+    struct WaitingModel;
+    impl ModelProvider for WaitingModel {
+        fn model_iden(&self) -> &str {
+            "waiting"
+        }
+        fn complete<'a>(
+            &'a self,
+            _: ModelRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
+            Box::pin(std::future::pending())
+        }
+        fn stream_events<'a>(
+            &'a self,
+            _: ModelRequest,
+        ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+    #[tokio::test]
+    async fn ordinary_send_queues_and_click_promotes_that_message() {
+        let (_dir, mut app) = fixture().await;
+        app.controller
+            .harness()
+            .switch_model(std::sync::Arc::new(WaitingModel), ContextPolicy::default())
+            .await
+            .unwrap();
+        type_text(&mut app, "first task");
+        app.handle(key(KeyCode::Enter));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                app.controller.harness().host.status(),
+                SessionStatus::Running { .. }
+            ) {
+                app.poll(None).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        type_text(&mut app, "change direction");
+        app.handle(key(KeyCode::Enter));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !app.view.session.pending_inputs.iter().any(
+                |entry| matches!(entry, In::UserText { text, .. } if text == "change direction"),
+            ) {
+                app.poll(None).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let queued = &app.view.session.pending_inputs[0];
+        assert!(
+            matches!(queued, In::UserText { mode: InputMode::FollowUp, text, .. } if text == "change direction")
+        );
+        let id = queued.id().unwrap().to_owned();
+        for width in [30, 80] {
+            app.paint(
+                Rect::new(0, 0, width, 24),
+                super::FrameTime {
+                    monotonic: Instant::now(),
+                    unix_seconds: 0,
+                },
+                1,
+                false,
+            );
+            let hit = (0..24).flat_map(|y| (0..width).map(move |x| (x,y)))
+                .find(|(x,y)| matches!(app.renderer.hit_test(*x,*y), Some(super::Hit::Steer(found)) if found == id));
+            let (x, y) = hit.expect("queued message must have a clickable Steer action");
+            if width == 80 {
+                app.handle(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+                app.handle(mouse(MouseEventKind::Up(MouseButton::Left), x, y));
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.controller.harness().host.queued() != 0 {
+                app.poll(None).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        app.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -1104,18 +1168,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn menu_tab_and_argument_rows_fill_without_dispatching() {
+    async fn menu_tab_fills_without_dispatching() {
         let (_dir, mut app) = fixture().await;
         type_text(&mut app, "/the");
         app.handle(key(KeyCode::Tab));
         assert_eq!(app.view.draft.text(), "/theme");
         assert!(!app.view.overlay.is_open());
-        app.view.draft.set_text("");
-        type_text(&mut app, "/qu");
-        app.handle(key(KeyCode::Enter));
-        // /queue takes an argument: Enter completes it but does not submit.
-        assert_eq!(app.view.draft.text(), "/queue ");
-        assert!(app.view.items().is_empty());
         app.close().await.unwrap();
     }
 

@@ -22,7 +22,7 @@ pub async fn create(
         &[],
         None,
         None,
-        &ContextPolicy::default(),
+        ContextPolicy::default().maintenance_threshold(model.token_budget()),
         &CancellationToken::new(),
     )
     .await?;
@@ -67,7 +67,7 @@ pub async fn restore(
             &[],
             None,
             None,
-            &policy,
+            policy.maintenance_threshold(model.token_budget()),
             &CancellationToken::new(),
         )
         .await?;

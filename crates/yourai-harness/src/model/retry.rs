@@ -96,11 +96,19 @@ mod tests {
                 webc_error: genai::webc::Error::ResponseFailedStatus {
                     status: "429".parse().unwrap(),
                     body: "{}".into(),
-                    headers: Box::default(),
+                    headers: Box::new(
+                        [(
+                            "content-type".parse().unwrap(),
+                            "application/json".parse().unwrap(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
                 },
             }
         } else {
             genai::Error::HttpError {
+                headers: Default::default(),
                 status: "429".parse().unwrap(),
                 canonical_reason: "Too Many Requests".into(),
                 body: "{}".into(),

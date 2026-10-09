@@ -292,23 +292,51 @@ impl HookEvent {
 }
 
 /// 一次完整的 Hook 调用：base 上下文 + 事件。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HookInvocation {
+    /// Frozen native capabilities; these are never serialized into hook wire input.
+    pub model: Option<std::sync::Arc<dyn crate::model::ModelProvider>>,
+    pub memory: Option<std::sync::Arc<dyn crate::memory::MemoryProvider>>,
+    pub sessions: Option<std::sync::Arc<dyn crate::session::SessionManager>>,
+    pub usage: Option<std::sync::Arc<dyn crate::usage::UsageTracker>>,
     pub base: BaseInput,
     pub event: HookEvent,
 }
 
 impl HookInvocation {
     pub fn new(base: BaseInput, event: HookEvent) -> Self {
-        Self { base, event }
+        Self {
+            base,
+            event,
+            model: None,
+            memory: None,
+            sessions: None,
+            usage: None,
+        }
     }
 
+    pub fn with_providers(mut self, providers: &crate::context::ProviderSnapshot) -> Self {
+        self.model = providers.model.clone();
+        self.memory = providers.memory.clone();
+        self.sessions = providers.session.clone();
+        self.usage = providers.usage.clone();
+        self
+    }
     pub fn event_name(&self) -> &'static str {
         self.event.event_name()
     }
 
     pub fn event_kind(&self) -> HookEventKind {
         self.event.kind()
+    }
+}
+
+impl std::fmt::Debug for HookInvocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookInvocation")
+            .field("base", &self.base)
+            .field("event", &self.event)
+            .finish_non_exhaustive()
     }
 }
 

@@ -23,7 +23,11 @@ import termios
 import threading
 import time
 
-DEFAULT_BIN = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
+REPO_ROOT = Path(__file__).resolve().parents[3]
+BUILD_DIR = Path(os.environ.get('CARGO_TARGET_DIR', 'target'))
+if not BUILD_DIR.is_absolute():
+    BUILD_DIR = REPO_ROOT / BUILD_DIR
+DEFAULT_BIN = BUILD_DIR / 'debug/yourai-tui'
 
 WHEEL_UP = b'\x1b[<64;10;10M'
 WHEEL_DOWN = b'\x1b[<65;10;10M'

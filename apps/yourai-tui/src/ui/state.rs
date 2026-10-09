@@ -222,6 +222,9 @@ pub struct View {
 /// State belonging to one conversation; replaced together on a session switch.
 #[derive(Default)]
 pub struct SessionView {
+    pub pending_inputs: Vec<In>,
+    pub pending_offset: usize,
+    pub can_steer: bool,
     pub model_metrics: yourai_harness::model::BudgetSnapshot,
     pub retry: Option<RetryState>,
     pub context_usage: Option<yourai_harness::runtime::ContextUsage>,
@@ -544,14 +547,10 @@ impl View {
             text: bounded(&text.into()),
         });
     }
-    pub fn user(&mut self, text: &str, queued: bool) {
+    pub fn user(&mut self, text: &str) {
         self.push(Item::Text {
             role: Role::User,
-            text: bounded(&if queued {
-                format!("[queued] {text}")
-            } else {
-                text.into()
-            }),
+            text: bounded(text),
         });
     }
     fn delta(&mut self, role: Role, text: &str) {
@@ -999,7 +998,7 @@ mod tests {
     fn idle_status_before_final_message_does_not_duplicate_stream() {
         let mut view = View::default();
         view.session.active = true;
-        view.user("你好", false);
+        view.user("你好");
         view.event(Out::Reasoning {
             text: "thinking".into(),
         });
@@ -1025,7 +1024,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(assistant, vec!["你好！有什么我可以帮你的？"]);
         // A later turn is allowed to return identical text; it must not be deduplicated.
-        view.user("再说一遍", false);
+        view.user("再说一遍");
         view.event(Out::Chunk {
             text: "你好！有什么我可以帮你的？".into(),
         });
@@ -1056,7 +1055,7 @@ mod tests {
         view.event(Out::Reasoning { text: "b".into() });
         assert!(view.session.expanded.contains(&id));
         for _ in 0..MAX_ITEMS {
-            view.user("new", false);
+            view.user("new");
         }
         assert!(!view.session.expanded.contains(&id));
         assert!(view.session.selected.is_none());
@@ -1395,11 +1394,11 @@ mod menu_tests {
         view.draft.set_text("");
         view.draft.insert("/co");
         assert_eq!(view.menu().selected, 0);
-        assert_eq!(view.menu().items().len(), 2);
+        assert_eq!(view.menu().items().len(), 1);
         view.overlay = Overlay::Help { scroll: 0 };
         assert!(view.menu().items().is_empty());
         view.overlay = Overlay::None;
-        assert_eq!(view.menu().items().len(), 2);
+        assert_eq!(view.menu().items().len(), 1);
         view.menu().dismiss();
         assert!(view.menu().items().is_empty());
     }

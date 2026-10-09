@@ -12,7 +12,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use yourai_harness::GenaiModel;
+use yourai_core::prelude::{ModelLimits, ModelProvider, ModelTimeouts, ModelTokenBudget};
+use yourai_harness::{model::ConfiguredModel, GenaiModel};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// Borrowed option maps for one picker entry: (model options, variant options).
 type EntryOptions<'a> = (&'a Map<String, Value>, Option<&'a Map<String, Value>>);
@@ -20,6 +21,8 @@ type EntryOptions<'a> = (&'a Map<String, Value>, Option<&'a Map<String, Value>>)
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub context: yourai_core::prelude::ContextPolicy,
     #[serde(default)]
     pub theme: crate::ui::theme::Theme,
     #[serde(rename = "$schema")]
@@ -41,8 +44,6 @@ pub struct Config {
     pub trusted_shell: bool,
     #[serde(default)]
     pub yolo: bool,
-    #[serde(default)]
-    pub context: yourai_core::prelude::ContextPolicy,
     #[serde(default = "sessions")]
     pub session_dir: PathBuf,
     pub system_prompt: Option<String>,
@@ -103,7 +104,7 @@ pub struct ModelConfig {
     #[serde(rename = "name")]
     pub _name: Option<String>,
     #[serde(default)]
-    pub limit: Limits,
+    pub limit: ModelLimits,
     #[serde(default)]
     pub options: Map<String, Value>,
     #[serde(default)]
@@ -121,26 +122,15 @@ pub struct Pricing {
     pub input: Option<f64>,
     pub output: Option<f64>,
 }
-#[derive(Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Limits {
-    pub context: Option<u64>,
-    pub input: Option<u64>,
-    pub output: Option<u32>,
-}
 
 pub struct ResolvedModel {
-    pub model: Arc<GenaiModel>,
-    pub context: yourai_core::prelude::ContextPolicy,
+    pub model: Arc<dyn ModelProvider>,
     pub settings: yourai_harness::assembly::ModelSettings,
 }
 impl ResolvedModel {
     pub fn apply_to(&self, config: &mut yourai_harness::HarnessConfig) {
-        config.context_policy = self.context.clone();
         config.model_provider = self.settings.provider.clone();
         config.request_policy = self.settings.requests.clone();
-        config.model_header_timeout = self.settings.header_timeout;
-        config.model_chunk_timeout = self.settings.chunk_timeout;
     }
 }
 
@@ -332,11 +322,8 @@ impl Config {
             parse("chunkTimeout", options.chunk_timeout_ms)?,
         ))
     }
-    /// Resolve the selected model (plus optional variant) into a live model
-    /// handle together with the context policy matching its limits. Pure:
-    /// callers explicitly adopt the policy (typically `self.context = …`),
-    /// keeping the model→context coupling visible at each call site instead
-    /// of hidden behind a mutation here.
+    /// Resolve one model/variant with its capacity, output budget and timeouts.
+    /// Context maintenance policy is independent of model selection.
     pub fn resolve(&self, variant: Option<&str>) -> Result<ResolvedModel, Error> {
         let requests = self.request_policy()?;
         if self.steps == Some(0) {
@@ -372,30 +359,13 @@ impl Config {
             .map(|v| {
                 v.as_u64()
                     .filter(|v| *v > 0 && *v <= u32::MAX as u64)
+                    .map(|n| n as u32)
                     .ok_or("maxOutputTokens must be a positive integer")
             })
             .transpose()?;
-        if model.limit.output == Some(0)
-            || model.limit.context == Some(0)
-            || model.limit.input == Some(0)
-        {
-            return Err("Model limits must be positive".into());
-        }
-        let output =
-            requested.unwrap_or(u64::from(model.limit.output.unwrap_or(32_000).min(32_000)));
-        if model
-            .limit
-            .output
-            .is_some_and(|limit| output > u64::from(limit))
-        {
-            return Err("maxOutputTokens exceeds model limit.output".into());
-        }
-        let mut context = self.context.clone();
-        context.context_window = model.limit.context;
-        context.input_limit = model.limit.input;
-        context.output_reserve = output;
-        context.validate()?;
-        let mut chat = ChatOptions::default().with_max_tokens(output as u32);
+        let budget = ModelTokenBudget::resolve(model.limit, requested)?;
+        self.context.validate_for(budget)?;
+        let mut chat = ChatOptions::default();
         if let Some(v) = options.remove("temperature") {
             chat.temperature = Some(
                 v.as_f64()
@@ -413,7 +383,7 @@ impl Config {
         if let Some(v) = options.remove("reasoningEffort") {
             use genai::chat::ReasoningEffort;
             chat.reasoning_effort = Some(match v.as_str() {
-                Some("none") => ReasoningEffort::None,
+                Some("none") => ReasoningEffort::Zero,
                 Some("minimal") => ReasoningEffort::Minimal,
                 Some("low") => ReasoningEffort::Low,
                 Some("medium") => ReasoningEffort::Medium,
@@ -453,19 +423,20 @@ impl Config {
             .collect::<Result<_, Error>>()?;
         let client = provider.client(provider_id, chat)?;
         let (header_timeout, chunk_timeout) = self.model_timeouts()?;
-        let model = Arc::new(
-            GenaiModel::new(client, name)
-                .with_headers(headers.into())
-                .with_timeouts(header_timeout, chunk_timeout),
-        );
+        let defaults = ModelTimeouts::default();
+        let model = ConfiguredModel::new(
+            Arc::new(GenaiModel::new(client, name).with_headers(headers.into())),
+            budget,
+            ModelTimeouts {
+                headers: header_timeout.unwrap_or(defaults.headers),
+                read: chunk_timeout.unwrap_or(defaults.read),
+            },
+        )?;
         Ok(ResolvedModel {
             model,
-            context,
             settings: yourai_harness::assembly::ModelSettings {
                 provider: provider_id.into(),
                 requests,
-                header_timeout,
-                chunk_timeout,
             },
         })
     }
@@ -592,7 +563,7 @@ impl ProviderConfig {
                 ..Default::default()
             });
         }
-        Ok(builder.build())
+        Ok(builder.build()?)
     }
 }
 
@@ -678,7 +649,6 @@ mod tests {
     }
     #[tokio::test]
     async fn minimal_gateway_config_uses_model_name_and_default_prompt() {
-        use yourai_core::model::ModelProvider;
         let config: Config = serde_json::from_value(json!({
             "model":"gateway/glm",
             "provider":{"gateway":{"options":{"baseURL":"http://localhost:8080/v1","apiKey":"test-only"}}}
@@ -706,14 +676,12 @@ mod tests {
     }
     #[test]
     fn selects_model_and_variant_without_resolving_unused_credentials() {
-        use yourai_core::model::ModelProvider;
         let config = config();
-        let ResolvedModel { model, context, .. } = config.resolve(Some("short")).unwrap();
+        let ResolvedModel { model, .. } = config.resolve(Some("short")).unwrap();
         assert_eq!(model.model_iden(), "actual-api-model");
-        // The returned policy carries the model's limits and the variant's
-        // output reserve; adopting it is the caller's explicit choice.
-        assert_eq!(context.context_window, Some(64000));
-        assert_eq!(context.output_reserve, 4000);
+        // Capacity and the variant's output budget belong to the resolved model.
+        assert_eq!(model.token_budget().limits().context, Some(64000));
+        assert_eq!(model.token_budget().max_output_tokens(), 4000);
         assert!(config.resolve(Some("off")).is_err());
         assert!(config.resolve(Some("missing")).is_err());
         let mut config = config;

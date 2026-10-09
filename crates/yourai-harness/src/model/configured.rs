@@ -6,34 +6,53 @@ use yourai_core::prelude::*;
 pub struct ConfiguredModel {
     inner: Arc<dyn ModelProvider>,
     timeouts: ModelTimeouts,
+    budget: ModelTokenBudget,
 }
 impl ConfiguredModel {
-    pub fn wrap(
+    pub fn new(
         inner: Arc<dyn ModelProvider>,
-        headers: Option<Duration>,
-        read: Option<Duration>,
-    ) -> Result<Arc<dyn ModelProvider>, YourAiError> {
-        if headers.into_iter().chain(read).any(|d| d.is_zero()) {
+        budget: ModelTokenBudget,
+        timeouts: ModelTimeouts,
+    ) -> Result<Arc<Self>, YourAiError> {
+        let existing = inner.token_budget();
+        existing.validate_output(budget.max_output_tokens())?;
+        let old = existing.limits();
+        let new = budget.limits();
+        for (declared, bound) in [
+            (new.context, old.context),
+            (new.input, old.input),
+            (new.output.map(u64::from), old.output.map(u64::from)),
+        ] {
+            if bound.is_some_and(|bound| declared.is_none_or(|n| n > bound)) {
+                return Err(ErrorKind::Config(
+                    "model configuration cannot broaden an existing capacity".into(),
+                )
+                .into());
+            }
+        }
+        if timeouts.headers.is_zero() || timeouts.read.is_zero() {
             return Err(ErrorKind::Config("model timeouts must be positive".into()).into());
         }
-        if headers.is_none() && read.is_none() {
-            return Ok(inner);
-        }
-        let defaults = inner.timeouts();
         Ok(Arc::new(Self {
             inner,
-            timeouts: ModelTimeouts {
-                headers: headers.unwrap_or(defaults.headers),
-                read: read.unwrap_or(defaults.read),
-            },
+            budget,
+            timeouts,
         }))
     }
-    fn request(&self, mut request: ModelRequest) -> ModelRequest {
+    fn request(&self, mut request: ModelRequest) -> Result<ModelRequest, YourAiError> {
+        let output = *request
+            .options
+            .max_tokens
+            .get_or_insert(self.budget.max_output_tokens());
+        self.budget.validate_output(output)?;
         self.timeouts.apply(&mut request.options);
-        request
+        Ok(request)
     }
 }
 impl ModelProvider for ConfiguredModel {
+    fn token_budget(&self) -> ModelTokenBudget {
+        self.budget
+    }
     fn timeouts(&self) -> ModelTimeouts {
         self.timeouts
     }
@@ -59,12 +78,12 @@ impl ModelProvider for ConfiguredModel {
         &'a self,
         request: ModelRequest,
     ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
-        self.inner.complete(self.request(request))
+        Box::pin(async move { self.inner.complete(self.request(request)?).await })
     }
     fn stream_events<'a>(
         &'a self,
         request: ModelRequest,
     ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
-        self.inner.stream_events(self.request(request))
+        Box::pin(async move { self.inner.stream_events(self.request(request)?).await })
     }
 }

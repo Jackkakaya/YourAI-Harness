@@ -47,10 +47,13 @@ fn context(
     services.store = Some(store.clone());
     services.hooks = hooks;
     services.usage = Some(Arc::new(storage::LocalUsage((*store).clone())));
-    services.policy.context_window = Some(32_000);
     services.policy.keep_recent_tokens = 0;
     services.policy.summary_min_savings = 1;
-    DefaultContext::new(id, model, services)
+    DefaultContext::new(
+        id,
+        context_fixture::configured(model, Some(32_000), 4096),
+        services,
+    )
 }
 async fn host(
     dir: &std::path::Path,
@@ -62,6 +65,7 @@ async fn host(
         Some(meta) => meta.id.clone(),
         None => store.create_session(SessionId::new(), "").await.unwrap().id,
     };
+    let model = context_fixture::configured(model, Some(32_000), 4096);
     let history = context(id.clone(), model.clone(), store.clone(), hooks.clone());
     let mut b = Agent::builder()
         .agent_loop(Arc::new(
@@ -756,9 +760,10 @@ async fn child_agent_runs_its_own_session_and_reports_lifecycle() {
     )
     .await;
     let child_model = Arc::new(Model::new(vec![answer("child result")]));
-    let tool = subagent(&h, child_model, None);
+    let tool = subagent(&h, Some(child_model), None);
     let cancel = CancellationToken::new();
     let tc = ToolContext {
+        providers: None,
         cwd: None,
         call_id: "child-tool".into(),
         emit: &DiscardSink,
@@ -1208,13 +1213,13 @@ async fn agent_hook_uses_real_loop_and_shared_budget() {
     use yourai_harness::hooks::{HookEvaluator, HookModelRequest};
     let budget = ModelBudget::new();
     let executor = assembly::model_hooks::DefaultHookEvaluator {
-        model: Arc::new(MeteredModel {
+        model: Some(Arc::new(MeteredModel {
             inner: Arc::new(Model::new(vec![
                 answer(r#"{"ok":false,"reason":"unfinished"}"#),
                 answer(r#"{"ok":true}"#),
             ])),
             budget: budget.clone(),
-        }),
+        })),
         tools: None,
         usage: None,
         timeout: Duration::from_secs(1),
@@ -1517,7 +1522,7 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
     let old_hooks = Arc::new(Hooks::new(|_, _| {}));
     let new_hooks = Arc::new(Hooks::new(|_, _| {}));
     let agent = Agent::builder()
-        .model(old.clone())
+        .model(context_fixture::configured(old.clone(), Some(32_000), 4096))
         .context_manager(history.inner.clone())
         .hooks(old_hooks.clone())
         .agent_loop(Arc::new(
@@ -1540,13 +1545,14 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
         ])
         .await
         .unwrap();
-    agent.ctx().set_model(new.clone());
+    let configured = context_fixture::configured(new.clone(), Some(32_000), 4096);
+    agent.ctx().set_model(configured.clone());
     agent.ctx().set_hooks(new_hooks.clone());
     let usage = Arc::new(storage::LocalUsage((*store).clone()));
     agent.ctx().set_usage(usage.clone());
     let before = history
         .inner
-        .build_request(&[], new.as_ref())
+        .build_request(&[], configured.as_ref(), &[])
         .unwrap()
         .estimated_tokens;
     let result = h
@@ -1579,9 +1585,14 @@ async fn context_usage_estimates_active_request_without_calling_model() {
     let dir = TempDir::new().unwrap();
     let model = Arc::new(Model::new(vec![answer("done")]));
     let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
-    config.context_policy.context_window = Some(32_000);
+
     config.system_prompt = Some("You are a coding assistant.".into());
-    let h = Harness::open(config, model.clone()).await.unwrap();
+    let h = Harness::open(
+        config,
+        context_fixture::configured(model.clone(), Some(32_000), 4096),
+    )
+    .await
+    .unwrap();
     let before = h.host.context_usage().unwrap();
     assert_eq!(before.context_window, Some(32_000));
     assert_eq!(before.input_budget, Some(32_000 - 4096 - 1024));
@@ -1633,6 +1644,7 @@ async fn rate_limit_attempts_stop_at_retry_limit() {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(ErrorKind::Model {
                     source: genai::Error::HttpError {
+                        headers: Default::default(),
                         status: "429".parse().unwrap(),
                         canonical_reason: "Too Many Requests".into(),
                         body: r#"{"error":{"code":"rate_limit_exceeded"}}"#.into(),
@@ -1682,9 +1694,14 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
     let dir = TempDir::new().unwrap();
     let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
     config.system_prompt = Some("test".into());
-    config.context_policy.context_window = Some(64_000);
+
     let old = Arc::new(Model::new(vec![answer("first")]));
-    let h = Harness::open(config, old.clone()).await.unwrap();
+    let h = Harness::open(
+        config,
+        context_fixture::configured(old.clone(), Some(64_000), 4096),
+    )
+    .await
+    .unwrap();
     h.host.submit(In::user_text("one")).unwrap();
     h.host
         .run_next(
@@ -1701,18 +1718,30 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
 
     let new = Arc::new(Model::new(vec![answer("second")]));
     let policy = ContextPolicy {
-        context_window: Some(32_000),
-        output_reserve: 2048,
         ..ContextPolicy::default()
     };
     h.switch_model_with_settings(
-        new.clone(),
+        yourai_harness::model::ConfiguredModel::new(
+            context_fixture::configured(new.clone(), Some(32_000), 2048),
+            ModelTokenBudget::resolve(
+                ModelLimits {
+                    context: Some(32_000),
+                    output: Some(2048),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap(),
+            ModelTimeouts {
+                headers: Duration::from_secs(1),
+                read: Duration::from_secs(1),
+            },
+        )
+        .unwrap(),
         policy,
         yourai_harness::assembly::ModelSettings {
             provider: "other".into(),
             requests: Default::default(),
-            header_timeout: Some(Duration::from_secs(1)),
-            chunk_timeout: Some(Duration::from_secs(1)),
         },
     )
     .await
@@ -1757,9 +1786,14 @@ async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
     let dir = TempDir::new().unwrap();
     let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
     config.system_prompt = Some("test".into());
-    config.context_policy.context_window = Some(64_000);
+
     let old = Arc::new(Model::new(vec![Box::pin(futures_util::stream::pending())]));
-    let h = Harness::open(config, old.clone()).await.unwrap();
+    let h = Harness::open(
+        config,
+        context_fixture::configured(old.clone(), Some(64_000), 4096),
+    )
+    .await
+    .unwrap();
     h.host.submit(In::user_text("wait")).unwrap();
     let host = h.host.clone();
     let turn = tokio::spawn(async move {
@@ -1778,12 +1812,14 @@ async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
     .await
     .unwrap();
     let policy = ContextPolicy {
-        context_window: Some(32_000),
         ..ContextPolicy::default()
     };
     let new = Arc::new(Model::new(vec![answer("new")]));
     assert!(h
-        .switch_model(new.clone(), policy)
+        .switch_model(
+            context_fixture::configured(new.clone(), Some(32_000), 4096),
+            policy
+        )
         .await
         .unwrap_err()
         .to_string()
@@ -1811,13 +1847,19 @@ async fn model_switch_publishes_chunk_timeout_with_model() {
         .unwrap();
     let next = Arc::new(Model::new(vec![hangs_after("partial")]));
     h.switch_model_with_settings(
-        next,
+        yourai_harness::model::ConfiguredModel::new(
+            next,
+            ModelTokenBudget::default(),
+            ModelTimeouts {
+                headers: Duration::from_millis(20),
+                read: Duration::from_millis(20),
+            },
+        )
+        .unwrap(),
         ContextPolicy::default(),
         yourai_harness::assembly::ModelSettings {
             provider: "new".into(),
             requests: Default::default(),
-            header_timeout: Some(Duration::from_millis(20)),
-            chunk_timeout: Some(Duration::from_millis(20)),
         },
     )
     .await
@@ -1876,8 +1918,6 @@ async fn harness_model_settings_are_inherited_by_child_default_loop() {
     config.system_prompt = Some("test".into());
     config.extensions = true;
     config.yolo = true;
-    config.model_header_timeout = Some(Duration::from_secs(7));
-    config.model_chunk_timeout = Some(Duration::from_secs(11));
     let mut spawn = call("spawn", "subagent");
     spawn.fn_arguments = json!({"prompt":"child task"});
     let model = Arc::new(Model::new(vec![
@@ -1885,7 +1925,20 @@ async fn harness_model_settings_are_inherited_by_child_default_loop() {
         answer("child done"),
         answer("parent done"),
     ]));
-    let h = Harness::open(config, model.clone()).await.unwrap();
+    let h = Harness::open(
+        config,
+        yourai_harness::model::ConfiguredModel::new(
+            model.clone(),
+            ModelTokenBudget::default(),
+            ModelTimeouts {
+                headers: Duration::from_secs(7),
+                read: Duration::from_secs(11),
+            },
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
     h.host.submit_async(In::user_text("go")).await.unwrap();
     let result = h
         .host
@@ -1967,9 +2020,10 @@ async fn blocked_subagent_start_does_not_create_a_persistent_session() {
     .await;
     let store = SqliteStore::open(&dir.path().join("sessions.sqlite3")).unwrap();
     let before = store.list_sessions().await.unwrap().len();
-    let tool = subagent(&h, Arc::new(Model::new(vec![])), None);
+    let tool = subagent(&h, Some(Arc::new(Model::new(vec![]))), None);
     let cancel = CancellationToken::new();
     let tc = ToolContext {
+        providers: None,
         cwd: None,
         call_id: "blocked-child".into(),
         emit: &DiscardSink,
@@ -2021,11 +2075,15 @@ async fn subagent_hook_identity_matches_persisted_session_and_continues_same_chi
     let h = host(dir.path(), Arc::new(Model::new(vec![])), Some(hooks)).await;
     let tool = subagent(
         &h,
-        Arc::new(Model::new(vec![answer("first"), answer("second")])),
+        Some(Arc::new(Model::new(vec![
+            answer("first"),
+            answer("second"),
+        ]))),
         None,
     );
     let cancel = CancellationToken::new();
     let tc = ToolContext {
+        providers: None,
         cwd: None,
         call_id: "child".into(),
         emit: &DiscardSink,
@@ -2244,9 +2302,10 @@ async fn subagent_start_context_goes_to_the_child_request() {
     }));
     let h = host(dir.path(), Arc::new(Model::new(vec![])), Some(hooks)).await;
     let child_model = Arc::new(Model::new(vec![answer("child done")]));
-    let tool = subagent(&h, child_model.clone(), None);
+    let tool = subagent(&h, Some(child_model.clone()), None);
     let cancel = CancellationToken::new();
     let tc = ToolContext {
+        providers: None,
         cwd: None,
         call_id: "child-context".into(),
         emit: &DiscardSink,
@@ -2425,7 +2484,7 @@ async fn parent_close_cancels_direct_subagent_and_reclaims_the_unique_child() {
     let h = host(dir.path(), Arc::new(Model::new(vec![])), None).await;
     let provider = subagent(
         &h,
-        Arc::new(Model::new(vec![hangs_after("child partial")])),
+        Some(Arc::new(Model::new(vec![hangs_after("child partial")]))),
         None,
     );
     let entered = Arc::new(tokio::sync::Notify::new());
@@ -2434,6 +2493,7 @@ async fn parent_close_cancels_direct_subagent_and_reclaims_the_unique_child() {
         let cancel = CancellationToken::new();
         let sink = ChildProgress(signal);
         let tc = ToolContext {
+            providers: None,
             cwd: None,
             call_id: "direct-child".into(),
             emit: &sink,
@@ -2595,8 +2655,9 @@ impl ContextManager for SuspendedRestore {
         &self,
         tools: &[ToolDefinition],
         model: &dyn ModelProvider,
+        suffix: &[ChatMessage],
     ) -> Result<ContextRequest, YourAiError> {
-        self.inner.build_request(tools, model)
+        self.inner.build_request(tools, model, suffix)
     }
     fn records(&self) -> Vec<StoredMessage> {
         self.inner.records()

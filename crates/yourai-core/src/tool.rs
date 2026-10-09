@@ -28,6 +28,8 @@ use tokio_util::sync::CancellationToken;
 
 /// 工具执行期的能力注入（由公共执行包装装配）。
 pub struct ToolContext<'a> {
+    /// Providers frozen for this turn, also used when assembling inherited children.
+    pub providers: Option<&'a ProviderSnapshot>,
     /// 本次工具调用的身份（= 模型 ToolCall 的 call_id）；
     /// 工具进度事件用此 id；Ask 使用独立 request_id 并关联此调用
     pub call_id: String,
@@ -352,7 +354,9 @@ impl Tool {
         let cancel = turn.tc.cancel.child_token();
         let _guard = cancel.clone().drop_guard();
         let session = turn.tc.info.options.session.clone();
+        let providers = turn.tc.snap.clone();
         let tool_context = ToolContext {
+            providers: Some(&providers),
             cwd: session.as_ref().map(|s| s.cwd.as_path()),
             call_id: call.call_id.clone(),
             emit: turn.tc.outbox,

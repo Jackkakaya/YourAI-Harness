@@ -60,13 +60,16 @@ impl ModelProvider for CustomProvider {
 }
 fn wrapped(class: ModelErrorClass, mode: Mode) -> (Arc<dyn ModelProvider>, Arc<ModelBudget>) {
     let budget = ModelBudget::new();
-    let inner = ConfiguredModel::wrap(
+    let inner = ConfiguredModel::new(
         Arc::new(SourceModel {
             inner: Arc::new(CustomProvider { class, mode }),
             source: "test",
         }),
-        Some(Duration::from_secs(1)),
-        None,
+        ModelTokenBudget::default(),
+        ModelTimeouts {
+            headers: Duration::from_secs(1),
+            ..Default::default()
+        },
     )
     .unwrap();
     (
@@ -173,6 +176,7 @@ fn unspecified_provider_does_not_inherit_vendor_protocol_policy() {
     }
     let error = ErrorKind::Model {
         source: genai::Error::HttpError {
+            headers: Default::default(),
             status: "429".parse().unwrap(),
             canonical_reason: "Too Many Requests".into(),
             body: "{}".into(),

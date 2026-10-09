@@ -1,4 +1,4 @@
-from smoke_support import wait_exit
+from smoke_support import DEFAULT_BIN, wait_exit
 """Launcher smoke test: bare `--resume` opens the session picker."""
 import fcntl
 import http.server
@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory() as tmp:
         "context": {"keep_recent_tokens": 0, "summary_min_savings": 1}
     }))
     # Seed an existing session by running the TUI once briefly.
-    bin_path = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
+    bin_path = DEFAULT_BIN
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
     child = subprocess.Popen([str(bin_path), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, XDG_DATA_HOME=str(Path(tmp) / 'xdg-data')))

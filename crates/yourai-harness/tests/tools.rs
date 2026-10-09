@@ -9,6 +9,7 @@ async fn call(tool: &dyn ToolProvider, input: Value) -> Result<Value, YourAiErro
     let cancel = CancellationToken::new();
     tool.run(
         ToolContext {
+            providers: None,
             cwd: None,
             call_id: "test".into(),
             emit: &DiscardSink,
@@ -119,6 +120,7 @@ async fn symlinks_permissions_line_endings_and_cancelled_write() {
     assert!(write
         .run(
             ToolContext {
+                providers: None,
                 cwd: None,
                 call_id: "cancel".into(),
                 emit: &DiscardSink,
@@ -197,6 +199,7 @@ async fn dropping_shell_future_kills_descendants() {
         shell
             .run(
                 ToolContext {
+                    providers: None,
                     cwd: None,
                     call_id: "drop".into(),
                     emit: &DiscardSink,
@@ -254,6 +257,7 @@ async fn hard_denial_prevents_side_effects() {
     assert!(write
         .run(
             ToolContext {
+                providers: None,
                 cwd: None,
                 call_id: "deny".into(),
                 emit: &DiscardSink,
@@ -305,6 +309,7 @@ async fn cancellation_token_stops_shell_and_sandbox_denial_prevents_spawn() {
         shell
             .run(
                 ToolContext {
+                    providers: None,
                     cwd: None,
                     call_id: "cancel".into(),
                     emit: &DiscardSink,
@@ -356,6 +361,7 @@ async fn cancellation_token_stops_shell_and_sandbox_denial_prevents_spawn() {
     assert!(shell
         .run(
             ToolContext {
+                providers: None,
                 cwd: None,
                 call_id: "sandbox".into(),
                 emit: &DiscardSink,

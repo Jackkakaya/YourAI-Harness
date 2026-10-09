@@ -1,4 +1,4 @@
-from smoke_support import wait_completed, wait_exit
+from smoke_support import DEFAULT_BIN, wait_completed, wait_exit
 from pty_probe import Screen
 """Offline POSIX TUI smoke test. Run cargo build -p yourai-tui first."""
 import fcntl
@@ -109,7 +109,7 @@ with tempfile.TemporaryDirectory() as tmp:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
     original = termios.tcgetattr(slave)
-    binary = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
+    binary = DEFAULT_BIN
     child = subprocess.Popen([str(binary), '--config', str(config)] + mode_args, stdin=slave, stdout=slave, stderr=slave, env=child_env)
     captured = bytearray()
     screen = Screen(120, 35)
@@ -169,7 +169,7 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_for(b'Copied')
         assert clipboard_file.read_text() == 'New session', repr(clipboard_file.read_text())
         os.write(master, b'/')
-        wait_for(b'/continue')
+        wait_for(b'/compact')
         os.write(master, b'\x1b\x7f/theme nord\r')
         # Esc dismisses completion; Backspace removes the slash before a new command.
         # Theme command is local; wait for the editor to clear (no theme button in footer now).

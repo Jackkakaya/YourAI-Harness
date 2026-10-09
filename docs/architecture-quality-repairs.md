@@ -6,13 +6,13 @@ DefaultContext / SQLite 的分工。整理的单位是职责和不变量，不�
 ## 模型执行策略
 
 - `ModelProvider::timeouts()` 是所选模型的默认响应头/读取时限，默认各 300 秒。
-- `GenaiModel` 在传输端执行时限；`ConfiguredModel` 将 Harness 的显式配置应用到任意模型，
+- `GenaiModel` 在传输端执行时限；`ConfiguredModel` 统一持有所选模型的容量、输出预算和显式时限，
   `MeteredModel`、`SourceModel` 透传默认值。LoopConfig 不再持有另一份模型默认超时。
 - 主循环优先级：TurnLimits.model_timeout > 请求 ChatOptions > 模型默认值。
   complete、compact、模型 Hook 和子 Agent 共享所持模型的默认值。
   Hook evaluation 自身的总时限仍独立存在。
-- 模型切换仍只替换主模型；已经配置的 Hook / 子 Agent 模型保持原身份，这是既定策略。
-- TUI 的 `Config::resolve` 一次返回 ResolvedModel，包含模型、上下文和运行设置；
+- 模型与上下文管理器通过同一次 Providers.update 发布。Hook 和新建子任务使用调用时冻结的依赖快照，默认继承模型；显式固定模型的子任务保持原身份。
+- TUI 的 `Config::resolve` 一次返回 ResolvedModel，包含已配置的模型和运行设置；容量不再存入上下文策略；
   启动、切换、创建会话共用，不在不同入口重新解析超时和请求策略。
 
 ## 错误与 Hook 契约

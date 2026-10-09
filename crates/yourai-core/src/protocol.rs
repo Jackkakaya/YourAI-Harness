@@ -102,9 +102,17 @@ pub enum In {
 }
 
 impl In {
+    /// Stable identity of a user message; replies address separate interaction IDs.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::UserText { id, .. } => id.as_deref(),
+            Self::Reply { .. } => None,
+        }
+    }
+
     pub(crate) fn ensure_id(&mut self) {
         if let Self::UserText { id, .. } = self {
-            if id.is_none() {
+            if id.as_ref().is_none_or(|id| id.is_empty()) {
                 *id = Some(uuid::Uuid::new_v4().to_string());
             }
         }

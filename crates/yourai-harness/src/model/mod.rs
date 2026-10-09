@@ -313,6 +313,9 @@ impl MeteredModel {
     }
 }
 impl ModelProvider for MeteredModel {
+    fn token_budget(&self) -> ModelTokenBudget {
+        self.inner.token_budget()
+    }
     fn timeouts(&self) -> ModelTimeouts {
         self.inner.timeouts()
     }
@@ -403,6 +406,9 @@ pub(crate) struct SourceModel {
     pub source: &'static str,
 }
 impl ModelProvider for SourceModel {
+    fn token_budget(&self) -> ModelTokenBudget {
+        self.inner.token_budget()
+    }
     fn timeouts(&self) -> ModelTimeouts {
         self.inner.timeouts()
     }
@@ -446,7 +452,7 @@ mod media_tokens_tests {
     use base64::Engine as _;
 
     fn model() -> GenaiModel {
-        GenaiModel::new(genai::Client::builder().build(), "test-model")
+        GenaiModel::new(genai::Client::builder().build().unwrap(), "test-model")
     }
 
     fn png_part(width: u32, height: u32) -> ContentPart {

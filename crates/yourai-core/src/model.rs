@@ -4,6 +4,9 @@
 //! capture_usage / capture_tool_calls / capture_reasoning_content 等
 //! 选项由 ContextManager 组装请求时带出，不再断链。
 
+mod budget;
+pub use budget::{ModelLimits, ModelTokenBudget};
+
 use crate::chat::ChatStreamEvent;
 use crate::chat::{ChatOptions, ChatRequest, ChatResponse, ToolCall};
 use crate::error::YourAiError;
@@ -89,6 +92,9 @@ impl ModelRequest {
 }
 
 pub trait ModelProvider: Send + Sync {
+    fn token_budget(&self) -> ModelTokenBudget {
+        ModelTokenBudget::default()
+    }
     fn timeouts(&self) -> ModelTimeouts {
         ModelTimeouts::default()
     }
@@ -319,7 +325,10 @@ impl Model {
                 .map(|registry| registry.snapshot())
                 .unwrap_or_default();
             let tools: Vec<_> = bindings.iter().map(Tool::definition).collect();
-            let mut prepared = turn.history.build_request(&tools, self.backend.as_ref())?;
+            // Count the final outgoing prefill before admitting the request.
+            // Workspace instruction updates are already part of persisted history.
+            let suffix: Vec<_> = model_options.prefill.iter().map(|s| ChatMessage::assistant(s.clone())).collect();
+            let mut prepared = turn.history.build_request(&tools, self.backend.as_ref(), &suffix)?;
             if prepared.maintenance_needed {
                 if let Err(e) = turn.compact(CompactionTrigger::Threshold).await {
                     if matches!(e, YourAiError::Aborted(_)) || !prepared.fits() {
@@ -330,7 +339,7 @@ impl Model {
                     turn.wait_operation(history.restore(), turn.op_timeout(), "history").await?;
                     turn.notice(Level::Warning, format!("Automatic maintenance failed: {e}"))?;
                 }
-                prepared = turn.history.build_request(&tools, self.backend.as_ref())?;
+                prepared = turn.history.build_request(&tools, self.backend.as_ref(), &suffix)?;
             }
             if !prepared.fits() {
                 return Err(ErrorKind::Loop(
@@ -338,20 +347,10 @@ impl Model {
                 )
                 .into());
             }
-            if let Some(prefill) = &model_options.prefill {
-                // opencode runner (llm.ts "isLastStep"): append an assistant-role
-                // MAX_STEPS_PROMPT prefill to the outgoing request only — never to
-                // persisted history — and forbid tool calls at the API level.
-                prepared
-                    .request
-                    .messages
-                    .push(ChatMessage::assistant(prefill.clone()));
-            }
             let request = prepared.request;
             let observed_request = request.clone();
-            let mut options = turn
-                .history
-                .default_options()
+            let mut options = ChatOptions::default()
+                .with_max_tokens(self.backend.token_budget().max_output_tokens())
                 .with_capture_content(true)
                 .with_capture_tool_calls(true)
                 .with_capture_usage(true)
@@ -410,7 +409,7 @@ impl Model {
                     .into());
                 };
                 match event {
-                    ChatStreamEvent::Start => {}
+                    ChatStreamEvent::Start | ChatStreamEvent::Heartbeat => {}
                     ChatStreamEvent::Chunk(chunk) => {
                         if !chunk.content.is_empty() {
                             text.push_str(&chunk.content);
@@ -518,8 +517,12 @@ impl Model {
                                 Some(model.model_iden().into()), "main",
                                 end.captured_usage.clone().unwrap_or_default(),
                             );
-                            turn.wait_operation(tracker.record_event(&session_id, &event),
-                                turn.op_timeout(), "usage").await?;
+                            match turn.wait_operation(async { Ok(tracker.record_response(&session_id, &event).await) }, turn.op_timeout(), "usage").await {
+                                Ok(Some(warning)) => turn.notice(Level::Warning, warning)?,
+                                Ok(None) => {},
+                                Err(e @ YourAiError::Aborted(_)) => return Err(e),
+                                Err(e) => turn.notice(Level::Warning, format!("Usage accounting incomplete: {e}"))?,
+                            }
                         }
                         validation?;
                         return Ok(calls);

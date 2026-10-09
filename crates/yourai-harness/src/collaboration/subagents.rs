@@ -10,7 +10,7 @@ pub use yourai_core::subagent::Subagent;
 /// Assemble the one core subagent tool without another execution object.
 pub fn subagent(
     host: &Arc<SessionHost>,
-    model: Arc<dyn ModelProvider>,
+    model: Option<Arc<dyn ModelProvider>>,
     tools: Option<Arc<dyn ToolRegistry>>,
 ) -> Arc<Subagent> {
     Arc::new(Subagent::new(

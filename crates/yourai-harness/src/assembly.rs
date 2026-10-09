@@ -37,8 +37,6 @@ pub struct HarnessConfig {
     pub request_policy: crate::model::RequestPolicy,
     /// Stable provider key used to retain admission state across model switches.
     pub model_provider: String,
-    pub model_header_timeout: Option<Duration>,
-    pub model_chunk_timeout: Option<Duration>,
 }
 impl HarnessConfig {
     pub fn new(root: PathBuf, cwd: PathBuf) -> Self {
@@ -60,8 +58,6 @@ impl HarnessConfig {
             memory_search_limit: 0,
             request_policy: Default::default(),
             model_provider: String::new(),
-            model_header_timeout: None,
-            model_chunk_timeout: None,
         }
     }
 }
@@ -70,8 +66,6 @@ impl HarnessConfig {
 pub struct ModelSettings {
     pub provider: String,
     pub requests: crate::model::RequestPolicy,
-    pub header_timeout: Option<Duration>,
-    pub chunk_timeout: Option<Duration>,
 }
 pub struct Harness {
     normal_security: Arc<dyn SecurityProvider>,
@@ -95,12 +89,7 @@ impl Harness {
         config: HarnessConfig,
         model: Arc<dyn ModelProvider>,
     ) -> Result<Self, YourAiError> {
-        config.context_policy.validate()?;
-        let model = crate::model::ConfiguredModel::wrap(
-            model,
-            config.model_header_timeout,
-            config.model_chunk_timeout,
-        )?;
+        config.context_policy.validate_for(model.token_budget())?;
         let catalog = Arc::new(SessionCatalog::new(&config.root)?);
         let source = if config.resume.is_some() {
             "resume"
@@ -130,7 +119,9 @@ impl Harness {
                 &config.instructions,
                 config.skill_provider.as_deref(),
                 config.memory_provider.as_deref(),
-                &config.context_policy,
+                config
+                    .context_policy
+                    .maintenance_threshold(model.token_budget()),
                 &tokio_util::sync::CancellationToken::new(),
             )
             .await?;
@@ -174,12 +165,9 @@ impl Harness {
         let usage = Arc::new(LocalUsage((*catalog.store).clone()));
         let hooks = Arc::new(DefaultHookRuntime::new().with_evaluator(Arc::new(
             DefaultHookEvaluator {
-                model: Arc::new(crate::model::SourceModel {
-                    inner: model.clone(),
-                    source: "hook",
-                }),
+                model: None,
                 tools: None,
-                usage: Some(usage.clone()),
+                usage: None,
                 timeout: Duration::from_secs(60),
                 steps: 8,
             },
@@ -220,9 +208,7 @@ impl Harness {
         } else if let Some(memory) = &memory {
             agent.ctx().set_memory(memory.clone());
         }
-        if let Some(provider) = agent.ctx().try_memory() {
-            crate::memory::register(hooks.as_ref(), provider, catalog.clone(), id.clone()).await?;
-        }
+        crate::memory::register(hooks.as_ref(), id.clone()).await?;
         let input = yourai_core::turn::InputOptions {
             memory_search_limit: config.memory_search_limit,
             ..Default::default()
@@ -275,7 +261,7 @@ impl Harness {
             // Task progress is a basic coding capability, independent of workspace/subagents.
             let tasks = Some(host.task_manager("default")?);
             let subagents = if config.extensions {
-                Some(subagent(&host, model, None))
+                Some(subagent(&host, None, None))
             } else {
                 None
             };
@@ -325,7 +311,7 @@ impl Harness {
     /// Replace the main model and its context policy at an idle boundary.
     /// Admission/metrics keep the existing shared budget (including calls already
     /// spent); active turns and compaction reject the switch without changes.
-    /// Existing hook and subagent executors retain their configured models.
+    /// Hooks and new children inherit this selection unless explicitly pinned.
     pub async fn switch_model(
         &self,
         model: Arc<dyn ModelProvider>,
@@ -345,13 +331,6 @@ impl Harness {
         settings: ModelSettings,
     ) -> Result<(), YourAiError> {
         settings.requests.validate()?;
-        if [settings.header_timeout, settings.chunk_timeout]
-            .into_iter()
-            .flatten()
-            .any(|d| d.is_zero())
-        {
-            return Err(ErrorKind::Config("model timeouts must be positive".into()).into());
-        }
         self.switch_model_inner(model, policy, Some(settings)).await
     }
     async fn switch_model_inner(
@@ -360,16 +339,7 @@ impl Harness {
         policy: ContextPolicy,
         settings: Option<ModelSettings>,
     ) -> Result<(), YourAiError> {
-        policy.validate()?;
-        let model = if let Some(settings) = &settings {
-            crate::model::ConfiguredModel::wrap(
-                model,
-                settings.header_timeout,
-                settings.chunk_timeout,
-            )?
-        } else {
-            model
-        };
+        policy.validate_for(model.token_budget())?;
         let _gate = self.host.try_operation()?;
         let selected_budget = if let Some(settings) = &settings {
             if let Some(budget) = self
@@ -411,8 +381,10 @@ impl Harness {
             );
         }
         *self.current_budget.lock().unwrap() = selected_budget;
-        self.host.agent().ctx().set_context_manager(history);
-        self.host.agent().ctx().set_model(model);
+        self.host.agent().ctx().update(|providers| {
+            providers.context_manager = Some(history);
+            providers.model = Some(model);
+        });
         Ok(())
     }
 

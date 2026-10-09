@@ -6,15 +6,9 @@ use yourai_core::prelude::*;
 
 pub(crate) async fn register(
     hooks: &dyn HookRegistry,
-    provider: Arc<dyn MemoryProvider>,
-    sessions: Arc<dyn SessionManager>,
     session_id: SessionId,
 ) -> Result<(), YourAiError> {
-    let handler = Arc::new(MemoryHookAdapter {
-        provider,
-        sessions,
-        session_id,
-    });
+    let handler = Arc::new(MemoryHookAdapter { session_id });
     for event in [
         HookEventKind::SessionStart,
         HookEventKind::SessionEnd,
@@ -37,13 +31,12 @@ pub(crate) async fn register(
     Ok(())
 }
 struct MemoryHookAdapter {
-    provider: Arc<dyn MemoryProvider>,
-    sessions: Arc<dyn SessionManager>,
     session_id: SessionId,
 }
 impl MemoryHookAdapter {
     async fn messages(
         &self,
+        sessions: &dyn SessionManager,
         after: i64,
         through: i64,
         active_only: bool,
@@ -51,8 +44,7 @@ impl MemoryHookAdapter {
         let mut cursor = after;
         let mut messages = vec![];
         loop {
-            let page = self
-                .sessions
+            let page = sessions
                 .read_messages(
                     &self.session_id,
                     MessageQuery {
@@ -89,6 +81,13 @@ impl HookHandler for MemoryHookAdapter {
             if invocation.base.session_id != self.session_id.as_str() {
                 return Ok(HookOutput::Parsed(serde_json::json!({})));
             }
+            let Some(provider) = invocation.memory.as_ref() else {
+                return Ok(HookOutput::Parsed(serde_json::json!({})));
+            };
+            let sessions = invocation
+                .sessions
+                .as_deref()
+                .ok_or_else(|| crate::error("memory", "sessions not configured"))?;
             let cancel = CancellationToken::new();
             let _cancel_on_drop = cancel.clone().drop_guard();
             let session = MemorySession {
@@ -97,18 +96,14 @@ impl HookHandler for MemoryHookAdapter {
             };
             match &invocation.event {
                 HookEvent::SessionStart { source, .. } => {
-                    self.provider
-                        .on_session_start(&session, source, &cancel)
-                        .await?
+                    provider.on_session_start(&session, source, &cancel).await?
                 }
                 HookEvent::SessionEnd { reason } => {
-                    self.provider
-                        .on_session_end(&session, reason, &cancel)
-                        .await?
+                    provider.on_session_end(&session, reason, &cancel).await?
                 }
                 HookEvent::PreCompact { trigger, .. } => {
-                    let messages = self.messages(0, i64::MAX, true).await?;
-                    self.provider
+                    let messages = self.messages(sessions, 0, i64::MAX, true).await?;
+                    provider
                         .on_pre_compact(&session, trigger, &messages, &cancel)
                         .await?;
                 }
@@ -117,9 +112,11 @@ impl HookHandler for MemoryHookAdapter {
                     after_seq,
                     through_seq,
                 } => {
-                    let messages = self.messages(*after_seq, *through_seq, false).await?;
+                    let messages = self
+                        .messages(sessions, *after_seq, *through_seq, false)
+                        .await?;
                     if messages.iter().any(|m| m.role == ChatRole::User) {
-                        self.provider
+                        provider
                             .sync_turn(
                                 &CompletedMemoryTurn {
                                     session,

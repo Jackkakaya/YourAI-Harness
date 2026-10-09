@@ -65,8 +65,6 @@ impl ModelProvider for Summarizer {
 }
 fn policy() -> ContextPolicy {
     ContextPolicy {
-        context_window: Some(12_000),
-        output_reserve: 500,
         safety_margin: 100,
         advance_tokens: 2000,
         keep_recent_tokens: 0,
@@ -75,6 +73,8 @@ fn policy() -> ContextPolicy {
     }
 }
 async fn setup(
+    window: Option<u64>,
+    output: u32,
     p: ContextPolicy,
     model: Arc<dyn ModelProvider>,
     hooks: Option<Arc<dyn HookRuntime>>,
@@ -87,7 +87,11 @@ async fn setup(
     services.policy = p;
     services.hooks = hooks;
     services.usage = Some(Arc::new(LocalUsage((*store).clone())));
-    let context = DefaultContext::new(id, model, services);
+    let context = DefaultContext::new(
+        id,
+        context_fixture::configured(model, window, output),
+        services,
+    );
     context.restore().await.unwrap();
     (dir, store, context)
 }
@@ -147,7 +151,7 @@ async fn custom_loop_compaction_uses_summary_lifecycle_and_retains_current_input
         }
     }));
     let model = Summarizer::new();
-    let (_dir, _store, history) = setup(policy(), model.clone(), None).await;
+    let (_dir, _store, history) = setup(Some(12_000), 500, policy(), model.clone(), None).await;
     append(
         &history,
         vec![
@@ -158,7 +162,11 @@ async fn custom_loop_compaction_uses_summary_lifecycle_and_retains_current_input
     .await;
     let agent = Agent::builder()
         .agent_loop(Arc::new(custom::CompactLoop))
-        .model(model.clone())
+        .model(context_fixture::configured(
+            model.clone(),
+            Some(12_000),
+            500,
+        ))
         .context_manager(history.clone())
         .hooks(hooks.clone())
         .build();
@@ -196,7 +204,7 @@ async fn custom_loop_compaction_uses_summary_lifecycle_and_retains_current_input
 async fn projection_is_bounded_valid_json_and_original_is_preserved() {
     let mut p = policy();
     p.tool_output_chars = 512;
-    let (_dir, _store, c) = setup(p, Summarizer::new(), None).await;
+    let (_dir, _store, c) = setup(Some(12_000), 500, p, Summarizer::new(), None).await;
     let original = json!({"ok":true,"output":"你好🌍".repeat(1000)}).to_string();
     append(
         &c,
@@ -215,14 +223,20 @@ async fn projection_is_bounded_valid_json_and_original_is_preserved() {
 #[tokio::test]
 async fn prune_only_avoids_model_hooks_and_survives_restore_and_fork() {
     let mut p = policy();
-    p.context_window = Some(4000);
     p.advance_tokens = 2200;
     p.prune_enabled = true;
     p.prune_growth = 0;
     p.prune_min_savings = 50;
     let model = Summarizer::new();
     let hooks = Arc::new(support::Hooks::new(|_, _| {}));
-    let (_dir, store, c) = setup(p.clone(), model.clone(), Some(hooks.clone())).await;
+    let (_dir, store, c) = setup(
+        Some(4000),
+        500,
+        p.clone(),
+        model.clone(),
+        Some(hooks.clone()),
+    )
+    .await;
     seed_tools(&c).await;
     let result = c
         .compact(
@@ -250,7 +264,11 @@ async fn prune_only_avoids_model_hooks_and_survives_restore_and_fork() {
     let mut services = ContextServices::new(&child);
     services.policy = p;
     services.store = Some(store);
-    let fork = DefaultContext::new(child, model, services);
+    let fork = DefaultContext::new(
+        child,
+        context_fixture::configured(model, Some(4000), 500),
+        services,
+    );
     fork.restore().await.unwrap();
     assert_eq!(
         expected,
@@ -260,13 +278,12 @@ async fn prune_only_avoids_model_hooks_and_survives_restore_and_fork() {
 #[tokio::test]
 async fn failed_combined_commit_keeps_pruning_and_summary_unapplied_but_accounts_usage() {
     let mut p = policy();
-    p.context_window = Some(4000);
     p.advance_tokens = 3300;
     p.prune_enabled = true;
     p.prune_growth = 0;
     p.prune_min_savings = 50;
     let model = Summarizer::new();
-    let (dir, store, c) = setup(p, model.clone(), None).await;
+    let (dir, store, c) = setup(Some(4000), 500, p, model.clone(), None).await;
     seed_tools(&c).await;
     let original = serde_json::to_value(c.messages()).unwrap();
     let db = rusqlite::Connection::open(dir.path().join("db.sqlite")).unwrap();
@@ -295,7 +312,7 @@ async fn failed_combined_commit_keeps_pruning_and_summary_unapplied_but_accounts
 #[tokio::test]
 async fn latest_user_unresolved_batch_and_parallel_pairs_are_protected() {
     let model = Summarizer::new();
-    let (_, _, c) = setup(policy(), model.clone(), None).await;
+    let (_, _, c) = setup(Some(12_000), 500, policy(), model.clone(), None).await;
     append(
         &c,
         vec![
@@ -339,7 +356,7 @@ async fn latest_user_unresolved_batch_and_parallel_pairs_are_protected() {
 }
 #[tokio::test]
 async fn long_turn_can_compact_closed_batches_while_retaining_its_user_request() {
-    let (_, _, c) = setup(policy(), Summarizer::new(), None).await;
+    let (_, _, c) = setup(Some(12_000), 500, policy(), Summarizer::new(), None).await;
     append(
         &c,
         vec![
@@ -363,11 +380,9 @@ async fn long_turn_can_compact_closed_batches_while_retaining_its_user_request()
 #[tokio::test]
 async fn chunking_has_one_final_commit_and_enforces_call_budget() {
     let mut p = policy();
-    p.context_window = Some(2200);
-    p.output_reserve = 200;
     p.safety_margin = 100;
     let model = Summarizer::new();
-    let (_, store, c) = setup(p, model.clone(), None).await;
+    let (_, store, c) = setup(Some(2200), 200, p, model.clone(), None).await;
     let mut messages: Vec<_> = (0..5)
         .map(|i| ChatMessage::user(format!("old {i}:{}", "x".repeat(3000))))
         .collect();
@@ -401,7 +416,7 @@ async fn invalid_summary_is_accounted_and_never_committed() {
         requests: Mutex::new(vec![]),
         empty: true,
     });
-    let (_, store, c) = setup(policy(), model, None).await;
+    let (_, store, c) = setup(Some(12_000), 500, policy(), model, None).await;
     append(
         &c,
         vec![
@@ -432,7 +447,14 @@ async fn post_hook_stop_reports_committed_state_and_is_not_dispatched_twice() {
             r.common.stop_reason = Some("stop after save".into());
         }
     }));
-    let (_, _, c) = setup(policy(), Summarizer::new(), Some(hooks.clone())).await;
+    let (_, _, c) = setup(
+        Some(12_000),
+        500,
+        policy(),
+        Summarizer::new(),
+        Some(hooks.clone()),
+    )
+    .await;
     append(
         &c,
         vec![
@@ -471,7 +493,14 @@ async fn committed_summary_survives_reload_failure_and_still_runs_post_hook() {
             result.common.stop_reason = Some("another post-hook reason".into());
         }
     }));
-    let (dir, store, context) = setup(policy(), Summarizer::new(), Some(hooks.clone())).await;
+    let (dir, store, context) = setup(
+        Some(12_000),
+        500,
+        policy(),
+        Summarizer::new(),
+        Some(hooks.clone()),
+    )
+    .await;
     append(
         &context,
         vec![
@@ -550,7 +579,7 @@ async fn committed_summary_survives_reload_failure_and_still_runs_post_hook() {
 }
 #[tokio::test]
 async fn observed_usage_is_invalidated_by_tools_projection() {
-    let (_, _, c) = setup(policy(), Summarizer::new(), None).await;
+    let (_, _, c) = setup(Some(12_000), 500, policy(), Summarizer::new(), None).await;
     append(&c, vec![ChatMessage::user("x".repeat(2000))]).await;
     let before = c.build_request(&[]).unwrap();
     let mut response = StoredMessage::new(ChatMessage::assistant("response"));
@@ -572,10 +601,9 @@ async fn observed_usage_is_invalidated_by_tools_projection() {
 }
 #[tokio::test]
 async fn automatic_cooldown_and_unknown_window_do_not_claim_success() {
-    let mut p = policy();
-    p.context_window = None;
+    let p = policy();
     let model = Summarizer::new();
-    let (_, _, c) = setup(p, model.clone(), None).await;
+    let (_, _, c) = setup(None, 500, p, model.clone(), None).await;
     append(
         &c,
         vec![
@@ -595,13 +623,12 @@ async fn automatic_cooldown_and_unknown_window_do_not_claim_success() {
 #[tokio::test]
 async fn automatic_failure_is_not_repeated_for_the_same_request() {
     let mut p = policy();
-    p.context_window = Some(4000);
     p.advance_tokens = 3000;
     let model = Arc::new(Summarizer {
         requests: Mutex::new(vec![]),
         empty: true,
     });
-    let (_, _, c) = setup(p, model.clone(), None).await;
+    let (_, _, c) = setup(Some(4000), 500, p, model.clone(), None).await;
     append(
         &c,
         vec![
@@ -708,7 +735,7 @@ impl SessionManager for UncertainStore {
 }
 #[tokio::test]
 async fn cancelled_uncertain_commit_blocks_reads_and_next_append_recovers_first() {
-    let (_dir, store, initial) = setup(policy(), Summarizer::new(), None).await;
+    let (_dir, store, initial) = setup(Some(12_000), 500, policy(), Summarizer::new(), None).await;
     append(
         &initial,
         vec![
@@ -726,7 +753,11 @@ async fn cancelled_uncertain_commit_blocks_reads_and_next_append_recovers_first(
         committed: committed.clone(),
         reads: Default::default(),
     }));
-    let c = DefaultContext::new(id, Summarizer::new(), services);
+    let c = DefaultContext::new(
+        id,
+        context_fixture::configured(Summarizer::new(), Some(12_000), 500),
+        services,
+    );
     c.restore().await.unwrap();
     let cancel = CancellationToken::new();
     let ctx = c.clone();
@@ -745,7 +776,7 @@ async fn cancelled_uncertain_commit_blocks_reads_and_next_append_recovers_first(
 
 #[tokio::test]
 async fn latest_user_protection_uses_persisted_origin_not_text_prefixes() {
-    let (_, _, c) = setup(policy(), Summarizer::new(), None).await;
+    let (_, _, c) = setup(Some(12_000), 500, policy(), Summarizer::new(), None).await;
     append(
         &c,
         vec![
@@ -772,7 +803,7 @@ async fn latest_user_protection_uses_persisted_origin_not_text_prefixes() {
 #[tokio::test]
 async fn successful_append_uses_committed_rows_without_reloading_history() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let (_dir, store, initial) = setup(policy(), Summarizer::new(), None).await;
+    let (_dir, store, initial) = setup(Some(12_000), 500, policy(), Summarizer::new(), None).await;
     let reads = Arc::new(AtomicUsize::new(0));
     let id = initial.session_id().clone();
     let mut services = ContextServices::new(&id);
@@ -781,7 +812,11 @@ async fn successful_append_uses_committed_rows_without_reloading_history() {
         committed: Default::default(),
         reads: reads.clone(),
     }));
-    let c = DefaultContext::new(id, Summarizer::new(), services);
+    let c = DefaultContext::new(
+        id,
+        context_fixture::configured(Summarizer::new(), Some(12_000), 500),
+        services,
+    );
     c.restore().await.unwrap();
     let baseline = reads.load(Ordering::SeqCst);
     let row = StoredMessage::new(ChatMessage::user("one"));
@@ -820,7 +855,14 @@ impl ModelProvider for MediaSummary {
 #[tokio::test]
 async fn compact_uses_message_content_without_opening_media_locations() {
     let model = Summarizer::new();
-    let (_dir, _store, c) = setup(policy(), Arc::new(MediaSummary(model.clone())), None).await;
+    let (_dir, _store, c) = setup(
+        Some(12_000),
+        500,
+        policy(),
+        Arc::new(MediaSummary(model.clone())),
+        None,
+    )
+    .await;
     let media = |url| ContentPart::Binary(Binary::from_url("image/png", url, None));
     let old = "file:///does-not-exist/old.png";
     let current = "file:///does-not-exist/current.png";
@@ -873,8 +915,9 @@ async fn compact_uses_message_content_without_opening_media_locations() {
 #[tokio::test]
 async fn binary_attachment_builds_request_with_genai_model() {
     use base64::Engine as _;
-    let model = yourai_harness::GenaiModel::new(genai::Client::builder().build(), "test-model");
-    let (_dir, _store, c) = setup(policy(), Arc::new(model), None).await;
+    let model =
+        yourai_harness::GenaiModel::new(genai::Client::builder().build().unwrap(), "test-model");
+    let (_dir, _store, c) = setup(Some(12_000), 500, policy(), Arc::new(model), None).await;
     // Blank 2000x2000 PNG — compresses to a tiny payload but keeps full
     // dimensions for the estimator.
     let img = image::DynamicImage::new_rgb8(2000, 2000);
@@ -932,7 +975,11 @@ async fn compaction_has_no_implicit_deadline_but_honors_explicit_deadline_and_ca
         let mut services = ContextServices::new(&id);
         services.policy = policy();
         services.hooks = Some(Arc::new(SlowPreCompact));
-        let context = DefaultContext::new(id, Summarizer::new(), services);
+        let context = DefaultContext::new(
+            id,
+            context_fixture::configured(Summarizer::new(), Some(12_000), 500),
+            services,
+        );
         append(
             &context,
             vec![

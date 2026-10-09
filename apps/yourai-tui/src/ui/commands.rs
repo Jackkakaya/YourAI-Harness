@@ -13,13 +13,10 @@ pub enum Parsed {
     Yolo(YoloArg),
     Help,
     Compact,
-    Continue,
     Status,
     Quit,
     /// `/editor`: edit the draft in `$VISUAL`/`$EDITOR`.
     Editor,
-    /// `/queue TEXT`: schedule a follow-up turn.
-    Queue(String),
     /// `/theme` (None) opens the picker; a name switches directly.
     Theme(Option<String>),
     /// `/models` (no id) opens the picker; `/models p/m [variant]` switches.
@@ -42,14 +39,7 @@ pub enum YoloArg {
 /// Parse a raw input line into a command. `None` means "not a command":
 /// either plain user text, or an unknown `/word` (the caller decides which
 /// by re-checking the raw leading slash).
-///
-/// `/queue` keeps its historical raw-prefix semantics: only a line that
-/// starts with `"/queue "` exactly (no leading whitespace) queues a
-/// follow-up — a spaced-out variant stays plain user text.
 pub fn parse(text: &str) -> Option<Parsed> {
-    if let Some(body) = text.strip_prefix("/queue ") {
-        return Some(Parsed::Queue(body.to_string()));
-    }
     let trimmed = text.trim();
     let (head, rest) = match trimmed.split_once(' ') {
         Some((head, rest)) => (head, Some(rest.trim())),
@@ -61,7 +51,6 @@ pub fn parse(text: &str) -> Option<Parsed> {
         "/help" => Some(Parsed::Help),
         "/editor" => Some(Parsed::Editor),
         "/new" | "/clear" => Some(Parsed::New),
-        "/continue" => Some(Parsed::Continue),
         "/status" => Some(Parsed::Status),
         "/sessions" => Some(Parsed::Sessions),
         "/compact" => Some(Parsed::Compact),
@@ -96,135 +85,101 @@ pub fn parse(text: &str) -> Option<Parsed> {
 pub struct Command {
     pub text: &'static str,
     pub description: &'static str,
-    pub argument: bool,
 }
 const COMMANDS: &[Command] = &[
     Command {
         text: "/new",
         description: "Start a fresh session",
-        argument: false,
     },
     Command {
         text: "/yolo",
         description: "Toggle permissions (or /yolo on|off) · Ctrl-G",
-        argument: false,
     },
     Command {
         text: "/help",
         description: "Show keyboard shortcuts",
-        argument: false,
     },
     Command {
         text: "/editor",
         description: "Edit the draft in $VISUAL/$EDITOR · Ctrl-X",
-        argument: false,
     },
     Command {
         text: "/compact",
         description: "Compact current context",
-        argument: false,
-    },
-    Command {
-        text: "/continue",
-        description: "Resume pending inputs",
-        argument: false,
     },
     Command {
         text: "/clear",
         description: "Reset context in a new session; keep saved history",
-        argument: false,
-    },
-    Command {
-        text: "/queue",
-        description: "Schedule a follow-up turn",
-        argument: true,
     },
     Command {
         text: "/theme",
         description: "Theme picker (or /theme NAME)",
-        argument: false,
     },
     Command {
         text: "/models",
         description: "Switch model then thinking effort (picker)",
-        argument: false,
     },
     Command {
         text: "/sessions",
         description: "List and switch sessions",
-        argument: false,
     },
     Command {
         text: "/status",
         description: "Toggle stats dashboard",
-        argument: false,
     },
     Command {
         text: "/quit",
         description: "Quit",
-        argument: false,
     },
 ];
 const THEMES: &[Command] = &[
     Command {
         text: "/theme system",
         description: "Follow OS",
-        argument: false,
     },
     Command {
         text: "/theme dark",
         description: "Dark",
-        argument: false,
     },
     Command {
         text: "/theme light",
         description: "Light",
-        argument: false,
     },
     Command {
         text: "/theme one-dark",
         description: "Atom One Dark",
-        argument: false,
     },
     Command {
         text: "/theme monokai",
         description: "Monokai",
-        argument: false,
     },
     Command {
         text: "/theme solarized-dark",
         description: "Solarized Dark",
-        argument: false,
     },
     Command {
         text: "/theme solarized-light",
         description: "Solarized Light",
-        argument: false,
     },
     Command {
         text: "/theme nord",
         description: "Cool tones",
-        argument: false,
     },
     Command {
         text: "/theme dracula",
         description: "Purple",
-        argument: false,
     },
     Command {
         text: "/theme catppuccin",
         description: "Catppuccin Mocha",
-        argument: false,
     },
     Command {
         text: "/theme tokyo-night",
         description: "Tokyo Night",
-        argument: false,
     },
     Command {
         text: "/theme gruvbox",
         description: "Gruvbox",
-        argument: false,
     },
 ];
 #[derive(Default)]
@@ -284,11 +239,11 @@ mod tests {
     fn filter_navigation_dismissal_and_arguments() {
         let mut menu = Menu::default();
         menu.sync("/", true);
-        assert_eq!(menu.items().len(), 13);
+        assert_eq!(menu.items().len(), 11);
         menu.step(true);
         assert_eq!(menu.items()[menu.selected].text, "/quit");
         menu.sync("/co", true);
-        assert_eq!(menu.items().len(), 2);
+        assert_eq!(menu.items().len(), 1);
         menu.dismiss();
         assert!(menu.items().is_empty());
         menu.sync("/theme ", true);
@@ -301,16 +256,9 @@ mod tests {
 
     #[test]
     fn menu_rows_and_parse_agree() {
-        // Every menu row must parse to a real command; argument rows need
-        // an argument to be meaningful. This is the guard against adding a
-        // COMMANDS entry without a dispatch arm (and vice versa).
+        // Every visible menu action must have a matching parser branch.
         for command in COMMANDS {
-            if command.argument {
-                let text = format!("{} example", command.text);
-                assert!(parse(&text).is_some(), "argument row: {text}");
-            } else {
-                assert!(parse(command.text).is_some(), "row: {}", command.text);
-            }
+            assert!(parse(command.text).is_some(), "row: {}", command.text);
         }
         for theme in THEMES {
             assert!(
@@ -326,11 +274,11 @@ mod tests {
         assert_eq!(parse("hello"), None);
         assert_eq!(parse("/unknown"), None);
         assert_eq!(parse("/queue"), None, "bare /queue is not a command");
-        assert_eq!(parse("/queue "), Some(Parsed::Queue(String::new())));
-        // Raw-prefix semantics: leading whitespace turns /queue into plain
-        // user text (the historical behavior), not a follow-up.
+        assert_eq!(parse("/queue "), None);
+        // Removed commands must not silently acquire scheduling semantics.
         assert_eq!(parse("  /queue hi  "), None);
-        assert_eq!(parse("/queue hi"), Some(Parsed::Queue("hi".into())));
+        assert_eq!(parse("/queue hi"), None);
+        assert_eq!(parse("/continue"), None);
         assert_eq!(parse("/yolo"), Some(Parsed::Yolo(YoloArg::Toggle)));
         assert_eq!(parse("/yolo on"), Some(Parsed::Yolo(YoloArg::On)));
         assert_eq!(parse("/yolo junk"), Some(Parsed::Yolo(YoloArg::Usage)));

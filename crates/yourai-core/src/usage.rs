@@ -35,6 +35,29 @@ impl UsageEvent {
     }
 }
 pub trait UsageTracker: Send + Sync {
+    /// A paid response is recorded with one identity across bounded retries.
+    /// Accounting failure is a warning; it must never repeat the model call.
+    fn record_response<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        event: &'a UsageEvent,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let mut failure = None;
+            for _ in 0..3 {
+                match self.record_event(session_id, event).await {
+                    Ok(()) => return None,
+                    Err(error) => failure = Some(error),
+                }
+            }
+            Some(format!(
+                "Usage accounting incomplete (event {}): {}",
+                event.id,
+                failure.unwrap()
+            ))
+        })
+    }
+
     fn record_event<'a>(
         &'a self,
         session_id: &'a SessionId,

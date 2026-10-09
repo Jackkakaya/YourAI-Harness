@@ -5,7 +5,8 @@ use yourai_core::prelude::*;
 /// Both prompt and agent hooks use the supplied (optionally shared-metered) model.
 /// Evaluator agents deliberately have no HookRuntime, preventing recursive evaluation.
 pub struct DefaultHookEvaluator {
-    pub model: Arc<dyn ModelProvider>,
+    /// None inherits the model frozen in this hook invocation.
+    pub model: Option<Arc<dyn ModelProvider>>,
     pub tools: Option<Arc<dyn ToolRegistry>>,
     pub usage: Option<Arc<dyn UsageTracker>>,
     pub timeout: Duration,
@@ -17,10 +18,21 @@ impl HookEvaluator for DefaultHookEvaluator {
         request: HookModelRequest,
     ) -> BoxFuture<'a, Result<HookModelDecision, YourAiError>> {
         Box::pin(async move {
+            let selected = self
+                .model
+                .as_ref()
+                .or(request.invocation.model.as_ref())
+                .cloned()
+                .ok_or_else(|| error("hook_model", "model not configured"))?;
+            let model: Arc<dyn ModelProvider> = Arc::new(crate::model::SourceModel {
+                inner: selected,
+                source: "hook",
+            });
+            let usage = self.usage.as_ref().or(request.invocation.usage.as_ref());
             if request
                 .model
                 .as_ref()
-                .is_some_and(|m| m != self.model.model_iden())
+                .is_some_and(|m| m != model.model_iden())
             {
                 return Err(error("hook_model", "requested model is not configured"));
             }
@@ -35,7 +47,7 @@ impl HookEvaluator for DefaultHookEvaluator {
                         },
                     );
                     let mut builder = Agent::builder()
-                        .model(self.model.clone())
+                        .model(model.clone())
                         .context_manager(history)
                         .agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
                             crate::default_loop::LoopConfig {
@@ -43,7 +55,7 @@ impl HookEvaluator for DefaultHookEvaluator {
                                 ..Default::default()
                             },
                         )));
-                    if let Some(usage) = &self.usage {
+                    if let Some(usage) = usage {
                         builder = builder.usage(Arc::new(HookUsage(usage.clone())));
                     }
                     if let Some(tools) = &self.tools {
@@ -56,8 +68,7 @@ impl HookEvaluator for DefaultHookEvaluator {
                         .map_err(|f| *f.error)?
                         .text
                 } else {
-                    let response = self
-                        .model
+                    let response = model
                         .complete(
                             ModelRequest::new(
                                 ChatRequest::from_user(request.prompt).with_system(instructions),
@@ -66,17 +77,16 @@ impl HookEvaluator for DefaultHookEvaluator {
                             .with_context("hook", request.invocation.base.session_id.clone()),
                         )
                         .await?;
-                    if let Some(usage) = &self.usage {
-                        usage
-                            .record_event(
-                                &SessionId::from(request.invocation.base.session_id.clone()),
-                                &UsageEvent::new(
-                                    Some(self.model.model_iden().into()),
-                                    "hook",
-                                    response.usage.clone(),
-                                ),
-                            )
-                            .await?;
+                    if let Some(usage) = usage {
+                        let id = SessionId::from(request.invocation.base.session_id.clone());
+                        let event = UsageEvent::new(
+                            Some(model.model_iden().into()),
+                            "hook",
+                            response.usage.clone(),
+                        );
+                        if let Some(warning) = usage.record_response(&id, &event).await {
+                            eprintln!("{warning}");
+                        }
                     }
                     response.content.texts().join("")
                 };

@@ -128,8 +128,8 @@ pub mod prelude {
         RecallRequest, RecalledMemory,
     };
     pub use crate::model::{
-        Model, ModelErrorClass, ModelEventStream, ModelOptions, ModelOutput, ModelProvider,
-        ModelRecovery, ModelRequest, ModelTimeouts,
+        Model, ModelErrorClass, ModelEventStream, ModelLimits, ModelOptions, ModelOutput,
+        ModelProvider, ModelRecovery, ModelRequest, ModelTimeouts, ModelTokenBudget,
     };
     pub use crate::observability::{ObservabilityProvider, Span};
     pub use crate::protocol::{

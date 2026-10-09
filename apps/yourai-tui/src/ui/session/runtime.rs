@@ -40,6 +40,11 @@ fn summarize_error(text: &str) -> String {
     }
 }
 
+enum InputAction {
+    Submit(In),
+    Steer(String),
+}
+
 type Stats = (
     Option<yourai_harness::runtime::ContextUsage>,
     Option<u64>,
@@ -51,11 +56,12 @@ pub(super) struct Runtime {
     rx: mpsc::UnboundedReceiver<Out>,
     cancel: CancellationToken,
     driver: Option<JoinHandle<Result<(), YourAiError>>>,
+    restart_requested: bool,
     compact: Option<JoinHandle<Option<Usage>>>,
     stats: Option<JoinHandle<Stats>>,
     stats_at: Instant,
     limits: TurnLimits,
-    submissions: Option<mpsc::UnboundedSender<In>>,
+    submissions: Option<mpsc::UnboundedSender<InputAction>>,
     submitter: JoinHandle<()>,
     pending_submissions: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -70,8 +76,26 @@ impl Runtime {
         let events = tx.clone();
         let submitter = tokio::spawn(async move {
             while let Some(input) = inputs.recv().await {
-                if let Err(rejection) = host.submit_async(input).await {
-                    let _ = events.send(Out::InputRejected { rejection });
+                match input {
+                    InputAction::Submit(input) => {
+                        if let Err(rejection) = host.submit_async(input).await {
+                            let _ = events.send(Out::InputRejected { rejection });
+                        }
+                    }
+                    InputAction::Steer(id) => match host.steer_pending(id).await {
+                        Ok(true) => {}
+                        result => {
+                            let message = match result {
+                                    Ok(false) => "Message is no longer pending or the turn ended; nothing was resent.".into(),
+                                    Err(e) => format!("Could not steer queued message: {e}"),
+                                    Ok(true) => unreachable!(),
+                                };
+                            let _ = events.send(Out::Notice {
+                                level: Level::Warning,
+                                message,
+                            });
+                        }
+                    },
                 }
                 pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -85,6 +109,7 @@ impl Runtime {
             rx,
             cancel: CancellationToken::new(),
             driver: None,
+            restart_requested: false,
             compact: None,
             stats: None,
             stats_at: Instant::now() - Duration::from_secs(2),
@@ -93,6 +118,18 @@ impl Runtime {
     }
     /// Queue in input order; durable rejection returns through the normal event reducer.
     pub fn submit(&mut self, input: In) -> bool {
+        let accepted = self.dispatch(InputAction::Submit(input));
+        self.restart_requested |= accepted;
+        accepted
+    }
+    pub fn steer_pending(&mut self, id: String) {
+        self.dispatch(InputAction::Steer(id));
+    }
+    pub fn interrupt(&mut self) {
+        self.restart_requested = false;
+        self.h.host.interrupt();
+    }
+    fn dispatch(&mut self, input: InputAction) -> bool {
         self.pending_submissions
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self
@@ -114,6 +151,7 @@ impl Runtime {
     }
     pub fn resume(&mut self) {
         if self.driver.is_none() {
+            self.restart_requested = false;
             let host = self.h.host.clone();
             let tx = self.tx.clone();
             let cancel = self.cancel.clone();
@@ -145,13 +183,21 @@ impl Runtime {
                 .compact(CompactionRequest::new(CompactionTrigger::Manual), &cancel)
                 .await;
             let (level, message) = match result {
-                Ok(r) => (
-                    Level::Info,
-                    format!(
-                        "Context {:?}: {} -> {} estimated tokens. {}",
-                        r.action, r.tokens_before, r.tokens_after, r.reason
-                    ),
-                ),
+                Ok(r) => {
+                    for notice in &r.notices {
+                        let _ = tx.send(Out::Notice {
+                            level: Level::Warning,
+                            message: notice.clone(),
+                        });
+                    }
+                    (
+                        Level::Info,
+                        format!(
+                            "Context {:?}: {} -> {} estimated tokens. {}",
+                            r.action, r.tokens_before, r.tokens_after, r.reason
+                        ),
+                    )
+                }
                 Err(e) => (Level::Error, format!("Compact failed: {e}")),
             };
             let _ = tx.send(Out::Notice { level, message });
@@ -182,12 +228,12 @@ impl Runtime {
             match self.driver.take().unwrap().await {
                 Ok(Err(YourAiError::Aborted(reason))) => view.notice(
                     Level::Info,
-                    format!("Stopped: {reason}. Queued inputs remain; /continue resumes them."),
+                    format!("Stopped: {reason}. Queued inputs remain; send a message to resume."),
                 ),
                 Ok(Err(e)) => view.notice(
                     Level::Error,
                     format!(
-                        "Execution failed: {}. /continue retries pending inputs.",
+                        "Execution failed: {}. Send a message to resume.",
                         summarize_error(&e.to_string())
                     ),
                 ),
@@ -196,6 +242,22 @@ impl Runtime {
             }
             view.settle();
         }
+        // A send requests continuation before submission/failed-turn cleanup finishes.
+        // Do not decide this using last_error or the transient Running status.
+        if self.driver.is_none()
+            && self.restart_requested
+            && !self.submitting()
+            && matches!(self.h.host.status(), SessionStatus::Idle)
+            && !self.compacting()
+        {
+            if self.h.host.queued() > 0 {
+                self.resume();
+            } else {
+                self.restart_requested = false;
+            }
+        }
+        view.session.pending_inputs = self.h.host.pending_inputs();
+        view.session.can_steer = matches!(self.h.host.status(), SessionStatus::Running { .. });
         let active = self.submitting()
             || !matches!(
                 self.h.host.status(),
@@ -329,7 +391,7 @@ mod tests {
         let h = controller.harness();
         let context = h.host.context();
         // A UI preview is not an admitted input and must never name a session.
-        view.user("uncommitted preview", false);
+        view.user("uncommitted preview");
         refresh(&mut controller.runtime, &mut view).await;
         assert!(view.session.title.is_none());
         h.sessions
@@ -423,5 +485,129 @@ mod tests {
             .title
             .is_none());
         controller.close().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod failure_cleanup_tests {
+    use super::*;
+    use crate::ui::session;
+    struct FailureCleanupGate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    impl HookHandler for FailureCleanupGate {
+        fn execute<'a>(
+            &'a self,
+            _: &'a HookInvocation,
+        ) -> BoxFuture<'a, Result<HookOutput, YourAiError>> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(HookOutput::Parsed(serde_json::json!({})))
+            })
+        }
+    }
+    struct ErrorModel(std::sync::atomic::AtomicUsize);
+    impl ModelProvider for ErrorModel {
+        fn model_iden(&self) -> &str {
+            "review-error"
+        }
+        fn complete<'a>(
+            &'a self,
+            _: ModelRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
+            Box::pin(async { unreachable!() })
+        }
+        fn stream_events<'a>(
+            &'a self,
+            _: ModelRequest,
+        ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Err(ErrorKind::Provider {
+                    name: "model",
+                    message: "failed".into(),
+                }
+                .into())
+            })
+        }
+    }
+    async fn cleanup_with_queued_input(cancel: bool) {
+        let (_dir, mut controller, mut view) = session::fixture().await;
+        let model = Arc::new(ErrorModel(std::sync::atomic::AtomicUsize::new(0)));
+        let gate = Arc::new(FailureCleanupGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        controller
+            .runtime
+            .h
+            .switch_model(model.clone(), ContextPolicy::default())
+            .await
+            .unwrap();
+        controller
+            .runtime
+            .h
+            .hooks
+            .register(NativeHookRegistration {
+                id: "review-cleanup-gate".into(),
+                event: HookEventKind::StopFailure,
+                matcher: None,
+                handler: gate.clone(),
+                timeout: Some(Duration::from_secs(10)),
+                source: HookSource::Session,
+                failure_policy: FailurePolicy::Closed,
+                once: true,
+            })
+            .await
+            .unwrap();
+        assert!(controller.submit(In::follow_up("first"), &mut view));
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        assert!(matches!(
+            controller.runtime.h.host.status(),
+            SessionStatus::Running { .. }
+        ));
+        assert!(controller.runtime.h.host.last_error().is_none());
+        assert!(controller.submit(
+            In::follow_up("new instruction during failure cleanup"),
+            &mut view
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while controller.runtime.submitting() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if cancel {
+            controller.interrupt();
+        }
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while controller.runtime.driver.is_some() {
+                controller.poll(&mut view, None).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let calls = model.0.load(std::sync::atomic::Ordering::SeqCst);
+        controller.close().await.unwrap();
+        assert_eq!(
+            calls,
+            if cancel { 1 } else { 2 },
+            "a new message resumes after failure unless explicitly cancelled"
+        );
+    }
+    #[tokio::test]
+    async fn send_during_failure_cleanup_resumes_without_replaying_input() {
+        cleanup_with_queued_input(false).await;
+    }
+    #[tokio::test]
+    async fn cancel_during_failure_cleanup_leaves_queued_input_paused() {
+        cleanup_with_queued_input(true).await;
     }
 }

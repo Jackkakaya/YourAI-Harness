@@ -20,6 +20,7 @@ pub struct Compactor {
     hooks: Option<Arc<dyn HookRuntime>>,
     usage: Option<Arc<dyn UsageTracker>>,
     hook_base: BaseInput,
+    providers: Option<ProviderSnapshot>,
 }
 impl Compactor {
     pub fn new(
@@ -35,6 +36,7 @@ impl Compactor {
             hooks,
             usage,
             hook_base,
+            providers: None,
         }
     }
     pub fn from_snapshot(
@@ -63,6 +65,7 @@ impl Compactor {
             hooks: snapshot.hooks.clone(),
             usage: snapshot.usage.clone(),
             hook_base,
+            providers: Some(snapshot.clone()),
         })
     }
 }
@@ -98,6 +101,7 @@ pub trait ContextManager: Send + Sync {
         &self,
         tools: &[ToolDefinition],
         model: &dyn ModelProvider,
+        suffix: &[ChatMessage],
     ) -> Result<ContextRequest, YourAiError>;
     /// Implementation-side planning. Public context operations own the hook lifecycle.
     ///
@@ -141,9 +145,6 @@ pub trait ContextManager: Send + Sync {
     }
     fn policy(&self) -> ContextPolicy {
         ContextPolicy::default()
-    }
-    fn default_options(&self) -> ChatOptions {
-        ChatOptions::default()
     }
 }
 
@@ -204,14 +205,17 @@ async fn dispatch_hook(
     event: HookEvent,
     timeout: Option<Duration>,
 ) -> Result<HookDispatchResult, YourAiError> {
-    let kind = event.kind();
+    let mut invocation = HookInvocation::new(execution.hook_base.clone(), event);
+    if let Some(providers) = &execution.providers {
+        invocation = invocation.with_providers(providers);
+    }
+    invocation.model = Some(execution.model.clone());
+    invocation.usage = execution.usage.clone();
+    let kind = invocation.event.kind();
     let result = match &execution.hooks {
-        Some(hooks) => crate::time::timeout(
-            timeout,
-            hooks.dispatch(&HookInvocation::new(execution.hook_base.clone(), event)),
-        )
-        .await
-        .map_err(|_| op_error("hook deadline exceeded"))??,
+        Some(hooks) => crate::time::timeout(timeout, hooks.dispatch(&invocation))
+            .await
+            .map_err(|_| op_error("hook deadline exceeded"))??,
         None => HookDispatchResult::empty(kind),
     };
     result.validate_for(kind)?;

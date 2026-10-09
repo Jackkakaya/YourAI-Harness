@@ -150,10 +150,11 @@ async fn child_inherits_normal_security_and_sandbox() {
         )]),
         answer("done"),
     ]));
-    let child_tool = subagent(&parent, model.clone(), None);
+    let child_tool = subagent(&parent, Some(model.clone()), None);
     child_tool
         .exec(
             ToolContext {
+                providers: None,
                 call_id: "child".into(),
                 cwd: Some(cwd.path()),
                 emit: &DiscardSink,

@@ -162,9 +162,12 @@ impl Controller {
             Err(e) => Reply::Rejected(e.to_string()),
         }
     }
-    pub fn resume(&mut self, view: &mut View) {
+    pub fn interrupt(&mut self) {
+        self.runtime.interrupt();
+    }
+    pub fn steer_pending(&mut self, id: String, view: &mut View) {
         if self.available(view) {
-            self.runtime.resume();
+            self.runtime.steer_pending(id);
         }
     }
     pub fn compact(&mut self, view: &mut View) {
@@ -259,7 +262,7 @@ impl Controller {
                 Ok(Ok(pending)) if !pending.is_empty() => view.notice(
                     Level::Warning,
                     format!(
-                        "{} queued inputs from previous session discarded.",
+                        "{} queued inputs saved in the previous session.",
                         pending.len()
                     ),
                 ),
@@ -509,7 +512,7 @@ mod tests {
             label: "mock/test · fast".into(),
             effort: None,
         }];
-        view.user("belongs to the old session", false);
+        view.user("belongs to the old session");
         view.session.title = Some("old title".into());
         view.restore_usage(
             Usage {

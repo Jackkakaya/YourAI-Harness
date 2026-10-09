@@ -23,14 +23,21 @@ fn error_leaf(error: &YourAiError) -> Option<&(dyn std::error::Error + 'static)>
 }
 
 pub fn has_http_headers(error: &YourAiError) -> bool {
-    matches!(
-        error_leaf(error).and_then(|e| e.downcast_ref::<genai::webc::Error>()),
-        Some(genai::webc::Error::ResponseFailedStatus { .. })
-    )
+    let Some(error) = error_leaf(error) else {
+        return false;
+    };
+    if let Some(genai::Error::HttpError { headers, .. }) = error.downcast_ref::<genai::Error>() {
+        return !headers.is_empty();
+    }
+    matches!(error.downcast_ref::<genai::webc::Error>(), Some(genai::webc::Error::ResponseFailedStatus { headers, .. }) if !headers.is_empty())
 }
 
 pub fn http_header<'a>(error: &'a YourAiError, name: &str) -> Option<&'a str> {
-    match error_leaf(error)?.downcast_ref::<genai::webc::Error>()? {
+    let error = error_leaf(error)?;
+    if let Some(genai::Error::HttpError { headers, .. }) = error.downcast_ref::<genai::Error>() {
+        return headers.get(name)?.to_str().ok();
+    }
+    match error.downcast_ref::<genai::webc::Error>()? {
         genai::webc::Error::ResponseFailedStatus { headers, .. } => {
             headers.get(name)?.to_str().ok()
         }
@@ -120,6 +127,11 @@ mod tests {
     #[test]
     fn http_status_survives_nested_stream_wrappers() {
         let source = genai::Error::HttpError {
+            headers: Box::new(
+                [("retry-after".parse().unwrap(), "3".parse().unwrap())]
+                    .into_iter()
+                    .collect(),
+            ),
             status: "429".parse().unwrap(),
             canonical_reason: "Too Many Requests".into(),
             body: r#"{"error":{"message":"rpm exceeded","dimension":"rpm"}}"#.into(),
@@ -130,6 +142,8 @@ mod tests {
         let (status, body) = http_error(&error).unwrap();
         assert_eq!(status, 429);
         assert!(body.contains("rpm exceeded"));
+        assert!(has_http_headers(&error));
+        assert_eq!(http_header(&error, "retry-after"), Some("3"));
     }
 
     #[test]
@@ -182,6 +196,7 @@ mod tests {
             ] {
                 let error = YourAiError::from(ErrorKind::Model {
                     source: genai::Error::HttpError {
+                        headers: Default::default(),
                         status: status.to_string().parse().unwrap(),
                         canonical_reason: String::new(),
                         body: body.into(),

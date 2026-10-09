@@ -247,10 +247,12 @@ impl DefaultContext {
         records: &[StoredMessage],
         system: Option<&str>,
         tools: &[ToolDefinition],
-        model: &str,
+        model: &dyn ModelProvider,
     ) -> String {
         format!(
-            "{model}:{:?}:{system:?}:{}",
+            "{}:{:?}:{:?}:{system:?}:{}",
+            model.model_iden(),
+            model.token_budget(),
             records
                 .iter()
                 .map(|m| (&m.id, m.tool_output_pruned_at))
@@ -271,10 +273,6 @@ impl ContextManager for DefaultContext {
     }
     fn policy(&self) -> ContextPolicy {
         self.services.policy.clone()
-    }
-    fn default_options(&self) -> ChatOptions {
-        ChatOptions::default()
-            .with_max_tokens(self.services.policy.output_reserve.min(u32::MAX as u64) as u32)
     }
     fn restore(&self) -> BoxFuture<'_, Result<(), YourAiError>> {
         Box::pin(async {
@@ -306,8 +304,9 @@ impl ContextManager for DefaultContext {
         &self,
         tools: &[ToolDefinition],
         model: &dyn ModelProvider,
+        suffix: &[ChatMessage],
     ) -> Result<ContextRequest, YourAiError> {
-        self.services.policy.validate()?;
+        self.services.policy.validate_for(model.token_budget())?;
         if self.dirty.load(Ordering::Acquire) {
             return Err(error(
                 "context",
@@ -317,16 +316,12 @@ impl ContextManager for DefaultContext {
         let owned_system = self.system_prompt();
         let system = Some(owned_system.as_str());
         let records = self.records();
-        let request = self.project(&records, system, tools)?;
+        let mut request = self.project(&records, system, tools)?;
+        request.messages.extend_from_slice(suffix);
         let estimated_tokens = self.estimate(&request, model)?;
-        let input_budget = self.services.policy.input_budget();
+        let input_budget = self.services.policy.input_budget(model.token_budget());
         let unchanged = self.view.lock().unwrap().last_maintenance.as_ref()
-            == Some(&Self::fingerprint(
-                &records,
-                system,
-                tools,
-                model.model_iden(),
-            ));
+            == Some(&Self::fingerprint(&records, system, tools, model));
         let maintenance_needed = !unchanged
             && input_budget.is_some_and(|b| {
                 estimated_tokens >= b.saturating_sub(self.services.policy.advance_tokens)

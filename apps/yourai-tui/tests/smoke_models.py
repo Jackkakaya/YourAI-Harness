@@ -1,4 +1,4 @@
-from smoke_support import wait_completed, wait_exit
+from smoke_support import DEFAULT_BIN, wait_completed, wait_exit
 from pty_probe import Screen
 """Smoke test for /models switching: verify the second request hits the switched model."""
 import fcntl
@@ -63,8 +63,8 @@ with tempfile.TemporaryDirectory() as tmp:
             "models": {
                 "smoke": {"id": "smoke-model", "limit": {"context": 16000, "output": 4096}},
                 "third": {"id": "third-model", "limit": {"context": 16000, "output": 4096}},
-                "alt": {"id": "alt-model", "limit": {"context": 16000, "output": 4096},
-                        "options": {"reasoningEffort": "low"}, "variants": {"inherit": {}}}
+                "alt": {"id": "alt-model", "limit": {"context": 262144, "output": 65536},
+                        "options": {"reasoningEffort": "low", "maxOutputTokens": 49152}, "variants": {"inherit": {}}}
             }
         }},
         "context": {"keep_recent_tokens": 0, "summary_min_savings": 1}
@@ -72,7 +72,7 @@ with tempfile.TemporaryDirectory() as tmp:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
     original = termios.tcgetattr(slave)
-    binary = Path(__file__).resolve().parents[3] / 'target/debug/yourai-tui'
+    binary = DEFAULT_BIN
     child = subprocess.Popen([str(binary), '--config', str(config)], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, XDG_DATA_HOME=str(Path(tmp) / 'xdg-data')))
     captured = bytearray()
     screen = Screen(120, 35)
@@ -132,6 +132,8 @@ with tempfile.TemporaryDirectory() as tmp:
         stream_reqs = [r for r in requests if r[1].get('stream')]
         assert len(stream_reqs) >= 2, f'expected 2 stream requests, got {len(stream_reqs)}'
         assert stream_reqs[1][1]['model'] == 'alt-model', f'expected alt-model, got {stream_reqs[1][1]["model"]}'
+        assert stream_reqs[0][1].get('max_tokens', stream_reqs[0][1].get('max_completion_tokens')) == 4096
+        assert stream_reqs[1][1].get('max_tokens', stream_reqs[1][1].get('max_completion_tokens')) == 49152
         assert stream_reqs[1][1].get('reasoning_effort') == 'low'
         # Set thinking effort via the /models picker's Enter drill-in.
         wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 2)
@@ -151,6 +153,7 @@ with tempfile.TemporaryDirectory() as tmp:
         stream_reqs = [r for r in requests if r[1].get('stream')]
         assert len(stream_reqs) >= 3, f'expected 3 stream requests, got {len(stream_reqs)}'
         assert stream_reqs[2][1]['model'] == 'alt-model', f'expected alt-model, got {stream_reqs[2][1]["model"]}'
+        assert stream_reqs[2][1].get('max_tokens', stream_reqs[2][1].get('max_completion_tokens')) == 49152
         assert stream_reqs[2][1].get('reasoning_effort') == 'high', \
             f'expected reasoning_effort high, got {stream_reqs[2][1].get("reasoning_effort")}'
         wait_completed(Path(tmp) / 'xdg-data/yourai/sessions/sessions.sqlite3', 'main', 3)

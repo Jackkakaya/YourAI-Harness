@@ -73,6 +73,7 @@ async fn call(
 ) -> Result<Value, YourAiError> {
     tool.run(
         ToolContext {
+            providers: None,
             cwd: None,
             call_id: "test".into(),
             emit: &DiscardSink,

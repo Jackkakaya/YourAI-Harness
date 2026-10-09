@@ -41,6 +41,7 @@ impl ContextManager for History {
         &self,
         _: &[ToolDefinition],
         _: &dyn ModelProvider,
+        _suffix: &[ChatMessage],
     ) -> Result<ContextRequest, YourAiError> {
         unreachable!()
     }

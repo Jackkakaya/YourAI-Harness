@@ -56,7 +56,7 @@ cargo run -p yourai-tui
 - `options.baseURL` 填基础地址（例如 `/v1`），不要填 `/chat/completions`；省略时使用 genai 的默认服务地址。
 - `options.apiKey` 支持 `{env:VAR}`；无需认证的本地服务可填任意非空占位值，或按 provider 默认认证方式省略。
 - `session_dir` 和提示词文件路径相对配置文件解析；工作目录仍是启动 TUI 时所在目录。
-- 模型窗口与输出上限放在 `provider.*.models.*.limit`；`options.maxOutputTokens` 不得超过 `limit.output`。旧的 `context.context_window/input_limit/output_reserve` 配置会被拒绝。
+- 模型窗口与输出上限放在 `provider.*.models.*.limit`；输出预算按 `options.maxOutputTokens`、`limit.output`、32000 的顺序取值，不得超过模型输出容量。输入预算取 `limit.input` 与 `limit.context - 输出预算` 中的较小值，再扣安全余量。思考强度独立于输出预算。旧的 `context.context_window/input_limit/output_reserve` 配置会被拒绝。
 - `variants` 会合并到模型 `options`；含 `"disabled": true` 的 variant 不会出现在 `/models` 选择器中。
 - `options.reasoningEffort`（或 variant 内同名键）设置思考强度：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`。OpenAI 系以 `reasoning_effort` 发送；Anthropic/Gemini/Bedrock 会换算成 thinking budget。variant 内的设置优先于模型级。
 - 可选 `pricing` 使用每百万 token 的美元价格：`{"input": 5.0, "output": 15.0}`。状态栏和仪表盘会显示估算成本；未配置时不显示。
@@ -69,7 +69,7 @@ cargo run -p yourai-tui
 - 二级选择器中 `Enter` 应用所选强度并切换到该模型；`Esc`/`←` 返回模型列表。
 - 确认当前预选强度保留其来源：继承模型设定的 variant 继续继承，已有显式覆盖继续独立。改变强度才建立覆盖；`config default` 恢复原配置或继承。
 - 有效的未声明模型同样可以确认、调整强度并恢复默认；只有显式覆盖需要创建内存条目。
-- 覆盖写入内存中的配置，随 `/models` 更新主对话与压缩模型；已绑定的 Hook 和子代理工厂保持原模型，新开会话使用当前选择。不回写 `yourai.json`，重启后回到文件配置。
+- 覆盖写入内存中的配置，随 `/models` 更新主对话与压缩模型；Hook 和新建子任务默认继承当前模型，显式指定模型的子任务保留自己的选择。不回写 `yourai.json`，重启后回到文件配置。
 - 当前 effort 显示在三处：`/models` 行内（如 `gateway/kimi-k3 · high`）、输入框左侧模型标签、`Ctrl-B` 仪表盘首行；切换成功也会提示 `Model switched to … · thinking high`。
 
 未配置窗口时会提示预算未知，自动摘要关闭，手动摘要报配置错误。工具输出预览默认 16000 字符，超限内容仅保留在会话记录中（投影层是唯一上限）。
@@ -84,12 +84,11 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --check-config
 
 | 操作 | 行为 |
 |---|---|
-| 输入后 Enter | 空闲时启动执行；运行中作为 steer |
+| 输入后 Enter | 空闲时启动执行；运行中排队到下一轮 |
+| 队列消息的 Steer 按钮 | 把选中的消息送入当前任务，保留其 ID 和附件 |
 | 审批时按 y / a / n | y 允许本次；a 允许本次并由安全策略记住该工具的会话授权；n 拒绝。显式拒绝和 hook 强制确认仍有效。↑↓ 选择 + Enter 同效，Esc 中断整轮 |
 | 普通提问时输入 JSON | 回复工具问题；文本写成 JSON 字符串，如 `"答案"` |
 | Esc / Ctrl-C | 取消当前执行，保留后续队列 |
-| `/queue 内容` | 排队为后续 Turn |
-| `/continue` | 重试暂时执行失败后保留的待处理输入 |
 | `/editor` | 把当前草稿交给 `$VISUAL`/`$EDITOR` 编辑（等价 `Ctrl-X`）；非零退出视为取消，草稿保持不变 |
 | `/compact` | 手动压缩；运行中会拒绝并提示 busy；压缩期间可按 Esc / Ctrl-C 取消 |
 | `/models [provider/model [variant]]` | 打开模型选择器或直接切换；选择器内 `Enter`（或 `Tab`/`→`）进入 thinking effort 二级选择器，选定强度后一并切换；仅空闲时可切换，模型与上下文限制一起更新，失败保留原选择 |
@@ -178,7 +177,7 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --import-json-sessions
 
 输入历史保留最近 100 条，在当前 TUI 进程内跨会话切换保留。启动时从已保存的会话文本初始化历史；原始 FileRef 与剪贴板暂存信息不额外落盘，退出后不承诺完整重建原始附件引用。
 
-无效附件只显示拒绝原因，不自动覆盖正在编辑的草稿，也不进入执行重试队列。按 ↑ 找回该输入后，可改文字、Esc 清附件、重新选择文件再发。暂时执行失败仍用 `/continue` 重试待处理输入。
+无效附件只显示拒绝原因，不自动覆盖正在编辑的草稿，也不进入执行重试队列。按 ↑ 找回该输入后，可改文字、Esc 清附件、重新选择文件再发。执行失败后发送新的普通消息即可继续，不重放已消费的输入。未执行的队列消息在退出或切换会话后仍保存在原会话中。
 
 文本、附件、文件补全和剪贴板读取属于当前输入。切换会话保留整份草稿；补全使用新会话目录，已选 FileRef 仍指向原文件。读图未完成时发送会提示等待。Esc 先关闭弹层或补全，再清附件并取消对应读取；Ctrl-C 用于中断执行。工具问答（ask）打开时，Ctrl+V 不读图到主草稿，文本粘贴仍进入当前回答。
 

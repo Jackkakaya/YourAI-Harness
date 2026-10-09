@@ -12,7 +12,7 @@ impl Turn<'_> {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
         }
-        HookInvocation::new(base, event)
+        HookInvocation::new(base, event).with_providers(&self.tc.snap)
     }
     pub(crate) async fn hook(
         &mut self,

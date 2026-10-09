@@ -120,17 +120,12 @@ pub(super) async fn switch_model(
             .set_entry_effort(model_id, variant.as_deref(), effort)
             .map_err(|e| e.to_string())?;
     }
-    let crate::config::ResolvedModel {
-        model,
-        context,
-        settings,
-    } = candidate
+    let crate::config::ResolvedModel { model, settings } = candidate
         .resolve(variant.as_deref())
         .map_err(|e| e.to_string())?;
-    candidate.context = context.clone();
     candidate.selected_variant = variant.clone();
     harness
-        .switch_model_with_settings(model, context, settings)
+        .switch_model_with_settings(model, candidate.context.clone(), settings)
         .await
         .map_err(|e| e.to_string())?;
     let effective_effort = candidate.effective_effort(model_id, variant.as_deref());
@@ -203,7 +198,7 @@ mod switch_tests {
     #[tokio::test]
     async fn failed_switch_is_atomic_and_session_rebuild_keeps_variant() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg: Config = serde_json::from_value(serde_json::json!({
+        let cfg: Config = serde_json::from_value(serde_json::json!({
             "model": "mock/large",
             "provider": { "mock": {
                 "npm": "@ai-sdk/openai-compatible",
@@ -217,8 +212,7 @@ mod switch_tests {
             }}
         }))
         .unwrap();
-        let crate::config::ResolvedModel { model, context, .. } = cfg.resolve(None).unwrap();
-        cfg.context = context;
+        let crate::config::ResolvedModel { model, .. } = cfg.resolve(None).unwrap();
         let mut hc = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
         hc.system_prompt = Some("test".into());
         hc.context_policy = cfg.context.clone();
@@ -238,7 +232,15 @@ mod switch_tests {
             );
             let cfg = config.lock().unwrap();
             assert_eq!(cfg.model, "mock/large");
-            assert_eq!(cfg.context.context_window, Some(64000));
+            assert_eq!(
+                cfg.resolve(None)
+                    .unwrap()
+                    .model
+                    .token_budget()
+                    .limits()
+                    .context,
+                Some(64000)
+            );
             assert_eq!(cfg.selected_variant, None);
             assert_eq!(view.model.label, "mock/large");
             assert_eq!(h.host.context_usage().unwrap().context_window, Some(64000));
@@ -248,10 +250,11 @@ mod switch_tests {
             .unwrap();
         view.model.label = selected.label;
         assert_eq!(h.host.context_usage().unwrap().output_reserve, 2048);
-        let (resume, _) = prepare_session(&config, &hc, Some(h.host.context().id)).unwrap();
-        assert_eq!(resume.context_policy.context_window, Some(32000));
+        let (_resume, resume_model) =
+            prepare_session(&config, &hc, Some(h.host.context().id)).unwrap();
+        assert_eq!(resume_model.token_budget().limits().context, Some(32000));
         // This differs from the default model's 4096, proving variant resolution.
-        assert_eq!(resume.context_policy.output_reserve, 2048);
+        assert_eq!(resume_model.token_budget().max_output_tokens(), 2048);
         assert_eq!(
             config.lock().unwrap().selected_variant.as_deref(),
             Some("short")
@@ -263,7 +266,7 @@ mod switch_tests {
     #[tokio::test]
     async fn effort_override_sets_clears_and_reports_effective() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg: Config = serde_json::from_value(serde_json::json!({
+        let cfg: Config = serde_json::from_value(serde_json::json!({
             "model": "mock/large",
             "provider": { "mock": {
                 "npm": "@ai-sdk/openai-compatible",
@@ -277,8 +280,7 @@ mod switch_tests {
             }}
         }))
         .unwrap();
-        let crate::config::ResolvedModel { model, context, .. } = cfg.resolve(None).unwrap();
-        cfg.context = context;
+        let crate::config::ResolvedModel { model, .. } = cfg.resolve(None).unwrap();
         let mut hc = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
         hc.system_prompt = Some("test".into());
         hc.context_policy = cfg.context.clone();

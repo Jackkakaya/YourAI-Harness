@@ -16,7 +16,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let harness = Harness::open(
         HarnessConfig::new(cwd.join(".yourai/sessions"), cwd),
-        Arc::new(GenaiModel::new(genai::Client::default(), model)),
+        Arc::new(GenaiModel::new(
+            genai::Client::builder().build().unwrap(),
+            model,
+        )),
     )
     .await?;
     harness.host.submit(In::user_text(prompt))?;

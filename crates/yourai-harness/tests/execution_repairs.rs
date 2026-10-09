@@ -76,8 +76,9 @@ mod tests {
             &self,
             t: &[ToolDefinition],
             m: &dyn ModelProvider,
+            suffix: &[ChatMessage],
         ) -> Result<ContextRequest, YourAiError> {
-            self.inner.build_request(t, m)
+            self.inner.build_request(t, m, suffix)
         }
         fn prepare_compaction<'a>(
             &'a self,
@@ -380,8 +381,9 @@ mod tests {
             &self,
             t: &[ToolDefinition],
             m: &dyn ModelProvider,
+            suffix: &[ChatMessage],
         ) -> Result<ContextRequest, YourAiError> {
-            self.inner.build_request(t, m)
+            self.inner.build_request(t, m, suffix)
         }
         fn prepare_compaction<'a>(
             &'a self,
