@@ -69,7 +69,7 @@ impl Subagent {
                     .await?;
             }
             let child = self.factory.create(&parent, id.clone(), &tc).await?;
-            let child_id = child.context().id;
+            let child_id = child.environment().id;
             let _cleanup = ChildCleanup {
                 parent: parent.clone(),
                 id: child_id.clone(),
@@ -107,7 +107,7 @@ impl Subagent {
                         stop_hook_active: continuation > 0,
                         agent_id: id.to_string(),
                         agent_transcript_path: child
-                            .context()
+                            .environment()
                             .transcript_path
                             .map(|p| p.to_string_lossy().into_owned())
                             .unwrap_or_default(),

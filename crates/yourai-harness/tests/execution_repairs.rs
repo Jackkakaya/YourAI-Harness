@@ -1,3 +1,5 @@
+#[path = "support/storage.rs"]
+mod storage_fixture;
 #[cfg(test)]
 #[path = "support/loop.rs"]
 mod support;
@@ -209,7 +211,13 @@ mod tests {
     async fn user_committed_with_lost_reply_is_reconciled_once() {
         let dir = tempfile::TempDir::new().unwrap();
         let history = Arc::new(LostAppendReply::new());
+        let (store, _) = super::storage_fixture::store().await;
+        store
+            .create_session(history.session_id().clone(), "")
+            .await
+            .unwrap();
         let a = Agent::builder()
+            .session(store)
             .agent_loop(Arc::new(
                 yourai_harness::default_loop::DefaultLoop::default(),
             ))
@@ -218,7 +226,7 @@ mod tests {
             .build();
         let h = SessionManager::open(
             dir.path(),
-            SessionContext::new(history.session_id().clone(), dir.path()),
+            SessionEnvironment::new(history.session_id().clone(), dir.path()),
             a,
             SessionConfig::default(),
             "startup",

@@ -1,4 +1,4 @@
-//! Durable host transitions. Writers serialize; readers never wait for filesystem I/O.
+//! Durable host transitions. Writers serialize; readers never wait for database I/O.
 use super::*;
 use std::ops::{Deref, DerefMut};
 
@@ -6,6 +6,7 @@ pub(super) struct Transaction<'a> {
     host: &'a SessionManager,
     _gate: std::sync::MutexGuard<'a, ()>,
     candidate: Journal,
+    revision: Option<i64>,
 }
 impl Deref for Transaction<'_> {
     type Target = Journal;
@@ -41,15 +42,23 @@ impl Transaction<'_> {
         }
         Ok(())
     }
-    pub fn commit(&self) -> Result<(), YourAiError> {
+    pub fn commit(&mut self) -> Result<(), YourAiError> {
         // The transaction gate also covers the final unlock in finish_close.
         // An old host must never overwrite a journal owned by a reopened host.
         // Closing is still writable for durable cleanup and recovery.
         if self.host.status() == SessionStatus::Closed {
             return Err(error("host", "session closed"));
         }
-        atomic_write(&self.host.dir.join("host.json"), &self.candidate)?;
-        self.host.live.lock().unwrap().journal = self.candidate.clone();
+        let revision = self.host.store().save_state(
+            &self.host.lease.id,
+            "runtime",
+            self.revision,
+            serde_json::to_value(&self.candidate).map_err(|e| error("host", e))?,
+        )?;
+        let mut live = self.host.live.lock().unwrap();
+        live.journal = self.candidate.clone();
+        live.revision = Some(revision);
+        self.revision = Some(revision);
         Ok(())
     }
 }
@@ -62,6 +71,7 @@ impl SessionManager {
             host: self,
             _gate: gate,
             candidate,
+            revision: self.live.lock().unwrap().revision,
         }
     }
     /// Once started, an owned durable transition finishes even if its waiter leaves.
@@ -117,7 +127,7 @@ mod tests {
         harness.close().await.unwrap();
         let reopened = SessionManager::open(
             old.dir.clone(),
-            old.context(),
+            old.environment(),
             old.agent.clone(),
             SessionConfig::default(),
             "resume",
@@ -128,8 +138,12 @@ mod tests {
             .submit_async(In::user_text("new owner input"))
             .await
             .unwrap();
-        let path = old.dir.join("host.json");
-        let saved = std::fs::read(&path).unwrap();
+        let saved = harness
+            .store
+            .read_state(&old.environment().id, "runtime")
+            .unwrap()
+            .unwrap()
+            .value;
 
         assert!(old.watch_path_async(old.dir.join("stale")).await.is_err());
         assert!(old
@@ -147,7 +161,15 @@ mod tests {
             .await
             .is_err());
         assert_eq!(old.status(), SessionStatus::Closed);
-        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(
+            harness
+                .store
+                .read_state(&old.environment().id, "runtime")
+                .unwrap()
+                .unwrap()
+                .value,
+            saved
+        );
         assert_eq!(reopened.close(None).await.unwrap().len(), 1);
     }
     async fn hold_writer(
@@ -189,7 +211,8 @@ mod tests {
         })
         .await
         .unwrap();
-        let saved: Journal = read_json(&host.directory().join("host.json")).unwrap();
+        let saved: Journal =
+            serde_json::from_value(host.read_state("runtime").unwrap().unwrap().value).unwrap();
         assert_eq!(saved.queue.len(), 1);
         assert_eq!(harness.close().await.unwrap().len(), 1);
     }
@@ -269,17 +292,19 @@ mod tests {
                 .await
         });
         agent_loop.entered.notified().await;
-        let path = host.directory().join("host.json");
-        let backup = path.with_extension("backup");
-        std::fs::rename(&path, &backup).unwrap();
-        std::fs::create_dir(&path).unwrap();
+        harness
+            .store
+            .fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         agent_loop.finish.notify_one();
         let result = task.await.unwrap().unwrap().unwrap();
         assert!(result.result.is_err());
         assert_eq!(host.status(), SessionStatus::Closing);
         assert_eq!(host.queued(), 1);
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::rename(backup, path).unwrap();
+        harness
+            .store
+            .fail
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(harness.close().await.unwrap().len(), 1);
     }
     #[tokio::test]
@@ -287,21 +312,23 @@ mod tests {
         let (_dir, harness) = fixture().await;
         let host = harness.host.clone();
         host.submit_async(In::user_text("unstarted")).await.unwrap();
-        let path = host.directory().join("host.json");
-        let backup = path.with_extension("backup");
         {
             let mut transaction = host.journal();
             let first = transaction.queue.pop_front().unwrap();
             transaction.active.push(first.clone());
             transaction.commit().unwrap();
-            std::fs::rename(&path, &backup).unwrap();
-            std::fs::create_dir(&path).unwrap();
+            harness
+                .store
+                .fail
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             assert!(transaction.restore_unstarted(first).is_err());
         }
         assert_eq!(host.status(), SessionStatus::Closing);
         assert_eq!(host.queued(), 1);
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::rename(backup, path).unwrap();
+        harness
+            .store
+            .fail
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(harness.close().await.unwrap().len(), 1);
     }
 }

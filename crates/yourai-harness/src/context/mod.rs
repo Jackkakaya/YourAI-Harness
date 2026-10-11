@@ -21,6 +21,8 @@ struct View {
     markers: Vec<String>,
     observation: Option<RequestObservation>,
 }
+/// Owns the active history and builds model requests, including cheap output pruning.
+/// It persists mutations but never calls the model or dispatches compaction hooks.
 pub struct DefaultContext {
     id: SessionId,
     view: Mutex<View>,

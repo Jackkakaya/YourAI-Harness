@@ -240,7 +240,7 @@ async fn compact_callback_uses_clean_active_history_without_rebuilding_system() 
     .unwrap();
     let h = Harness::open(config, model).await.unwrap();
     let store = SessionCatalog::new(root).unwrap().store;
-    let id = h.host.context().id;
+    let id = h.host.environment().id;
     let mut user = StoredMessage::new(ChatMessage::user("CLEAN ".repeat(1000)));
     user.attach_recall(vec![RecalledMemory {
         provider: "test".into(),
@@ -314,7 +314,7 @@ async fn cancelling_hook_dispatch_cancels_provider_callback_token() {
         .await
         .unwrap();
     let event = HookInvocation::new(
-        BaseInput::new(h.host.context().id.as_str(), ""),
+        BaseInput::new(h.host.environment().id.as_str(), ""),
         HookEvent::SessionStart {
             source: "test-timeout".into(),
             model: None,
@@ -374,7 +374,7 @@ async fn completion_notification_cannot_veto_result_and_resume_gets_start_callba
     .await
     .unwrap();
     assert_eq!(run(&h, "question").await.result.unwrap().text, "complete");
-    let id = h.host.context().id;
+    let id = h.host.environment().id;
     h.close().await.unwrap();
     drop(h);
     let mut config = HarnessConfig::new(root, d.path().into());

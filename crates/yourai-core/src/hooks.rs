@@ -172,6 +172,8 @@ pub enum HookEvent {
     ConfigChange {
         source: String,
         file_path: Option<String>,
+        /// Database-backed proposals have no temporary file.
+        config: Option<Value>,
     },
     InstructionsLoaded {
         file_path: String,

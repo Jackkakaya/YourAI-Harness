@@ -209,7 +209,7 @@ impl Runtime {
             };
             let _ = tx.send(Out::Notice { level, message });
             h.usage
-                .session_usage(&h.host.context().id)
+                .session_usage(&h.host.environment().id)
                 .await
                 .ok()
                 .map(|u| Usage {
@@ -288,7 +288,7 @@ impl Runtime {
         if self.stats.is_none() && self.stats_at.elapsed() >= Duration::from_secs(1) {
             let host = self.h.host.clone();
             let usage = self.h.usage.clone();
-            let id = host.context().id;
+            let id = host.environment().id;
             let h = self.h.clone();
             let title = view.session.title.clone();
             self.stats = Some(tokio::spawn(async move {
@@ -396,7 +396,7 @@ mod tests {
     async fn title_write_failure_retries_from_committed_history_and_restores_consistently() {
         let (_dir, mut controller, mut view) = session::fixture().await;
         let h = controller.harness();
-        let context = h.host.context();
+        let context = h.host.environment();
         // A UI preview is not an admitted input and must never name a session.
         view.user("uncommitted preview");
         refresh(&mut controller.runtime, &mut view).await;
@@ -446,7 +446,7 @@ mod tests {
     async fn closing_before_first_refresh_saves_committed_title() {
         let (_dir, controller, view) = session::fixture().await;
         let h = controller.harness();
-        let id = h.host.context().id;
+        let id = h.host.environment().id;
         h.sessions
             .append_messages(
                 &id,
@@ -486,7 +486,7 @@ mod tests {
         assert!(view.session.title.is_none());
         assert!(h
             .sessions
-            .load_session(&h.host.context().id)
+            .load_session(&h.host.environment().id)
             .await
             .unwrap()
             .title

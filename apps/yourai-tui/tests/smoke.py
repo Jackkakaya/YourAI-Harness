@@ -193,16 +193,12 @@ with tempfile.TemporaryDirectory() as tmp:
         if isinstance(content, list):
             content = ''.join(p.get('text', '') for p in content)
         assert content == 'list tasks\nsecond line', repr(content)
-        if not yolo:
-            # Clear the historical approval dialog (which contains the tool input JSON)
-            # before checking the folded card preview — only the current screen matters.
-            captured.clear()
         wait_for(b'SMOKE_STREAM_OK')
         wait_for(b'Todo')
         wait_for(b'Review parser')
         # Card preview shows the tool OUTPUT (Task JSON), but the INPUT JSON
         # (with "action":"create") stays hidden until the block is expanded.
-        assert b'"action"' not in captured, 'tool input should start folded'
+        assert '"action"' not in screen.text(), 'tool input should start folded'
         os.write(master, b'\x1b[17~\x0f')  # F6 selects the tool; Ctrl-O opens only that block.
         wait_for(b'"action"')
         os.write(master, b'\x0f\x1b[1;5F')  # fold again and follow the latest output

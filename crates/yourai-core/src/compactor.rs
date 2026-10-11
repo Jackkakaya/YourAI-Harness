@@ -26,6 +26,10 @@ pub struct ContextPolicy {
     pub keep_recent_tokens: u64,
     pub summary_tokens: u64,
     pub tool_output_chars: usize,
+    /// Protect this much older tool output in addition to the latest two user turns.
+    pub tool_prune_keep_tokens: u64,
+    /// Minimum net request savings; zero disables automatic tool-output pruning.
+    pub tool_prune_min_savings: u64,
     pub summary_min_savings: u64,
 }
 impl Default for ContextPolicy {
@@ -36,6 +40,8 @@ impl Default for ContextPolicy {
             keep_recent_tokens: 20_000,
             summary_tokens: 2000,
             tool_output_chars: 16_000,
+            tool_prune_keep_tokens: 40_000,
+            tool_prune_min_savings: 20_000,
             summary_min_savings: 256,
         }
     }
@@ -130,6 +136,8 @@ impl CompactionResult {
     }
 }
 
+/// Runs one model-generated history summary with hooks, budget checks, and atomic commit.
+/// Request projection and cheap tool-output pruning belong to ContextManager.
 /// Dependencies selected once for this execution; context storage does not retain providers.
 #[derive(Clone)]
 pub struct Compactor {
@@ -159,16 +167,16 @@ impl Compactor {
     }
     pub fn from_snapshot(
         snapshot: &ProviderSnapshot,
-        session: Option<&SessionContext>,
+        environment: Option<&SessionEnvironment>,
     ) -> Result<Self, YourAiError> {
         let context = snapshot
             .context_manager
             .clone()
             .ok_or_else(|| ErrorKind::Config("context not configured".into()))?;
         let mut hook_base = BaseInput::new(context.session_id().as_str(), "");
-        if let Some(session) = session {
-            hook_base.cwd = session.cwd.to_string_lossy().into_owned();
-            hook_base.transcript_path = session
+        if let Some(environment) = environment {
+            hook_base.cwd = environment.cwd.to_string_lossy().into_owned();
+            hook_base.transcript_path = environment
                 .transcript_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())

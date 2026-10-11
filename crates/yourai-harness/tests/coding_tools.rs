@@ -1,5 +1,7 @@
 #[path = "support/context.rs"]
 mod context_fixture;
+#[path = "support/storage.rs"]
+mod storage_fixture;
 #[path = "support/loop.rs"]
 mod support;
 use serde_json::{json, Value};
@@ -82,7 +84,7 @@ async fn coding_loop_modifies_tests_and_persists_results() {
     for name in ["read", "write", "edit", "shell", "webfetch", "websearch"] {
         assert!(offered.iter().any(|t| t.name.as_str() == name));
     }
-    let id = h.host.context().id;
+    let id = h.host.environment().id;
     h.close().await.unwrap();
     drop(h);
     let catalog = SessionCatalog::new(&root).unwrap();
@@ -171,13 +173,10 @@ async fn local_policy_requires_shell_and_external_approval_and_honors_hard_deny(
     let d = TempDir::new().unwrap();
     let outside = TempDir::new().unwrap();
     let root = d.path().canonicalize().unwrap();
-    let policy = PolicySecurity::open_for_workspace(
-        root.join("p.json"),
-        vec!["edit".into()],
-        root.clone(),
-        false,
-    )
-    .unwrap();
+    let (db, policy_id) = storage_fixture::store().await;
+    let policy =
+        PolicySecurity::open_for_workspace(db, policy_id, vec!["edit".into()], root.clone(), false)
+            .unwrap();
     let tools = yourai_harness::tools::coding_tools(&root).unwrap();
     for (name, input, expected) in [
         ("read", json!({"path":"a"}), ApprovalDecision::Allow),
@@ -383,7 +382,7 @@ async fn yolo_skips_all_permissions_including_children_but_preserves_questions()
     assert_eq!(questions, 2);
     task.await.unwrap().unwrap().unwrap().result.unwrap();
     assert_eq!(std::fs::read_to_string(path).unwrap(), "approved by mode");
-    let id = h.host.context().id;
+    let id = h.host.environment().id;
     h.close().await.unwrap();
     drop(h);
     let mut cfg = HarnessConfig::new(d.path().join("sessions"), d.path().into());

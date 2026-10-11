@@ -885,3 +885,5 @@ conformance 测试后才可启用该表述。
 | Runtime（注册 + 分发 + 聚合） | `crates/yourai-harness/src/hooks/runtime.rs` |
 | Claude Code 源码核对 | `docs/claude-code-hook-protocol.md` |
 | 设计背景 | `docs/hooks.md` |
+
+ConfigChange 的数据库配置提案直接携带 `config` JSON，`file_path` 为 None；不创建临时文件。Hook 在提交前仍能检查候选配置。

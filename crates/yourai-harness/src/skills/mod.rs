@@ -1,31 +1,20 @@
 use crate::{error, storage::table::Table};
-use std::path::PathBuf;
+use std::sync::Arc;
 use yourai_core::prelude::*;
 pub struct LocalSkills(Table<SkillContent>);
 impl LocalSkills {
-    pub fn open(path: PathBuf) -> Result<Self, YourAiError> {
-        Ok(Self(Table::open(path)?))
+    pub fn new(store: Arc<dyn SessionStore>, id: SessionId) -> Self {
+        Self(Table::new(store, id, "skills"))
     }
 }
 impl SkillProvider for LocalSkills {
     fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SkillInfo>, YourAiError>> {
-        Box::pin(async {
-            Ok(self
-                .0
-                .data
-                .lock()
-                .unwrap()
-                .values()
-                .map(|s| s.info.clone())
-                .collect())
-        })
+        Box::pin(async { Ok(self.0.read()?.values().map(|s| s.info.clone()).collect()) })
     }
     fn load<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<SkillContent, YourAiError>> {
         Box::pin(async move {
             self.0
-                .data
-                .lock()
-                .unwrap()
+                .read()?
                 .get(id)
                 .cloned()
                 .ok_or_else(|| error("skills", "unknown skill"))

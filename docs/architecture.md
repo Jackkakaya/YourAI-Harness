@@ -1,5 +1,7 @@
 > 2026-10-09 更新：当前业务执行采用 [Hook 最终实现](hook-template-design.md)：Tool / Model / Compactor 的公共 exec 直接拥有流程，Turn 只管理本轮状态。Providers 是注册容器，ContextManager / SessionStore 保留原领域名。本文保留早期调研与运输示例；正常业务调用使用 [execution.md](execution.md)，完整协议以当前源码为准。
 
+> 当前存储已改为 SQLite schema v6：队列、扩展状态和工具原文使用 SessionStore；SessionLease 使用数据库租约。旧章节中的状态 JSON、输出文件和文件锁描述已被 [云端存储实现](cloud-storage.md) 替代。
+
 > Hook 执行采用模板方法模式：core 的具体执行对象固定公共 exec/操作流程，内部业务步骤私有；插件只实现业务 Provider。全部 28 个 Hook 的触发与结果处理在 core。Harness 负责默认 Loop、具体 Provider 和装配。历史“core 只含 trait”的表述以此更新为准。
 
 > 工具与调度的当前调用接口见 [公共执行层](./execution.md)。业务 Loop 使用 AgentLoop；Hook、审批和执行不再放在 DefaultLoop。下文保留早期架构讨论。

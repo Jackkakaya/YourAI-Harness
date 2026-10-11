@@ -37,7 +37,8 @@ mod tests {
             .await
             .unwrap();
         let connection =
-            rusqlite::Connection::open(harness.host.context().transcript_path.unwrap()).unwrap();
+            rusqlite::Connection::open(harness.host.environment().transcript_path.unwrap())
+                .unwrap();
         connection.execute("DROP TABLE model_requests", []).unwrap();
         let metered = crate::MeteredModel {
             inner: Arc::new(Model),

@@ -94,7 +94,7 @@ impl AgentLoop for MetadataLoop {
 
 #[tokio::test]
 async fn turn_metadata_reaches_loop_and_deadline_failure_retains_input() {
-    let session = Arc::new(SessionContext::new(SessionId::new(), "/workspace"));
+    let session = Arc::new(SessionEnvironment::new(SessionId::new(), "/workspace"));
     let mut options = TurnOptions::default();
     options.session = Some(session.clone());
     options.limits.steps = Some(4);

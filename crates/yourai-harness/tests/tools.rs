@@ -1,3 +1,5 @@
+#[path = "support/storage.rs"]
+mod storage_fixture;
 use serde_json::{json, Value};
 use std::{path::Path, sync::Arc, time::Duration};
 use tempfile::TempDir;
@@ -382,38 +384,53 @@ async fn cancellation_token_stops_shell_and_sandbox_denial_prevents_spawn() {
 #[tokio::test]
 async fn managed_shell_spills_both_streams_without_stopping_at_capture_limit() {
     let d = TempDir::new().unwrap();
-    let store = ToolOutputStore::open(d.path().join("output")).unwrap();
-    let shell = Shell::with_output(d.path().to_owned(), Some(store));
+    let (db, output_id) = storage_fixture::store().await;
+    let store = yourai_harness::tools::ToolOutputStore::new(db, output_id);
+    let shell = Shell::with_output(d.path().to_owned(), Some(store.clone()));
     let result = call(&shell, json!({"command":"printf HEAD; head -c 9000000 /dev/zero | tr '\\0' x; printf TAIL; printf ERRHEAD >&2; head -c 60000 /dev/zero | tr '\\0' e >&2; printf ERRTAIL >&2", "timeout_ms":10000})).await.unwrap();
     assert_eq!(result["termination"], "exit");
     assert_eq!(result["exit_code"], 0);
     assert_eq!(result["capture_complete"], true);
     assert_eq!(result["output_complete"], false);
-    let out = result["stdout_path"].as_str().unwrap();
-    let err = result["stderr_path"].as_str().unwrap();
+    let out = result["stdout_ref"].as_str().unwrap();
+    let err = result["stderr_ref"].as_str().unwrap();
     assert_ne!(out, err);
-    let saved = std::fs::read(out).unwrap();
+    let mut saved = Vec::new();
+    while saved.len() < 9_000_008 {
+        let bytes = store
+            .read(out, saved.len() as u64, 1024 * 1024)
+            .await
+            .unwrap();
+        saved.extend(bytes);
+    }
     assert_eq!(saved.len(), 9_000_008);
     assert!(saved.starts_with(b"HEAD"));
     assert!(saved.ends_with(b"TAIL"));
     assert!(result["stdout"].as_str().unwrap().starts_with("HEAD"));
     assert!(result["stderr"].as_str().unwrap().starts_with("ERRHEAD"));
     assert!(result["stderr"].as_str().unwrap().ends_with("ERRTAIL"));
-    assert!(std::fs::read(err).unwrap().ends_with(b"ERRTAIL"));
+    assert!(store
+        .read(err, 0, 1024 * 1024)
+        .await
+        .unwrap()
+        .ends_with(b"ERRTAIL"));
     assert!(result["stdout"].as_str().unwrap().ends_with("TAIL"));
     assert!(result["stdout"].as_str().unwrap().len() < 25 * 1024);
-    let page = call(&Read::new(d.path().to_owned()), json!({"path":err}))
-        .await
-        .unwrap();
-    assert!(page["content"].as_str().unwrap().contains("line truncated"));
+    let page = call(
+        &Read::with_output(d.path().to_owned(), Some(store.clone())),
+        json!({"path":err,"byte_limit":1024*1024}),
+    )
+    .await
+    .unwrap();
+    assert!(page["content"].as_str().unwrap().ends_with("ERRTAIL"));
     let second = call(
         &shell,
         json!({"command":"head -c 60000 /dev/zero | tr '\\0' z"}),
     )
     .await
     .unwrap();
-    assert_ne!(second["stdout_path"], result["stdout_path"]);
-    assert_eq!(std::fs::metadata(out).unwrap().len(), 9_000_008);
+    assert_ne!(second["stdout_ref"], result["stdout_ref"]);
+    assert_eq!(store.read(out, 9_000_004, 4).await.unwrap(), b"TAIL");
 }
 
 #[tokio::test]

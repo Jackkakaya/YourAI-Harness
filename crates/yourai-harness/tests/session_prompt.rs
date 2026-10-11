@@ -118,7 +118,7 @@ async fn frozen_prompt_and_recall_replay_survive_file_changes_restart_and_fork()
         2
     );
     let store = SessionCatalog::new(&root).unwrap().store;
-    let id = h.host.context().id;
+    let id = h.host.environment().id;
     let rows = store
         .read_messages(&id, MessageQuery::default())
         .await

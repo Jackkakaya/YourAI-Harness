@@ -9,19 +9,14 @@ mod lifecycle;
 mod lifecycle_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
-use crate::{
-    error,
-    file_store::{atomic_write, read_json},
-};
+use crate::error;
 use crate::{
     prelude::*,
     runtime_event::{RuntimeEvent, RuntimeEvents},
 };
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::{File, OpenOptions},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -59,24 +54,36 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 /// Follow-up injected to make an idle host consume a pending runtime event.
 const RUNTIME_EVENT_PROMPT: &str = "Process the pending runtime event.";
 
-/// Acquire execution ownership before assembly can mutate session state.
-/// The lease is transferred into the host without releasing or reacquiring it.
+/// Database-owned execution lease. The scoped store fences every durable operation.
 pub struct SessionLease {
+    pub(crate) id: SessionId,
     pub dir: PathBuf,
-    lock: File,
+    store: Arc<dyn SessionStore>,
 }
 impl SessionLease {
-    pub fn acquire(dir: PathBuf) -> Result<Self, YourAiError> {
-        std::fs::create_dir_all(&dir).map_err(|e| error("host", e))?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(dir.join("host.lock"))
-            .map_err(|e| error("host", e))?;
-        lock.try_lock_exclusive().map_err(|e| error("host", e))?;
-        Ok(Self { dir, lock })
+    pub const TTL_MS: u64 = 60_000;
+    pub fn acquire(
+        dir: PathBuf,
+        id: &SessionId,
+        store: Arc<dyn SessionStore>,
+    ) -> Result<Self, YourAiError> {
+        let owner = uuid::Uuid::new_v4().to_string();
+        Ok(Self {
+            id: id.clone(),
+            dir,
+            store: store.claim_session(id, &owner, Self::TTL_MS)?,
+        })
+    }
+    pub fn store(&self) -> Arc<dyn SessionStore> {
+        self.store.clone()
+    }
+    fn release(&self) -> Result<(), YourAiError> {
+        self.store.release_session()
+    }
+}
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        let _ = self.release();
     }
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -93,6 +100,7 @@ struct Journal {
 }
 struct Live {
     journal: Journal,
+    revision: Option<i64>,
     status: SessionStatus,
     inbox: Option<mpsc::UnboundedSender<In>>,
     cancel: Option<CancellationToken>,
@@ -110,7 +118,7 @@ enum CloseNotification {
 /// Manages the execution and lifecycle of one session.
 pub struct SessionManager {
     self_ref: std::sync::OnceLock<std::sync::Weak<SessionManager>>,
-    pub(crate) context: Mutex<SessionContext>,
+    pub(crate) environment: Mutex<SessionEnvironment>,
     agent: Arc<Agent>,
     pub(crate) dir: PathBuf,
     config: SessionConfig,
@@ -127,7 +135,7 @@ pub struct SessionManager {
     notify: Notify,
     closing: CancellationToken,
     background: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    _lock: File,
+    lease: SessionLease,
 }
 pub(crate) struct Activity {
     host: Arc<SessionManager>,
@@ -199,41 +207,61 @@ impl SessionManager {
         })
     }
 
-    pub fn context(&self) -> SessionContext {
-        self.context.lock().unwrap().clone()
+    /// Snapshot of the session's execution environment, without conversation history.
+    /// Conversation history is provided by the Agent's ContextManager.
+    pub fn environment(&self) -> SessionEnvironment {
+        self.environment.lock().unwrap().clone()
+    }
+    pub fn store(&self) -> Arc<dyn SessionStore> {
+        self.lease.store()
+    }
+    pub(crate) fn read_state(&self, key: &str) -> Result<Option<SessionState>, YourAiError> {
+        self.store().read_state(&self.lease.id, key)
+    }
+    pub(crate) fn save_state(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), YourAiError> {
+        let old = self.read_state(key)?;
+        self.store()
+            .save_state(&self.lease.id, key, old.map(|s| s.revision), value)?;
+        Ok(())
     }
     pub fn status(&self) -> SessionStatus {
         self.live.lock().unwrap().status.clone()
     }
     pub async fn open(
         dir: impl Into<PathBuf>,
-        context: SessionContext,
+        environment: SessionEnvironment,
         agent: Arc<Agent>,
         config: SessionConfig,
         source: &str,
     ) -> Result<Arc<Self>, YourAiError> {
-        let lease = SessionLease::acquire(dir.into())?;
-        Self::open_owned(lease, context, agent, config, source).await
+        let lease = SessionLease::acquire(dir.into(), &environment.id, agent.ctx().session()?)?;
+        agent.ctx().set_session(lease.store());
+        Self::open_owned(lease, environment, agent, config, source).await
     }
 
     fn run_open(
         lease: SessionLease,
-        context: SessionContext,
+        environment: SessionEnvironment,
         agent: Arc<Agent>,
         config: SessionConfig,
     ) -> Result<(Arc<Self>, bool), YourAiError> {
-        let SessionLease { dir, lock } = lease;
+        let dir = lease.dir.clone();
         let history = agent.ctx().context_manager()?;
-        if history.session_id() != &context.id {
+        if history.session_id() != &environment.id || lease.id != environment.id {
             return Err(error("host", "history/session identity mismatch"));
         }
-        let mut journal: Journal = if dir.join("host.json").exists() {
-            read_json(&dir.join("host.json"))?
-        } else {
-            Journal {
-                cwd: context.cwd.clone(),
+        let saved = lease.store.read_state(&environment.id, "runtime")?;
+        let revision = saved.as_ref().map(|s| s.revision);
+        let mut journal: Journal = match saved {
+            Some(state) => serde_json::from_value(state.value).map_err(|e| error("host", e))?,
+            None => Journal {
+                cwd: environment.cwd.clone(),
                 ..Default::default()
-            }
+            },
         };
         for input in &mut journal.queue {
             input.ensure_id();
@@ -245,11 +273,11 @@ impl SessionManager {
         for e in &journal.events {
             events.push(e.clone());
         }
-        let mut context = context;
-        context.cwd = journal.cwd.clone();
+        let mut environment = environment;
+        environment.cwd = journal.cwd.clone();
         let host = Arc::new(Self {
             self_ref: std::sync::OnceLock::new(),
-            context: Mutex::new(context),
+            environment: Mutex::new(environment),
             agent,
             dir,
             input_options: Mutex::new(crate::turn::InputOptions {
@@ -260,6 +288,7 @@ impl SessionManager {
             journal_gate: Mutex::new(()),
             live: Mutex::new(Live {
                 journal,
+                revision,
                 status: SessionStatus::Idle,
                 inbox: None,
                 cancel: None,
@@ -277,7 +306,7 @@ impl SessionManager {
             notify: Notify::new(),
             closing: CancellationToken::new(),
             background: Mutex::new(vec![]),
-            _lock: lock,
+            lease,
         });
         let _ = host.self_ref.set(Arc::downgrade(&host));
         Ok((host, was_interrupted))
@@ -341,7 +370,7 @@ impl SessionManager {
     }
     pub(crate) fn register_child(&self, child: &Arc<Self>) -> Result<(), YourAiError> {
         let mut children = self.children.lock().unwrap();
-        children.insert(child.context().id, child.clone());
+        children.insert(child.environment().id, child.clone());
         self.ensure_open()?;
         Ok(())
     }
@@ -362,7 +391,7 @@ impl SessionManager {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let parent = self.clone();
             let task = runtime.spawn(async move {
-                let id = child.context().id;
+                let id = child.environment().id;
                 if let Err(cause) = child.close(None).await {
                     parent.close_warning(&cause);
                 }
@@ -440,7 +469,7 @@ impl SessionManager {
         let path = if path.is_absolute() {
             path
         } else {
-            self.context().cwd.join(path)
+            self.environment().cwd.join(path)
         };
         let mut journal = self.journal();
         self.ensure_open()?;
@@ -600,7 +629,7 @@ impl SessionManager {
             }
         }
         journal.commit()?;
-        self.context.lock().unwrap().cwd = cwd;
+        self.environment.lock().unwrap().cwd = cwd;
         Ok(())
     }
 }
@@ -725,7 +754,7 @@ impl SessionManager {
                     }
                     let options = TurnOptions {
                         source: None,
-                        session: Some(Arc::new(host.context())),
+                        session: Some(Arc::new(host.environment())),
                         limits,
                         events: Some(host.events.clone()),
                         input: Some(host.input_options.lock().unwrap().clone()),
@@ -909,7 +938,7 @@ impl SessionManager {
             let task = async {
                 request.trigger = CompactionTrigger::Manual;
                 let snapshot = host.agent.ctx().snapshot()?;
-                let context = host.context();
+                let environment = host.environment();
                 let history = snapshot
                     .context_manager
                     .clone()
@@ -930,7 +959,7 @@ impl SessionManager {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                Compactor::from_snapshot(&snapshot, Some(&context))?
+                Compactor::from_snapshot(&snapshot, Some(&environment))?
                     .exec(request, &token, host.config.hook_timeout)
                     .await
             };
@@ -965,7 +994,7 @@ impl SessionManager {
         let children: Vec<_> = self.children.lock().unwrap().values().cloned().collect();
         let mut failures = vec![];
         for child in children {
-            let id = child.context().id;
+            let id = child.environment().id;
             if let Err(cause) = Box::pin(child.close(self.config.cleanup_timeout.or(timeout))).await
             {
                 failures.push(cause.to_string());
@@ -1001,7 +1030,7 @@ impl SessionManager {
             journal.commit()?;
             // Keep the durable queue in its session; callers receive only a snapshot.
             host.live.lock().unwrap().closed_pending = pending;
-            FileExt::unlock(&host._lock).map_err(|e| error("host", e))?;
+            host.lease.release()?;
             host.live.lock().unwrap().status = SessionStatus::Closed;
             Ok(())
         })

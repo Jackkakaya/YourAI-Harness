@@ -1,3 +1,5 @@
+#[path = "support/storage.rs"]
+mod storage_fixture;
 #[path = "support/loop.rs"]
 mod support;
 
@@ -27,14 +29,16 @@ impl AgentLoop for BrokenLoop {
 }
 
 async fn loop_host(dir: &std::path::Path, loop_: Arc<dyn AgentLoop>) -> Arc<SessionManager> {
-    let id = SessionId::new();
+    let store = Arc::new(yourai_harness::SqliteStore::open(&dir.join("sessions.sqlite3")).unwrap());
+    let id = store.create_session(SessionId::new(), "").await.unwrap().id;
     let agent = Agent::builder()
+        .session(store)
         .agent_loop(loop_)
         .context_manager(DefaultContext::memory(id.clone()))
         .build();
     SessionManager::open(
         dir,
-        SessionContext::new(id, dir),
+        SessionEnvironment::new(id, dir),
         agent,
         SessionConfig::default(),
         "startup",
@@ -84,8 +88,11 @@ async fn watchdog_quarantines_and_retains_active_inputs_without_replaying_unread
         .await
         .is_err());
     assert_eq!(host.close(None).await.unwrap().len(), 1);
-    let journal: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.path().join("host.json")).unwrap()).unwrap();
+    let journal: serde_json::Value = storage_fixture::state(
+        &dir.path().join("sessions.sqlite3"),
+        &host.environment().id,
+        "runtime",
+    );
     assert_eq!(journal["interrupted"].as_array().unwrap().len(), 2);
     assert!(journal["active"].as_array().unwrap().is_empty());
 }
@@ -181,7 +188,7 @@ async fn rejected_resume_and_restore_do_not_change_active_session_metadata() {
     )
     .await
     .unwrap();
-    let id = harness.host.context().id;
+    let id = harness.host.environment().id;
     let mut config = HarnessConfig::new(root.clone(), dir.path().into());
     config.resume = Some(id.clone());
     assert!(Harness::open(config, NamedModel::new("second"))
@@ -320,7 +327,7 @@ async fn failed_assembly_releases_execution_lease_for_the_next_open() {
     )
     .await
     .unwrap();
-    let id = harness.host.context().id;
+    let id = harness.host.environment().id;
     harness.close().await.unwrap();
     let mut config = HarnessConfig::new(root.clone(), dir.path().into());
     config.resume = Some(id.clone());

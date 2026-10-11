@@ -2,14 +2,14 @@ mod hooks;
 use crate::storage::table::Table;
 pub(crate) use hooks::register;
 use std::{
-    path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use yourai_core::prelude::*;
 pub struct LocalMemory(Table<MemoryEntry>);
 impl LocalMemory {
-    pub fn open(path: PathBuf) -> Result<Self, YourAiError> {
-        Ok(Self(Table::open(path)?))
+    pub fn new(store: Arc<dyn SessionStore>, id: SessionId) -> Self {
+        Self(Table::new(store, id, "memory"))
     }
 
     pub async fn store(
@@ -37,21 +37,13 @@ impl LocalMemory {
         })
     }
     pub async fn retrieve(&self, key: &str) -> Result<Option<String>, YourAiError> {
-        Ok(self
-            .0
-            .data
-            .lock()
-            .unwrap()
-            .get(key)
-            .map(|e| e.value.clone()))
+        Ok(self.0.read()?.get(key).map(|e| e.value.clone()))
     }
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>, YourAiError> {
         let words: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
         let mut entries: Vec<_> = self
             .0
-            .data
-            .lock()
-            .unwrap()
+            .read()?
             .values()
             .filter_map(|e| {
                 let text = format!("{} {}", e.key, e.value).to_lowercase();
@@ -65,9 +57,7 @@ impl LocalMemory {
     pub async fn list(&self, category: Option<&str>) -> Result<Vec<MemoryEntry>, YourAiError> {
         Ok(self
             .0
-            .data
-            .lock()
-            .unwrap()
+            .read()?
             .values()
             .filter(|e| category.is_none() || e.category.as_deref() == category)
             .cloned()

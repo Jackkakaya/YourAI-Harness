@@ -1,5 +1,7 @@
 # Hook 最终实现
 
+> 当前存储已改为 SQLite schema v6：队列、扩展状态和工具原文使用 SessionStore；SessionLease 使用数据库租约。旧章节中的状态 JSON、输出文件和文件锁描述已被 [云端存储实现](cloud-storage.md) 替代。
+
 状态：已在 `refactor/simplify-hook-design` 实现。基于 PR10、PR11 合并后的代码；日期：2026-10-09。本文描述当前源码，替代之前的目标方案。测试结果见 [实施记录](hook-execution-refactor.md)。
 
 ## 一句话

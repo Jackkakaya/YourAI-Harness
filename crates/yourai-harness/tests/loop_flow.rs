@@ -1,3 +1,5 @@
+#[path = "support/storage.rs"]
+mod storage_fixture;
 #[path = "support/loop.rs"]
 mod support;
 use serde_json::json;
@@ -260,9 +262,10 @@ async fn approval_routes_replies_steer_and_follow_up_without_losing_input() {
 #[tokio::test]
 async fn session_approval_is_owned_by_security_and_does_not_bypass_hook_asks() {
     for force_ask in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("permissions.json");
-        let policy = yourai_harness::security::PolicySecurity::open(path.clone(), vec![]).unwrap();
+        let (db, policy_id) = storage_fixture::store().await;
+        let policy =
+            yourai_harness::security::PolicySecurity::open(db.clone(), policy_id.clone(), vec![])
+                .unwrap();
         let registry = Arc::new(Registry::default());
         let handler = Arc::new(Handler::new("tool", Mode::Return));
         registry.register(handler.clone());
@@ -302,7 +305,7 @@ async fn session_approval_is_owned_by_security_and_does_not_bypass_hook_asks() {
             *handler.inputs.lock().unwrap(),
             [json!({"value":1}), json!({"value":1})]
         );
-        assert!(!path.exists());
+        assert!(db.read_state(&policy_id, "permissions").unwrap().is_none());
         let context = SecurityContext {
             action: "other".into(),
             input: json!({}),
@@ -1213,7 +1216,7 @@ async fn relative_file_references_resolve_against_the_session_directory() {
     )
     .build();
     let mut options = TurnOptions::default();
-    options.session = Some(Arc::new(SessionContext::new(
+    options.session = Some(Arc::new(SessionEnvironment::new(
         history.id.clone(),
         dir.path(),
     )));
@@ -1606,8 +1609,8 @@ async fn repeated_calls_allow_hook_rewrites_and_yolo_without_extra_gate() {
 
 #[tokio::test]
 async fn managed_output_bounds_post_hook_mcp_results_and_preserves_original_file() {
-    let d = tempfile::tempdir().unwrap();
-    let store = yourai_harness::tools::ToolOutputStore::open(d.path().to_owned()).unwrap();
+    let (db, output_id) = storage_fixture::store().await;
+    let store = yourai_harness::tools::ToolOutputStore::new(db, output_id);
     let h = Arc::new(Handler::new("mcp__large", Mode::Return));
     let registry = Arc::new(Registry::default());
     registry.register(h);
@@ -1622,7 +1625,7 @@ async fn managed_output_bounds_post_hook_mcp_results_and_preserves_original_file
         history.clone(),
         LoopConfig {
             execution: yourai_core::execution::ExecutionConfig {
-                tool_output: Some(store),
+                tool_output: Some(store.clone()),
                 ..Default::default()
             },
             ..Default::default()
@@ -1641,8 +1644,11 @@ async fn managed_output_bounds_post_hook_mcp_results_and_preserves_original_file
         .tool_responses()[0];
     let value: serde_json::Value = serde_json::from_str(&response.content).unwrap();
     assert_eq!(value["truncated"], true);
-    let saved: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(value["output_paths"][0].as_str().unwrap()).unwrap(),
+    let saved: serde_json::Value = serde_json::from_slice(
+        &store
+            .read(value["output_refs"][0].as_str().unwrap(), 0, 1024 * 1024)
+            .await
+            .unwrap(),
     )
     .unwrap();
     assert_eq!(saved["content"].as_str().unwrap().len(), 100_000);

@@ -190,7 +190,7 @@ impl Controller {
         view.overlay = Overlay::LoadingSessions;
         let h = self.harness();
         self.operation = Some(tokio::spawn(async move {
-            let current = h.host.context().id;
+            let current = h.host.environment().id;
             Effect::Listed(
                 h.sessions
                     .list_sessions()
@@ -203,7 +203,7 @@ impl Controller {
         if !self.available(view) {
             return;
         }
-        if id == self.runtime.h.host.context().id {
+        if id == self.runtime.h.host.environment().id {
             view.notice(Level::Warning, "The current session cannot be deleted.");
             return;
         }
@@ -235,12 +235,12 @@ impl Controller {
         }
         let id = match target {
             Target::New => None,
-            Target::Resume(id) if id == self.runtime.h.host.context().id => return,
+            Target::Resume(id) if id == self.runtime.h.host.environment().id => return,
             Target::Resume(id) => Some(id),
         };
         let config = self.config.clone();
         let mut template = self.template.clone();
-        template.cwd = self.runtime.h.host.context().cwd;
+        template.cwd = self.runtime.h.host.environment().cwd;
         let yolo = self.yolo;
         self.operation = Some(tokio::spawn(async move {
             Effect::Opened(
@@ -374,7 +374,7 @@ impl Controller {
         if let Some(task) = self.retired.take() {
             let _ = task.await;
         }
-        let id = self.runtime.h.host.context().id.as_str().to_owned();
+        let id = self.runtime.h.host.environment().id.as_str().to_owned();
         Ok((id, self.runtime.close().await?))
     }
 }
@@ -435,7 +435,7 @@ mod tests {
     async fn input_is_accepted_while_the_previous_session_closes() {
         let (_dir, mut controller, mut view) = fixture().await;
         let old = controller.harness();
-        let id = old.host.context().id;
+        let id = old.host.environment().id;
         controller.switch(Target::New, &mut view);
         // Let the switch complete so only the background close remains.
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -446,7 +446,7 @@ mod tests {
         })
         .await
         .expect("switch did not complete");
-        assert_ne!(controller.harness().host.context().id, id);
+        assert_ne!(controller.harness().host.environment().id, id);
         // Pin the retire window open: the previous session's close blocks.
         let (release, waiting) = oneshot::channel();
         controller.retired = Some(tokio::spawn(async move {
@@ -497,10 +497,10 @@ mod tests {
     async fn failed_switch_keeps_current_session_and_success_preserves_inflight_draft() {
         let (_dir, mut controller, mut view) = fixture().await;
         let old = controller.harness();
-        let id = old.host.context().id;
+        let id = old.host.environment().id;
         controller.switch(Target::Resume(SessionId::new()), &mut view);
         finish(&mut controller, &mut view).await;
-        assert_eq!(controller.harness().host.context().id, id);
+        assert_eq!(controller.harness().host.environment().id, id);
         assert_eq!(old.host.status(), SessionStatus::Idle);
         controller.switch(Target::New, &mut view);
         assert!(controller.operation.is_some());
@@ -525,7 +525,7 @@ mod tests {
         // A second operation cannot supersede the first or mutate its settings.
         controller.model("missing/model".into(), None, None, &mut view);
         finish(&mut controller, &mut view).await;
-        assert_ne!(controller.harness().host.context().id, id);
+        assert_ne!(controller.harness().host.environment().id, id);
         assert_eq!(old.host.status(), SessionStatus::Closed);
         assert_eq!(view.draft.text(), "draft typed during opening");
         assert_eq!(view.theme, Theme::Nord);
@@ -580,12 +580,12 @@ mod tests {
             .host
             .submit(In::follow_up("queued"))
             .unwrap();
-        let id = controller.harness().host.context().id;
+        let id = controller.harness().host.environment().id;
         controller.switch(Target::New, &mut view);
         assert!(controller.operation.is_none());
         controller.switch(Target::Resume(SessionId::new()), &mut view);
         assert!(controller.operation.is_none());
-        assert_eq!(controller.harness().host.context().id, id);
+        assert_eq!(controller.harness().host.environment().id, id);
         controller.close().await.unwrap();
     }
     #[tokio::test]
@@ -599,7 +599,7 @@ mod tests {
         );
         assert!(controller.submit(input, &mut view));
         view.draft.insert("new unsent draft");
-        let id = controller.harness().host.context().id;
+        let id = controller.harness().host.environment().id;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 controller.poll(&mut view, None).await;
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(view.draft.attachment_counts(), (0, 0));
         controller.switch(Target::New, &mut view);
         finish(&mut controller, &mut view).await;
-        assert_ne!(controller.harness().host.context().id, id);
+        assert_ne!(controller.harness().host.environment().id, id);
         assert_eq!(view.draft.attachment_counts(), (0, 0));
         let (_, pending) = controller.close().await.unwrap();
         assert!(pending.is_empty());
@@ -626,16 +626,15 @@ mod tests {
     #[tokio::test]
     async fn failed_async_submission_preserves_new_draft_and_blocks_session_switch_until_settled() {
         let (_dir, mut controller, mut view) = fixture().await;
-        let id = controller.harness().host.context().id;
-        let journal = controller.template.root.join(id.as_str()).join("host.json");
-        let backup = journal.with_extension("backup");
-        std::fs::rename(&journal, &backup).unwrap();
-        std::fs::create_dir(&journal).unwrap();
+        let id = controller.harness().host.environment().id;
+        let db =
+            rusqlite::Connection::open(controller.template.root.join("sessions.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_input_insert BEFORE INSERT ON session_state WHEN NEW.state_key='runtime' BEGIN SELECT RAISE(ABORT,'injected state failure'); END; CREATE TRIGGER fail_input_update BEFORE UPDATE ON session_state WHEN NEW.state_key='runtime' BEGIN SELECT RAISE(ABORT,'injected state failure'); END;").unwrap();
         assert!(controller.submit(In::user_text("failed input"), &mut view));
         assert!(!controller.runtime.idle());
         controller.switch(Target::New, &mut view);
         assert!(controller.operation.is_none());
-        view.draft.insert("new draft while disk is pending");
+        view.draft.insert("new draft while storage is pending");
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 controller.poll(&mut view, None).await;
@@ -643,11 +642,11 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
-        assert_eq!(view.draft.text(), "new draft while disk is pending");
+        assert_eq!(view.draft.text(), "new draft while storage is pending");
         assert_eq!(controller.harness().host.queued(), 0);
-        assert_eq!(controller.harness().host.context().id, id);
-        std::fs::remove_dir(&journal).unwrap();
-        std::fs::rename(backup, journal).unwrap();
+        assert_eq!(controller.harness().host.environment().id, id);
+        db.execute_batch("DROP TRIGGER fail_input_insert; DROP TRIGGER fail_input_update;")
+            .unwrap();
         controller.close().await.unwrap();
     }
 }

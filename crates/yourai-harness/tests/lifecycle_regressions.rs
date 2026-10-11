@@ -1,3 +1,5 @@
+#[path = "support/storage.rs"]
+mod storage_fixture;
 #[path = "support/loop.rs"]
 mod support;
 
@@ -307,7 +309,7 @@ async fn instructions_reverting_to_old_content_publish_the_latest_value() {
         workspace.load_instructions(&path, "include").await.unwrap();
     }
     assert_eq!(
-        host.context().instructions[&path.canonicalize().unwrap()],
+        host.environment().instructions[&path.canonicalize().unwrap()],
         "A-CONTENT"
     );
     turn(&host).await;
@@ -441,11 +443,14 @@ async fn legacy_path_only_worktree_registration_can_remove_a_missing_directory()
         ],
     );
     let linked = linked.canonicalize().unwrap();
-    std::fs::write(
-        host.directory().join("worktrees.json"),
-        serde_json::to_vec(&json!({"legacy":linked})).unwrap(),
-    )
-    .unwrap();
+    host.store()
+        .save_state(
+            &host.environment().id,
+            "worktrees",
+            None,
+            json!({"legacy":linked}),
+        )
+        .unwrap();
     std::fs::remove_dir_all(&linked).unwrap();
     host.workspace()
         .unwrap()
@@ -463,7 +468,7 @@ async fn imported_task_backup_is_retired_even_when_it_changes_or_breaks() {
     let root = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let host = open(root.path(), cwd.path(), Arc::new(Model::new(vec![]))).await;
-    let id = host.context().id;
+    let id = host.environment().id;
     let legacy = host.directory().join("tasks.json");
     std::fs::write(&legacy, r#"{"a":{"id":"a","subject":"imported","description":null,"owner":null,"completed":false}}"#).unwrap();
     host.task_manager("team")
@@ -506,24 +511,30 @@ async fn task_import_can_retry_after_completion_marker_write_fails() {
     let cwd = TempDir::new().unwrap();
     let host = open(root.path(), cwd.path(), Arc::new(Model::new(vec![]))).await;
     std::fs::write(host.directory().join("tasks.json"), r#"{"a":{"id":"a","subject":"imported","description":null,"owner":null,"completed":false}}"#).unwrap();
-    let marker = host.directory().join("tasks.migrated.json");
-    // The marker path is a directory: existence alone must not acknowledge an
-    // import. This fails only after the database has accepted the task.
-    std::fs::create_dir(&marker).unwrap();
+    let marker = root.path().join("sessions.sqlite3");
+    // Fail the acknowledgement after the task batch has durably committed.
+    storage_fixture::failure(&marker, "task_import", true);
     assert!(host.task_manager("team").is_err());
     assert_eq!(
         host.agent()
             .ctx()
             .session()
             .unwrap()
-            .read_tasks(&host.context().id)
+            .read_tasks(&host.environment().id)
             .unwrap()
             .len(),
         1
     );
-    std::fs::remove_dir(&marker).unwrap();
+    storage_fixture::failure(&marker, "task_import", false);
     let manager = host.task_manager("team").unwrap();
     assert_eq!(manager.list().len(), 1);
-    assert!(marker.is_file());
+    assert_eq!(
+        host.store()
+            .read_state(&host.environment().id, "task_import")
+            .unwrap()
+            .unwrap()
+            .value,
+        json!(true)
+    );
     host.close(None).await.unwrap();
 }

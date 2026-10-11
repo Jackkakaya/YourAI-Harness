@@ -6,10 +6,12 @@
 
 | 对象 | 负责 |
 |---|---|
-| `Compactor` | Hook 固定流程、历史选择、摘要生成、预算、校验 |
-| `ContextManager` / `DefaultContext` | 当前视图、请求投影、估算、原子应用与恢复 |
+| `Compactor` | 一次历史摘要操作：Hook 固定流程、历史选择、调用模型、摘要预算和校验 |
+| `ContextManager` / `DefaultContext` | 当前历史视图、请求投影（含旧工具正文清理）、估算、原子应用与恢复；不调用模型 |
 | `SessionStore` / `SqliteStore` | SQLite 完整历史、事务、会话恢复与 fork |
 | `ModelProvider` / `UsageTracker` | 本次选定模型与统一用量记账 |
+
+`SessionManager.environment()` 返回 `SessionEnvironment`：会话身份、工作目录、transcript 位置和已加载指令，没有聊天消息列表。对话历史通过 `SessionManager.agent().ctx().context_manager()` 获取。`environment` 用于执行环境，`context` 用于模型上下文；不保留混淆两者的旧访问器或类型别名。
 
 Compactor 只保存选定的依赖。候选消息、滚动摘要和游标是一次执行的局部变量。ContextManager 不保存第二份模型、Hook 或计量绑定。
 
@@ -77,7 +79,15 @@ Pending / Started / Committed 区分未开始写入、提交状态未知和已�
 
 ## 工具输出与自动触发
 
-不再提供持久化剪枝策略。普通请求与摘要复用同一份工具输出预览，保留状态、头尾和回看路径；完整原文仍在 SQLite。旧数据库已有的剪枝标记仍按原规则读取，不新增这类标记。prune_enabled、prune_min_savings、prune_growth 配置已移除。
+`DefaultContext.project` 对输出先做常规限幅，再做无需模型调用的旧正文清理。原消息、调用 ID、调用参数、执行状态和媒体保留，只改变这次发送的 ToolResponse 正文；不写持久化剪枝标记，不删除历史，不创建新的清理执行类。旧数据库已有的剪枝标记继续兼容。
+
+清理保护最近两次真实用户请求及其后的工具结果；summary、Hook 和 runtime-context 消息不增加用户 turn 计数。更老的已闭合工具批次再保留 `tool_prune_keep_tokens`（默认 40,000）的近期输出预算，跨预算边界的结果整份保留。未闭合的并行批次不清理，当前权威运行上下文也不清理。低于两次真实用户请求时全部保留。
+
+更老结果可替换为 `pruned=true` 的 JSON，含 call_id、状态、原 output_refs 和 `tool-output://message/SEQ` 原文引用。后者通过现有 Read 工具直接分段读取本会话 SQLite 消息，不复制原文到另一张表；普通大输出仍使用 `tool-output://UUID` BLOB 引用。摘要后仍能回看被标记 compacted 的原消息。纯内存上下文没有持久化回看能力，因此不做这种清理。
+
+只有净节省达到 `tool_prune_min_savings`（默认 20,000，设为 0 关闭）才整体应用。节省量按常规限幅后的实际请求正文计算，使用与请求估算一致的序列化 UTF-8 字节 / 3；不把已移出请求的巨大归档原文算作收益。先累加字节差再向下换算，避免逐条四舍五入夸大收益。无法在输出上限内保留状态和引用时，保留原预览。
+
+完整运行顺序是：`Model.exec → DefaultContext.build_request/project → 输出限幅和旧正文清理 → 容量估算 → 仍需维护时 Compactor.exec → PreCompact → private run 调模型生成摘要 → DefaultContext.save_summary → SessionStore 原子提交 → PostCompact → 重建请求`。纯工具正文清理不发送 Compact Hook，也不计为一次已提交摘要。
 
 ContextManager 不保存自动维护冷却状态，也不向外暴露 note_maintenance 或维护后的 token 数。一次 Model.exec 的重试共享一个局部自动压缩标记，避免失败后对同一请求重复收费；新请求已经超过容量时仍必须先压缩。独立的显式压缩请求不依赖上一次调用的隐藏状态。
 

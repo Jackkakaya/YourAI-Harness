@@ -256,8 +256,15 @@ fn serialize_event_fields(event: &HookEvent, map: &mut Map<String, Value>) {
                 map.insert("content".into(), v.clone());
             }
         }
-        HookEvent::ConfigChange { source, file_path } => {
+        HookEvent::ConfigChange {
+            source,
+            file_path,
+            config,
+        } => {
             map.insert("source".into(), json!(source));
+            if let Some(v) = config {
+                map.insert("config".into(), v.clone());
+            }
             if let Some(v) = file_path {
                 map.insert("file_path".into(), json!(v));
             }
@@ -438,6 +445,7 @@ mod tests {
             HookEvent::ConfigChange {
                 source: text(),
                 file_path: Some(text()),
+                config: None,
             },
             HookEvent::InstructionsLoaded {
                 file_path: text(),

@@ -95,7 +95,6 @@ impl Harness {
         };
         let (meta, lease, prepared) = prepare_session(&catalog, &config, model.as_ref()).await?;
         let id = meta.id;
-        let dir = lease.dir.clone();
         let prompt_notices = prepared.notices;
         let initial_instructions = prepared.instructions;
         let budget =
@@ -112,6 +111,7 @@ impl Harness {
         let (agent, tools) = assemble(
             &catalog,
             &id,
+            lease.store(),
             &config.cwd,
             config.trusted_shell,
             model.clone(),
@@ -128,12 +128,12 @@ impl Harness {
                 .set_security(Arc::new(crate::security::YoloSecurity));
         }
         let memory = if config.extensions {
-            Some(Arc::new(LocalMemory::open(dir.join("memory.json"))?))
+            Some(Arc::new(LocalMemory::new(lease.store(), id.clone())))
         } else {
             None
         };
         let skills = if config.extensions {
-            Some(Arc::new(LocalSkills::open(dir.join("skills.json"))?))
+            Some(Arc::new(LocalSkills::new(lease.store(), id.clone())))
         } else {
             None
         };
@@ -155,12 +155,12 @@ impl Harness {
         } else if let Some(skills) = &skills {
             agent.ctx().set_skills(skills.clone());
         }
-        let mut context = SessionContext::new(id, config.cwd);
-        context.transcript_path = Some(crate::SqliteStore::path(&config.root));
-        context.instructions = initial_instructions;
+        let mut environment = SessionEnvironment::new(id, config.cwd);
+        environment.transcript_path = Some(crate::SqliteStore::path(&config.root));
+        environment.instructions = initial_instructions;
         let host = SessionManager::open_owned(
             lease,
-            context,
+            environment,
             agent,
             SessionConfig {
                 input,
@@ -290,18 +290,14 @@ impl Harness {
         } else {
             self.current_budget.lock().unwrap().clone()
         };
-        let id = self.host.context().id;
-        let history = DefaultContext::new(
-            id.clone(),
-            String::new(),
-            Some(self.sessions.clone()),
-            policy,
-        );
+        let id = self.host.environment().id;
+        let history =
+            DefaultContext::new(id.clone(), String::new(), Some(self.host.store()), policy);
         // Prepare everything that can fail before publishing either provider.
         history.restore().await?;
         let mut meta = self.sessions.load_session(&id).await?;
         meta.model = Some(model.model_iden().into());
-        self.sessions.save_session(&meta).await?;
+        self.host.store().save_session(&meta).await?;
         let model = Arc::new(MeteredModel {
             inner: model,
             budget: selected_budget.clone(),
@@ -334,6 +330,7 @@ impl Harness {
 pub(crate) async fn assemble(
     catalog: &Arc<SessionCatalog>,
     id: &SessionId,
+    store: Arc<dyn SessionStore>,
     cwd: &std::path::Path,
     trusted_shell: bool,
     model: Arc<dyn ModelProvider>,
@@ -342,7 +339,8 @@ pub(crate) async fn assemble(
     inherited: Option<Arc<dyn ToolRegistry>>,
     policy: ContextPolicy,
 ) -> Result<(Arc<Agent>, Arc<ToolSet>), YourAiError> {
-    let dir = catalog.directory(id)?;
+    let _dir = catalog.directory(id)?;
+    let output = crate::tools::ToolOutputStore::new(store.clone(), id.clone());
     let inherited = inherited
         .map(|registry| {
             registry
@@ -355,20 +353,15 @@ pub(crate) async fn assemble(
     let registry = Arc::new(ToolSet::new(inherited));
     registry.extend(crate::tools::coding_tools_with_output(
         cwd,
-        Some(catalog.tool_output.clone()),
+        Some(output.clone()),
     )?);
 
-    let history = DefaultContext::new(
-        id.clone(),
-        String::new(),
-        Some(catalog.store.clone()),
-        policy,
-    );
+    let history = DefaultContext::new(id.clone(), String::new(), Some(store.clone()), policy);
     let mut builder = Agent::builder()
         .agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
             crate::default_loop::LoopConfig {
                 execution: yourai_core::execution::ExecutionConfig {
-                    tool_output: Some(catalog.tool_output.clone()),
+                    tool_output: Some(output.clone()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -376,10 +369,11 @@ pub(crate) async fn assemble(
         )))
         .model(model)
         .context_manager(history)
-        .session(catalog.store.clone())
+        .session(store.clone())
         .tools(registry.clone())
         .security(PolicySecurity::open_for_workspace(
-            dir.join("permissions.json"),
+            store,
+            id.clone(),
             vec![],
             cwd.to_owned(),
             trusted_shell,
@@ -414,6 +408,8 @@ pub(crate) async fn prepare_session(
     let lease = match &existing {
         Some(meta) => Some(crate::runtime::SessionLease::acquire(
             catalog.directory(&meta.id)?,
+            &meta.id,
+            catalog.store.clone(),
         )?),
         None => None,
     };
@@ -460,9 +456,15 @@ pub(crate) async fn prepare_session(
     };
     let lease = match lease {
         Some(lease) => lease,
-        None => crate::runtime::SessionLease::acquire(catalog.directory(&meta.id)?)?,
+        None => crate::runtime::SessionLease::acquire(
+            catalog.directory(&meta.id)?,
+            &meta.id,
+            catalog.store.clone(),
+        )?,
     };
+    catalog.import_state(&meta.id, lease.store().as_ref())?;
+    catalog.import_outputs(&meta.id, lease.store()).await?;
     meta.model = Some(model.model_iden().into());
-    catalog.store.save_session(&meta).await?;
+    lease.store().save_session(&meta).await?;
     Ok((meta, lease, prepared))
 }

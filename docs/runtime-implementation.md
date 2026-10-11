@@ -1,5 +1,7 @@
 > 当前 core 直接拥有 Tool、Model、Turn、SessionManager、Workspace、TaskManager、Subagent 和 Compactor 的执行模板。下表中的 Harness runtime / execution / workspace 路径是兼容再导出；Provider、SQLite及装配仍在Harness，任务JSON适配已并入core TaskManager。当前接口见 [execution.md](./execution.md)。
 
+> 当前存储已改为 SQLite schema v6：队列、扩展状态和工具原文使用 SessionStore；SessionLease 使用数据库租约。旧章节中的状态 JSON、输出文件和文件锁描述已被 [云端存储实现](cloud-storage.md) 替代。
+
 # Runtime 实现与验收
 
 > 后续架构决定：默认由统一用户级 Server 持有和驱动会话，所有前端连接该服务，按 `session_id` 复用宿主并同步状态。尚未实现；当前 TUI 仍在进程内创建宿主。详见 [默认共享 Server 决定](./architecture.md#已确定的后续方向默认共享-server2026-10-01)。

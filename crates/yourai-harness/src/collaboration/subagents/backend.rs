@@ -15,7 +15,7 @@ impl SubagentFactory for ChildFactory {
     ) -> BoxFuture<'a, Result<Arc<SessionManager>, YourAiError>> {
         Box::pin(async move {
             let root = parent
-                .context()
+                .environment()
                 .transcript_path
                 .as_ref()
                 .and_then(|p| p.parent())
@@ -50,14 +50,14 @@ impl SubagentFactory for ChildFactory {
                 .store
                 .create_session(id.clone(), &history.system_prompt())
                 .await?;
-            meta.parent_session_id = Some(parent.context().id);
+            meta.parent_session_id = Some(parent.environment().id);
             catalog.store.save_session(&meta).await?;
             let child = crate::runtime::restore(
                 &root,
                 id,
                 tc.cwd
                     .map(Path::to_owned)
-                    .unwrap_or_else(|| parent.context().cwd),
+                    .unwrap_or_else(|| parent.environment().cwd),
                 model,
                 snapshot.hooks.clone(),
                 self.tools.clone(),

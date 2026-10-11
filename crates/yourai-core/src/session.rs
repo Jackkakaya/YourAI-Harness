@@ -59,6 +59,63 @@ pub struct SessionMeta {
 }
 
 pub trait SessionStore: Send + Sync {
+    /// Atomically claim a session and return a store fenced to this owner.
+    /// Every operation on that store must reject expired/replaced ownership.
+    fn claim_session(
+        &self,
+        _id: &SessionId,
+        _owner: &str,
+        _ttl_ms: u64,
+    ) -> Result<Arc<dyn SessionStore>, YourAiError> {
+        Err(crate::error("storage", "session ownership unsupported"))
+    }
+    fn renew_session(&self, _ttl_ms: u64) -> Result<(), YourAiError> {
+        Err(crate::error("storage", "session ownership unsupported"))
+    }
+    fn release_session(&self) -> Result<(), YourAiError> {
+        Err(crate::error("storage", "session ownership unsupported"))
+    }
+    /// Runtime/extension documents are separate from model-facing messages.
+    fn read_state(&self, _id: &SessionId, _key: &str) -> Result<Option<SessionState>, YourAiError> {
+        Err(crate::error("storage", "session state unsupported"))
+    }
+    /// Compare-and-set. None expects absence; stale revisions must fail.
+    fn save_state(
+        &self,
+        _id: &SessionId,
+        _key: &str,
+        _expected: Option<i64>,
+        _value: serde_json::Value,
+    ) -> Result<i64, YourAiError> {
+        Err(crate::error("storage", "session state unsupported"))
+    }
+    /// Append immutable output chunks. Offset makes uncertain retries idempotent.
+    fn append_output<'a>(
+        &'a self,
+        _id: &'a SessionId,
+        _output: &'a str,
+        _offset: u64,
+        _bytes: Vec<u8>,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(async { Err(crate::error("storage", "tool output unsupported")) })
+    }
+    fn read_output<'a>(
+        &'a self,
+        _id: &'a SessionId,
+        _output: &'a str,
+        _offset: u64,
+        _limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<u8>, YourAiError>> {
+        Box::pin(async { Err(crate::error("storage", "tool output unsupported")) })
+    }
+    fn cleanup_outputs<'a>(
+        &'a self,
+        _id: &'a SessionId,
+        _older_than_ms: i64,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(async { Err(crate::error("storage", "tool output unsupported")) })
+    }
+
     /// Task rows belong to the session's existing persistence connection.
     /// Initialization reads synchronously; runtime writes use the host's owned blocking worker.
     fn read_tasks(&self, id: &SessionId) -> Result<Vec<crate::tasks::Task>, YourAiError>;
@@ -237,4 +294,11 @@ pub enum CommitStatus {
     Pending = 0,
     Started = 1,
     Committed = 2,
+}
+
+/// Optimistic version of an opaque runtime/extension document.
+#[derive(Debug, Clone)]
+pub struct SessionState {
+    pub revision: i64,
+    pub value: serde_json::Value,
 }

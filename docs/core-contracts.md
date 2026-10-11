@@ -1,5 +1,7 @@
 # Core 组件接口契约
 
+> 当前存储已改为 SQLite schema v6：队列、扩展状态和工具原文使用 SessionStore；SessionLease 使用数据库租约。旧章节中的状态 JSON、输出文件和文件锁描述已被 [云端存储实现](cloud-storage.md) 替代。
+
 普通自定义调度使用 core 的 [AgentLoop 与公共执行层](./execution.md)。Core AgentLoop 保留为底层运输接口。
 
 
@@ -13,7 +15,7 @@ Core 的 deadline watchdog（截止时间后 60 秒宽限）强制丢弃 Loop，
 
 | 流程 | 已定义的接口/类型 | 实现边界 |
 |---|---|---|
-| 图 1：会话宿主 | `SessionManager`、`SessionContext`、`SessionStatus`、`SessionTurn`、`InputRejected` | 具体宿主 SessionManager 在 core；不是 Context 的新 Provider 插槽 |
+| 图 1：会话宿主 | `SessionManager`、`SessionEnvironment`、`SessionStatus`、`SessionTurn`、`InputRejected` | 具体宿主 SessionManager 在 core；不是 Context 的新 Provider 插槽 |
 | 图 2：主循环 | `AgentLoop`、`TurnResult`、`TurnFailure`、`TurnInfo`、`TurnOptions`、`TurnLimits` | core 传递环境与结果；AgentLoop 自主管理调度；Tool / Model / Compactor 管理各自执行流程 |
 | 图 2：compact | `CompactionRequest`、`CompactionResult`、`CompactionTrigger`；`ContextManager::project / estimate / apply` | Compactor::exec 固定 Hook；private run 生成摘要；ContextManager 核对快照并应用；SessionStore 原子提交 |
 | 图 3：工具 | `ToolRegistry::resolve`；`ToolInteraction`、`InteractionRequest`、`InteractionKind`；`ToolContext::ask` | Tool::exec 位于 core tool 模块；AgentLoop 调用固定公共操作，交互桥和回复路由归公共执行层 |
@@ -44,7 +46,7 @@ run_next(limits, outbox, cancel)
 - 暂时执行失败（存储失败、暂时 I/O 故障、超时或取消）：保留原输入到 `TurnFailure.output.pending`，沿用已有重试约定。
 - UserText 的可选 id 对旧 wire 保持兼容，入口在转移所有权前补齐。重试必须复用 pending 中的身份；StoredMessage.input 保存原输入，恢复已确认提交后不重复追加或准备附件。用户消息与该次 Hook 附加上下文须由 ContextManager.append 原子保存。
 - `Out::InputRejected` 与 `TurnOutput.rejected` 是同一拒绝的实时通知与最终报告；消费者选择一种恢复渠道，不能当成两次拒绝。非流式 `Agent::run` 调用方需要检查 `rejected`，成功完成接纳判定不等于输入已提交给模型。
-- 附件读取和解码在阻塞工作线程准备；主循环继续响应取消与 deadline。取消后的只读工作可以自行结束，但不提交历史。相对 FileRef 路径基于 `SessionContext.cwd` 解析。
+- 附件读取和解码在阻塞工作线程准备；主循环继续响应取消与 deadline。取消后的只读工作可以自行结束，但不提交历史。相对 FileRef 路径基于 `SessionEnvironment.cwd` 解析。
 
 详细状态归属与恢复流程见 [草稿与输入接纳设计](./draft-admission-design.md)。
 
@@ -65,7 +67,7 @@ run_next(limits, outbox, cancel)
 
 ```rust
 let mut options = TurnOptions::default();
-options.session = Some(Arc::new(SessionContext::new(session_id, cwd)));
+options.session = Some(Arc::new(SessionEnvironment::new(session_id, cwd)));
 options.limits.max_model_calls = Some(32);
 options.limits.deadline = Some(Instant::now() + Duration::from_secs(120));
 
@@ -75,7 +77,8 @@ let handle = agent.start_with(In::user_text("任务"), options)?;
 
 - `Agent::start_with` / `run_with` 接收 TurnOptions；原 `start` / `run` 使用默认参数。
 - `TurnInfo` 包含 TurnId、开始时间及本次选项；通过 TurnContext.info 传给 Loop。
-- 有 SessionContext 且装配了 ContextManager 时，Core 校验其 session_id 一致，避免写入其他会话的历史。
+- 有 SessionEnvironment 且装配了 ContextManager 时，Core 校验其 session_id 一致，避免写入其他会话的历史。
+- `SessionManager.environment()` 读取会话运行环境；聊天历史由 Agent 的 `context_manager` 提供。两者不共用 `context()` 这个名称。
 - 无会话的独立 Loop 仍可运行；会话宿主应始终传递会话绑定。
 - TurnLimits 定义模型/工具调用次数、绝对截止时间、模型/工具/审批/Hook 单次超时。None 表示未指定，次数为 0 表示不允许调用。
 - `tc.check_control()` 检查取消和总截止时间。Loop 必须在异步等待时监听取消/超时，并在调用边界维护计数；core 不自动强杀不合作的 Provider。

@@ -9,11 +9,10 @@ pub use usage::LocalUsage;
 use std::{fs, path::PathBuf, sync::Arc};
 use yourai_core::prelude::*;
 
-pub(crate) use yourai_core::file_store::{atomic_write, read_json};
-/// Session directories hold host/extension state, while all session records use SQLite.
+pub(crate) use yourai_core::file_store::read_json;
+/// SQLite owns Agent state; directories are only workspace locations and legacy import sources.
 pub struct SessionCatalog {
     root: PathBuf,
-    pub(crate) tool_output: Arc<crate::tools::ToolOutputStore>,
     pub store: Arc<crate::SqliteStore>,
 }
 impl SessionCatalog {
@@ -44,12 +43,111 @@ impl SessionCatalog {
                 }
             }
         }
-        let tool_output = crate::tools::ToolOutputStore::open(root.join("tool-output"))?;
-        Ok(Self {
-            root,
-            store,
-            tool_output,
-        })
+        Ok(Self { root, store })
+    }
+    /// One-way import of previous runtime files; normal reads/writes use the database only.
+    pub(crate) fn import_state(
+        &self,
+        id: &SessionId,
+        store: &dyn SessionStore,
+    ) -> Result<(), YourAiError> {
+        let directory = self.root.join(id.as_str());
+        for (file, key) in [
+            ("host.json", "runtime"),
+            ("memory.json", "memory"),
+            ("skills.json", "skills"),
+            ("permissions.json", "permissions"),
+            ("config.json", "config"),
+            ("worktrees.json", "worktrees"),
+        ] {
+            if store.read_state(id, key)?.is_some() {
+                continue;
+            }
+            let path = directory.join(file);
+            if path.is_file() {
+                let value = read_json(&path)?;
+                store.save_state(id, key, None, value)?;
+            }
+        }
+        Ok(())
+    }
+    /// Import referenced immutable legacy outputs, leaving the history and backups unchanged.
+    pub(crate) async fn import_outputs(
+        &self,
+        id: &SessionId,
+        store: Arc<dyn SessionStore>,
+    ) -> Result<(), YourAiError> {
+        use tokio::io::AsyncReadExt;
+        if store.read_state(id, "output_import")?.is_some() {
+            return Ok(());
+        }
+        let directory = self.root.join("tool-output");
+        if !directory.is_dir() {
+            return Ok(());
+        }
+        let directory = directory.canonicalize().map_err(|e| error("storage", e))?;
+        let mut after = 0;
+        let output = crate::tools::ToolOutputStore::new(store.clone(), id.clone());
+        loop {
+            let page = store
+                .read_messages(
+                    id,
+                    MessageQuery {
+                        after,
+                        active_only: false,
+                        limit: 1000,
+                    },
+                )
+                .await?;
+            let mut paths = std::collections::HashSet::new();
+            for record in &page.messages {
+                for response in record.message.content.tool_responses() {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&response.content)
+                    else {
+                        continue;
+                    };
+                    if let Some(list) = value.get("output_paths").and_then(|v| v.as_array()) {
+                        paths.extend(list.iter().filter_map(|v| v.as_str()).map(str::to_owned));
+                    }
+                }
+            }
+            for path in paths {
+                let Some(reference) = crate::tools::ToolOutputStore::legacy_reference(&path) else {
+                    continue;
+                };
+                let path = PathBuf::from(path);
+                if !path.is_file() {
+                    continue;
+                }
+                let canonical = path.canonicalize().map_err(|e| error("storage", e))?;
+                if canonical.parent() != Some(directory.as_path()) {
+                    continue;
+                }
+                let mut file = tokio::fs::File::open(canonical)
+                    .await
+                    .map_err(|e| error("storage", e))?;
+                let mut buffer = vec![0; 128 * 1024];
+                let mut offset = 0;
+                loop {
+                    let n = file
+                        .read(&mut buffer)
+                        .await
+                        .map_err(|e| error("storage", e))?;
+                    if n == 0 {
+                        break;
+                    }
+                    store.renew_session(crate::runtime::SessionLease::TTL_MS)?;
+                    output.append(&reference, offset, &buffer[..n]).await?;
+                    offset += n as u64;
+                }
+            }
+            match page.next {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+        store.save_state(id, "output_import", None, serde_json::json!(true))?;
+        Ok(())
     }
     pub fn directory(&self, id: &SessionId) -> Result<PathBuf, YourAiError> {
         if id.as_str().is_empty()

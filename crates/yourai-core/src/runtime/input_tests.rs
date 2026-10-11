@@ -39,7 +39,7 @@ async fn equal_messages_get_distinct_ids_and_keep_attachments_after_reopen() {
     assert_eq!(wire(&harness.close().await.unwrap()), before);
     let reopened = SessionManager::open(
         host.dir.clone(),
-        host.context(),
+        host.environment(),
         host.agent.clone(),
         SessionConfig::default(),
         "resume",
@@ -69,7 +69,8 @@ async fn steer_transfers_only_the_selected_identity_and_rejects_stale_clicks() {
     }
     assert_eq!(wire(std::slice::from_ref(&sent)), wire(&[expected]));
     assert_eq!(wire(&host.pending_inputs()), wire(&pending[..1]));
-    let durable: Journal = read_json(&host.dir.join("host.json")).unwrap();
+    let durable: Journal =
+        serde_json::from_value(host.read_state("runtime").unwrap().unwrap().value).unwrap();
     assert_eq!(wire(&durable.active), wire(&[sent]));
     assert!(host.submit_async(pending[0].clone()).await.is_err());
     assert!(host.submit_async(pending[1].clone()).await.is_err());
@@ -84,18 +85,20 @@ async fn failed_steer_commit_cannot_deliver_or_remove_the_queued_message() {
     let mut rx = running(&host);
     host.submit_async(attached("keep")).await.unwrap();
     let pending = host.pending_inputs();
-    let path = host.dir.join("host.json");
-    let backup = path.with_extension("backup");
-    std::fs::rename(&path, &backup).unwrap();
-    std::fs::create_dir(&path).unwrap();
+    harness
+        .store
+        .fail
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(host
         .steer_pending(pending[0].id().unwrap().into())
         .await
         .is_err());
     assert!(rx.try_recv().is_err());
     assert_eq!(wire(&host.pending_inputs()), wire(&pending));
-    std::fs::remove_dir(&path).unwrap();
-    std::fs::rename(backup, path).unwrap();
+    harness
+        .store
+        .fail
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     idle(&host);
     harness.close().await.unwrap();
 }
@@ -114,7 +117,8 @@ async fn closed_inbox_restores_the_same_message_position_mode_and_attachments() 
         .await
         .unwrap());
     assert_eq!(wire(&host.pending_inputs()), wire(&before));
-    let durable: Journal = read_json(&host.dir.join("host.json")).unwrap();
+    let durable: Journal =
+        serde_json::from_value(host.read_state("runtime").unwrap().unwrap().value).unwrap();
     assert!(durable.active.is_empty());
     assert_eq!(
         wire(&durable.queue.into_iter().collect::<Vec<_>>()),
@@ -129,13 +133,25 @@ async fn legacy_queue_ids_are_migrated_once_and_persisted() {
     let (_dir, harness) = fixture().await;
     let host = harness.host.clone();
     harness.close().await.unwrap();
-    let path = host.dir.join("host.json");
-    let mut journal: Journal = read_json(&path).unwrap();
+    let state = harness
+        .store
+        .read_state(&host.environment().id, "runtime")
+        .unwrap()
+        .unwrap();
+    let mut journal: Journal = serde_json::from_value(state.value).unwrap();
     journal.queue.push_back(attached("legacy"));
-    atomic_write(&path, &journal).unwrap();
+    harness
+        .store
+        .save_state(
+            &host.environment().id,
+            "runtime",
+            Some(state.revision),
+            serde_json::to_value(&journal).unwrap(),
+        )
+        .unwrap();
     let reopened = SessionManager::open(
         host.dir.clone(),
-        host.context(),
+        host.environment(),
         host.agent.clone(),
         SessionConfig::default(),
         "resume",
@@ -144,7 +160,8 @@ async fn legacy_queue_ids_are_migrated_once_and_persisted() {
     .unwrap();
     let pending = reopened.pending_inputs();
     assert!(pending[0].id().is_some_and(|id| !id.is_empty()));
-    let durable: Journal = read_json(&path).unwrap();
+    let durable: Journal =
+        serde_json::from_value(reopened.read_state("runtime").unwrap().unwrap().value).unwrap();
     assert_eq!(
         wire(&durable.queue.into_iter().collect::<Vec<_>>()),
         wire(&pending)

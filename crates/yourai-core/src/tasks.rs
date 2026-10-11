@@ -1,10 +1,5 @@
 //! One task manager owns transitions, tool input and the session's persisted task view.
-use crate::{
-    error,
-    file_store::{atomic_write, read_json},
-    prelude::*,
-    runtime::SessionManager,
-};
+use crate::{error, file_store::read_json, prelude::*, runtime::SessionManager};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -39,7 +34,7 @@ impl TaskManager {
     /// The host owns initialization and publishes only one manager per session.
     pub(crate) fn open(host: &Arc<SessionManager>, team: String) -> Result<Arc<Self>, YourAiError> {
         let sessions = host.agent().ctx().session()?;
-        let id = host.context().id;
+        let id = host.environment().id;
         let mut tasks: HashMap<_, _> = sessions
             .read_tasks(&id)?
             .into_iter()
@@ -48,8 +43,7 @@ impl TaskManager {
         // Retain the old file as a backup, but retire it after a confirmed import.
         // Saving first makes a failed marker write retryable without overwriting SQLite.
         let legacy = host.directory().join("tasks.json");
-        let migrated = host.directory().join("tasks.migrated.json");
-        if !migrated.is_file() && legacy.exists() {
+        if sessions.read_state(&id, "task_import")?.is_none() && legacy.exists() {
             let old: HashMap<String, Task> = read_json(&legacy)?;
             if old.iter().any(|(key, task)| key != &task.id) {
                 return Err(error("tasks", "legacy task key differs from task identity"));
@@ -63,7 +57,7 @@ impl TaskManager {
                     tasks.insert(task.id.clone(), task);
                 }
             }
-            atomic_write(&migrated, &true)?;
+            sessions.save_state(&id, "task_import", None, serde_json::json!(true))?;
         }
         Ok(Arc::new(Self {
             host: Arc::downgrade(host),
@@ -203,7 +197,7 @@ impl TaskManager {
             let _write = host.resource_lock()?;
             let saved = manager
                 .sessions
-                .save_tasks(&host.context().id, vec![task])?
+                .save_tasks(&host.environment().id, vec![task])?
                 .pop()
                 .ok_or_else(|| error("tasks", "session manager returned no saved task"))?;
             manager

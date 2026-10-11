@@ -15,10 +15,11 @@
 use crate::{agent_loop::TurnResult, session::SessionId, turn::TurnId};
 use std::path::PathBuf;
 
-/// 会话运行环境。每次启动拷贝到 TurnOptions，不在运行中修改旧快照。
+/// 会话运行环境：身份、工作目录及已加载指令，不保存聊天历史。
+/// 每次启动拷贝到 TurnOptions，不在运行中修改旧快照。
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct SessionContext {
+pub struct SessionEnvironment {
     pub id: SessionId,
     pub cwd: PathBuf,
     pub transcript_path: Option<PathBuf>,
@@ -26,7 +27,7 @@ pub struct SessionContext {
     pub instructions: std::collections::BTreeMap<PathBuf, String>,
 }
 
-impl SessionContext {
+impl SessionEnvironment {
     pub fn new(id: SessionId, cwd: impl Into<PathBuf>) -> Self {
         Self {
             id,

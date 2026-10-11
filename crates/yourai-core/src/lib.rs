@@ -141,9 +141,11 @@ pub mod prelude {
     };
     pub use crate::session::{
         CommitStatus, MessagePage, MessageQuery, MessageStatus, RequestObservation, SessionId,
-        SessionMeta, SessionStore, StoredMessage,
+        SessionMeta, SessionState, SessionStore, StoredMessage,
     };
-    pub use crate::session_runtime::{InputRejected, SessionContext, SessionStatus, SessionTurn};
+    pub use crate::session_runtime::{
+        InputRejected, SessionEnvironment, SessionStatus, SessionTurn,
+    };
     pub use crate::skill::{SkillContent, SkillInfo, SkillProvider};
     pub use crate::tasks::{Task, TaskManager};
     pub use crate::tool::{ExecutedTool, Tool, ToolContext, ToolProvider, ToolRegistry};

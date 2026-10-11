@@ -125,9 +125,9 @@ with tempfile.TemporaryDirectory() as tmp:
         # before opening a dashboard that the replacement would dismiss.
         while True:
             try:
-                closed = all(json.loads((db_path.parent / old / 'host.json').read_text())['closed']
+                closed = all(json.loads(db.execute("SELECT value_json FROM session_state WHERE session_id=? AND state_key='runtime'", (old,)).fetchone()[0])['closed']
                              for old in previous_ids)
-            except (OSError, ValueError, KeyError):
+            except (OSError, ValueError, KeyError, TypeError):
                 closed = False
             if closed: break
             if time.monotonic() >= deadline: raise AssertionError('previous session did not close')

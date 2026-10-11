@@ -21,7 +21,7 @@ impl Workspace {
         let host = self.host()?;
         let activity = host.activity()?;
         let gate = host.try_operation()?;
-        let path = resolve(&host.context().cwd, path)?;
+        let path = resolve(&host.environment().cwd, path)?;
         let content = std::fs::read_to_string(&path).map_err(|e| error("instructions", e))?;
         let result = host
             .dispatch_active(HookEvent::InstructionsLoaded {
@@ -58,13 +58,12 @@ impl Workspace {
         let gate = host.try_operation()?;
         let config: RuntimeConfig =
             serde_json::from_value(value.clone()).map_err(|e| error("config", e))?;
-        let candidate = host.dir.join("config.candidate.json");
-        atomic_write(&candidate, &value)?;
-        let _candidate = CandidateFile(candidate.clone());
+
         let result = host
             .dispatch_active(HookEvent::ConfigChange {
                 source: source.into(),
-                file_path: Some(candidate.to_string_lossy().into_owned()),
+                file_path: None,
+                config: Some(value.clone()),
             })
             .await;
         let result = result?;
@@ -76,7 +75,7 @@ impl Workspace {
         let host = self.host()?;
         let activity = host.activity()?;
         let gate = host.try_operation()?;
-        let old = host.context().cwd;
+        let old = host.environment().cwd;
         let new = resolve(&old, path)?;
         if !new.is_dir() {
             return Err(error("workspace", "cwd is not a directory"));
@@ -193,11 +192,5 @@ impl Workspace {
                 format!("FileChanged event save failed: {cause}"),
             ));
         }
-    }
-}
-struct CandidateFile(PathBuf);
-impl Drop for CandidateFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
     }
 }

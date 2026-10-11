@@ -55,7 +55,8 @@ pub(super) struct App {
 
 impl App {
     pub(super) fn new(controller: Controller, mut view: View, meta: Metadata) -> Self {
-        view.draft.set_cwd(&controller.harness().host.context().cwd);
+        view.draft
+            .set_cwd(&controller.harness().host.environment().cwd);
         Self {
             renderer: Renderer::default(),
             controller,
@@ -86,16 +87,16 @@ impl App {
         let had_ask = !self.view.asks_empty();
         let was_active = self.view.session.active;
         let switched = self.controller.poll(&mut self.view, first).await;
-        let context = self.controller.harness().host.context();
+        let environment = self.controller.harness().host.environment();
         if switched {
-            self.meta.session = context.id.as_str().to_owned();
+            self.meta.session = environment.id.as_str().to_owned();
             self.renderer = Renderer::default();
             self.synced_todos = None;
         }
         // Workspace changes can happen within a session, not just on switch.
         // Footer, file completion and git must observe the same live cwd.
-        let cwd = context.cwd.to_string_lossy().into_owned();
-        self.view.draft.set_cwd(&context.cwd);
+        let cwd = environment.cwd.to_string_lossy().into_owned();
+        self.view.draft.set_cwd(&environment.cwd);
         if self.meta.cwd != cwd {
             self.meta.cwd = cwd;
             if let Some(task) = self.git_task.take() {
@@ -203,7 +204,7 @@ impl App {
             .git_refreshed
             .is_none_or(|at| at.elapsed() >= GIT_REFRESH_INTERVAL);
         if self.git_task.is_none() && due {
-            let cwd = self.controller.harness().host.context().cwd.clone();
+            let cwd = self.controller.harness().host.environment().cwd.clone();
             self.git_task = Some(tokio::spawn(async move {
                 crate::git::GitContext::detect(&cwd).await
             }));
@@ -1239,13 +1240,13 @@ mod tests {
     #[tokio::test]
     async fn new_session_switches_and_keeps_the_inflight_draft() {
         let (_dir, mut app) = fixture().await;
-        let old = app.controller.harness().host.context().id;
+        let old = app.controller.harness().host.environment().id;
         type_text(&mut app, "/new");
         app.handle(key(KeyCode::Enter));
         assert!(app.controller.busy());
         type_text(&mut app, "draft typed while opening");
         finish(&mut app).await;
-        assert_ne!(app.controller.harness().host.context().id, old);
+        assert_ne!(app.controller.harness().host.environment().id, old);
         assert_eq!(app.view.draft.text(), "draft typed while opening");
         assert_ne!(app.meta.session, old.as_str());
         app.close().await.unwrap();
@@ -1388,7 +1389,7 @@ mod tests {
     async fn regression_cwd_change_refreshes_footer_and_file_completion() {
         let (dir, mut app) = fixture().await;
         let host = app.controller.harness().host.clone();
-        let original = host.context().cwd;
+        let original = host.environment().cwd;
         app.meta.cwd = original.to_string_lossy().into_owned();
         let next = dir.path().join("next-workspace");
         std::fs::create_dir(&next).unwrap();
@@ -1414,7 +1415,7 @@ mod tests {
             .map(|entry| entry.path.clone())
             .collect();
         let displayed = app.meta.cwd.clone();
-        let expected = host.context().cwd;
+        let expected = host.environment().cwd;
         app.close().await.unwrap();
         assert_eq!(
             displayed,
@@ -1442,11 +1443,11 @@ mod tests {
         let next = dir.path().join("next-workspace");
         std::fs::create_dir(&next).unwrap();
         host.workspace().unwrap().change_cwd(&next).await.unwrap();
-        let expected = host.context().cwd;
+        let expected = host.environment().cwd;
         app.poll(None).await;
         app.controller.switch(super::Target::New, &mut app.view);
         finish(&mut app).await;
-        let actual = app.controller.harness().host.context().cwd;
+        let actual = app.controller.harness().host.environment().cwd;
         app.close().await.unwrap();
         assert_eq!(actual, expected);
     }

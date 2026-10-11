@@ -2,7 +2,7 @@
 //!
 //! Detection is best-effort and purely informational: outside a repository
 //! every field stays `None` and callers render nothing. The harness tracks
-//! registered worktrees by name in `worktrees.json`; auto-created ones live
+//! registered worktrees by name in the session database; auto-created ones live
 //! under `<session>/worktrees/<name>`, so the linked-worktree's toplevel
 //! basename matches the registered name.
 use std::path::Path;

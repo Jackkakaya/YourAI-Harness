@@ -1,32 +1,46 @@
-use crate::storage::{atomic_write, read_json};
+//! Small typed document access; database revisions reject lost updates.
 use serde::{de::DeserializeOwned, Serialize};
-use std::{collections::BTreeMap, path::PathBuf, sync::Mutex};
-use yourai_core::YourAiError;
+use std::{collections::BTreeMap, sync::Arc};
+use yourai_core::prelude::*;
 pub(crate) struct Table<T> {
-    path: PathBuf,
-    pub(crate) data: Mutex<BTreeMap<String, T>>,
+    store: Arc<dyn SessionStore>,
+    id: SessionId,
+    key: &'static str,
+    _entry: std::marker::PhantomData<T>,
 }
 impl<T: Clone + Serialize + DeserializeOwned> Table<T> {
-    pub(crate) fn open(path: PathBuf) -> Result<Self, YourAiError> {
-        let data = if path.exists() {
-            read_json(&path)?
-        } else {
-            BTreeMap::new()
-        };
-        Ok(Self {
-            path,
-            data: Mutex::new(data),
-        })
+    pub(crate) fn new(store: Arc<dyn SessionStore>, id: SessionId, key: &'static str) -> Self {
+        Self {
+            store,
+            id,
+            key,
+            _entry: std::marker::PhantomData,
+        }
+    }
+    pub(crate) fn read(&self) -> Result<BTreeMap<String, T>, YourAiError> {
+        self.store
+            .read_state(&self.id, self.key)?
+            .map(|s| serde_json::from_value(s.value).map_err(|e| crate::error("storage", e)))
+            .transpose()
+            .map(|v| v.unwrap_or_default())
     }
     pub(crate) fn update(
         &self,
         f: impl FnOnce(&mut BTreeMap<String, T>),
     ) -> Result<(), YourAiError> {
-        let mut guard = self.data.lock().unwrap();
-        let mut next = guard.clone();
-        f(&mut next);
-        atomic_write(&self.path, &next)?;
-        *guard = next;
+        let saved = self.store.read_state(&self.id, self.key)?;
+        let revision = saved.as_ref().map(|s| s.revision);
+        let mut values = saved
+            .map(|s| serde_json::from_value(s.value).map_err(|e| crate::error("storage", e)))
+            .transpose()?
+            .unwrap_or_default();
+        f(&mut values);
+        self.store.save_state(
+            &self.id,
+            self.key,
+            revision,
+            serde_json::to_value(values).map_err(|e| crate::error("storage", e))?,
+        )?;
         Ok(())
     }
 }

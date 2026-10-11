@@ -52,6 +52,7 @@ async fn open(
     let (agent, _) = crate::assembly::assemble(
         &catalog,
         &id,
+        lease.store(),
         &config.cwd,
         false,
         model,
@@ -67,8 +68,8 @@ async fn open(
     if let Some(sandbox) = sandbox {
         agent.ctx().set_sandbox(sandbox);
     }
-    let mut context = SessionContext::new(id, config.cwd);
-    context.instructions = prepared.instructions;
-    context.transcript_path = Some(crate::SqliteStore::path(&config.root));
-    SessionManager::open_owned(lease, context, agent, SessionConfig::default(), source).await
+    let mut environment = SessionEnvironment::new(id, config.cwd);
+    environment.instructions = prepared.instructions;
+    environment.transcript_path = Some(crate::SqliteStore::path(&config.root));
+    SessionManager::open_owned(lease, environment, agent, SessionConfig::default(), source).await
 }

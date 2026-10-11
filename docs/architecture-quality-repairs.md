@@ -1,5 +1,7 @@
 # 代码质量整改：策略归属与持久化
 
+> 当前存储已改为 SQLite schema v6：队列、扩展状态和工具原文使用 SessionStore；SessionLease 使用数据库租约。旧章节中的状态 JSON、输出文件和文件锁描述已被 [云端存储实现](cloud-storage.md) 替代。
+
 本次保留 core / harness / TUI 三个包，以及 SessionManager / DefaultLoop /
 DefaultContext / SQLite 的分工。整理的单位是职责和不变量，不按文件行数新增公共 trait。
 

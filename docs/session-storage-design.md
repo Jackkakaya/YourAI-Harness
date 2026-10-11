@@ -1,5 +1,7 @@
 # 会话存储与内存上下文
 
+> 当前存储已改为 SQLite schema v6：队列、扩展状态和工具原文使用 SessionStore；SessionLease 使用数据库租约。旧章节中的状态 JSON、输出文件和文件锁描述已被 [云端存储实现](cloud-storage.md) 替代。
+
 状态：SQLite 主链已实现，TUI/Harness 默认使用。此前的 JSON 历史实现已移除。
 
 ContextManager负责上下文变更流程，TaskManager负责任务转换，SessionStore负责记录读写和事务。来源归档与新摘要在一次`save_summary`事务中完成；任务复用同一SQLite，单次转换或旧数据导入原子提交。算法见[ContextManager设计](./context-manager-design.md)。

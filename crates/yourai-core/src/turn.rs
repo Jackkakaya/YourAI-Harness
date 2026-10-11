@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::session_runtime::SessionContext;
+use crate::session_runtime::SessionEnvironment;
 
 /// 一次执行的身份，由 Core 在启动时生成。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -61,7 +61,7 @@ pub struct TurnOptions {
     /// Origin used consistently by request diagnostics and usage accounting.
     pub source: Option<&'static str>,
     /// None 允许独立的无会话 Loop；会话宿主应始终提供绑定信息。
-    pub session: Option<Arc<SessionContext>>,
+    pub session: Option<Arc<SessionEnvironment>>,
     pub limits: TurnLimits,
     pub events: Option<Arc<crate::runtime_event::RuntimeEvents>>,
     pub input: Option<InputOptions>,

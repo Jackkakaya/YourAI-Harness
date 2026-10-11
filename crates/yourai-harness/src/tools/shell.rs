@@ -2,7 +2,7 @@ use crate::tools::*;
 use serde::Deserialize;
 use std::{process::Stdio, time::Duration};
 #[cfg(unix)]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 pub struct Shell {
     cwd: PathBuf,
@@ -184,29 +184,27 @@ async fn run(
     } else {
         termination
     };
-    stdout.flush().await?;
-    stderr.flush().await?;
     let paths: Vec<_> = [&stdout.path, &stderr.path]
         .into_iter()
         .flatten()
-        .map(|p| p.to_string_lossy().into_owned())
+        .cloned()
         .collect();
     Ok(json!({
         "ok":termination=="exit" && status.success(), "exit_code":status.code(),
         "stdout":stdout.text(), "stderr":stderr.text(), "termination":termination,
         "capture_complete":oeof && eeof, "output_complete":oeof && eeof && paths.is_empty(),
-        "output_paths":paths, "stdout_path":stdout.path, "stderr_path":stderr.path, "cwd":cwd_str,
+        "output_refs":paths, "stdout_ref":stdout.path, "stderr_ref":stderr.path, "cwd":cwd_str,
     }))
 }
 
-/// Each stream gets a unique file. After spilling, a fixed head and rolling tail remain in memory.
+/// Each stream gets a unique database reference. After spilling, a fixed head and rolling tail remain in memory.
 #[cfg(unix)]
 struct Capture {
     store: Option<Arc<ToolOutputStore>>,
     buffer: Vec<u8>,
     head: Vec<u8>,
-    path: Option<PathBuf>,
-    file: Option<tokio::fs::File>,
+    path: Option<String>,
+    offset: u64,
     lines: usize,
 }
 #[cfg(unix)]
@@ -218,7 +216,7 @@ impl Capture {
             buffer: vec![],
             head: vec![],
             path: None,
-            file: None,
+            offset: 0,
             lines: 1,
         }
     }
@@ -226,23 +224,22 @@ impl Capture {
         self.lines = self
             .lines
             .saturating_add(bytes.iter().filter(|b| **b == b'\n').count());
-        if self.file.is_none()
+        if self.path.is_none()
             && (self.buffer.len() + bytes.len() > Self::BYTES || self.lines > 1000)
         {
             if let Some(store) = &self.store {
-                let (path, mut file) = store.create().await?;
-                file.write_all(&self.buffer)
-                    .await
-                    .map_err(|e| error("shell", e))?;
-                self.path = Some(path);
-                self.file = Some(file);
+                let reference = store.create();
+                store.append(&reference, 0, &self.buffer).await?;
+                self.offset = self.buffer.len() as u64;
+                self.path = Some(reference);
             }
         }
-        if let Some(file) = &mut self.file {
-            file.write_all(bytes).await.map_err(|e| error("shell", e))?;
+        if let (Some(reference), Some(store)) = (&self.path, &self.store) {
+            store.append(reference, self.offset, bytes).await?;
+            self.offset += bytes.len() as u64;
         }
         self.buffer.extend_from_slice(bytes);
-        if self.file.is_some() {
+        if self.path.is_some() {
             if self.head.is_empty() {
                 let end = (Self::BYTES / 2).min(self.buffer.len());
                 // Keep the current bytes available to the rolling tail too.
@@ -255,18 +252,12 @@ impl Capture {
         }
         Ok(())
     }
-    async fn flush(&mut self) -> Result<(), YourAiError> {
-        if let Some(file) = &mut self.file {
-            file.flush().await.map_err(|e| error("shell", e))?;
-        }
-        Ok(())
-    }
     fn text(&self) -> String {
         match &self.path {
             Some(path) => super::output::preview_parts(
                 &head_text(&self.head),
                 &tail_text(&self.buffer),
-                path.to_str().expect("validated output root"),
+                path,
                 1000,
                 Self::BYTES,
             ),
@@ -276,7 +267,7 @@ impl Capture {
 }
 
 // Sample boundaries can bisect a UTF-8 character even when the captured stream
-// is valid. Omit just that partial character; the disk file retains every byte.
+// is valid. Omit just that partial character; the database retains every byte.
 #[cfg(unix)]
 fn head_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
     let bytes = match std::str::from_utf8(bytes) {
@@ -300,8 +291,9 @@ mod tests {
 
     #[tokio::test]
     async fn line_count_spill_keeps_head_and_actual_tail_across_chunk_sizes() {
-        let root = tempfile::tempdir().unwrap();
-        let store = ToolOutputStore::open(root.path().join("output")).unwrap();
+        let db = Arc::new(crate::SqliteStore::open(std::path::Path::new(":memory:")).unwrap());
+        let id = db.create_session(SessionId::new(), "").await.unwrap().id;
+        let store = ToolOutputStore::new(db, id);
         let text = format!(
             "HEAD\n{}MIDDLE\n{}TAIL",
             "x\n".repeat(600),
@@ -314,9 +306,9 @@ mod tests {
                 capture.push(chunk).await.unwrap();
                 assert!(capture.head.len() + capture.buffer.len() <= Capture::BYTES);
             }
-            capture.flush().await.unwrap();
             assert_eq!(
-                tokio::fs::read(capture.path.as_ref().unwrap())
+                store
+                    .read(capture.path.as_ref().unwrap(), 0, 1024 * 1024)
                     .await
                     .unwrap(),
                 text.as_bytes()
@@ -333,9 +325,10 @@ mod tests {
 
     #[tokio::test]
     async fn capture_keeps_head_and_tail_with_exact_file_and_unicode_boundaries() {
-        let root = tempfile::tempdir().unwrap();
-        let store = ToolOutputStore::open(root.path().join("output")).unwrap();
-        let mut capture = Capture::new(Some(store));
+        let db = Arc::new(crate::SqliteStore::open(std::path::Path::new(":memory:")).unwrap());
+        let id = db.create_session(SessionId::new(), "").await.unwrap().id;
+        let store = ToolOutputStore::new(db, id);
+        let mut capture = Capture::new(Some(store.clone()));
         let text = format!(
             "HEAD{}MIDDLE{}TAIL",
             "界".repeat(20_000),
@@ -345,9 +338,9 @@ mod tests {
             capture.push(chunk).await.unwrap();
             assert!(capture.head.len() + capture.buffer.len() <= Capture::BYTES);
         }
-        capture.flush().await.unwrap();
         assert_eq!(
-            tokio::fs::read(capture.path.as_ref().unwrap())
+            store
+                .read(capture.path.as_ref().unwrap(), 0, 1024 * 1024)
                 .await
                 .unwrap(),
             text.as_bytes()

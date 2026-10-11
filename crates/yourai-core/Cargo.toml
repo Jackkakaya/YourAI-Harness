@@ -17,7 +17,6 @@ futures-core = "0.3"
 futures-util = "0.3"
 
 jsonschema = { version = "0.33", default-features = false }
-fs2 = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 base64 = "0.22"
 

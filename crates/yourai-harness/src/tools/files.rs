@@ -145,6 +145,10 @@ fn save(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadInput {
+    #[serde(default)]
+    byte_offset: Option<u64>,
+    #[serde(default)]
+    byte_limit: Option<usize>,
     path: String,
     #[serde(default = "one")]
     offset: usize,
@@ -173,6 +177,7 @@ struct EditInput {
 
 pub struct Read {
     cwd: PathBuf,
+    output: Option<Arc<ToolOutputStore>>,
 }
 pub struct Write {
     cwd: PathBuf,
@@ -189,14 +194,33 @@ macro_rules! constructor {
         }
     };
 }
-constructor!(Read);
+impl Read {
+    pub fn new(cwd: PathBuf) -> Self {
+        Self::with_output(cwd, None)
+    }
+    pub fn with_output(cwd: PathBuf, output: Option<Arc<ToolOutputStore>>) -> Self {
+        Self { cwd, output }
+    }
+}
 constructor!(Write);
 constructor!(Edit);
 impl ToolProvider for Read {
     fn definition(&self) -> ToolDefinition {
-        schema("read","Read a UTF-8 text file with line numbers. offset is 1-based; use next_offset for subsequent pages. No images or binary files.",json!({"path":{"type":"string","minLength":1},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":2000}}), &["path"])
+        schema("read","Read a UTF-8 text file with line numbers. offset is 1-based; use next_offset for subsequent pages. For tool-output:// references (including tool-output://message/SEQ for archived tool results), use byte_offset (0-based) and byte_limit (max 1048576); use next_byte_offset to continue. No images or binary files.",json!({"path":{"type":"string","minLength":1},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":2000},"byte_offset":{"type":"integer","minimum":0},"byte_limit":{"type":"integer","minimum":1,"maximum":1048576}}), &["path"])
     }
     fn security_context(&self, input: &Value, cwd: Option<&Path>) -> SecurityContext {
+        if input
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|p| p.starts_with("tool-output://"))
+        {
+            return SecurityContext {
+                action: "read".into(),
+                input: input.clone(),
+                is_destructive: false,
+                is_network: false,
+            };
+        }
         security("read", cwd.unwrap_or(&self.cwd), input, false)
     }
     fn run<'a>(
@@ -208,6 +232,26 @@ impl ToolProvider for Read {
             let i: ReadInput = serde_json::from_value(input).map_err(|e| error("read", e))?;
             if i.path.is_empty() || i.offset == 0 || !(1..=2000).contains(&i.limit) {
                 return Err(error("read", "invalid path, offset or limit"));
+            }
+            if i.path.starts_with("tool-output://") {
+                check_cancel(&tc)?;
+                let store = self
+                    .output
+                    .as_ref()
+                    .ok_or_else(|| error("read", "output storage unavailable"))?;
+                let offset = i.byte_offset.unwrap_or(0);
+                let limit = i.byte_limit.unwrap_or(50 * 1024);
+                let bytes = store.read(&i.path, offset, limit).await?;
+                check_cancel(&tc)?;
+                return Ok(
+                    json!({"ok":true,"path":i.path,"byte_offset":offset,"next_byte_offset":(bytes.len()==limit).then_some(offset+bytes.len() as u64),"content":String::from_utf8_lossy(&bytes),"bytes":bytes.len()}),
+                );
+            }
+            if i.byte_offset.is_some() || i.byte_limit.is_some() {
+                return Err(error(
+                    "read",
+                    "byte ranges require tool-output:// reference",
+                ));
             }
             let cwd = tc.cwd.unwrap_or(&self.cwd).to_owned();
             let raw = i.path.clone();

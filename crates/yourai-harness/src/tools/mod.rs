@@ -40,7 +40,7 @@ pub(crate) fn coding_tools_with_output(
         return Err(error("tools", "cwd must be a directory"));
     }
     Ok(vec![
-        Arc::new(Read::new(cwd.clone())),
+        Arc::new(Read::with_output(cwd.clone(), output.clone())),
         Arc::new(Write::new(cwd.clone())),
         Arc::new(Edit::new(cwd.clone())),
         Arc::new(Shell::with_output(cwd, output)),

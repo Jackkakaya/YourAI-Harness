@@ -66,7 +66,7 @@ impl AgentLoop for MyLoop {
 
 ToolProvider 只实现 definition、security_context、run。Tool 构造时固定名字和 schema，backend 私有。ToolRegistry 必需 register / unregister / snapshot；其余元数据查询由一次默认实现派生。模型请求和固定工具来自同一快照。
 
-ToolContext.cwd 来自本轮 SessionContext 快照，security_context 也接收同一 cwd。内置文件和 Shell 工具据此解析执行与审批路径；独立调用没有会话快照时使用构造时目录。切换 cwd 不改变自定义安全策略的许可范围。子会话启动前继承本次 ToolContext 的安全和沙箱快照。
+ToolContext.cwd 来自本轮 SessionEnvironment 快照，security_context 也接收同一 cwd。内置文件和 Shell 工具据此解析执行与审批路径；独立调用没有会话快照时使用构造时目录。切换 cwd 不改变自定义安全策略的许可范围。子会话启动前继承本次 ToolContext 的安全和沙箱快照。
 
 PreToolUse 的拒绝优先于 YOLO；YOLO 只跳过审批。修改参数先校验再授权；审批后的修改再次检查 schema 和硬策略。真实工具结果先进入调用记录，再执行 post 和结果保存。post 失败不让调用变回 Pending。
 

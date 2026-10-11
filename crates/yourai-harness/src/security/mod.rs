@@ -1,7 +1,4 @@
-use crate::{
-    error,
-    storage::{atomic_write, read_json},
-};
+use crate::error;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -47,38 +44,46 @@ impl SecurityProvider for YoloSecurity {
 }
 /// Persistent exact tool-name rules. Hard deny configuration cannot be removed by hooks.
 pub struct PolicySecurity {
-    path: PathBuf,
+    store: Arc<dyn SessionStore>,
+    id: SessionId,
     rules: Mutex<Policy>,
     hard_deny: Vec<String>,
     workspace: Option<PathBuf>,
     trusted_shell: bool,
 }
 impl PolicySecurity {
-    pub fn open(path: PathBuf, hard_deny: Vec<String>) -> Result<Arc<Self>, YourAiError> {
-        Self::open_policy(path, hard_deny, None, false)
+    pub fn open(
+        store: Arc<dyn SessionStore>,
+        id: SessionId,
+        hard_deny: Vec<String>,
+    ) -> Result<Arc<Self>, YourAiError> {
+        Self::open_policy(store, id, hard_deny, None, false)
     }
     pub fn open_for_workspace(
-        path: PathBuf,
+        store: Arc<dyn SessionStore>,
+        id: SessionId,
         hard_deny: Vec<String>,
         cwd: PathBuf,
         trusted_shell: bool,
     ) -> Result<Arc<Self>, YourAiError> {
         let cwd = std::fs::canonicalize(cwd).map_err(|e| error("security", e))?;
-        Self::open_policy(path, hard_deny, Some(cwd), trusted_shell)
+        Self::open_policy(store, id, hard_deny, Some(cwd), trusted_shell)
     }
     fn open_policy(
-        path: PathBuf,
+        store: Arc<dyn SessionStore>,
+        id: SessionId,
         hard_deny: Vec<String>,
         workspace: Option<PathBuf>,
         trusted_shell: bool,
     ) -> Result<Arc<Self>, YourAiError> {
-        let rules = if path.exists() {
-            read_json(&path)?
-        } else {
-            Policy::default()
-        };
+        let rules = store
+            .read_state(&id, "permissions")?
+            .map(|s| serde_json::from_value(s.value).map_err(|e| error("security", e)))
+            .transpose()?
+            .unwrap_or_default();
         Ok(Arc::new(Self {
-            path,
+            store,
+            id,
             rules: Mutex::new(rules),
             hard_deny,
             workspace,
@@ -114,7 +119,13 @@ impl SecurityProvider for PolicySecurity {
     ) -> BoxFuture<'a, Result<(), YourAiError>> {
         Box::pin(async move {
             let mut guard = self.rules.lock().unwrap();
-            let mut next = guard.clone();
+            let old = self.store.read_state(&self.id, "permissions")?;
+            let mut next: Policy = old
+                .as_ref()
+                .map(|s| serde_json::from_value(s.value.clone()).map_err(|e| error("security", e)))
+                .transpose()?
+                .unwrap_or_default();
+            next.session_allow = guard.session_allow.clone();
             for update in updates {
                 if update
                     .get("destination")
@@ -160,7 +171,12 @@ impl SecurityProvider for PolicySecurity {
                     }
                 }
             }
-            atomic_write(&self.path, &next)?;
+            self.store.save_state(
+                &self.id,
+                "permissions",
+                old.map(|s| s.revision),
+                serde_json::to_value(&next).map_err(|e| error("security", e))?,
+            )?;
             *guard = next;
             Ok(())
         })
@@ -170,7 +186,13 @@ impl SecurityProvider for PolicySecurity {
         c: &'a SecurityContext,
     ) -> BoxFuture<'a, Result<ApprovalDecision, YourAiError>> {
         Box::pin(async move {
-            let p = self.rules.lock().unwrap();
+            let mut p: Policy = self
+                .store
+                .read_state(&self.id, "permissions")?
+                .map(|s| serde_json::from_value(s.value).map_err(|e| error("security", e)))
+                .transpose()?
+                .unwrap_or_default();
+            p.session_allow = self.rules.lock().unwrap().session_allow.clone();
             Ok(
                 if self.hard_deny.contains(&c.action) || p.deny.contains(&c.action) {
                     ApprovalDecision::Deny
@@ -187,18 +209,22 @@ impl SecurityProvider for PolicySecurity {
                     == Some(true)
                 {
                     ApprovalDecision::Deny
-                } else if self.workspace.as_ref().is_some_and(|root| {
-                    matches!(c.action.as_str(), "read" | "write" | "edit")
-                        && c.input
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .and_then(|p| {
-                                crate::tools::resolve_path(root, std::path::Path::new(p)).ok()
-                            })
-                            .is_some_and(|p| p.starts_with(root))
-                }) || (self.workspace.is_some()
-                    && self.trusted_shell
-                    && c.action == "shell")
+                } else if (c.action == "read"
+                    && c.input
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|p| p.starts_with("tool-output://")))
+                    || self.workspace.as_ref().is_some_and(|root| {
+                        matches!(c.action.as_str(), "read" | "write" | "edit")
+                            && c.input
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .and_then(|p| {
+                                    crate::tools::resolve_path(root, std::path::Path::new(p)).ok()
+                                })
+                                .is_some_and(|p| p.starts_with(root))
+                    })
+                    || (self.workspace.is_some() && self.trusted_shell && c.action == "shell")
                 {
                     ApprovalDecision::Allow
                 } else {

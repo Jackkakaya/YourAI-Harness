@@ -5,11 +5,7 @@
 //! update), so the dependency is real, not incidental.
 mod backend;
 mod operations;
-use crate::{
-    error,
-    file_store::{atomic_write, read_json},
-    runtime::SessionManager,
-};
+use crate::{error, runtime::SessionManager};
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -64,12 +60,11 @@ pub struct Workspace {
 }
 impl Workspace {
     pub(crate) fn new(host: &Arc<SessionManager>) -> Result<Arc<Self>, YourAiError> {
-        let p = host.dir.join("worktrees.json");
-        let worktrees = if p.exists() {
-            read_json(&p)?
-        } else {
-            HashMap::new()
-        };
+        let worktrees = host
+            .read_state("worktrees")?
+            .map(|s| serde_json::from_value(s.value).map_err(|e| error("workspace", e)))
+            .transpose()?
+            .unwrap_or_default();
         Ok(Arc::new(Self {
             host: Arc::downgrade(host),
             worktrees: Mutex::new(worktrees),
@@ -84,12 +79,11 @@ impl Workspace {
             .ok_or_else(|| error("workspace", "session gone"))
     }
     pub fn config(&self) -> Result<Value, YourAiError> {
-        let p = self.host()?.dir.join("config.json");
-        if p.exists() {
-            read_json(&p)
-        } else {
-            Ok(json!({}))
-        }
+        Ok(self
+            .host()?
+            .read_state("config")?
+            .map(|s| s.value)
+            .unwrap_or_else(|| json!({})))
     }
     /// Polling watcher avoids OS-specific dependencies; only explicitly registered paths.
     pub fn start_watching(self: &Arc<Self>, interval: Duration) -> Result<(), YourAiError> {

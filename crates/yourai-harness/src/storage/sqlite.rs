@@ -19,7 +19,7 @@ fn sql(e: impl std::fmt::Display) -> YourAiError {
 }
 #[derive(Clone)]
 pub struct SqliteStore {
-    session_root: Option<PathBuf>,
+    owner: Option<(SessionId, String)>,
     connection: Arc<Mutex<Connection>>,
     gate: Arc<tokio::sync::Mutex<()>>,
 }
@@ -38,7 +38,7 @@ impl SqliteStore {
         let version: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(sql)?;
-        if version > 5 {
+        if version > 6 {
             return Err(sql("database schema is newer than this application"));
         }
         if version < 1 {
@@ -78,29 +78,58 @@ impl SqliteStore {
             )
             .map_err(sql)?;
         }
+        if version < 6 {
+            c.execute_batch("BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS session_state (
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    state_key TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>0), value_json TEXT NOT NULL,
+                    PRIMARY KEY(session_id,state_key)
+                );
+                CREATE TABLE IF NOT EXISTS session_owners (
+                    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    owner TEXT NOT NULL, expires_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tool_outputs (
+                    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                    output_id TEXT NOT NULL, offset INTEGER NOT NULL CHECK(offset>=0),
+                    content BLOB NOT NULL, created_at INTEGER NOT NULL,
+                    PRIMARY KEY(session_id,output_id,offset)
+                );
+                CREATE INDEX IF NOT EXISTS tool_outputs_expiry ON tool_outputs(created_at);
+                PRAGMA user_version=6; COMMIT;").map_err(sql)?;
+        }
         Ok(Self {
-            session_root: (path != Path::new(":memory:")).then(|| {
-                path.parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or(Path::new("."))
-                    .to_owned()
-            }),
+            owner: None,
             connection: Arc::new(Mutex::new(c)),
             gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
     pub(crate) fn with<T>(
         &self,
-        f: impl FnOnce(&mut Connection) -> Result<T, YourAiError>,
+        f: impl FnOnce(&Connection) -> Result<T, YourAiError>,
     ) -> Result<T, YourAiError> {
-        f(&mut *self
+        let mut connection = self
             .connection
             .lock()
-            .map_err(|_| sql("connection poisoned"))?)
+            .map_err(|_| sql("connection poisoned"))?;
+        // Ownership validation and every read/write occur in the same transaction.
+        // No local file lock participates in correctness.
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        if let Some((id, owner)) = &self.owner {
+            let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM session_owners WHERE session_id=?1 AND owner=?2 AND expires_at>?3)", params![id.as_str(),owner,now()], |r|r.get(0)).map_err(sql)?;
+            if !valid {
+                return Err(sql("session ownership expired or replaced"));
+            }
+        }
+        let value = f(&tx)?;
+        tx.commit().map_err(sql)?;
+        Ok(value)
     }
     pub(crate) async fn run<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut Connection) -> Result<T, YourAiError> + Send + 'static,
+        f: impl FnOnce(&Connection) -> Result<T, YourAiError> + Send + 'static,
     ) -> Result<T, YourAiError> {
         let guard = self.gate.clone().lock_owned().await;
         let db = self.clone();
@@ -328,6 +357,149 @@ fn insert(
     Ok(m)
 }
 impl SessionStore for SqliteStore {
+    fn claim_session(
+        &self,
+        id: &SessionId,
+        owner: &str,
+        ttl_ms: u64,
+    ) -> Result<Arc<dyn SessionStore>, YourAiError> {
+        let expires = now()
+            .checked_add(i64::try_from(ttl_ms).map_err(sql)?)
+            .ok_or_else(|| sql("lease expiry overflow"))?;
+        if ttl_ms == 0 {
+            return Err(sql("lease duration must be positive"));
+        }
+        let mut db = self.clone();
+        db.owner = None;
+        db.with(|c| {
+            let changed = c.execute("INSERT INTO session_owners(session_id,owner,expires_at) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at WHERE session_owners.expires_at<=?4",params![id.as_str(),owner,expires,now()]).map_err(sql)?;
+            if changed != 1 { return Err(sql("session is already owned")); }
+            Ok(())
+        })?;
+        let mut owned = self.clone();
+        owned.owner = Some((id.clone(), owner.to_owned()));
+        Ok(Arc::new(owned))
+    }
+    fn renew_session(&self, ttl_ms: u64) -> Result<(), YourAiError> {
+        if ttl_ms == 0 {
+            return Err(sql("lease duration must be positive"));
+        }
+        let (id, owner) = self
+            .owner
+            .as_ref()
+            .ok_or_else(|| sql("no session ownership"))?;
+        let expires = now()
+            .checked_add(i64::try_from(ttl_ms).map_err(sql)?)
+            .ok_or_else(|| sql("lease expiry overflow"))?;
+        self.with(|c| {
+            c.execute(
+                "UPDATE session_owners SET expires_at=?3 WHERE session_id=?1 AND owner=?2",
+                params![id.as_str(), owner, expires],
+            )
+            .map_err(sql)?;
+            Ok(())
+        })
+    }
+    fn release_session(&self) -> Result<(), YourAiError> {
+        let (id, owner) = self
+            .owner
+            .as_ref()
+            .ok_or_else(|| sql("no session ownership"))?;
+        let mut db = self.clone();
+        db.owner = None;
+        db.with(|c| {
+            c.execute(
+                "DELETE FROM session_owners WHERE session_id=?1 AND owner=?2",
+                params![id.as_str(), owner],
+            )
+            .map_err(sql)?;
+            Ok(())
+        })
+    }
+    fn read_state(&self, id: &SessionId, key: &str) -> Result<Option<SessionState>, YourAiError> {
+        self.with(|c| {
+            let row: Option<(i64,String)> = c.query_row("SELECT revision,value_json FROM session_state WHERE session_id=?1 AND state_key=?2",params![id.as_str(),key],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sql)?;
+            row.map(|(revision,raw)|Ok(SessionState{revision,value:serde_json::from_str(&raw).map_err(sql)?})).transpose()
+        })
+    }
+    fn save_state(
+        &self,
+        id: &SessionId,
+        key: &str,
+        expected: Option<i64>,
+        value: serde_json::Value,
+    ) -> Result<i64, YourAiError> {
+        if key.is_empty() || key.len() > 128 {
+            return Err(sql("invalid state key"));
+        }
+        let revision = expected
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| sql("state revision overflow"))?;
+        let raw = serde_json::to_string(&value).map_err(sql)?;
+        self.with(|c| {
+            let n=match expected {
+                Some(old)=>c.execute("UPDATE session_state SET revision=?3,value_json=?4 WHERE session_id=?1 AND state_key=?2 AND revision=?5",params![id.as_str(),key,revision,raw,old]),
+                None=>c.execute("INSERT INTO session_state(session_id,state_key,revision,value_json) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id,state_key) DO NOTHING",params![id.as_str(),key,revision,raw]),
+            }.map_err(sql)?;
+            if n!=1 { return Err(sql("session state changed; retry from current revision")); }
+            Ok(revision)
+        })
+    }
+    fn append_output<'a>(
+        &'a self,
+        id: &'a SessionId,
+        output: &'a str,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        let id = id.clone();
+        let output = output.to_owned();
+        Box::pin(self.run(move |c| {
+            if bytes.is_empty() {return Ok(());}
+            let offset=i64::try_from(offset).map_err(sql)?;
+            let existing: Option<Vec<u8>>=c.query_row("SELECT content FROM tool_outputs WHERE session_id=?1 AND output_id=?2 AND offset=?3",params![id.as_str(),output,offset],|r|r.get(0)).optional().map_err(sql)?;
+            if let Some(previous)=existing {return if previous==bytes {Ok(())} else {Err(sql("output chunk identity conflict"))};}
+            let end: i64=c.query_row("SELECT COALESCE(MAX(offset+length(content)),0) FROM tool_outputs WHERE session_id=?1 AND output_id=?2",params![id.as_str(),output],|r|r.get(0)).map_err(sql)?;
+            if end!=offset {return Err(sql("output chunk offset conflict"));}
+            c.execute("INSERT INTO tool_outputs(session_id,output_id,offset,content,created_at) VALUES(?1,?2,?3,?4,?5)",params![id.as_str(),output,offset,bytes,now()]).map_err(sql)?;
+            Ok(())
+        }))
+    }
+    fn read_output<'a>(
+        &'a self,
+        id: &'a SessionId,
+        output: &'a str,
+        offset: u64,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<u8>, YourAiError>> {
+        let id = id.clone();
+        let output = output.to_owned();
+        Box::pin(self.run(move |c| {
+            if limit==0 || limit>1024*1024 {return Err(sql("output read limit must be 1..=1048576 bytes"));}
+            let offset=i64::try_from(offset).map_err(sql)?;
+            let end=offset.checked_add(limit as i64).ok_or_else(||sql("output range overflow"))?;
+            let exists: bool=c.query_row("SELECT EXISTS(SELECT 1 FROM tool_outputs WHERE session_id=?1 AND output_id=?2)",params![id.as_str(),output],|r|r.get(0)).map_err(sql)?;
+            if !exists {return Err(sql("unknown or expired tool output"));}
+            let mut stmt=c.prepare("SELECT offset,content FROM tool_outputs WHERE session_id=?1 AND output_id=?2 AND offset<?3 AND offset+length(content)>?4 ORDER BY offset").map_err(sql)?;
+            let rows=stmt.query_map(params![id.as_str(),output,end,offset],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Vec<u8>>(1)?))).map_err(sql)?;
+            let mut result=Vec::new();
+            for row in rows {let (start,chunk)=row.map_err(sql)?;let from=(offset-start).max(0) as usize;let to=((end-start).max(0) as usize).min(chunk.len());result.extend_from_slice(&chunk[from..to]);}
+            Ok(result)
+        }))
+    }
+    fn cleanup_outputs<'a>(
+        &'a self,
+        id: &'a SessionId,
+        older_than_ms: i64,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        let id = id.clone();
+        Box::pin(self.run(move |c| {
+            c.execute("DELETE FROM tool_outputs WHERE session_id=?1 AND output_id IN (SELECT output_id FROM tool_outputs WHERE session_id=?1 GROUP BY output_id HAVING MAX(created_at)<?2)",params![id.as_str(),older_than_ms]).map_err(sql)?;
+            Ok(())
+        }))
+    }
+
     fn read_tasks(&self, id: &SessionId) -> Result<Vec<Task>, YourAiError> {
         self.with(|c| {
             let mut stmt = c.prepare("SELECT task_id,subject,description,owner,completed,seq FROM tasks WHERE session_id=?1 ORDER BY seq,task_id").map_err(sql)?;
@@ -337,7 +509,7 @@ impl SessionStore for SqliteStore {
     }
     fn save_tasks(&self, id: &SessionId, tasks: Vec<Task>) -> Result<Vec<Task>, YourAiError> {
         self.with(|c| {
-            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+            let tx = c;
             let mut saved = Vec::with_capacity(tasks.len());
             for mut task in tasks {
                 let seq = i64::try_from(task.seq).map_err(sql)?;
@@ -359,7 +531,7 @@ impl SessionStore for SqliteStore {
                 ).map_err(sql)?;
                 saved.push(task);
             }
-            tx.commit().map_err(sql)?;
+
             Ok(saved)
         })
     }
@@ -372,10 +544,10 @@ impl SessionStore for SqliteStore {
         let id = id.clone();
         let system = system.to_owned();
         Box::pin(self.run(move |c| {
-            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+            let tx = c;
             tx.execute("UPDATE sessions SET system_prompt=?2 WHERE session_id=?1 AND system_prompt IS NULL", params![id.as_str(),system]).map_err(sql)?;
             let saved = tx.query_row("SELECT system_prompt FROM sessions WHERE session_id=?1", [id.as_str()], |r| r.get(0)).map_err(sql)?;
-            tx.commit().map_err(sql)?; Ok(saved)
+             Ok(saved)
         }))
     }
 
@@ -415,29 +587,10 @@ impl SessionStore for SqliteStore {
     }
     fn delete_session<'a>(&'a self, id: &'a SessionId) -> BoxFuture<'a, Result<(), YourAiError>> {
         let id = id.clone();
-        let directory = self
-            .session_root
-            .as_ref()
-            .map(|root| root.join(id.as_str()));
         Box::pin(self.run(move |c| {
-            if id.as_str().is_empty()
-                || !id
-                    .as_str()
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-            {
-                return Err(sql("invalid session id"));
-            }
-            // The worker retains ownership through SQL and directory cleanup, even if its waiter leaves.
-            let _lease = directory
-                .as_ref()
-                .map(|dir| yourai_core::runtime::SessionLease::acquire(dir.clone()))
-                .transpose()?;
-            c.execute("DELETE FROM sessions WHERE session_id=?1", [id.as_str()])
-                .map_err(sql)?;
-            if let Some(dir) = directory {
-                std::fs::remove_dir_all(dir).map_err(sql)?;
-            }
+            let active: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM session_owners WHERE session_id=?1 AND expires_at>?2)", params![id.as_str(), now()], |r|r.get(0)).map_err(sql)?;
+            if active { return Err(sql("session is running; close it before deletion")); }
+            c.execute("DELETE FROM sessions WHERE session_id=?1", [id.as_str()]).map_err(sql)?;
             Ok(())
         }))
     }
@@ -447,14 +600,17 @@ impl SessionStore for SqliteStore {
     ) -> BoxFuture<'a, Result<SessionId, YourAiError>> {
         let id = id.clone();
         Box::pin(self.run(move |c| {
-            let tx=c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+            let tx = c;
             let child=SessionId::new();
             let n=tx.execute("INSERT INTO sessions(session_id,parent_session_id,title,model,provider,created_at,updated_at,system_prompt) SELECT ?2,session_id,title,model,provider,?3,?3,system_prompt FROM sessions WHERE session_id=?1",params![id.as_str(),child.as_str(),now()]).map_err(sql)?;
             if n==0 { return Err(sql("unknown parent session")); }
             tx.execute("INSERT INTO messages SELECT lower(hex(randomblob(16))),?2,seq,kind,role,content_json,format_version,tool_call_id,token_count,status,created_at,tool_output_pruned_at FROM messages WHERE session_id=?1",params![id.as_str(),child.as_str()]).map_err(sql)?;
+            // Copied messages retain their output IDs; copy their session-local
+            // original bytes atomically so retrieval also works in the fork.
+            tx.execute("INSERT INTO tool_outputs(session_id,output_id,offset,content,created_at) SELECT ?2,output_id,offset,content,created_at FROM tool_outputs WHERE session_id=?1",params![id.as_str(),child.as_str()]).map_err(sql)?;
             // Forked admissions use the same new identity as their copied message.
             tx.execute("UPDATE messages SET content_json=json_set(content_json,'$.yourai_input.UserText.id',message_id) WHERE session_id=?1 AND json_type(content_json,'$.yourai_input.UserText')='object'",[child.as_str()]).map_err(sql)?;
-            tx.commit().map_err(sql)?; Ok(child)
+             Ok(child)
         }))
     }
     fn read_messages<'a>(
@@ -478,17 +634,15 @@ impl SessionStore for SqliteStore {
     ) -> BoxFuture<'a, Result<Vec<StoredMessage>, YourAiError>> {
         let id = id.clone();
         Box::pin(self.run(move |c| {
-            let tx = c
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql)?;
+            let tx = c;
             let mut result = vec![];
             for m in messages {
                 if m.summary || m.status != MessageStatus::Active {
                     return Err(sql("append accepts active ordinary messages only"));
                 }
-                result.push(insert(&tx, &id, m)?);
+                result.push(insert(tx, &id, m)?);
             }
-            tx.commit().map_err(sql)?;
+
             Ok(result)
         }))
     }
@@ -500,72 +654,86 @@ impl SessionStore for SqliteStore {
         progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
     ) -> BoxFuture<'a, Result<(), YourAiError>> {
         let id = id.clone();
-        Box::pin(self.run(move |c| {
-            progress.store(
-                CommitStatus::Started as u8,
-                std::sync::atomic::Ordering::Release,
-            );
-            let tx = c
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql)?;
-            tx.execute(
-                "UPDATE sessions SET updated_at=?2 WHERE session_id=?1",
-                params![id.as_str(), now()],
-            )
-            .map_err(sql)?;
-            if !summary.summary || summary.status != MessageStatus::Active || sources.is_empty() {
-                return Err(sql("invalid compaction candidate"));
-            }
-            let unique: std::collections::HashSet<_> = sources.iter().collect();
-            if unique.len() != sources.len() {
-                return Err(sql("duplicate compaction source"));
-            }
-            // A completed retry is accepted only for the same summary identity/content and compacted sources.
-            let existing: Option<(String, String, String)> = tx
-                .query_row(
-                    "SELECT session_id,content_json,kind FROM messages WHERE message_id=?1",
-                    [&summary.id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()
-                .map_err(sql)?;
-            let retry = existing.is_some();
-            if let Some((sid, raw, kind)) = existing {
-                if sid != id.as_str() || kind != "summary" || raw != stored_json(&summary)? {
-                    return Err(sql("summary identity conflict"));
-                }
-            }
-            for source in &sources {
-                let status: Option<String> = tx
-                    .query_row(
-                        "SELECT status FROM messages WHERE session_id=?1 AND message_id=?2",
-                        params![id.as_str(), source],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(sql)?;
-                let expected = if retry { "compacted" } else { "active" };
-                if status.as_deref() != Some(expected) {
-                    return Err(sql("stale compaction source"));
-                }
-            }
-            if !retry {
-                for source in &sources {
+        let db = self.clone();
+        Box::pin(async move {
+            let guard = db.gate.clone().lock_owned().await;
+            tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                let result = db.with(|c| {
+                    progress.store(
+                        CommitStatus::Started as u8,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    let tx = c;
                     tx.execute(
-                        "UPDATE messages SET status='compacted' WHERE message_id=?1",
-                        [source],
+                        "UPDATE sessions SET updated_at=?2 WHERE session_id=?1",
+                        params![id.as_str(), now()],
                     )
                     .map_err(sql)?;
+                    if !summary.summary
+                        || summary.status != MessageStatus::Active
+                        || sources.is_empty()
+                    {
+                        return Err(sql("invalid compaction candidate"));
+                    }
+                    let unique: std::collections::HashSet<_> = sources.iter().collect();
+                    if unique.len() != sources.len() {
+                        return Err(sql("duplicate compaction source"));
+                    }
+                    // A completed retry is accepted only for the same summary identity/content and compacted sources.
+                    let existing: Option<(String, String, String)> = tx
+                        .query_row(
+                            "SELECT session_id,content_json,kind FROM messages WHERE message_id=?1",
+                            [&summary.id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .optional()
+                        .map_err(sql)?;
+                    let retry = existing.is_some();
+                    if let Some((sid, raw, kind)) = existing {
+                        if sid != id.as_str() || kind != "summary" || raw != stored_json(&summary)?
+                        {
+                            return Err(sql("summary identity conflict"));
+                        }
+                    }
+                    for source in &sources {
+                        let status: Option<String> = tx
+                            .query_row(
+                                "SELECT status FROM messages WHERE session_id=?1 AND message_id=?2",
+                                params![id.as_str(), source],
+                                |r| r.get(0),
+                            )
+                            .optional()
+                            .map_err(sql)?;
+                        let expected = if retry { "compacted" } else { "active" };
+                        if status.as_deref() != Some(expected) {
+                            return Err(sql("stale compaction source"));
+                        }
+                    }
+                    if !retry {
+                        for source in &sources {
+                            tx.execute(
+                                "UPDATE messages SET status='compacted' WHERE message_id=?1",
+                                [source],
+                            )
+                            .map_err(sql)?;
+                        }
+                        insert(tx, &id, summary)?;
+                    }
+
+                    Ok(())
+                });
+                if result.is_ok() {
+                    progress.store(
+                        CommitStatus::Committed as u8,
+                        std::sync::atomic::Ordering::Release,
+                    );
                 }
-                insert(&tx, &id, summary)?;
-            }
-            tx.commit().map_err(sql)?;
-            progress.store(
-                CommitStatus::Committed as u8,
-                std::sync::atomic::Ordering::Release,
-            );
-            Ok(())
-        }))
+                result
+            })
+            .await
+            .map_err(sql)?
+        })
     }
 }
 
@@ -597,14 +765,13 @@ pub fn import_json_sessions(root: &Path) -> Result<usize, YourAiError> {
         if !dir.is_dir() || !dir.join("meta.json").exists() {
             continue;
         }
+        // Honor locks held by old binaries without creating new state files.
         for name in ["host.lock", "history.lock"] {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(dir.join(name))
-                .map_err(sql)?;
+            let path = dir.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let file = std::fs::File::open(path).map_err(sql)?;
             file.try_lock_exclusive()
                 .map_err(|e| sql(format!("close the session before importing: {e}")))?;
             guards.push(file);
@@ -631,18 +798,18 @@ pub fn import_json_sessions(root: &Path) -> Result<usize, YourAiError> {
     let count = sessions.len();
     let store = SqliteStore::open(&SqliteStore::path(root))?;
     store.with(move |c| {
-        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        let tx = c;
         for (meta,history) in sessions {
             let id=SessionId::from(meta.id);
             tx.execute("INSERT INTO sessions(session_id,title,model,created_at,updated_at) VALUES(?1,?2,?3,?4,?5)",params![id.as_str(),meta.title,meta.model,meta.created.checked_mul(1000).ok_or_else(||sql("timestamp overflow"))?,meta.updated.checked_mul(1000).ok_or_else(||sql("timestamp overflow"))?]).map_err(sql)?;
             for (index,message) in history.messages.into_iter().enumerate() {
                 // Instructions are reloaded from host configuration, never imported as chat facts.
                 if message.role==ChatRole::System {continue;}
-                let row=insert(&tx,&id,StoredMessage::new(message))?;
+                let row=insert(tx,&id,StoredMessage::new(message))?;
                 if index<history.boundary {tx.execute("UPDATE messages SET status='compacted' WHERE message_id=?1",[row.id]).map_err(sql)?;}
             }
             if let Some(summary)=history.summary {
-                let mut row=StoredMessage::new(ChatMessage::user(format!("[Conversation summary; historical context]\n{summary}")));row.summary=true;insert(&tx,&id,row)?;
+                let mut row=StoredMessage::new(ChatMessage::user(format!("[Conversation summary; historical context]\n{summary}")));row.summary=true;insert(tx,&id,row)?;
             }
             for (index,u) in history.usage.into_iter().enumerate() {
                 let cv=|v:u64|i64::try_from(v).map_err(sql);
@@ -651,7 +818,7 @@ pub fn import_json_sessions(root: &Path) -> Result<usize, YourAiError> {
             // Do not import usage.json as well: it aggregates the same calls.
             tx.execute("UPDATE sessions SET updated_at=?2 WHERE session_id=?1",params![id.as_str(),meta.updated*1000]).map_err(sql)?;
         }
-        tx.commit().map_err(sql)?;Ok(())
+        Ok(())
     })?;
     drop(guards);
     Ok(count)

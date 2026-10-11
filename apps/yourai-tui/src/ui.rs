@@ -126,10 +126,10 @@ pub async fn run(
     session::restore_history(&harness, &mut view).await?;
     let scroll_region: crate::terminal::SharedRegion = Arc::new(std::sync::Mutex::new(None));
     let mut screen = Screen::open(scroll_region.clone())?;
-    let context = harness.host.context();
+    let environment = harness.host.environment();
     let meta = Metadata {
-        session: context.id.as_str().to_owned(),
-        cwd: context.cwd.to_string_lossy().into(),
+        session: environment.id.as_str().to_owned(),
+        cwd: environment.cwd.to_string_lossy().into(),
         trusted_shell,
         yolo,
     };

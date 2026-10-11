@@ -4,12 +4,12 @@ use super::*;
 impl SessionManager {
     pub async fn open_owned(
         lease: SessionLease,
-        context: SessionContext,
+        environment: SessionEnvironment,
         agent: Arc<Agent>,
         config: SessionConfig,
         source: &str,
     ) -> Result<Arc<Self>, YourAiError> {
-        let (host, interrupted) = Self::run_open(lease, context, agent, config)?;
+        let (host, interrupted) = Self::run_open(lease, environment, agent, config)?;
         let source = source.to_owned();
         let cancel = CancellationToken::new();
         let _guard = cancel.clone().drop_guard();
@@ -44,25 +44,41 @@ impl SessionManager {
         self.reconcile_history().await?;
         self.persist().await?;
         self.attach_background();
-        let path = self.dir.join("config.json");
-        if path.exists() {
-            let mut value: serde_json::Value = read_json(&path)?;
-            // Older releases persisted an unsupported field. Preserve resume while
-            // rejecting the field in every new change_config request.
+        if let Some(state) = self.read_state("config")? {
+            let mut value = state.value;
             if value
                 .as_object_mut()
                 .is_some_and(|v| v.remove("system_prompt").is_some())
             {
-                atomic_write(&path, &value)?;
-                self.post_event_async(RuntimeEvent {
-                    id: uuid::Uuid::new_v4().to_string(), context: None,
-                    notice: Some("Removed unsupported system_prompt from legacy runtime settings; the session prompt remains frozen.".into()), wake: false,
-                }).await?;
+                self.save_state("config", value.clone())?;
+                self.post_event_async(RuntimeEvent {id:uuid::Uuid::new_v4().to_string(),context:None,notice:Some("Removed unsupported system_prompt from legacy runtime settings; the session prompt remains frozen.".into()),wake:false}).await?;
             }
             serde_json::from_value::<crate::workspace::RuntimeConfig>(value)
                 .map_err(|e| error("config", e))?
                 .apply(self);
         }
+        // Heartbeat renews database ownership; a lost lease cancels execution.
+        let weak = Arc::downgrade(self);
+        self.background
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    let Some(host) = weak.upgrade() else { break };
+                    if host.closing.is_cancelled() {
+                        break;
+                    }
+                    let renewed = host
+                        .blocking(|h| h.store().renew_session(SessionLease::TTL_MS))
+                        .await;
+                    if !matches!(renewed, Ok(Ok(()))) {
+                        host.closing.cancel();
+                        host.interrupt();
+                        break;
+                    }
+                }
+            }));
         if self.config.workspace_enabled || !self.config.instruction_paths.is_empty() {
             let workspace = self.workspace()?;
             workspace
@@ -118,7 +134,7 @@ impl SessionManager {
             self.close_warning(&cause);
         }
         if let Some(hooks) = self.agent.ctx().try_hooks() {
-            if let Err(cause) = hooks.shutdown_session(self.context().id.as_str()).await {
+            if let Err(cause) = hooks.shutdown_session(self.environment().id.as_str()).await {
                 self.close_warning(&cause);
             }
         }
@@ -144,7 +160,7 @@ impl SessionManager {
         let Some(hooks) = &snapshot.hooks else {
             return Ok(HookDispatchResult::empty(event.kind()));
         };
-        let c = self.context();
+        let c = self.environment();
         let mut base = BaseInput::new(c.id.as_str(), c.cwd.to_string_lossy());
         base.transcript_path = c
             .transcript_path
@@ -177,7 +193,7 @@ impl SessionManager {
                 let event = tokio::select! {_=cancel.cancelled()=>break,e=rx.recv()=>e};
                 let Some(host) = weak.upgrade() else { break };
                 match event {
-                    Ok(e) if e.session_id == host.context().id.as_str() => {
+                    Ok(e) if e.session_id == host.environment().id.as_str() => {
                         let wake = e.rewake && e.exit_code == 2;
                         let text = if e.stderr.is_empty() {
                             e.stdout
@@ -306,7 +322,7 @@ impl SessionManager {
             warning
         };
         if let Some(hooks) = self.agent.ctx().try_hooks() {
-            if let Err(cause) = hooks.shutdown_session(self.context().id.as_str()).await {
+            if let Err(cause) = hooks.shutdown_session(self.environment().id.as_str()).await {
                 warning = Some(
                     [warning.unwrap_or_default(), cause.to_string()]
                         .into_iter()

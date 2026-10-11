@@ -5,7 +5,7 @@ use yourai_core::prelude::*;
 use yourai_harness::{Harness, HarnessConfig};
 
 pub(in crate::ui) async fn restore_history(h: &Harness, v: &mut View) -> Result<(), YourAiError> {
-    let id = h.host.context().id;
+    let id = h.host.environment().id;
     let mut after = 0;
     loop {
         let page = h
@@ -46,7 +46,7 @@ pub(in crate::ui) async fn restore_history(h: &Harness, v: &mut View) -> Result<
 /// One title policy for startup and live sessions. Only committed user messages
 /// are candidates; a failed write leaves the caller free to retry next poll.
 pub(super) async fn restore_title(h: &Harness) -> Result<Option<String>, YourAiError> {
-    let id = h.host.context().id;
+    let id = h.host.environment().id;
     let mut meta = h.sessions.load_session(&id).await?;
     if let Some(title) = meta
         .title
@@ -251,7 +251,7 @@ mod switch_tests {
         view.model.label = selected.label;
         assert_eq!(h.host.context_usage().unwrap().output_reserve, 2048);
         let (_resume, resume_model) =
-            prepare_session(&config, &hc, Some(h.host.context().id)).unwrap();
+            prepare_session(&config, &hc, Some(h.host.environment().id)).unwrap();
         assert_eq!(resume_model.token_budget().limits().context, Some(32000));
         // This differs from the default model's 4096, proving variant resolution.
         assert_eq!(resume_model.token_budget().max_output_tokens(), 2048);

@@ -18,7 +18,7 @@ impl Workspace {
             let history = host.agent().ctx().context_manager()?;
             let prefix = format!("[Instructions: {}]\n", path.display());
             let note = format!("{prefix}{content}");
-            let indexed = host.context().instructions.get(&path) == Some(&content);
+            let indexed = host.environment().instructions.get(&path) == Some(&content);
             // Only the latest value for this path is current. A historical A
             // must not suppress a real B -> A update; it can suppress a retry
             // whose append succeeded before the in-memory index was published.
@@ -40,7 +40,7 @@ impl Workspace {
                 row.context_key = Some(format!("instructions:{}", path.display()));
                 history.append(vec![row]).await?;
             }
-            host.context
+            host.environment
                 .lock()
                 .unwrap()
                 .instructions
@@ -79,7 +79,7 @@ impl Workspace {
             let _gate = gate;
             let _activity = activity;
             let _write = host.resource_lock()?;
-            atomic_write(&host.dir.join("config.json"), &value)?;
+            host.save_state("config", value)?;
             config.apply(&host);
             Ok(())
         })
@@ -98,7 +98,7 @@ impl Workspace {
             let operation_gate = gate;
             let operation_activity = activity;
             host.ensure_open()?;
-            let cwd = host.context().cwd;
+            let cwd = host.environment().cwd;
             let repository = common_dir(&cwd).await?;
             let path = if let Some(path) = custom {
                 let path = PathBuf::from(path).canonicalize().map_err(|e| error("workspace", e))?;
@@ -128,7 +128,7 @@ impl Workspace {
                 next.insert(name, WorktreeRegistration::Known {
                     path: path.clone(), repository,
                 });
-                atomic_write(&host.dir.join("worktrees.json"), &next)
+                host.save_state("worktrees", serde_json::to_value(&next).map_err(|e|error("workspace",e))?)
                     .map_err(|e| error("workspace", format!("git worktree exists at {}; registration was not confirmed: {e}; verify before retrying", path.display())))?;
                 *map = next;
                 Ok(path)
@@ -156,7 +156,7 @@ impl Workspace {
             } else {
                 // Older path-only registrations can still be repaired if the
                 // current repository confirms ownership of the missing path.
-                let repository = common_dir(&host.context().cwd).await?;
+                let repository = common_dir(&host.environment().cwd).await?;
                 if !registered_worktree(&repository, &path).await? {
                     return Err(error("workspace", "missing legacy worktree has no confirmed repository; restore its directory or repair its registration"));
                 }
@@ -172,7 +172,7 @@ impl Workspace {
                 let mut map = workspace.worktrees.lock().unwrap();
                 let mut next = map.clone();
                 next.remove(&name);
-                atomic_write(&host.dir.join("worktrees.json"), &next)
+                host.save_state("worktrees", serde_json::to_value(&next).map_err(|e|error("workspace",e))?)
                     .map_err(|e| error("workspace", format!("git worktree removed at {}; registration removal was not confirmed: {e}; verify before retrying", path.display())))?;
                 *map = next;
                 Ok(())

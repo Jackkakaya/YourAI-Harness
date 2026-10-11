@@ -1,3 +1,5 @@
+#[path = "support/storage.rs"]
+mod storage_fixture;
 use std::sync::Arc;
 use tempfile::TempDir;
 use yourai_core::prelude::*;
@@ -246,8 +248,11 @@ async fn schema_separates_request_diagnostics_from_history() {
         vec![
             "messages",
             "model_requests",
+            "session_owners",
+            "session_state",
             "sessions",
             "tasks",
+            "tool_outputs",
             "usage_events"
         ]
     );
@@ -411,7 +416,7 @@ async fn version_one_migrates_pruning_column_without_changing_original_messages(
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        5
+        6
     );
 }
 
@@ -546,7 +551,12 @@ async fn deletion_keeps_locked_session_and_history_intact() {
         .await
         .unwrap();
     let session_dir = dir.path().join(id.as_str());
-    let lease = yourai_core::runtime::SessionLease::acquire(session_dir.clone()).unwrap();
+    let lease = yourai_core::runtime::SessionLease::acquire(
+        session_dir.clone(),
+        &id,
+        Arc::new(store.clone()),
+    )
+    .unwrap();
     assert!(store.delete_session(&id).await.is_err());
     assert_eq!(
         store
@@ -557,9 +567,7 @@ async fn deletion_keeps_locked_session_and_history_intact() {
             .len(),
         1
     );
-    assert!(session_dir.exists());
     drop(lease);
     store.delete_session(&id).await.unwrap();
     assert!(store.load_session(&id).await.is_err());
-    assert!(!session_dir.exists());
 }

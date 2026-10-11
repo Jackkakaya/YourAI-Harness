@@ -69,6 +69,7 @@ impl AgentLoop for IdleLoop {
 }
 pub(crate) struct Fixture {
     pub host: Arc<SessionManager>,
+    pub store: Arc<Store>,
 }
 impl Fixture {
     pub async fn close(&self) -> Result<Vec<In>, YourAiError> {
@@ -86,11 +87,13 @@ pub(crate) async fn fixture_with_hooks(
         id: SessionId::new(),
         rows: Mutex::new(vec![]),
     });
-    let context = SessionContext::new(history.id.clone(), dir.path().to_path_buf());
+    let context = SessionEnvironment::new(history.id.clone(), dir.path().to_path_buf());
+    let store = Arc::new(Store::default());
     let mut builder = Agent::builder()
         .agent_loop(Arc::new(IdleLoop))
         .model(Arc::new(Model))
-        .context_manager(history);
+        .context_manager(history)
+        .session(store.clone());
     if let Some(hooks) = hooks {
         builder = builder.hooks(hooks);
     }
@@ -107,7 +110,7 @@ pub(crate) async fn fixture_with_hooks(
     )
     .await
     .unwrap();
-    (dir, Fixture { host })
+    (dir, Fixture { host, store })
 }
 
 #[derive(Default)]
@@ -160,5 +163,146 @@ impl HookManager for Hooks {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         })
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct Store {
+    states: Arc<Mutex<std::collections::HashMap<String, SessionState>>>,
+    owner: Arc<Mutex<Option<String>>>,
+    scope: Option<String>,
+    pub fail: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Store {
+    fn valid(&self) -> Result<(), YourAiError> {
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|s| self.owner.lock().unwrap().as_ref() != Some(s))
+        {
+            return Err(error("storage", "stale owner"));
+        }
+        Ok(())
+    }
+}
+impl SessionStore for Store {
+    fn claim_session(
+        &self,
+        _: &SessionId,
+        owner: &str,
+        _: u64,
+    ) -> Result<Arc<dyn SessionStore>, YourAiError> {
+        let mut current = self.owner.lock().unwrap();
+        if current.is_some() {
+            return Err(error("storage", "already owned"));
+        }
+        *current = Some(owner.into());
+        let mut next = self.clone();
+        next.scope = Some(owner.into());
+        Ok(Arc::new(next))
+    }
+    fn renew_session(&self, _: u64) -> Result<(), YourAiError> {
+        self.valid()
+    }
+    fn release_session(&self) -> Result<(), YourAiError> {
+        let mut owner = self.owner.lock().unwrap();
+        if owner.as_ref() == self.scope.as_ref() {
+            *owner = None;
+        }
+        Ok(())
+    }
+    fn read_state(&self, _: &SessionId, key: &str) -> Result<Option<SessionState>, YourAiError> {
+        self.valid()?;
+        Ok(self.states.lock().unwrap().get(key).cloned())
+    }
+    fn save_state(
+        &self,
+        _: &SessionId,
+        key: &str,
+        expected: Option<i64>,
+        value: serde_json::Value,
+    ) -> Result<i64, YourAiError> {
+        self.valid()?;
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(error("storage", "injected write failure"));
+        }
+        let mut states = self.states.lock().unwrap();
+        if states.get(key).map(|s| s.revision) != expected {
+            return Err(error("storage", "stale state"));
+        }
+        let revision = expected.unwrap_or(0) + 1;
+        states.insert(key.into(), SessionState { revision, value });
+        Ok(revision)
+    }
+    fn read_tasks(&self, _id: &SessionId) -> Result<Vec<crate::tasks::Task>, YourAiError> {
+        panic!("unused persistence in runtime fixture")
+    }
+    fn save_tasks(
+        &self,
+        _id: &SessionId,
+        _tasks: Vec<crate::tasks::Task>,
+    ) -> Result<Vec<crate::tasks::Task>, YourAiError> {
+        panic!("unused persistence in runtime fixture")
+    }
+    fn initialize_system<'a>(
+        &'a self,
+        _id: &'a SessionId,
+        _system: &'a str,
+    ) -> BoxFuture<'a, Result<String, YourAiError>> {
+        panic!("unused persistence in runtime fixture")
+    }
+    fn read_messages<'a>(
+        &'a self,
+        _id: &'a SessionId,
+        _query: MessageQuery,
+    ) -> BoxFuture<'a, Result<MessagePage, YourAiError>> {
+        panic!("unused persistence in runtime fixture")
+    }
+    fn append_messages<'a>(
+        &'a self,
+        _id: &'a SessionId,
+        _messages: Vec<StoredMessage>,
+    ) -> BoxFuture<'a, Result<Vec<StoredMessage>, YourAiError>> {
+        panic!("unused persistence in runtime fixture")
+    }
+    fn save_summary<'a>(
+        &'a self,
+        _id: &'a SessionId,
+        _sources: Vec<String>,
+        _summary: StoredMessage,
+        _progress: Arc<std::sync::atomic::AtomicU8>,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        panic!("unused persistence in runtime fixture")
+    }
+    fn create_session<'a>(
+        &'a self,
+        _id: SessionId,
+        _system: &'a str,
+    ) -> BoxFuture<'a, Result<SessionMeta, YourAiError>> {
+        panic!("unused persistence in runtime fixture")
+    }
+    fn load_session<'a>(
+        &'a self,
+        _id: &'a SessionId,
+    ) -> BoxFuture<'a, Result<SessionMeta, YourAiError>> {
+        panic!("unused persistence in runtime fixture")
+    }
+    fn save_session<'a>(
+        &'a self,
+        _session: &'a SessionMeta,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        panic!("unused persistence in runtime fixture")
+    }
+    fn list_sessions<'a>(&'a self) -> BoxFuture<'a, Result<Vec<SessionMeta>, YourAiError>> {
+        panic!("unused persistence in runtime fixture")
+    }
+    fn delete_session<'a>(&'a self, _id: &'a SessionId) -> BoxFuture<'a, Result<(), YourAiError>> {
+        panic!("unused persistence in runtime fixture")
+    }
+    fn fork_session<'a>(
+        &'a self,
+        _id: &'a SessionId,
+    ) -> BoxFuture<'a, Result<SessionId, YourAiError>> {
+        panic!("unused persistence in runtime fixture")
     }
 }

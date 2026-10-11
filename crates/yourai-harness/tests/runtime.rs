@@ -1,5 +1,7 @@
 #[path = "support/context.rs"]
 mod context_fixture;
+#[path = "support/storage.rs"]
+mod storage_fixture;
 use context_fixture::DefaultContext;
 use context_fixture::TestModel;
 #[path = "support/loop.rs"]
@@ -78,7 +80,7 @@ async fn host(
     }
     SessionManager::open(
         dir,
-        SessionContext::new(id, dir),
+        SessionEnvironment::new(id, dir),
         b.build(),
         SessionConfig::default(),
         "startup",
@@ -244,7 +246,7 @@ async fn startup_instructions_configuration_and_notifications_are_real_operation
     let child = dir.path().join("cwd");
     std::fs::create_dir(&child).unwrap();
     ws.change_cwd(&child).await.unwrap();
-    assert_eq!(h.context().cwd, child.canonicalize().unwrap());
+    assert_eq!(h.environment().cwd, child.canonicalize().unwrap());
     h.submit(In::user_text("go")).unwrap();
     h.run_next(
         TurnLimits::default(),
@@ -390,7 +392,7 @@ async fn invalid_legacy_task_file_leaves_no_partial_import() {
         .ctx()
         .session()
         .unwrap()
-        .read_tasks(&h.context().id)
+        .read_tasks(&h.environment().id)
         .unwrap()
         .is_empty());
     h.close(None).await.unwrap();
@@ -415,7 +417,7 @@ async fn blocked_task_create_leaves_no_row_and_releases_the_transition_lock() {
         .ctx()
         .session()
         .unwrap()
-        .read_tasks(&h.context().id)
+        .read_tasks(&h.environment().id)
         .unwrap()
         .is_empty());
     denied.store(false, Ordering::SeqCst);
@@ -444,10 +446,9 @@ async fn invalid_task_hook_or_failed_effect_storage_prevents_task_save() {
         }));
         let h = host(dir.path(), Arc::new(Model::new(vec![])), Some(hooks)).await;
         let manager = h.task_manager("team").unwrap();
-        let journal = h.directory().join("host.json");
+        let journal = dir.path().join("sessions.sqlite3");
         if !invalid {
-            std::fs::remove_file(&journal).unwrap();
-            std::fs::create_dir(&journal).unwrap();
+            storage_fixture::failure(&journal, "runtime", true);
         }
         assert!(manager.create("subject".into(), None, None).await.is_err());
         assert!(manager.list().is_empty());
@@ -457,11 +458,11 @@ async fn invalid_task_hook_or_failed_effect_storage_prevents_task_save() {
             .ctx()
             .session()
             .unwrap()
-            .read_tasks(&h.context().id)
+            .read_tasks(&h.environment().id)
             .unwrap()
             .is_empty());
         if !invalid {
-            std::fs::remove_dir(journal).unwrap();
+            storage_fixture::failure(&journal, "runtime", false);
         }
         h.close(None).await.unwrap();
     }
@@ -491,7 +492,7 @@ async fn concurrent_task_creates_have_unique_sequences_and_no_lost_rows() {
             .ctx()
             .session()
             .unwrap()
-            .read_tasks(&h.context().id)
+            .read_tasks(&h.environment().id)
             .unwrap(),
         manager.list()
     );
@@ -549,7 +550,7 @@ async fn dropping_task_save_waiter_still_finishes_commit_and_cache_publication()
         .ctx()
         .session()
         .unwrap()
-        .read_tasks(&h.context().id)
+        .read_tasks(&h.environment().id)
         .unwrap();
     assert_eq!(rows, manager.list());
     assert_eq!(rows[0].subject, "durable");
@@ -633,7 +634,7 @@ async fn close_during_task_hook_prevents_a_late_write_by_the_old_host() {
         .ctx()
         .session()
         .unwrap()
-        .read_tasks(&reopened.context().id)
+        .read_tasks(&reopened.environment().id)
         .unwrap();
     assert_eq!(rows[0].subject, "new owner");
     assert_eq!(rows.len(), 1);
@@ -1070,9 +1071,9 @@ async fn concurrent_close_runs_session_end_once_and_releases_history_lock() {
 }
 #[tokio::test]
 async fn permission_updates_are_atomic_persistent_and_cannot_expand_scope() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("permissions.json");
-    let policy = PolicySecurity::open(path.clone(), vec!["danger".into()]).unwrap();
+    let (db, policy_id) = storage_fixture::store().await;
+    let policy =
+        PolicySecurity::open(db.clone(), policy_id.clone(), vec!["danger".into()]).unwrap();
     let grant = json!({"type":"addRules","destination":"session","behavior":"allow","rules":[{"toolName":"safe"},{"toolName":"danger"}]});
     policy.update_permissions(&[grant]).await.unwrap();
     let context = |name: &str| SecurityContext {
@@ -1088,7 +1089,7 @@ async fn permission_updates_are_atomic_persistent_and_cannot_expand_scope() {
     let invalid =
         json!({"type":"replaceRules","destination":"userSettings","behavior":"allow","rules":[]});
     assert!(policy.update_permissions(&[invalid]).await.is_err());
-    let policy = PolicySecurity::open(path, vec![]).unwrap();
+    let policy = PolicySecurity::open(db.clone(), policy_id.clone(), vec![]).unwrap();
     assert!(matches!(
         policy.check_tool_call(&context("safe")).await.unwrap(),
         ApprovalDecision::Allow
@@ -1103,9 +1104,9 @@ async fn permission_updates_are_atomic_persistent_and_cannot_expand_scope() {
 
 #[tokio::test]
 async fn remembered_approvals_are_ephemeral_and_explicit_denies_still_win() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("permissions.json");
-    let policy = PolicySecurity::open(path.clone(), vec!["danger".into()]).unwrap();
+    let (db, policy_id) = storage_fixture::store().await;
+    let policy =
+        PolicySecurity::open(db.clone(), policy_id.clone(), vec!["danger".into()]).unwrap();
     let context = |name: &str| SecurityContext {
         action: name.into(),
         input: json!({}),
@@ -1118,17 +1119,22 @@ async fn remembered_approvals_are_ephemeral_and_explicit_denies_still_win() {
         policy.check_tool_call(&context("safe")).await.unwrap(),
         ApprovalDecision::Allow
     );
-    assert!(!path.exists());
+    assert!(db.read_state(&policy_id, "permissions").unwrap().is_none());
     policy
         .update_permissions(&[
             json!({"type":"addRules","behavior":"allow","rules":[{"toolName":"other"}]}),
         ])
         .await
         .unwrap();
-    let saved = std::fs::read_to_string(&path).unwrap();
+    let saved = db
+        .read_state(&policy_id, "permissions")
+        .unwrap()
+        .unwrap()
+        .value
+        .to_string();
     assert!(!saved.contains("safe"));
     assert!(!saved.contains("session_allow"));
-    let reopened = PolicySecurity::open(path, vec![]).unwrap();
+    let reopened = PolicySecurity::open(db.clone(), policy_id.clone(), vec![]).unwrap();
     assert_eq!(
         reopened.check_tool_call(&context("safe")).await.unwrap(),
         ApprovalDecision::Ask
@@ -1173,7 +1179,7 @@ async fn harness_runs_real_task_tool_through_loop_and_restores_session() {
     let frozen = SessionCatalog::new(dir.path().join("sessions"))
         .unwrap()
         .store
-        .load_session(&harness.host.context().id)
+        .load_session(&harness.host.environment().id)
         .await
         .unwrap()
         .system_prompt
@@ -1200,7 +1206,7 @@ async fn harness_runs_real_task_tool_through_loop_and_restores_session() {
     assert_eq!(harness.tasks.as_ref().unwrap().list().len(), 1);
     assert_eq!(harness.budget.snapshot().calls, 2);
     assert_eq!(harness.usage.total().await.unwrap().total_tokens, 6);
-    let id = harness.host.context().id;
+    let id = harness.host.environment().id;
     harness.close().await.unwrap();
     let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
     config.resume = Some(id);
@@ -1492,7 +1498,7 @@ async fn basic_harness_has_todos_without_optional_extensions() {
     let session = dir
         .path()
         .join("sessions")
-        .join(h.host.context().id.as_str());
+        .join(h.host.environment().id.as_str());
     assert!(
         !session.join("memory.json").exists()
             && !session.join("skills.json").exists()
@@ -1537,6 +1543,7 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
     let old_hooks = Arc::new(Hooks::new(|_, _| {}));
     let new_hooks = Arc::new(Hooks::new(|_, _| {}));
     let agent = Agent::builder()
+        .session(store.clone())
         .model(context_fixture::configured(old.clone(), Some(32_000), 4096))
         .context_manager(history.inner.clone())
         .hooks(old_hooks.clone())
@@ -1546,7 +1553,7 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
         .build();
     let h = SessionManager::open(
         dir.path(),
-        SessionContext::new(id.clone(), dir.path()),
+        SessionEnvironment::new(id.clone(), dir.path()),
         agent.clone(),
         SessionConfig::default(),
         "startup",
@@ -1766,7 +1773,7 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
     assert_eq!(usage.output_reserve, 2048);
     assert_eq!(
         h.sessions
-            .load_session(&h.host.context().id)
+            .load_session(&h.host.environment().id)
             .await
             .unwrap()
             .model
@@ -2020,7 +2027,7 @@ async fn host_rejects_matching_event_with_wrong_hook_outcome() {
         .build();
     let result = SessionManager::open(
         dir.path(),
-        SessionContext::new(id, dir.path()),
+        SessionEnvironment::new(id, dir.path()),
         agent,
         SessionConfig::default(),
         "startup",
@@ -2132,7 +2139,7 @@ async fn subagent_hook_identity_matches_persisted_session_and_continues_same_chi
     assert_eq!(*ids.lock().unwrap(), vec![id, id, id]);
     let store = SqliteStore::open(&SqliteStore::path(&dir.path().join("children"))).unwrap();
     let child = store.load_session(&SessionId::from(id)).await.unwrap();
-    assert_eq!(child.parent_session_id, Some(h.context().id));
+    assert_eq!(child.parent_session_id, Some(h.environment().id));
     assert!(h.child_ids().is_empty());
     h.close(None).await.unwrap();
 }
@@ -2239,9 +2246,14 @@ impl HookManager for LifecycleHooks {
         })
     }
 }
-fn startup_agent(id: SessionId, hooks: Arc<dyn HookManager>) -> Arc<Agent> {
+fn startup_agent(
+    id: SessionId,
+    store: Arc<dyn SessionStore>,
+    hooks: Arc<dyn HookManager>,
+) -> Arc<Agent> {
     Agent::builder()
         .context_manager(yourai_harness::DefaultContext::memory(id))
+        .session(store)
         .hooks(hooks)
         .build()
 }
@@ -2252,11 +2264,11 @@ async fn failed_startup_reclaims_hook_resources_and_releases_the_lease() {
         fail_start: true,
         ..Default::default()
     });
-    let id = SessionId::new();
+    let (store, id) = storage_fixture::store().await;
     let result = SessionManager::open(
         dir.path(),
-        SessionContext::new(id.clone(), dir.path()),
-        startup_agent(id, hooks.clone()),
+        SessionEnvironment::new(id.clone(), dir.path()),
+        startup_agent(id.clone(), store.clone(), hooks.clone()),
         SessionConfig::default(),
         "startup",
     )
@@ -2264,7 +2276,7 @@ async fn failed_startup_reclaims_hook_resources_and_releases_the_lease() {
     assert!(result.is_err());
     assert_eq!(hooks.shutdowns.load(Ordering::SeqCst), 1);
     assert_eq!(hooks.ends.load(Ordering::SeqCst), 0);
-    assert!(SessionLease::acquire(dir.path().into()).is_ok());
+    assert!(SessionLease::acquire(dir.path().into(), &id, store.clone()).is_ok());
 }
 #[tokio::test]
 async fn abandoned_startup_keeps_an_owner_until_cleanup_finishes() {
@@ -2273,11 +2285,11 @@ async fn abandoned_startup_keeps_an_owner_until_cleanup_finishes() {
         pause_start: true,
         ..Default::default()
     });
-    let id = SessionId::new();
+    let (store, id) = storage_fixture::store().await;
     let mut opening = Box::pin(SessionManager::open(
         dir.path(),
-        SessionContext::new(id.clone(), dir.path()),
-        startup_agent(id, hooks.clone()),
+        SessionEnvironment::new(id.clone(), dir.path()),
+        startup_agent(id.clone(), store.clone(), hooks.clone()),
         SessionConfig::default(),
         "startup",
     ));
@@ -2288,7 +2300,7 @@ async fn abandoned_startup_keeps_an_owner_until_cleanup_finishes() {
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if SessionLease::acquire(dir.path().into()).is_ok() {
+            if SessionLease::acquire(dir.path().into(), &id, store.clone()).is_ok() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2317,7 +2329,7 @@ async fn hook_shutdown_failure_cannot_swallow_inputs_or_keep_the_lease() {
     assert!(h.last_error().unwrap().contains("hook shutdown failed"));
     assert!(h.close(None).await.unwrap().is_empty());
     assert_eq!(hooks.ends.load(Ordering::SeqCst), 1);
-    assert!(SessionLease::acquire(dir.path().into()).is_ok());
+    assert!(SessionLease::acquire(dir.path().into(), &h.environment().id, h.store()).is_ok());
 }
 #[tokio::test]
 async fn retrying_close_after_journal_failure_does_not_repeat_confirmed_session_end() {
@@ -2330,12 +2342,11 @@ async fn retrying_close_after_journal_failure_does_not_repeat_confirmed_session_
     )
     .await;
     h.submit(In::follow_up("handoff")).unwrap();
-    let journal = dir.path().join("host.json");
-    std::fs::remove_file(&journal).unwrap();
-    std::fs::create_dir(&journal).unwrap();
+    let journal = dir.path().join("sessions.sqlite3");
+    storage_fixture::failure(&journal, "runtime", true);
     assert!(h.close(None).await.is_err());
     assert_eq!(h.status(), SessionStatus::Closing);
-    std::fs::remove_dir(&journal).unwrap();
+    storage_fixture::failure(&journal, "runtime", false);
     assert_eq!(h.close(None).await.unwrap().len(), 1);
     assert_eq!(hooks.ends.load(Ordering::SeqCst), 1);
 }
@@ -2433,7 +2444,7 @@ async fn dropped_config_change_removes_its_candidate() {
     });
     hooks.0.notified().await;
     let candidate = dir.path().join("config.candidate.json");
-    assert!(candidate.exists());
+    assert!(!candidate.exists());
     worker.abort();
     assert!(worker.await.unwrap_err().is_cancelled());
     assert!(!candidate.exists());
@@ -2471,26 +2482,25 @@ async fn worktree_registration_failures_report_effects_and_retries_adopt_them() 
     let h = host(dir.path(), Arc::new(Model::new(vec![])), None).await;
     let workspace = h.workspace().unwrap();
     workspace.change_cwd(repo.path()).await.unwrap();
-    let registration = dir.path().join("worktrees.json");
-    std::fs::create_dir(&registration).unwrap();
+    let registration = dir.path().join("sessions.sqlite3");
+    storage_fixture::failure(&registration, "worktrees", true);
     let failure = workspace.create_worktree("retry").await.unwrap_err();
     assert!(failure.to_string().contains("git worktree exists at"));
     let path = dir.path().join("worktrees/retry");
     assert!(path.join(".git").is_file());
-    std::fs::remove_dir(&registration).unwrap();
+    storage_fixture::failure(&registration, "worktrees", false);
     assert_eq!(
         workspace.create_worktree("retry").await.unwrap(),
         path.canonicalize().unwrap()
     );
-    std::fs::remove_file(&registration).unwrap();
-    std::fs::create_dir(&registration).unwrap();
+    storage_fixture::failure(&registration, "worktrees", true);
     let failure = workspace.remove_worktree("retry").await.unwrap_err();
     assert!(failure.to_string().contains("git worktree removed at"));
     assert!(!path.exists());
-    std::fs::remove_dir(&registration).unwrap();
+    storage_fixture::failure(&registration, "worktrees", false);
     workspace.remove_worktree("retry").await.unwrap();
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&std::fs::read(registration).unwrap()).unwrap(),
+        storage_fixture::state(&registration, &h.environment().id, "worktrees"),
         json!({})
     );
     h.close(None).await.unwrap();
@@ -2623,9 +2633,12 @@ async fn file_changed_hook_failure_is_visible_and_does_not_lose_the_fact() {
     std::fs::write(&path, "new contents").unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let journal: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(dir.path().join("host.json")).unwrap())
-                    .unwrap();
+            let journal: serde_json::Value = h
+                .store()
+                .read_state(&h.environment().id, "runtime")
+                .unwrap()
+                .unwrap()
+                .value;
             if journal["events"].as_array().unwrap().iter().any(|event| {
                 event["notice"]
                     .as_str()
@@ -2652,11 +2665,11 @@ async fn abandoned_completed_startup_also_reclaims_unpublished_resources() {
         pause_start: true,
         ..Default::default()
     });
-    let id = SessionId::new();
+    let (store, id) = storage_fixture::store().await;
     let mut opening = Box::pin(SessionManager::open(
         dir.path(),
-        SessionContext::new(id.clone(), dir.path()),
-        startup_agent(id, hooks.clone()),
+        SessionEnvironment::new(id.clone(), dir.path()),
+        startup_agent(id.clone(), store.clone(), hooks.clone()),
         SessionConfig::default(),
         "startup",
     ));
@@ -2664,14 +2677,14 @@ async fn abandoned_completed_startup_also_reclaims_unpublished_resources() {
     hooks.start_release.notify_one();
     // Leave the completed result in its channel without polling the caller.
     tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(SessionLease::acquire(dir.path().into()).is_err());
+    assert!(SessionLease::acquire(dir.path().into(), &id, store.clone()).is_err());
     drop(opening);
     tokio::time::timeout(Duration::from_secs(2), hooks.cleaned.notified())
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if SessionLease::acquire(dir.path().into()).is_ok() {
+            if SessionLease::acquire(dir.path().into(), &id, store.clone()).is_ok() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -2683,11 +2696,16 @@ async fn abandoned_completed_startup_also_reclaims_unpublished_resources() {
 #[tokio::test]
 async fn legacy_runtime_prompt_setting_is_removed_without_changing_frozen_prompt() {
     let dir = TempDir::new().unwrap();
-    std::fs::write(
-        dir.path().join("config.json"),
-        r#"{"system_prompt":"ignored legacy value","memory_search_limit":7}"#,
-    )
-    .unwrap();
+    let store = SqliteStore::open(&dir.path().join("sessions.sqlite3")).unwrap();
+    let id = store.create_session(SessionId::new(), "").await.unwrap().id;
+    store
+        .save_state(
+            &id,
+            "config",
+            None,
+            json!({"system_prompt":"ignored legacy value","memory_search_limit":7}),
+        )
+        .unwrap();
     let h = host(dir.path(), Arc::new(Model::new(vec![])), None).await;
     let config = h.workspace().unwrap().config().unwrap();
     assert_eq!(config["memory_search_limit"], 7);
@@ -2773,14 +2791,20 @@ async fn host_with_suspended_restore(
 ) -> (Arc<SessionManager>, Arc<SuspendedRestore>, Arc<Model>) {
     let history = Arc::new(SuspendedRestore::default());
     let model = Arc::new(Model::new(vec![answer("done")]));
+    let store = Arc::new(SqliteStore::open(&dir.join("sessions.sqlite3")).unwrap());
+    store
+        .create_session(history.session_id().clone(), "")
+        .await
+        .unwrap();
     let agent = Agent::builder()
+        .session(store)
         .agent_loop(Arc::new(default_loop::DefaultLoop::default()))
         .model(model.clone())
         .context_manager(history.clone())
         .build();
     let host = SessionManager::open(
         dir,
-        SessionContext::new(history.session_id().clone(), dir),
+        SessionEnvironment::new(history.session_id().clone(), dir),
         agent,
         SessionConfig::default(),
         "startup",
