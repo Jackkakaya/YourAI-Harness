@@ -1,6 +1,6 @@
 # TUI screenshots
 
-These PNGs capture the actual `yourai-tui` terminal output at 120 × 38 cells, replayed through a VT emulator and rendered with a monospace font. They are not UI mockups.
+These PNGs capture the actual `yourai` terminal output at 120 × 38 cells, replayed through a VT emulator and rendered with a monospace font. They are not UI mockups.
 
 A local HTTP demo model drives a temporary project: the real tools create a task, read and edit `parser.py`, ask for shell approval, run two Python tests, and complete the task. No external model service or private session is used. `demo/code`, its variants, and the response text are demonstration fixtures.
 

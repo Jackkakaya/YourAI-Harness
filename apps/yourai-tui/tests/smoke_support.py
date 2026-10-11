@@ -2,7 +2,7 @@
 
 The mock streams one long assistant transcript over both the chat-completions
 and the codex-flavored Responses wire format, so the same server drives
-yourai-tui, opencode and codex. `Probe` runs the binary on a PTY, answers its
+yourai, opencode and codex. `Probe` runs the binary on a PTY, answers its
 terminal capability queries and counts the frames/bytes it writes back;
 `MuxProbe` does the same through a real tmux server (what a remote client
 would receive). Keep the default line protocols stable: the performance log
@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 BUILD_DIR = Path(os.environ.get('CARGO_TARGET_DIR', 'target'))
 if not BUILD_DIR.is_absolute():
     BUILD_DIR = REPO_ROOT / BUILD_DIR
-DEFAULT_BIN = BUILD_DIR / 'debug/yourai-tui'
+DEFAULT_BIN = BUILD_DIR / 'debug/yourai'
 
 WHEEL_UP = b'\x1b[<64;10;10M'
 WHEEL_DOWN = b'\x1b[<65;10;10M'
@@ -137,7 +137,7 @@ def start_model_server(text):
 
 
 def write_yourai_config(tmp, port):
-    """Point a scratch yourai-tui config at the mock server."""
+    """Point a scratch yourai config at the mock server."""
     config = Path(tmp) / 'config.json'
     config.write_text(json.dumps({
         'model': 'mock/scroll', 'extensions': False,
@@ -266,7 +266,7 @@ def wait_exit(child, master, timeout=10):
 
 
 class Probe:
-    """A yourai-tui binary under test on a PTY against the mock model.
+    """A yourai binary under test on a PTY against the mock model.
 
     Counters assume the 2026 sync wrapper (frames are delimited by
     `\\x1b[?2026l`), so probes that count frames force

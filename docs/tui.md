@@ -5,11 +5,12 @@
 默认按 XDG Base Directory 规范查找配置文件：`$XDG_CONFIG_HOME/yourai/yourai.json`，未设置时回退到 `~/.config/yourai/yourai.json`。可用 `--config PATH` 指定任意路径覆盖。
 
 ```sh
+cargo install --path apps/yourai-tui --locked
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/yourai"
 cp yourai.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/yourai/yourai.json"
 # 编辑 yourai.json 中的 provider、baseURL 与 apiKey
 export OPENAI_API_KEY='你的密钥'
-cargo run -p yourai-tui
+yourai
 ```
 
 `yourai.json` 含密钥，请勿提交；仓库根的 `yourai.json` 与 `.yourai/` 已加入 gitignore。配置中的 `apiKey` 可用 `{env:VAR}` 引用环境变量，避免明文。不会将密钥打印到界面或写入会话历史。
@@ -76,7 +77,7 @@ cargo run -p yourai-tui
 仅验证配置、不请求模型：
 
 ```sh
-cargo run -p yourai-tui -- --config /path/to/yourai.json --check-config
+yourai --config /path/to/yourai.json --check-config
 ```
 
 ## 操作
@@ -124,7 +125,7 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --check-config
 退出时打印会话 ID，可恢复上下文：
 
 ```sh
-cargo run -p yourai-tui -- --config /path/to/yourai.json --resume 会话ID
+yourai --config /path/to/yourai.json --resume 会话ID
 ```
 
 `--resume` 不带 ID 时进入启动会话选择器（launcher）：搜索框过滤 title/id/model，`↑↓`/`Ctrl-P/N` 移动，`Enter` 恢复选中会话，`Esc` 开启全新会话，`Ctrl-Q` 直接退出。恢复会话会继续使用原历史；界面恢复原始历史消息（不重复展示压缩摘要）。退出时尚未处理的输入由 close 交还，打印在终端，由调用者决定是否再次提交。
@@ -150,7 +151,7 @@ python3 apps/yourai-tui/tests/smoke_ui.py
 旧 JSON 会话先关闭再显式导入；命令不调用模型，保留原文件：
 
 ```sh
-cargo run -p yourai-tui -- --config /path/to/yourai.json --import-json-sessions
+yourai --config /path/to/yourai.json --import-json-sessions
 ```
 
 导入范围和边界见 [会话存储](./session-storage-design.md)。

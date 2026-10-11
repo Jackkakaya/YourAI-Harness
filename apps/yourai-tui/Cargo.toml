@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "yourai"
+path = "src/main.rs"
+
 [dependencies]
 yourai-core = { path = "../../crates/yourai-core" }
 yourai-harness = { path = "../../crates/yourai-harness" }

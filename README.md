@@ -18,7 +18,7 @@ cd YourAI-Harness
 cargo install --path apps/yourai-tui --locked
 ```
 
-Cargo installs `yourai-tui` into its bin directory, normally `~/.cargo/bin`. You can also run from source with `cargo run -p yourai-tui -- …`.
+Cargo installs `yourai` into its bin directory, normally `~/.cargo/bin`. You can also run from source with `cargo run -p yourai-tui -- …`.
 
 ## Configure your model
 
@@ -56,7 +56,7 @@ The limits above are examples. `baseURL` is the API base, such as `/v1`, rather 
 
 ```sh
 export OPENAI_API_KEY='your-api-key'
-yourai-tui --check-config
+yourai --check-config
 ```
 
 `--check-config` validates configuration without making a model request. The default config location is `$XDG_CONFIG_HOME/yourai/yourai.json`, falling back to `~/.config/yourai/yourai.json`; use `--config PATH` to override it.
@@ -69,7 +69,7 @@ Start in the directory you want the agent to work on:
 
 ```sh
 cd /path/to/your/project
-yourai-tui
+yourai
 ```
 
 For example, ask: “Find the failing test, fix the bug, and run the relevant tests.” The agent can read/write/edit files, run shell commands, search/fetch web content, and track tasks. Set `"extensions": true` in the config to enable subagents, workspace management, memory, and skills.
@@ -102,8 +102,8 @@ Model/session switching and manual compact require the current turn to finish or
 ## Resume a session
 
 ```sh
-yourai-tui --resume              # Open the saved-session picker
-yourai-tui --resume SESSION_ID   # Resume a specific session
+yourai --resume              # Open the saved-session picker
+yourai --resume SESSION_ID   # Resume a specific session
 ```
 
 You can also switch with **/sessions** inside the app. The session ID is printed on exit.
@@ -115,7 +115,7 @@ Before calling the model, the context manager limits large tool outputs and repl
 For old JSON sessions, close the old client and import once:
 
 ```sh
-yourai-tui --import-json-sessions
+yourai --import-json-sessions
 ```
 
 ## Build on the runtime

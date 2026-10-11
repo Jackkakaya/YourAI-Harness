@@ -18,7 +18,7 @@ cd YourAI-Harness
 cargo install --path apps/yourai-tui --locked
 ```
 
-Cargo 将 `yourai-tui` 安装到 bin 目录，通常是 `~/.cargo/bin`。也可以直接从源码运行：`cargo run -p yourai-tui -- …`。
+Cargo 将 `yourai` 安装到 bin 目录，通常是 `~/.cargo/bin`。也可以直接从源码运行：`cargo run -p yourai-tui -- …`。
 
 ## 配置模型
 
@@ -56,7 +56,7 @@ cp yourai.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/yourai/yourai.json"
 
 ```sh
 export OPENAI_API_KEY='你的密钥'
-yourai-tui --check-config
+yourai --check-config
 ```
 
 `--check-config` 只验证配置，不请求模型。默认配置位置是 `$XDG_CONFIG_HOME/yourai/yourai.json`，未设置时使用 `~/.config/yourai/yourai.json`；可通过 `--config PATH` 指定其他文件。
@@ -69,7 +69,7 @@ yourai-tui --check-config
 
 ```sh
 cd /path/to/your/project
-yourai-tui
+yourai
 ```
 
 例如输入：“找到失败的测试，修复问题，然后运行相关测试。”Agent 可以读写和编辑文件、执行 Shell、搜索和读取网页、跟踪任务。在配置里设置 `"extensions": true`，可以启用子 Agent、工作区管理、记忆和技能扩展。
@@ -102,8 +102,8 @@ yourai-tui
 ## 恢复会话
 
 ```sh
-yourai-tui --resume              # 打开已保存会话的选择器
-yourai-tui --resume SESSION_ID   # 直接恢复指定会话
+yourai --resume              # 打开已保存会话的选择器
+yourai --resume SESSION_ID   # 直接恢复指定会话
 ```
 
 也可以在应用内使用 **/sessions** 切换；退出时会打印会话 ID。
@@ -115,7 +115,7 @@ Agent 数据统一保存到 SQLite：消息、摘要、排队输入、运行状�
 旧 JSON 会话需要先关闭旧客户端，再导入一次：
 
 ```sh
-yourai-tui --import-json-sessions
+yourai --import-json-sessions
 ```
 
 ## 基于 runtime 开发

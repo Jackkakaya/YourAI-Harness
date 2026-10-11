@@ -1,6 +1,6 @@
 """Measure tmux-client-side output when scrolling inside a tmux pane.
 
-Chain: probe PTY -> tmux client -> tmux server -> pane (yourai-tui + mock model).
+Chain: probe PTY -> tmux client -> tmux server -> pane (yourai + mock model).
 Wheel events written to the PTY are forwarded by tmux to the pane's app.
 We count bytes tmux sends back over the PTY (approximates the SSH link).
 Client-side "paints" are chunks separated by >30ms: tmux consumes the app's

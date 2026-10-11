@@ -39,7 +39,7 @@ impl SessionCatalog {
                     .map_err(|e| error("storage", e))
                 })?;
                 if !imported {
-                    return Err(error("storage","legacy JSON sessions found; run yourai-tui --import-json-sessions before opening"));
+                    return Err(error("storage","legacy JSON sessions found; run yourai --import-json-sessions before opening"));
                 }
             }
         }

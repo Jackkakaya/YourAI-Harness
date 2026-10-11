@@ -1,4 +1,4 @@
-"""Compare wheel-scroll cost across yourai-tui, opencode and codex under a
+"""Compare wheel-scroll cost across yourai, opencode and codex under a
 mux, from the CLIENT side (what a remote terminal would receive).
 
 Chain: probe PTY -> tmux client -> tmux server (mouse on, UURemote-style
