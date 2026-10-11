@@ -16,7 +16,7 @@
 | R5 | checkpoint 保存失败丢 Hook 上下文 | 稳定 StoredMessage 身份，成功才移除；execution 验证 cleanup 仍保存 |
 | R6a | 外层取消遮蔽压缩提交状态 | Turn 转发取消并等待内层；宿主 owned supervisor 保留操作锁；Compactor 统一结算 |
 | R6b | DB 已提交但确认过晚 | SQLite 事务提交后立即更新共享进度；DefaultContext 保持 dirty 恢复屏障；context 验证取消后恢复实际持久历史 |
-| R7 | Task 多缓存覆盖 | SessionHost 唯一 TaskManager，SQLite 按行事务保存；runtime / sqlite 验证共享、并发、恢复 |
+| R7 | Task 多缓存覆盖 | SessionManager 唯一 TaskManager，SQLite 按行事务保存；runtime / sqlite 验证共享、并发、恢复 |
 | R8 | Task Hook 等待期间关闭后晚写 | 活动所有权覆盖操作，worker 持锁再次检查；runtime 验证关闭竞态和 dropped waiter |
 | R9 | 可公开构造第二份 Workspace | new 收窄，host 在资源锁内唯一初始化；所有正常入口取同一对象 |
 | R10 | 启动失败或放弃结果遗留资源 | owned 初始化等待接收确认，失败清理；runtime 验证失败、等待中取消、成功结果无人接收 |
@@ -39,13 +39,13 @@
 | C5 | Hook worktree_path 必须是同仓库的真实 Git worktree；保存创建仓库供删除 | runtime 真实 Git 路径验证 |
 | C6 | 已确认 SessionEnd 不重发；未知效果有阶段记录和警告，不宣称跨进程 exactly once | runtime 并发关闭与 journal 保存失败重试测试 |
 
-对应源码：[Tool](../crates/yourai-core/src/tool.rs)、[Model](../crates/yourai-core/src/model.rs)、[Turn](../crates/yourai-core/src/execution/mod.rs)、[Compactor](../crates/yourai-core/src/context_manager.rs)、[SessionHost](../crates/yourai-core/src/runtime/mod.rs)、[Workspace](../crates/yourai-core/src/workspace/operations.rs)、[TaskManager](../crates/yourai-core/src/tasks.rs)、[Subagent](../crates/yourai-core/src/subagent.rs)、[Hook 注册与调度](../crates/yourai-harness/src/hooks/runtime.rs)。
+对应源码：[Tool](../crates/yourai-core/src/tool.rs)、[Model](../crates/yourai-core/src/model.rs)、[Turn](../crates/yourai-core/src/execution/mod.rs)、[Compactor](../crates/yourai-core/src/compactor.rs)、[SessionManager](../crates/yourai-core/src/runtime/mod.rs)、[Workspace](../crates/yourai-core/src/workspace/operations.rs)、[TaskManager](../crates/yourai-core/src/tasks.rs)、[Subagent](../crates/yourai-core/src/subagent.rs)、[Hook 注册与调度](../crates/yourai-harness/src/hooks/runtime.rs)。
 
 对应测试：[execution](../crates/yourai-harness/tests/execution.rs)、[context](../crates/yourai-harness/tests/context.rs)、[runtime](../crates/yourai-harness/tests/runtime.rs)、[sqlite](../crates/yourai-harness/tests/sqlite.rs)、[生命周期故障](../crates/yourai-harness/tests/lifecycle_repairs.rs)。完整运行结果单独记录于 [实施记录](hook-execution-refactor.md)。
 
 ## 保留的类型有实际职责
 
-ContextManager / SessionManager 是替换边界；DefaultContext / SqliteStore 是默认实现。CompactionPlan / Job 承载 PreCompact 前准备与锁；私有 guard 承载资源回收。Hook wire、配置、事件、结果 DTO 保留各自数据语义。它们不是附加业务执行层。当前生产源码类型数量与定位见 [类型清单](current-type-inventory.md)，不能把配置和枚举计作 Hook 类。
+ContextManager / SessionStore 是替换边界；DefaultContext / SqliteStore 是默认实现。Compactor 直接持有私有压缩算法；apply 在提交时核对快照并持锁；私有 guard 承载资源回收。Hook wire、配置、事件、结果 DTO 保留各自数据语义。它们不是附加业务执行层。当前生产源码类型数量与定位见 [类型清单](current-type-inventory.md)，不能把配置和枚举计作 Hook 类。
 
 ## 最后一轮审查的 14 项修复
 
@@ -68,6 +68,6 @@ ContextManager / SessionManager 是替换边界；DefaultContext / SqliteStore �
 | 13 | 压缩普通错误丢提交状态和 PostCompact | 普通错误按提交进度解释；默认实现已提交后 reload 失败仍返回摘要 / stop_reason 并执行 PostCompact |
 | 14 | 大输入 command Hook 管道死锁 | OwnedChild 持有 stdin writer，并发读取输出；262144 字节及异步交接回归 |
 
-替换 CompactionJob 确认提交后，若后续记账或恢复失败，须返回带 stop_reason 的已提交结果及真实摘要，才能执行 PostCompact。返回 Err 仍会明确报告提交阶段，但没有摘要可发送。
+ContextManager.save_summary 确认提交后，若恢复失败，Compactor 返回带 stop_reason 的已提交结果及真实摘要，并执行 PostCompact。未知提交返回明确错误，先 restore，不重新调用模型。
 
 回归位于 execution_repairs、lifecycle_regressions、hook_fix_flow、context 和 command 单元测试。SQLite fork 还同步更新新输入身份，避免复制后的消息与其元数据身份不一致。最终验证见 [实施记录](hook-execution-refactor.md)。

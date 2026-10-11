@@ -319,9 +319,7 @@ pub(super) fn aggregate(event_name: &str, contributions: Vec<Contribution>) -> H
     match event_name {
         "PreToolUse" => HookPointOutcome::PreToolUse(aggregate_pre_tool_use(contributions)),
         "PostToolUse" => HookPointOutcome::PostToolUse(aggregate_post_tool_use(contributions)),
-        "UserPromptSubmit" => {
-            HookPointOutcome::UserPromptSubmit(aggregate_user_prompt_submit(contributions))
-        }
+        "UserPromptSubmit" => HookPointOutcome::UserPromptSubmit,
         "SessionStart" => HookPointOutcome::SessionStart(aggregate_session_start(contributions)),
         "PermissionDenied" => {
             HookPointOutcome::PermissionDenied(aggregate_permission_denied(contributions))
@@ -344,7 +342,7 @@ pub(super) fn aggregate(event_name: &str, contributions: Vec<Contribution>) -> H
         "WorktreeCreate" => {
             HookPointOutcome::WorktreeCreate(aggregate_worktree_create(contributions))
         }
-        _ => HookPointOutcome::Generic(aggregate_generic(contributions)),
+        _ => HookPointOutcome::Generic,
     }
 }
 
@@ -379,6 +377,7 @@ pub(super) fn aggregate_common(contributions: &[Contribution]) -> HookCommonOutc
         .collect();
 
     HookCommonOutcome {
+        additional_contexts: aggregate_contexts(contributions),
         prevent_continuation,
         stop_reason,
         system_messages,
@@ -397,7 +396,6 @@ fn aggregate_contexts(contributions: &[Contribution]) -> Vec<String> {
 pub(super) fn aggregate_pre_tool_use(
     contributions: Vec<Contribution>,
 ) -> yourai_core::hooks::PreToolUseOutcome {
-    let additional_contexts = aggregate_contexts(&contributions);
     let mut permission = HookPermission::Pass;
     let mut updated_input = None;
 
@@ -415,38 +413,25 @@ pub(super) fn aggregate_pre_tool_use(
     yourai_core::hooks::PreToolUseOutcome {
         permission,
         updated_input,
-        additional_contexts,
     }
 }
 
 fn aggregate_post_tool_use(
     contributions: Vec<Contribution>,
 ) -> yourai_core::hooks::PostToolUseOutcome {
-    let additional_contexts = aggregate_contexts(&contributions);
     let updated_mcp_tool_output = contributions
         .iter()
         .rev()
         .find_map(|c| c.updated_mcp_tool_output.clone());
 
     yourai_core::hooks::PostToolUseOutcome {
-        additional_contexts,
         updated_mcp_tool_output,
-    }
-}
-
-fn aggregate_user_prompt_submit(
-    contributions: Vec<Contribution>,
-) -> yourai_core::hooks::UserPromptSubmitOutcome {
-    let additional_contexts = aggregate_contexts(&contributions);
-    yourai_core::hooks::UserPromptSubmitOutcome {
-        additional_contexts,
     }
 }
 
 fn aggregate_session_start(
     contributions: Vec<Contribution>,
 ) -> yourai_core::hooks::SessionStartOutcome {
-    let additional_contexts = aggregate_contexts(&contributions);
     let initial_user_message = contributions
         .iter()
         .rev()
@@ -457,7 +442,6 @@ fn aggregate_session_start(
         .collect();
 
     yourai_core::hooks::SessionStartOutcome {
-        additional_contexts,
         initial_user_message,
         watch_paths,
     }
@@ -522,11 +506,4 @@ fn aggregate_worktree_create(
         .rev()
         .find_map(|c| c.worktree_path.clone());
     yourai_core::hooks::WorktreeCreateOutcome { worktree_path }
-}
-
-fn aggregate_generic(contributions: Vec<Contribution>) -> yourai_core::hooks::GenericOutcome {
-    let additional_contexts = aggregate_contexts(&contributions);
-    yourai_core::hooks::GenericOutcome {
-        additional_contexts,
-    }
 }

@@ -17,14 +17,14 @@ use yourai_core::{
     hooks::{PermissionRequestBehavior, PermissionRequestDecision},
     prelude::*,
 };
-use yourai_harness::{collaboration::subagent, runtime, SessionHost};
+use yourai_harness::{collaboration::subagent, runtime, SessionManager};
 
-async fn open(root: &Path, cwd: &Path, model: Arc<Model>) -> Arc<SessionHost> {
+async fn open(root: &Path, cwd: &Path, model: Arc<Model>) -> Arc<SessionManager> {
     runtime::create(root, cwd.to_owned(), model, None, None)
         .await
         .unwrap()
 }
-async fn turn(host: &SessionHost) {
+async fn turn(host: &SessionManager) {
     host.submit_async(In::user_text("continue")).await.unwrap();
     host.run_next(
         TurnLimits::default(),
@@ -318,10 +318,17 @@ async fn instructions_reverting_to_old_content_publish_the_latest_value() {
         .filter_map(|message| message.content.first_text().map(str::to_owned))
         .filter(|text| text.starts_with("[Instructions: "))
         .collect();
-    assert_eq!(texts.len(), 3);
+    assert_eq!(texts.len(), 1);
     assert!(texts[0].ends_with("A-CONTENT"));
-    assert!(texts[1].ends_with("B-CONTENT"));
-    assert!(texts[2].ends_with("A-CONTENT"));
+    let archive = host.agent().ctx().context_manager().unwrap().records();
+    let updates: Vec<_> = archive.iter().filter(|m| m.context_key.is_some()).collect();
+    assert_eq!(updates.len(), 3);
+    assert!(updates[1]
+        .message
+        .content
+        .first_text()
+        .unwrap()
+        .ends_with("B-CONTENT"));
     host.close(None).await.unwrap();
 }
 

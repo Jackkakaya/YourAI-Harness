@@ -58,6 +58,8 @@ pub struct InputOptions {
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct TurnOptions {
+    /// Origin used consistently by request diagnostics and usage accounting.
+    pub source: Option<&'static str>,
     /// None 允许独立的无会话 Loop；会话宿主应始终提供绑定信息。
     pub session: Option<Arc<SessionContext>>,
     pub limits: TurnLimits,

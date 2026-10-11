@@ -77,7 +77,7 @@ async fn setup(
     output: u32,
     p: ContextPolicy,
     model: Arc<dyn ModelProvider>,
-    hooks: Option<Arc<dyn HookRuntime>>,
+    hooks: Option<Arc<dyn HookManager>>,
 ) -> (TempDir, Arc<SqliteStore>, Arc<DefaultContext>) {
     let dir = TempDir::new().unwrap();
     let store = Arc::new(SqliteStore::open(&dir.path().join("db.sqlite")).unwrap());
@@ -131,8 +131,8 @@ async fn seed_tools(c: &DefaultContext) {
         ],
     )
     .await;
-    let mut response = StoredMessage::new(ChatMessage::assistant("read both outputs"));
-    response.model_response = true;
+    let response = StoredMessage::new(ChatMessage::assistant("read both outputs"));
+
     c.append(vec![
         response,
         StoredMessage::new(ChatMessage::user("current user request")),
@@ -144,8 +144,9 @@ async fn seed_tools(c: &DefaultContext) {
 #[tokio::test]
 async fn custom_loop_compaction_uses_summary_lifecycle_and_retains_current_input() {
     let hooks = Arc::new(support::Hooks::new(|_, result| {
-        if let HookPointOutcome::Generic(outcome) = &mut result.outcome {
-            outcome
+        if let HookPointOutcome::Generic = &mut result.outcome {
+            result
+                .common
                 .additional_contexts
                 .push("compaction context".into());
         }
@@ -221,12 +222,10 @@ async fn projection_is_bounded_valid_json_and_original_is_preserved() {
     );
 }
 #[tokio::test]
-async fn prune_only_avoids_model_hooks_and_survives_restore_and_fork() {
+async fn summary_keeps_original_tool_archive_and_survives_restore_and_fork() {
     let mut p = policy();
     p.advance_tokens = 2200;
-    p.prune_enabled = true;
-    p.prune_growth = 0;
-    p.prune_min_savings = 50;
+
     let model = Summarizer::new();
     let hooks = Arc::new(support::Hooks::new(|_, _| {}));
     let (_dir, store, c) = setup(
@@ -245,15 +244,22 @@ async fn prune_only_avoids_model_hooks_and_survives_restore_and_fork() {
         )
         .await
         .unwrap();
-    assert_eq!(result.action, CompactAction::Pruned);
-    assert!(model.requests.lock().unwrap().is_empty());
-    assert!(hooks.seen.lock().unwrap().is_empty());
-    let active = c.records();
-    assert!(active[2].tool_output_pruned_at.is_some());
-    assert!(active[3].tool_output_pruned_at.is_none());
-    assert!(active[2].message.content.tool_responses()[0]
-        .content
-        .contains(&"x".repeat(6000)));
+    assert!(result.compacted);
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        *hooks.seen.lock().unwrap(),
+        [HookEventKind::PreCompact, HookEventKind::PostCompact]
+    );
+    assert!(c.records()[0].summary);
+    let archive = store
+        .read_messages(c.session_id(), MessageQuery::default())
+        .await
+        .unwrap();
+    assert!(archive
+        .messages
+        .iter()
+        .flat_map(|m| m.message.content.tool_responses())
+        .any(|r| r.content.contains(&"x".repeat(6000))));
     let expected = serde_json::to_value(c.build_request(&[]).unwrap().request).unwrap();
     c.restore().await.unwrap();
     assert_eq!(
@@ -276,12 +282,10 @@ async fn prune_only_avoids_model_hooks_and_survives_restore_and_fork() {
     );
 }
 #[tokio::test]
-async fn failed_combined_commit_keeps_pruning_and_summary_unapplied_but_accounts_usage() {
+async fn failed_summary_commit_keeps_history_unapplied_but_accounts_usage() {
     let mut p = policy();
     p.advance_tokens = 3300;
-    p.prune_enabled = true;
-    p.prune_growth = 0;
-    p.prune_min_savings = 50;
+
     let model = Summarizer::new();
     let (dir, store, c) = setup(Some(4000), 500, p, model.clone(), None).await;
     seed_tools(&c).await;
@@ -329,7 +333,7 @@ async fn latest_user_unresolved_batch_and_parallel_pairs_are_protected() {
         .compact(manual(), &CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(result.action, CompactAction::Summarized);
+    assert!(result.compacted);
     let records = c.records();
     assert_eq!(records.len(), 3);
     assert!(records[0].summary);
@@ -339,20 +343,16 @@ async fn latest_user_unresolved_batch_and_parallel_pairs_are_protected() {
         "pending"
     );
     let req = &model.requests.lock().unwrap()[0].request;
-    assert_eq!(
-        req.messages
-            .iter()
-            .flat_map(|m| m.content.tool_calls())
-            .count(),
-        2
-    );
-    assert_eq!(
-        req.messages
-            .iter()
-            .flat_map(|m| m.content.tool_responses())
-            .count(),
-        2
-    );
+    assert!(req.tools.as_ref().unwrap().is_empty());
+    assert!(req
+        .messages
+        .iter()
+        .all(|m| m.content.tool_calls().is_empty() && m.content.tool_responses().is_empty()));
+    let history = req.messages[0].content.texts().join("\n");
+    for id in ["a", "b"] {
+        assert_eq!(history.matches(&format!("\"call_id\":\"{id}\"")).count(), 2);
+    }
+    assert!(!history.contains("pending"));
 }
 #[tokio::test]
 async fn long_turn_can_compact_closed_batches_while_retaining_its_user_request() {
@@ -395,7 +395,7 @@ async fn chunking_has_one_final_commit_and_enforces_call_budget() {
     let mut request = manual();
     request.max_model_calls = 8;
     let result = c.compact(request, &CancellationToken::new()).await.unwrap();
-    assert_eq!(result.action, CompactAction::Summarized);
+    assert!(result.compacted);
     assert!(model.requests.lock().unwrap().len() >= 4);
     let rows = store
         .read_messages(c.session_id(), MessageQuery::default())
@@ -467,7 +467,7 @@ async fn post_hook_stop_reports_committed_state_and_is_not_dispatched_twice() {
         .compact(manual(), &CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(result.action, CompactAction::Summarized);
+    assert!(result.compacted);
     assert!(result.stop_reason.is_some());
     assert!(c.records()[0].summary);
     let seen = hooks.seen.lock().unwrap();
@@ -517,7 +517,7 @@ async fn committed_summary_survives_reload_failure_and_still_runs_post_hook() {
         .compact(manual(), &CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(result.action, CompactAction::Summarized);
+    assert!(result.compacted);
     assert!(result
         .stop_reason
         .as_deref()
@@ -555,16 +555,15 @@ async fn committed_summary_survives_reload_failure_and_still_runs_post_hook() {
     context.restore().await.unwrap();
     assert!(context.records()[0].summary);
     assert!(context.build_request(&[]).is_ok());
-    assert_eq!(
-        context
+    assert!(
+        !context
             .compact(
                 CompactionRequest::new(CompactionTrigger::Threshold),
                 &CancellationToken::new()
             )
             .await
             .unwrap()
-            .action,
-        CompactAction::Unchanged
+            .compacted
     );
     assert_eq!(
         hooks
@@ -583,7 +582,7 @@ async fn observed_usage_is_invalidated_by_tools_projection() {
     append(&c, vec![ChatMessage::user("x".repeat(2000))]).await;
     let before = c.build_request(&[]).unwrap();
     let mut response = StoredMessage::new(ChatMessage::assistant("response"));
-    response.model_response = true;
+
     response.request_observation = Some(RequestObservation {
         model: "summary".into(),
         request: before.request,
@@ -621,40 +620,79 @@ async fn automatic_cooldown_and_unknown_window_do_not_claim_success() {
 }
 
 #[tokio::test]
-async fn automatic_failure_is_not_repeated_for_the_same_request() {
+async fn automatic_summary_failure_is_not_repeated_during_model_retries() {
+    struct RetryingModel {
+        summary: Arc<Summarizer>,
+        streams: std::sync::atomic::AtomicUsize,
+    }
+    impl ModelProvider for RetryingModel {
+        fn model_iden(&self) -> &str {
+            "summary"
+        }
+        fn complete<'a>(
+            &'a self,
+            request: ModelRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
+            self.summary.complete(request)
+        }
+        fn stream_events<'a>(
+            &'a self,
+            _: ModelRequest,
+        ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
+            Box::pin(async move {
+                if self
+                    .streams
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
+                    let stream: ModelEventStream = Box::pin(futures_util::stream::once(async {
+                        Err(ErrorKind::Provider {
+                            name: "test",
+                            message: "retry once".into(),
+                        }
+                        .into())
+                    }));
+                    Ok(stream)
+                } else {
+                    Ok(support::answer("done"))
+                }
+            })
+        }
+        fn recovery(&self, _: &YourAiError) -> ModelRecovery {
+            ModelRecovery::Retry
+        }
+    }
+    let model = Arc::new(RetryingModel {
+        summary: Arc::new(Summarizer {
+            requests: Mutex::new(vec![]),
+            empty: true,
+        }),
+        streams: Default::default(),
+    });
     let mut p = policy();
     p.advance_tokens = 3000;
-    let model = Arc::new(Summarizer {
-        requests: Mutex::new(vec![]),
-        empty: true,
-    });
     let (_, _, c) = setup(Some(4000), 500, p, model.clone(), None).await;
     append(
         &c,
         vec![
-            ChatMessage::user("x".repeat(2000)),
-            ChatMessage::user("latest"),
+            ChatMessage::user("old history ".repeat(200)),
+            ChatMessage::user("current task"),
         ],
     )
     .await;
-    assert!(c.build_request(&[]).unwrap().maintenance_needed);
-    assert!(c
-        .compact(
-            CompactionRequest::new(CompactionTrigger::Threshold),
-            &CancellationToken::new()
-        )
-        .await
-        .is_err());
-    assert!(!c.build_request(&[]).unwrap().maintenance_needed);
-    let next = c
-        .compact(
-            CompactionRequest::new(CompactionTrigger::Threshold),
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(next.action, CompactAction::Unchanged);
-    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    let agent = Agent::builder()
+        .model(context_fixture::configured(model.clone(), Some(4000), 500))
+        .context_manager(c.inner.clone())
+        .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop::new(
+            Default::default(),
+        )))
+        .build();
+    let output = agent.run(In::user_text("continue")).await.unwrap();
+    assert_eq!(output.text, "done");
+    assert_eq!(model.summary.requests.lock().unwrap().len(), 1);
+    assert_eq!(model.streams.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(c.records().iter().all(|m| !m.summary));
+    assert_eq!(output.usage.unwrap().total_tokens, 113);
 }
 
 struct UncertainStore {
@@ -662,7 +700,7 @@ struct UncertainStore {
     committed: Arc<tokio::sync::Notify>,
     reads: Arc<std::sync::atomic::AtomicUsize>,
 }
-impl SessionManager for UncertainStore {
+impl SessionStore for UncertainStore {
     fn read_tasks(&self, id: &SessionId) -> Result<Vec<Task>, YourAiError> {
         self.inner.read_tasks(id)
     }
@@ -693,13 +731,17 @@ impl SessionManager for UncertainStore {
     ) -> BoxFuture<'a, Result<Vec<StoredMessage>, YourAiError>> {
         self.inner.append_messages(id, m)
     }
-    fn save_context<'a>(
+    fn save_summary<'a>(
         &'a self,
         id: &'a SessionId,
-        c: ContextChange,
+        sources: Vec<String>,
+        summary: StoredMessage,
+        progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
     ) -> BoxFuture<'a, Result<(), YourAiError>> {
         Box::pin(async move {
-            self.inner.save_context(id, c).await?;
+            self.inner
+                .save_summary(id, sources, summary, progress)
+                .await?;
             self.committed.notify_one();
             std::future::pending().await
         })
@@ -884,7 +926,7 @@ async fn compact_uses_message_content_without_opening_media_locations() {
         .compact(manual(), &CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(result.action, CompactAction::Summarized);
+    assert!(result.compacted);
     let requests = model.requests.lock().unwrap();
     let summary = &requests[0].request;
     assert!(summary.messages.iter().all(|m| m
@@ -957,7 +999,24 @@ async fn binary_attachment_builds_request_with_genai_model() {
 async fn compaction_has_no_implicit_deadline_but_honors_explicit_deadline_and_cancel() {
     use std::time::{Duration, Instant};
     struct SlowPreCompact;
-    impl HookRuntime for SlowPreCompact {
+    impl HookManager for SlowPreCompact {
+        // This fixed-response fixture does not support dynamic registration.
+        fn register<'a>(
+            &'a self,
+            _: yourai_core::hooks::NativeHookRegistration,
+        ) -> yourai_core::BoxFuture<'a, Result<(), yourai_core::YourAiError>> {
+            panic!("registration is not used by this test hook")
+        }
+        fn unregister<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> yourai_core::BoxFuture<'a, Result<bool, yourai_core::YourAiError>> {
+            panic!("unregistration is not used by this test hook")
+        }
+        fn handler_ids<'a>(&'a self) -> yourai_core::BoxFuture<'a, Vec<String>> {
+            panic!("registry inspection is not used by this test hook")
+        }
+
         fn dispatch<'a>(
             &'a self,
             i: &'a HookInvocation,
@@ -1013,4 +1072,306 @@ async fn compaction_has_no_implicit_deadline_but_honors_explicit_deadline_and_ca
             )),
         }
     }
+}
+
+#[tokio::test]
+async fn pre_compact_can_append_authoritative_context_without_holding_context_lock() {
+    struct AppendContext(Arc<dyn ContextManager>);
+    impl HookManager for AppendContext {
+        // This fixed-response fixture does not support dynamic registration.
+        fn register<'a>(
+            &'a self,
+            _: yourai_core::hooks::NativeHookRegistration,
+        ) -> yourai_core::BoxFuture<'a, Result<(), yourai_core::YourAiError>> {
+            panic!("registration is not used by this test hook")
+        }
+        fn unregister<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> yourai_core::BoxFuture<'a, Result<bool, yourai_core::YourAiError>> {
+            panic!("unregistration is not used by this test hook")
+        }
+        fn handler_ids<'a>(&'a self) -> yourai_core::BoxFuture<'a, Vec<String>> {
+            panic!("registry inspection is not used by this test hook")
+        }
+
+        fn dispatch<'a>(
+            &'a self,
+            invocation: &'a HookInvocation,
+        ) -> BoxFuture<'a, Result<HookDispatchResult, YourAiError>> {
+            Box::pin(async move {
+                if invocation.event.kind() == HookEventKind::PreCompact {
+                    let mut row = StoredMessage::runtime_context("Keep the exact new rule.");
+                    row.context_key = Some("rules".into());
+                    self.0.append(vec![row]).await?;
+                }
+                Ok(HookDispatchResult::empty(invocation.event.kind()))
+            })
+        }
+    }
+    let model = Summarizer::new();
+    let (_, _, c) = setup(Some(12_000), 500, policy(), model.clone(), None).await;
+    append(
+        &c,
+        vec![
+            ChatMessage::user("old history ".repeat(300)),
+            ChatMessage::user("current task"),
+        ],
+    )
+    .await;
+    let compact = Compactor::new(
+        c.inner.clone(),
+        context_fixture::configured(model.clone(), Some(12_000), 500),
+        Some(Arc::new(AppendContext(c.inner.clone()))),
+        None,
+        BaseInput::new(c.session_id().as_str(), ""),
+    );
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        compact.exec(manual(), &CancellationToken::new(), None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(result.compacted);
+    assert!(c
+        .records()
+        .iter()
+        .any(|m| m.context_key.as_deref() == Some("rules")
+            && m.message.content.first_text() == Some("Keep the exact new rule.")));
+    assert!(
+        !serde_json::to_string(&model.requests.lock().unwrap()[0].request)
+            .unwrap()
+            .contains("Keep the exact new rule.")
+    );
+}
+
+#[tokio::test]
+async fn concurrent_append_discards_stale_summary_without_losing_or_archiving_messages() {
+    struct SuspendedSummary {
+        model: Arc<Summarizer>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    impl ModelProvider for SuspendedSummary {
+        fn model_iden(&self) -> &str {
+            "summary"
+        }
+        fn complete<'a>(
+            &'a self,
+            request: ModelRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.model.complete(request).await
+            })
+        }
+        fn stream_events<'a>(
+            &'a self,
+            request: ModelRequest,
+        ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
+            self.model.stream_events(request)
+        }
+    }
+    let model = Arc::new(SuspendedSummary {
+        model: Summarizer::new(),
+        entered: Default::default(),
+        release: Default::default(),
+    });
+    let (_, store, c) = setup(Some(12_000), 500, policy(), model.clone(), None).await;
+    append(
+        &c,
+        vec![
+            ChatMessage::user("old ".repeat(600)),
+            ChatMessage::user("current task"),
+        ],
+    )
+    .await;
+    let context = c.clone();
+    let pending =
+        tokio::spawn(async move { context.compact(manual(), &CancellationToken::new()).await });
+    model.entered.notified().await;
+    append(&c, vec![ChatMessage::user("new message while summarizing")]).await;
+    model.release.notify_one();
+    let error = pending.await.unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("context changed during compaction"),
+        "{error}"
+    );
+    assert_eq!(c.records().len(), 3);
+    assert!(c.records().iter().all(|m| !m.summary));
+    c.restore().await.unwrap();
+    assert_eq!(c.records().len(), 3);
+    assert_eq!(
+        LocalUsage((*store).clone())
+            .session_usage(c.session_id())
+            .await
+            .unwrap()
+            .total_tokens,
+        110
+    );
+}
+
+#[tokio::test]
+async fn repeated_compaction_updates_an_explicit_summary_with_its_own_output_budget() {
+    let model = Summarizer::new();
+    let (_, _, c) = setup(Some(100_000), 32_000, policy(), model.clone(), None).await;
+    append(
+        &c,
+        vec![
+            ChatMessage::user("old goal ".repeat(500)),
+            ChatMessage::user("current task"),
+        ],
+    )
+    .await;
+    c.compact(manual(), &CancellationToken::new())
+        .await
+        .unwrap();
+    append(
+        &c,
+        vec![
+            ChatMessage::assistant("new work ".repeat(500)),
+            ChatMessage::user("updated task"),
+        ],
+    )
+    .await;
+    c.compact(manual(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(request.options.max_tokens, Some(8000));
+        assert!(request.request.tools.as_ref().unwrap().is_empty());
+        assert!(request
+            .request
+            .system
+            .as_deref()
+            .unwrap()
+            .contains("Completed and verified"));
+    }
+    let text = requests[1].request.messages[0]
+        .content
+        .first_text()
+        .unwrap();
+    let (previous, history) = text.split_once("</previous-summary>").unwrap();
+    assert!(previous.contains("Decisions and completed work."));
+    assert!(!history.contains("Decisions and completed work."));
+    assert!(history.contains("new work"));
+    assert_eq!(c.records().iter().filter(|m| m.summary).count(), 1);
+}
+
+#[tokio::test]
+async fn current_keyed_instructions_survive_compaction_restore_and_fork_verbatim() {
+    let model = Summarizer::new();
+    let (_, store, c) = setup(Some(12_000), 500, policy(), model.clone(), None).await;
+    let keyed = |text: &str| {
+        let mut row = StoredMessage::runtime_context(text);
+        row.context_key = Some("instructions:/project/AGENTS.md".into());
+        row
+    };
+    c.append(vec![
+        keyed("obsolete instruction"),
+        StoredMessage::new(ChatMessage::user("old history ".repeat(300))),
+        keyed("current exact instruction"),
+        StoredMessage::new(ChatMessage::user("current task")),
+    ])
+    .await
+    .unwrap();
+    let before = serde_json::to_string(&c.build_request(&[]).unwrap().request).unwrap();
+    assert!(!before.contains("obsolete instruction"));
+    assert!(before.contains("current exact instruction"));
+    c.compact(manual(), &CancellationToken::new())
+        .await
+        .unwrap();
+    c.restore().await.unwrap();
+    let after = serde_json::to_string(&c.build_request(&[]).unwrap().request).unwrap();
+    assert!(after.contains("current exact instruction"));
+    assert!(!after.contains("obsolete instruction"));
+    let summary_request =
+        serde_json::to_string(&model.requests.lock().unwrap()[0].request).unwrap();
+    assert!(!summary_request.contains("current exact instruction"));
+    assert!(!summary_request.contains("obsolete instruction"));
+    let child = store.fork_session(c.session_id()).await.unwrap();
+    let mut services = ContextServices::new(&child);
+    services.store = Some(store);
+    services.policy = policy();
+    let fork = DefaultContext::new(
+        child,
+        context_fixture::configured(model, Some(12_000), 500),
+        services,
+    );
+    fork.restore().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(c.build_request(&[]).unwrap().request).unwrap(),
+        serde_json::to_value(fork.build_request(&[]).unwrap().request).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn old_unkeyed_workspace_instructions_are_preserved_after_restore() {
+    let (_, _, c) = setup(Some(12_000), 500, policy(), Summarizer::new(), None).await;
+    c.append(vec![
+        StoredMessage::runtime_context("[Instructions: /project/AGENTS.md]\nlegacy rule"),
+        StoredMessage::new(ChatMessage::user("old history ".repeat(300))),
+        StoredMessage::new(ChatMessage::user("current task")),
+    ])
+    .await
+    .unwrap();
+    c.restore().await.unwrap();
+    assert_eq!(
+        c.records()[0].context_key.as_deref(),
+        Some("instructions:/project/AGENTS.md")
+    );
+    c.compact(manual(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(c.records().iter().any(|m| m.message.content.first_text()
+        == Some("[Instructions: /project/AGENTS.md]\nlegacy rule")));
+}
+
+#[tokio::test]
+async fn summary_reuses_bounded_tool_projection_and_preserves_the_original_and_retrieval_path() {
+    let model = Summarizer::new();
+    let mut p = policy();
+    p.tool_output_chars = 1024;
+    let (_, store, c) = setup(Some(4000), 500, p, model.clone(), None).await;
+    let original =
+        json!({"ok":true,"output_paths":["/project/output.txt"],"output":"large ".repeat(100_000)})
+            .to_string();
+    append(
+        &c,
+        vec![
+            ChatMessage::user("old task"),
+            vec![call("large")].into(),
+            tool("large", original.clone()),
+            ChatMessage::user("current task"),
+        ],
+    )
+    .await;
+    c.compact(manual(), &CancellationToken::new())
+        .await
+        .unwrap();
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let text = requests[0].request.messages[0]
+            .content
+            .first_text()
+            .unwrap();
+        assert!(text.contains("/project/output.txt"));
+        assert!(!text.contains(&"large ".repeat(1000)));
+    }
+    let archive = store
+        .read_messages(c.session_id(), MessageQuery::default())
+        .await
+        .unwrap();
+    assert!(archive
+        .messages
+        .iter()
+        .flat_map(|m| m.message.content.tool_responses())
+        .any(|response| response.content == original));
 }

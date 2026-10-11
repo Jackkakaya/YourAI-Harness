@@ -1,12 +1,15 @@
 #![allow(dead_code)]
+#[path = "model.rs"]
+mod model_fixture;
+pub use model_fixture::TestModel;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
 /// Test fixture owns an execution separately from the context under test.
 pub struct ContextServices {
-    pub store: Option<Arc<dyn SessionManager>>,
+    pub store: Option<Arc<dyn SessionStore>>,
     pub policy: ContextPolicy,
-    pub hooks: Option<Arc<dyn HookRuntime>>,
+    pub hooks: Option<Arc<dyn HookManager>>,
     pub usage: Option<Arc<dyn UsageTracker>>,
 }
 impl ContextServices {
@@ -32,12 +35,8 @@ impl std::ops::Deref for DefaultContext {
 }
 impl DefaultContext {
     pub fn new(id: SessionId, model: Arc<dyn ModelProvider>, s: ContextServices) -> Arc<Self> {
-        let services = yourai_harness::context::ContextServices {
-            store: s.store,
-            policy: s.policy,
-            ..Default::default()
-        };
-        let inner = yourai_harness::DefaultContext::new(id.clone(), services);
+        let inner =
+            yourai_harness::DefaultContext::new(id.clone(), String::new(), s.store, s.policy);
         Arc::new(Self {
             execution: Compactor::new(
                 inner.clone(),
@@ -97,13 +96,29 @@ impl ContextManager for DefaultContext {
     ) -> Result<ContextRequest, YourAiError> {
         self.inner.build_request(t, e, suffix)
     }
-    fn prepare_compaction<'a>(
+    fn save_summary<'a>(
         &'a self,
-        r: &'a CompactionRequest,
-        e: &'a dyn ModelProvider,
-        c: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
-        self.inner.prepare_compaction(r, e, c)
+        expected: &'a [StoredMessage],
+        sources: Vec<String>,
+        summary: StoredMessage,
+        progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        self.inner
+            .save_summary(expected, sources, summary, progress)
+    }
+    fn project(
+        &self,
+        records: &[StoredMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<ChatRequest, YourAiError> {
+        self.inner.project(records, tools)
+    }
+    fn estimate(
+        &self,
+        request: &ChatRequest,
+        model: &dyn ModelProvider,
+    ) -> Result<u64, YourAiError> {
+        self.inner.estimate(request, model)
     }
 }
 
@@ -113,7 +128,7 @@ pub fn configured(
     context: Option<u64>,
     output: u32,
 ) -> Arc<dyn ModelProvider> {
-    yourai_harness::model::ConfiguredModel::new(
+    TestModel::new(
         model,
         ModelTokenBudget::resolve(
             ModelLimits {

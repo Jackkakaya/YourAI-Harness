@@ -51,7 +51,7 @@
 //! ```
 
 pub mod agent_loop;
-pub mod compaction;
+pub mod compactor;
 pub mod completion;
 pub mod context;
 pub mod context_manager;
@@ -103,29 +103,28 @@ pub use ui::OutSink;
 pub mod prelude {
     pub use crate::agent_loop::{AgentLoop, TurnFailure, TurnOutput, TurnResult};
     pub use crate::chat::*;
-    pub use crate::compaction::{
-        CompactAction, CompactionRequest, CompactionResult, CompactionTrigger, ContextPolicy,
+    pub use crate::compactor::Compactor;
+    pub use crate::compactor::{
+        CompactionRequest, CompactionResult, CompactionTrigger, ContextPolicy,
     };
     pub use crate::completion::Completion;
     pub use crate::context::{
         Agent, AgentBuilder, ProviderSnapshot, Providers, TurnContext, TurnHandle,
     };
-    pub use crate::context_manager::{
-        CompactionJob, CompactionPlan, Compactor, ContextManager, ContextRequest,
-    };
+    pub use crate::context_manager::{ContextManager, ContextRequest};
     pub use crate::error::{AbortReason, ErrorKind, YourAiError};
     pub use crate::execution::Turn;
     pub use crate::future::BoxFuture;
     pub use crate::hooks::{
         BaseInput, FailurePolicy, HookBlockingError, HookCommonOutcome, HookDispatchResult,
-        HookEvent, HookEventKind, HookHandler, HookInvocation, HookMessage, HookMessageKind,
-        HookOutput, HookPermission, HookPointOutcome, HookRegistry, HookRun, HookRunStatus,
-        HookRuntime, HookSource, NativeHookRegistration,
+        HookEvent, HookEventKind, HookHandler, HookInvocation, HookManager, HookMessage,
+        HookMessageKind, HookOutput, HookPermission, HookPointOutcome, HookRun, HookRunStatus,
+        HookSource, NativeHookRegistration,
     };
     pub use crate::interaction::{InteractionKind, InteractionRequest, ToolInteraction};
     pub use crate::memory::{
-        CompletedMemoryTurn, MemoryEntry, MemoryManager, MemoryProvider, MemorySession,
-        RecallRequest, RecalledMemory,
+        CompletedMemoryTurn, MemoryEntry, MemoryManager, MemorySession, RecallRequest,
+        RecalledMemory,
     };
     pub use crate::model::{
         Model, ModelErrorClass, ModelEventStream, ModelLimits, ModelOptions, ModelOutput,
@@ -135,13 +134,14 @@ pub mod prelude {
     pub use crate::protocol::{
         AttachmentData, FileRef, In, InputMode, Level, Out, Usage, UserAttachment,
     };
+    pub use crate::runtime::{SessionConfig, SessionManager};
     pub use crate::sandbox::{SandboxPolicy, SandboxProvider, SandboxType};
     pub use crate::security::{
         ApprovalDecision, PolicyDecision, SecurityContext, SecurityProvider,
     };
     pub use crate::session::{
-        CommitStatus, CompactionChange, ContextChange, MessagePage, MessageQuery, MessageStatus,
-        RequestObservation, SessionId, SessionManager, SessionMeta, StoredMessage,
+        CommitStatus, MessagePage, MessageQuery, MessageStatus, RequestObservation, SessionId,
+        SessionMeta, SessionStore, StoredMessage,
     };
     pub use crate::session_runtime::{InputRejected, SessionContext, SessionStatus, SessionTurn};
     pub use crate::skill::{SkillContent, SkillInfo, SkillProvider};

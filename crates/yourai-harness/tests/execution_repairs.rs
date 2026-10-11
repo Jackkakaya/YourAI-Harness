@@ -14,7 +14,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use yourai_core::execution::ExecutionConfig;
     use yourai_core::prelude::*;
-    use yourai_core::runtime::{HostConfig, SessionHost};
+    use yourai_core::runtime::{SessionConfig, SessionManager};
     use yourai_harness::DefaultContext;
 
     struct LostAppendReply {
@@ -80,13 +80,29 @@ mod tests {
         ) -> Result<ContextRequest, YourAiError> {
             self.inner.build_request(t, m, suffix)
         }
-        fn prepare_compaction<'a>(
+        fn save_summary<'a>(
             &'a self,
-            r: &'a CompactionRequest,
-            m: &'a dyn ModelProvider,
-            c: &'a CancellationToken,
-        ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
-            self.inner.prepare_compaction(r, m, c)
+            expected: &'a [StoredMessage],
+            sources: Vec<String>,
+            summary: StoredMessage,
+            progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        ) -> BoxFuture<'a, Result<(), YourAiError>> {
+            self.inner
+                .save_summary(expected, sources, summary, progress)
+        }
+        fn project(
+            &self,
+            records: &[StoredMessage],
+            tools: &[ToolDefinition],
+        ) -> Result<ChatRequest, YourAiError> {
+            self.inner.project(records, tools)
+        }
+        fn estimate(
+            &self,
+            request: &ChatRequest,
+            model: &dyn ModelProvider,
+        ) -> Result<u64, YourAiError> {
+            self.inner.estimate(request, model)
         }
     }
     struct RejectThenExec(Arc<LostAppendReply>);
@@ -200,11 +216,11 @@ mod tests {
             .context_manager(history.clone())
             .model(Arc::new(Model::new(vec![answer("done")])))
             .build();
-        let h = SessionHost::open(
+        let h = SessionManager::open(
             dir.path(),
             SessionContext::new(history.session_id().clone(), dir.path()),
             a,
-            HostConfig::default(),
+            SessionConfig::default(),
             "startup",
         )
         .await
@@ -385,13 +401,29 @@ mod tests {
         ) -> Result<ContextRequest, YourAiError> {
             self.inner.build_request(t, m, suffix)
         }
-        fn prepare_compaction<'a>(
+        fn save_summary<'a>(
             &'a self,
-            r: &'a CompactionRequest,
-            m: &'a dyn ModelProvider,
-            c: &'a CancellationToken,
-        ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
-            self.inner.prepare_compaction(r, m, c)
+            expected: &'a [StoredMessage],
+            sources: Vec<String>,
+            summary: StoredMessage,
+            progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        ) -> BoxFuture<'a, Result<(), YourAiError>> {
+            self.inner
+                .save_summary(expected, sources, summary, progress)
+        }
+        fn project(
+            &self,
+            records: &[StoredMessage],
+            tools: &[ToolDefinition],
+        ) -> Result<ChatRequest, YourAiError> {
+            self.inner.project(records, tools)
+        }
+        fn estimate(
+            &self,
+            request: &ChatRequest,
+            model: &dyn ModelProvider,
+        ) -> Result<u64, YourAiError> {
+            self.inner.estimate(request, model)
         }
     }
     #[tokio::test]
@@ -442,10 +474,9 @@ mod tests {
             .id;
         let inner = DefaultContext::new(
             id.clone(),
-            yourai_harness::context::ContextServices {
-                store: Some(store.clone()),
-                ..Default::default()
-            },
+            String::new(),
+            Some(store.clone()),
+            ContextPolicy::default(),
         );
         let history = Arc::new(LostAppendReply {
             inner,
@@ -454,8 +485,11 @@ mod tests {
             fail_result: AtomicBool::new(false),
         });
         let hooks = Arc::new(Hooks::new(|_, result| {
-            if let HookPointOutcome::UserPromptSubmit(outcome) = &mut result.outcome {
-                outcome.additional_contexts.push("admission context".into());
+            if let HookPointOutcome::UserPromptSubmit = &mut result.outcome {
+                result
+                    .common
+                    .additional_contexts
+                    .push("admission context".into());
             }
         }));
         let path = dir.path().join("input.txt");
@@ -476,13 +510,8 @@ mod tests {
         let failure = agent.run(input).await.unwrap_err();
         assert_eq!(failure.output.pending.len(), 1);
         std::fs::write(&path, "CHANGED-CONTENT").unwrap();
-        let restored = DefaultContext::new(
-            id,
-            yourai_harness::context::ContextServices {
-                store: Some(store),
-                ..Default::default()
-            },
-        );
+        let restored =
+            DefaultContext::new(id, String::new(), Some(store), ContextPolicy::default());
         let agent = Agent::builder()
             .agent_loop(Arc::new(
                 yourai_harness::default_loop::DefaultLoop::default(),

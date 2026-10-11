@@ -14,9 +14,9 @@ Hook 不是一套独立于 Loop 的流程，也不是一个能够自行修改 Ag
 ```text
 Loop 到达 Hook Point
   → 构造 HookEvent
-  → HookRuntime 匹配 Handler
+  → HookManager 匹配 Handler
   → Handler 接收输入并执行
-  → HookRuntime 解析、校验、聚合输出
+  → HookManager 解析、校验、聚合输出
   → 返回 HookDispatchResult
   → Loop 根据当前 Hook Point 的规则消费结果
   → Loop 继续、阻断、询问用户、修改工具输入或注入上下文
@@ -27,7 +27,7 @@ Loop 到达 Hook Point
 | 角色 | 负责 | 不负责 |
 |---|---|---|
 | Hook Point Owner | 决定何时触发，并消费最终结果；prompt/tool Hook 的 Owner 是 `DefaultLoop` | 不负责执行 shell、解析外部 JSON |
-| HookRuntime | 匹配、执行、超时、取消、解析、校验和聚合 Handler | 不直接修改历史、执行工具或向用户提问 |
+| HookManager | 匹配、执行、超时、取消、解析、校验和聚合 Handler | 不直接修改历史、执行工具或向用户提问 |
 | Hook Handler | 根据输入产生一个结果；可以是 Rust callback、command 或 HTTP | 不直接控制 Loop，不读取 turn inbox |
 
 所以，Hook 真正接入 Loop 的方式就是一行有语义的调用：
@@ -37,7 +37,7 @@ let result = hooks.dispatch(invocation, &tc.cancel).await?;
 ```
 
 但是这行调用必须放在正确位置，而且调用后的结果必须由 Loop 明确消费。只定义
-`HookRegistry::dispatch()` 而不修改 `DefaultLoop`，Hook 就没有真正接入系统。
+`HookManager::dispatch()` 而不修改 `DefaultLoop`，Hook 就没有真正接入系统。
 
 ### 0.2 通用 Hook 协议
 
@@ -162,8 +162,8 @@ raw stdout
 通用接入代码可以固定成：
 
 ```rust
-// HookRuntime 是装进 ProviderSnapshot 的 trait object，因此边界处类型擦除为 Value。
-pub trait HookRuntime: Send + Sync {
+// HookManager 是装进 ProviderSnapshot 的 trait object，因此边界处类型擦除为 Value。
+pub trait HookManager: Send + Sync {
     fn dispatch<'a>(
         &'a self,
         invocation: HookInvocation<Value>,
@@ -176,9 +176,9 @@ pub struct RawHookDispatchResult {
     pub runs: Vec<HookRun>,
 }
 
-// 泛型只存在于 Hook Point adapter，不放进 dyn HookRuntime。
+// 泛型只存在于 Hook Point adapter，不放进 dyn HookManager。
 async fn run_hook_point<P: HookPointSpec>(
-    runtime: &dyn HookRuntime,
+    runtime: &dyn HookManager,
     context: HookContext,
     input: P::Input,
     cancel: &CancellationToken,
@@ -238,7 +238,7 @@ continue_original_operation(operation_state).await
 Point::apply(&mut operation_state, validated_output)
 ```
 
-它不是全局 EventBus 广播，也不是 HookRuntime 随意修改 `ContextManager`、工具或 UI。
+它不是全局 EventBus 广播，也不是 HookManager 随意修改 `ContextManager`、工具或 UI。
 每个 Hook Point 的 Owner 手里正好持有那一刻的局部操作状态，所以只有 Owner 知道怎样
 安全地应用结果。
 
@@ -250,12 +250,12 @@ Point::apply(&mut operation_state, validated_output)
   → HookRegistration {
       point, matcher, executor, order, timeout, failure_policy
     }
-  → HookRuntime Registry
+  → HookManager Registry
 
 二、触发阶段
 业务代码运行到固定 Hook Point
   → Point::capture(operation_state)
-  → HookRuntime.dispatch(invocation)
+  → HookManager.dispatch(invocation)
 
 三、执行阶段
 Registry 按 point + matcher 找到 registrations
@@ -271,13 +271,13 @@ Executor 解释 transport 状态
   → Point::reduce(handler_outputs)
 
 五、消费阶段
-HookRuntime 返回 HookPointResult
+HookManager 返回 HookPointResult
   → Hook Point Owner 检查 control
   → Point::apply(operation_state, output)
   → 原业务流程继续或结束
 ```
 
-HookRuntime 不需要知道 `output` 最后如何改变业务；Owner 不需要知道 Handler 是脚本、
+HookManager 不需要知道 `output` 最后如何改变业务；Owner 不需要知道 Handler 是脚本、
 HTTP 还是 Rust。这两者通过 `HookPointSpec` 连接。
 
 ### 0.5 Command Hook 只是一个 Executor Adapter
@@ -350,9 +350,9 @@ YourAI                     hook process
 
 脚本退出 `0`。`ask` 是业务决策，不是进程错误，因此不能通过 exit `1` 表示。
 
-### 0.6 HookRuntime 如何处理一次调用
+### 0.6 HookManager 如何处理一次调用
 
-`HookRuntime::dispatch()` 内部执行以下步骤：
+`HookManager::dispatch()` 内部执行以下步骤：
 
 1. 根据 `invocation.event.point()` 取得该 Hook Point 的注册项快照；
 2. 使用事件专属 matcher 过滤，例如 `PreToolUse` 匹配 `get_order`；
@@ -379,7 +379,7 @@ stdout、stderr 或某个脚本异常被误当成模型上下文。
 
 ### 0.7 示例：UserPromptSubmit 记忆召回
 
-`DefaultLoop` 收到一条用户消息以后、构造模型请求以前，必须显式调用 HookRuntime：
+`DefaultLoop` 收到一条用户消息以后、构造模型请求以前，必须显式调用 HookManager：
 
 ```rust
 let text = receive_user_text(&mut tc).await?;
@@ -414,7 +414,7 @@ let response = model.stream(request, &tc.cancel).await?;
   → CommandHookHandler 把 event JSON 写入脚本 stdin
   → 脚本调用外部 memory API
   → 脚本 stdout 返回 additionalContext JSON，exit 0
-  → HookRuntime 校验并返回 UserPromptSubmitOutcome
+  → HookManager 校验事件并返回公共 additional_contexts
   → DefaultLoop 调 ContextManager::add_hook_context
   → ContextManager 把用户消息和 HookContext 一起构造成模型请求
   → 模型看到本次召回的记忆
@@ -471,7 +471,7 @@ match decision {
 ```
 
 因此，脚本返回 `ask` 并不意味着脚本自己弹窗或等待用户。脚本已经执行结束；
-`HookRuntime` 把 `ask` 变成类型化结果；最后由 `DefaultLoop` 发 `Out::Ask`、等待
+`HookManager` 把 `ask` 变成类型化结果；最后由 `DefaultLoop` 发 `Out::Ask`、等待
 `In::Reply`，并决定是否调用工具。
 
 ### 0.9 Claude Code 实际怎么设计
@@ -533,7 +533,7 @@ Hook 并行执行。当多个 PreToolUse Hook 都修改 `updatedInput` 时，并
 | PreToolUse 调度 | 多 Handler 并行，权限按优先级聚合 | 串行 waterfall，使后一个看到前一个的 updated input |
 | 用户确认 | 工具流程消费 ask 并调用权限 UI | Loop 消费 Ask，通过统一 `Out::Ask/In::Reply` 完成 |
 
-最重要的边界是：**HookRuntime 负责把外部程序变成可信的类型化结果；Loop 负责让这个
+最重要的边界是：**HookManager 负责把外部程序变成可信的类型化结果；Loop 负责让这个
 结果在 Agent 流程中真正生效。**
 
 ## 1. 目标
@@ -734,12 +734,12 @@ prompt 当正则匹配输入，复杂内容判断应由 Handler 自己完成。
 
 ```text
 配置文件 ─┐
-Rust API ─┼─► HookLoader / PluginLoader ─► HookRegistration ─► HookRuntime
+Rust API ─┼─► HookLoader / PluginLoader ─► HookRegistration ─► HookManager
 Plugin ───┤
 Session ──┘
 ```
 
-`yourai-core` 和 `HookRuntime` 不读取配置文件。CLI/应用层负责读取配置、创建具体
+`yourai-core` 和 `HookManager` 不读取配置文件。CLI/应用层负责读取配置、创建具体
 Handler 并完成注册。
 
 ### 4.4 配置示例
@@ -875,7 +875,7 @@ pub enum HookEvent {
 #[non_exhaustive]
 pub enum HookPointOutcome {
     SessionStart(SessionStartOutcome),
-    UserPromptSubmit(UserPromptSubmitOutcome),
+    UserPromptSubmit,
     PreToolUse(PreToolUseOutcome),
     PostToolUse(PostToolUseOutcome),
     PreCompact(PreCompactOutcome),
@@ -891,10 +891,6 @@ pub enum HookControl {
     Block { reason: String },
 }
 
-pub struct UserPromptSubmitOutcome {
-    pub control: HookControl,
-    pub additional_contexts: Vec<String>,
-}
 
 #[non_exhaustive]
 pub enum HookPermission {
@@ -1118,11 +1114,10 @@ HTTP Hook 必须返回合法 JSON；不接受普通文本兼容路径。
 
 ### 7.1 对外 Provider
 
-当前 `HookRegistry` 同时表达注册和分发，但名称只强调“注册表”。建议将 Context 中的
-Provider 收敛为 `HookRuntime`：
+当前只有一个 `HookManager` 接口，统一注册、注销、分发与会话后台任务管理。默认实现为 `DefaultHookManager`。下面为接口概要，完整签名见 `yourai-core/src/hooks.rs`：
 
 ```rust
-pub trait HookRuntime: Send + Sync {
+pub trait HookManager: Send + Sync {
     fn register(&self, registration: HookRegistration);
     fn unregister(&self, id: &str);
     fn handler_ids(&self) -> Vec<String>;
@@ -1135,7 +1130,7 @@ pub trait HookRuntime: Send + Sync {
 }
 ```
 
-`HookRuntime` 内部可以包含 registry、matcher、executor、parser 和 aggregator；这些
+`HookManager` 内部可以包含 registry、matcher、executor、parser 和 aggregator；这些
 不是新的 Context Provider。
 
 ### 7.2 Handler
@@ -1240,7 +1235,7 @@ fail-open；`SessionEnd` 使用较短的整体 deadline，避免应用无法退�
 ```text
 In::UserText
   → DefaultLoop 触发 UserPromptSubmit
-  → HookRuntime 调记忆 Handler
+  → HookManager 调记忆 Handler
   → 返回 additional_contexts
   → DefaultLoop 写用户消息
   → DefaultLoop 写 HookContext conversation item
@@ -1311,7 +1306,7 @@ fn add_hook_context<'a>(
 }
 ```
 
-HookRuntime 不发送 Ask，也不等待 Reply；这一过程完全属于 DefaultLoop。
+HookManager 不发送 Ask，也不等待 Reply；这一过程完全属于 DefaultLoop。
 
 ## 10. 安全与可靠性
 
@@ -1367,7 +1362,7 @@ timeout / failure_policy
 ```text
 yourai-core
   └─ HookPoint / HookEvent / HookInvocation / HookOutcome
-     HookHandler trait / HookRuntime trait
+     HookHandler trait / HookManager trait
 
 yourai-hooks-inmemory
   └─ 默认 registry、matcher、排序、调度、聚合、HookRun 记录
@@ -1403,7 +1398,7 @@ yourai-cli
 
 1. 用 `HookEvent` enum 代替 optional-field event；
 2. 用事件专属 `HookPointOutcome` 代替万能 `Modify(Value)`；
-3. 将 Context Provider 从 `HookRegistry` 收敛为 `HookRuntime`；
+3. 将注册和执行收敛为一个 `HookManager` 接口；
 4. 为 `TurnContext` 增加 `TurnMeta`；
 5. 给 dispatch 传入 cancellation；
 6. 明确每个 Hook Point 的调度、合并与失败规则；

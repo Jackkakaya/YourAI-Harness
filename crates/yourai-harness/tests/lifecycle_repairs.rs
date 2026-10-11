@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use yourai_core::{context::DiscardSink, model::ModelEventStream, prelude::*};
-use yourai_harness::{DefaultContext, Harness, HarnessConfig, HostConfig, SessionHost};
+use yourai_harness::{DefaultContext, Harness, HarnessConfig, SessionConfig, SessionManager};
 
 struct BrokenLoop {
     panic: bool,
@@ -26,24 +26,24 @@ impl AgentLoop for BrokenLoop {
     }
 }
 
-async fn loop_host(dir: &std::path::Path, loop_: Arc<dyn AgentLoop>) -> Arc<SessionHost> {
+async fn loop_host(dir: &std::path::Path, loop_: Arc<dyn AgentLoop>) -> Arc<SessionManager> {
     let id = SessionId::new();
     let agent = Agent::builder()
         .agent_loop(loop_)
         .context_manager(DefaultContext::memory(id.clone()))
         .build();
-    SessionHost::open(
+    SessionManager::open(
         dir,
         SessionContext::new(id, dir),
         agent,
-        HostConfig::default(),
+        SessionConfig::default(),
         "startup",
     )
     .await
     .unwrap()
 }
 
-struct SteerOnStart(Arc<SessionHost>);
+struct SteerOnStart(Arc<SessionManager>);
 impl OutSink for SteerOnStart {
     fn send(&self, event: Out) -> bool {
         if matches!(event, Out::Notice { ref message, .. } if message == "started") {
@@ -243,7 +243,7 @@ async fn rejected_resume_and_restore_do_not_change_active_session_metadata() {
 #[tokio::test]
 async fn oversized_hook_first_line_and_combined_stdout_are_rejected() {
     use yourai_core::hooks::{BaseInput, HookEvent, HookInvocation, HookRunStatus, HookSource};
-    use yourai_harness::hooks::{DefaultHookRuntime, HooksConfig};
+    use yourai_harness::hooks::{DefaultHookManager, HooksConfig};
     for (command, failure_policy, stopped) in [
         ("head -c 2097152 /dev/zero | tr '\\0' x", "open", false),
         (
@@ -252,7 +252,7 @@ async fn oversized_hook_first_line_and_combined_stdout_are_rejected() {
             true,
         ),
     ] {
-        let runtime = DefaultHookRuntime::new();
+        let runtime = DefaultHookManager::new();
         let config: HooksConfig = serde_json::from_value(serde_json::json!({
             "hooks": {"UserPromptSubmit": [{"hooks": [{"type":"command", "command":command, "failurePolicy":failure_policy}]}]}
         }))
@@ -284,8 +284,8 @@ async fn oversized_hook_first_line_and_combined_stdout_are_rejected() {
 #[tokio::test]
 async fn hook_stdout_exactly_at_shared_limit_is_preserved() {
     use yourai_core::hooks::{BaseInput, HookEvent, HookInvocation, HookRunStatus, HookSource};
-    use yourai_harness::hooks::{DefaultHookRuntime, HooksConfig};
-    let runtime = DefaultHookRuntime::new();
+    use yourai_harness::hooks::{DefaultHookManager, HooksConfig};
+    let runtime = DefaultHookManager::new();
     let config: HooksConfig = serde_json::from_value(serde_json::json!({
         "hooks": {"UserPromptSubmit": [{"hooks": [{
             "type":"command", "command":"printf 'hi\\n'; head -c 1048573 /dev/zero | tr '\\0' x"

@@ -45,12 +45,13 @@ impl ContextManager for History {
     ) -> Result<ContextRequest, YourAiError> {
         unreachable!()
     }
-    fn prepare_compaction<'a>(
+    fn save_summary<'a>(
         &'a self,
-        _: &'a CompactionRequest,
-        _: &'a dyn ModelProvider,
-        _: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
+        _: &'a [StoredMessage],
+        _sources: Vec<String>,
+        _summary: StoredMessage,
+        _progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
         unreachable!()
     }
 }
@@ -67,7 +68,7 @@ impl AgentLoop for IdleLoop {
     }
 }
 pub(crate) struct Fixture {
-    pub host: Arc<SessionHost>,
+    pub host: Arc<SessionManager>,
 }
 impl Fixture {
     pub async fn close(&self) -> Result<Vec<In>, YourAiError> {
@@ -78,7 +79,7 @@ pub(crate) async fn fixture() -> (tempfile::TempDir, Fixture) {
     fixture_with_hooks(None).await
 }
 pub(crate) async fn fixture_with_hooks(
-    hooks: Option<Arc<dyn HookRuntime>>,
+    hooks: Option<Arc<dyn HookManager>>,
 ) -> (tempfile::TempDir, Fixture) {
     let dir = tempfile::tempdir().unwrap();
     let history = Arc::new(History {
@@ -94,11 +95,11 @@ pub(crate) async fn fixture_with_hooks(
         builder = builder.hooks(hooks);
     }
     let agent = builder.build();
-    let host = SessionHost::open(
+    let host = SessionManager::open(
         dir.path().join("session"),
         context,
         agent,
-        HostConfig {
+        SessionConfig {
             workspace_enabled: true,
             ..Default::default()
         },
@@ -116,7 +117,24 @@ pub(crate) struct Hooks {
     pub seen: Mutex<Vec<HookEventKind>>,
     pub shutdown: std::sync::atomic::AtomicUsize,
 }
-impl HookRuntime for Hooks {
+impl HookManager for Hooks {
+    // This fixed-response fixture does not support dynamic registration.
+    fn register<'a>(
+        &'a self,
+        _: crate::hooks::NativeHookRegistration,
+    ) -> crate::BoxFuture<'a, Result<(), crate::YourAiError>> {
+        panic!("registration is not used by this test hook")
+    }
+    fn unregister<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> crate::BoxFuture<'a, Result<bool, crate::YourAiError>> {
+        panic!("unregistration is not used by this test hook")
+    }
+    fn handler_ids<'a>(&'a self) -> crate::BoxFuture<'a, Vec<String>> {
+        panic!("registry inspection is not used by this test hook")
+    }
+
     fn dispatch<'a>(
         &'a self,
         invocation: &'a HookInvocation,

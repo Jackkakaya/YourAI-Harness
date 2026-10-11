@@ -29,11 +29,14 @@ async fn custom_scheduling_uses_wrapped_calls_and_can_change_order() {
     let hooks = Arc::new(Hooks::new(|i, result| {
         if let HookPointOutcome::PreToolUse(outcome) = &mut result.outcome {
             outcome.updated_input = Some(json!({"value":7}));
-            outcome.additional_contexts.push("pre context".into());
+            result.common.additional_contexts.push("pre context".into());
         }
         if matches!(i.event, HookEvent::PostToolUse { .. }) {
-            if let HookPointOutcome::PostToolUse(outcome) = &mut result.outcome {
-                outcome.additional_contexts.push("post context".into());
+            if let HookPointOutcome::PostToolUse(_) = &mut result.outcome {
+                result
+                    .common
+                    .additional_contexts
+                    .push("post context".into());
             }
         }
     }));
@@ -321,7 +324,7 @@ async fn harness_configuration_keeps_the_custom_loop_and_lifecycle_hooks() {
                 ))
             },
         ));
-        HookRegistry::register(
+        HookManager::register(
             harness.hooks.as_ref(),
             NativeHookRegistration {
                 id: event.as_str().into(),
@@ -374,10 +377,21 @@ async fn harness_configuration_keeps_the_custom_loop_and_lifecycle_hooks() {
 async fn replacement_context_summary_gets_hooks_and_preserves_commit_after_post_stop() {
     let history = Arc::new(History::default());
     history.tokens.store(100, Ordering::SeqCst);
+    history
+        .append(vec![
+            StoredMessage::new(ChatMessage::user("old task")),
+            StoredMessage::new(ChatMessage::user("current task")),
+        ])
+        .await
+        .unwrap();
+    let model = Arc::new(Model::new(vec![]).with_budget(12_000, 500));
     let hooks = Arc::new(Hooks::new(|i, result| {
         if matches!(i.event, HookEvent::PreCompact { .. }) {
-            if let HookPointOutcome::Generic(outcome) = &mut result.outcome {
-                outcome.additional_contexts.push("retain decisions".into());
+            if let HookPointOutcome::Generic = &mut result.outcome {
+                result
+                    .common
+                    .additional_contexts
+                    .push("retain decisions".into());
             }
         }
         if matches!(i.event, HookEvent::PostCompact { .. }) {
@@ -388,7 +402,7 @@ async fn replacement_context_summary_gets_hooks_and_preserves_commit_after_post_
     let agent = Agent::builder()
         .agent_loop(Arc::new(custom::CompactLoop))
         .context_manager(history.clone())
-        .model(Arc::new(Model::new(vec![])))
+        .model(model.clone())
         .hooks(hooks.clone())
         .build();
     let snapshot = agent.ctx().snapshot().unwrap();
@@ -399,13 +413,16 @@ async fn replacement_context_summary_gets_hooks_and_preserves_commit_after_post_
         .exec(request, &tokio_util::sync::CancellationToken::new(), None)
         .await
         .unwrap();
-    assert_eq!(result.action, CompactAction::Summarized);
+    assert!(result.compacted);
     assert_eq!(result.stop_reason.as_deref(), Some("stop after commit"));
     assert_eq!(history.tokens.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        *history.summary_instructions.lock().unwrap(),
-        [Some("original instructions\nretain decisions".into())]
-    );
+    let requests = model.requests.lock().unwrap();
+    assert!(requests[0]
+        .request
+        .system
+        .as_deref()
+        .unwrap()
+        .contains("original instructions\nretain decisions"));
     assert_eq!(
         *hooks.seen.lock().unwrap(),
         [HookEventKind::PreCompact, HookEventKind::PostCompact]
@@ -429,7 +446,6 @@ async fn replacement_context_pre_stop_does_not_run_summary_backend() {
         .build();
     assert!(agent.run(In::user_text("compact")).await.is_err());
     assert!(history.compactions.lock().unwrap().is_empty());
-    assert!(history.summary_instructions.lock().unwrap().is_empty());
     assert_eq!(history.tokens.load(Ordering::SeqCst), 100);
     assert_eq!(
         *hooks.seen.lock().unwrap(),
@@ -438,27 +454,28 @@ async fn replacement_context_pre_stop_does_not_run_summary_backend() {
 }
 
 #[tokio::test]
-async fn replacement_context_noop_and_prune_do_not_emit_summary_hooks() {
-    for action in [CompactAction::Unchanged, CompactAction::Pruned] {
-        let history = Arc::new(History::default());
-        *history.compaction_action.lock().unwrap() = Some(action);
-        let hooks = Arc::new(Hooks::new(|_, _| {}));
-        let agent = Agent::builder()
-            .agent_loop(Arc::new(custom::CompactLoop))
-            .context_manager(history.clone())
-            .model(Arc::new(Model::new(vec![])))
-            .hooks(hooks.clone())
-            .build();
-        assert_eq!(
-            agent.run(In::user_text("compact")).await.unwrap().text,
-            "compacted"
-        );
-        assert_eq!(
-            *hooks.seen.lock().unwrap(),
-            [HookEventKind::UserPromptSubmit, HookEventKind::Stop]
-        );
-        assert!(history.summary_instructions.lock().unwrap().is_empty());
-    }
+async fn replacement_context_below_threshold_does_not_emit_compaction_hooks() {
+    let history = Arc::new(History::default());
+    let hooks = Arc::new(Hooks::new(|_, _| {}));
+    let model = Arc::new(Model::new(vec![]));
+    let compact = Compactor::new(
+        history.clone(),
+        model.clone(),
+        Some(hooks.clone()),
+        None,
+        BaseInput::new(history.session_id().as_str(), ""),
+    );
+    let result = compact
+        .exec(
+            CompactionRequest::new(CompactionTrigger::Threshold),
+            &tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!result.compacted);
+    assert!(hooks.seen.lock().unwrap().is_empty());
+    assert!(model.requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -800,8 +817,9 @@ async fn failed_checkpoint_keeps_deferred_hook_context_for_cleanup() {
     let registry = Arc::new(Registry::default());
     registry.register(Arc::new(Handler::new("tool", Mode::Return)));
     let hooks = Arc::new(Hooks::new(|_, result| {
-        if let HookPointOutcome::PostToolUse(outcome) = &mut result.outcome {
-            outcome
+        if let HookPointOutcome::PostToolUse(_) = &mut result.outcome {
+            result
+                .common
                 .additional_contexts
                 .push("must survive failed save".into());
         }

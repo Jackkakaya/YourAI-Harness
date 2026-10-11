@@ -1,5 +1,5 @@
 //! Model capacity and generation settings have one owner: the selected model.
-use crate::{ErrorKind, YourAiError};
+use crate::{chat::*, model::ModelProvider, ErrorKind, YourAiError};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -65,6 +65,36 @@ impl ModelTokenBudget {
     }
 }
 
+fn budget_error(message: impl std::fmt::Display) -> YourAiError {
+    ErrorKind::Config(message.to_string()).into()
+}
+pub fn estimate_request(
+    request: &ChatRequest,
+    model: &dyn ModelProvider,
+) -> Result<u64, YourAiError> {
+    let mut text = request.clone();
+    let mut media = 0u64;
+    for message in &mut text.messages {
+        let mut parts = vec![];
+        for part in message.content.clone().into_parts() {
+            if matches!(part, ContentPart::Binary(_) | ContentPart::Custom(_)) {
+                media = media
+                    .checked_add(model.media_tokens(&part)?)
+                    .ok_or_else(|| budget_error("media budget overflow"))?;
+            } else {
+                parts.push(part);
+            }
+        }
+        message.content = MessageContent::from_parts(parts);
+    }
+    let tokens = serde_json::to_vec(&text)
+        .map_err(budget_error)?
+        .len()
+        .div_ceil(3) as u64;
+    tokens
+        .checked_add(media)
+        .ok_or_else(|| budget_error("request budget overflow"))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

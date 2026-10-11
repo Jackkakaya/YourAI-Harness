@@ -1,3 +1,5 @@
+#[path = "support/model.rs"]
+mod model_fixture;
 #[path = "support/loop.rs"]
 mod support;
 use std::sync::{
@@ -16,7 +18,7 @@ struct Memory {
     queries: Mutex<Vec<String>>,
     fail: bool,
 }
-impl MemoryProvider for Memory {
+impl MemoryManager for Memory {
     fn system_prompt_block<'a>(
         &'a self,
         _: &'a CancellationToken,
@@ -79,7 +81,7 @@ async fn frozen_prompt_and_recall_replay_survive_file_changes_restart_and_fork()
     let model = Arc::new(Model::new(vec![answer("one"), answer("two")]));
     let mut config = HarnessConfig::new(root.clone(), d.path().into());
     config.instructions = vec!["AGENTS.md".into(), "Memory.md".into()];
-    config.memory_provider = Some(memory.clone());
+    config.memory_manager = Some(memory.clone());
     config.memory_search_limit = 3;
     let h = Harness::open(config, model.clone()).await.unwrap();
     turn(&h, "A").await;
@@ -115,7 +117,7 @@ async fn frozen_prompt_and_recall_replay_survive_file_changes_restart_and_fork()
             .count(),
         2
     );
-    let store = SessionCatalog::new(&root).unwrap();
+    let store = SessionCatalog::new(&root).unwrap().store;
     let id = h.host.context().id;
     let rows = store
         .read_messages(&id, MessageQuery::default())
@@ -174,7 +176,7 @@ async fn frozen_prompt_and_recall_replay_survive_file_changes_restart_and_fork()
     config.system_prompt = Some("changed configuration".into());
     config.prompt.soul_file = Some(d.path().join("missing.md"));
     config.instructions = vec!["AGENTS.md".into()];
-    config.memory_provider = Some(offline.clone());
+    config.memory_manager = Some(offline.clone());
     config.memory_search_limit = 3;
     let h = Harness::open(config, resumed_model.clone()).await.unwrap();
     turn(&h, "C").await;
@@ -203,6 +205,7 @@ async fn no_provider_works_and_explicit_missing_or_oversize_files_fail_before_se
         .is_err());
     assert!(SessionCatalog::new(&root)
         .unwrap()
+        .store
         .list_sessions()
         .await
         .unwrap()
@@ -261,13 +264,11 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
         .id;
     let c = DefaultContext::new(
         id.clone(),
-        yourai_harness::context::ContextServices {
-            store: Some(store.clone()),
-            policy: ContextPolicy {
-                keep_recent_tokens: 0,
-                summary_min_savings: 1,
-                ..Default::default()
-            },
+        String::new(),
+        Some(store.clone()),
+        ContextPolicy {
+            keep_recent_tokens: 0,
+            summary_min_savings: 1,
             ..Default::default()
         },
     );
@@ -287,7 +288,7 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
     .await
     .unwrap();
     let model = Arc::new(SummaryCapture(Mutex::new(vec![])));
-    let configured_model = yourai_harness::model::ConfiguredModel::new(
+    let configured_model = model_fixture::TestModel::new(
         model.clone(),
         ModelTokenBudget::resolve(
             ModelLimits {
@@ -320,7 +321,7 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
         )
         .await
         .unwrap();
-    assert_eq!(result.action, CompactAction::Summarized);
+    assert!(result.compacted);
     let requests = serde_json::to_string(&*model.0.lock().unwrap()).unwrap();
     assert!(requests.contains("IMPORTANT-RECALL"));
     assert!(!requests.contains("FROZEN-DO-NOT-SUMMARIZE"));
@@ -408,7 +409,7 @@ async fn request_retry_reuses_exact_recall_without_querying_again() {
     let model = Arc::new(model);
     let memory = Arc::new(Memory::default());
     let mut cfg = HarnessConfig::new(d.path().join("sessions"), d.path().into());
-    cfg.memory_provider = Some(memory.clone());
+    cfg.memory_manager = Some(memory.clone());
     cfg.memory_search_limit = 3;
     let h = Harness::open(cfg, model.clone()).await.unwrap();
     turn(&h, "query").await;

@@ -3,7 +3,7 @@ use super::*;
 use std::ops::{Deref, DerefMut};
 
 pub(super) struct Transaction<'a> {
-    host: &'a SessionHost,
+    host: &'a SessionManager,
     _gate: std::sync::MutexGuard<'a, ()>,
     candidate: Journal,
 }
@@ -53,7 +53,7 @@ impl Transaction<'_> {
         Ok(())
     }
 }
-impl SessionHost {
+impl SessionManager {
     pub(super) fn journal(&self) -> Transaction<'_> {
         let gate = self.journal_gate.lock().unwrap();
         let mut candidate = self.live.lock().unwrap().journal.clone();
@@ -115,11 +115,11 @@ mod tests {
         let (_dir, harness) = fixture().await;
         let old = harness.host.clone();
         harness.close().await.unwrap();
-        let reopened = SessionHost::open(
+        let reopened = SessionManager::open(
             old.dir.clone(),
             old.context(),
             old.agent.clone(),
-            HostConfig::default(),
+            SessionConfig::default(),
             "resume",
         )
         .await
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(reopened.close(None).await.unwrap().len(), 1);
     }
     async fn hold_writer(
-        host: Arc<SessionHost>,
+        host: Arc<SessionManager>,
     ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
         let (ready, wait) = oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();

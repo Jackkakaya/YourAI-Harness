@@ -1,5 +1,5 @@
 //! A child lifecycle is one public exec around private business work.
-use crate::{prelude::*, runtime::SessionHost};
+use crate::{prelude::*, runtime::SessionManager};
 use serde_json::{json, Value};
 use std::sync::{Arc, Weak};
 
@@ -7,21 +7,21 @@ use std::sync::{Arc, Weak};
 pub trait SubagentFactory: Send + Sync {
     fn create<'a>(
         &'a self,
-        parent: &'a SessionHost,
+        parent: &'a SessionManager,
         id: SessionId,
         tc: &'a ToolContext<'_>,
-    ) -> BoxFuture<'a, Result<Arc<SessionHost>, YourAiError>>;
+    ) -> BoxFuture<'a, Result<Arc<SessionManager>, YourAiError>>;
 }
 
 pub struct Subagent {
-    parent: Weak<SessionHost>,
+    parent: Weak<SessionManager>,
     factory: Arc<dyn SubagentFactory>,
     agent_type: String,
     max_continuations: u32,
 }
 impl Subagent {
     pub fn new(
-        parent: &Arc<SessionHost>,
+        parent: &Arc<SessionManager>,
         factory: Arc<dyn SubagentFactory>,
         agent_type: String,
         max_continuations: u32,
@@ -140,7 +140,7 @@ impl Subagent {
     }
     async fn run(
         &self,
-        child: &Arc<SessionHost>,
+        child: &Arc<SessionManager>,
         tc: &ToolContext<'_>,
         id: &str,
     ) -> Result<Option<String>, YourAiError> {
@@ -196,9 +196,9 @@ impl ToolProvider for Subagent {
     }
 }
 struct ChildCleanup {
-    parent: Arc<SessionHost>,
+    parent: Arc<SessionManager>,
     id: SessionId,
-    child: Arc<SessionHost>,
+    child: Arc<SessionManager>,
 }
 impl Drop for ChildCleanup {
     fn drop(&mut self) {

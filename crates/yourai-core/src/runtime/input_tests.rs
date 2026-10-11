@@ -9,7 +9,7 @@ fn attached(text: &str) -> In {
         attachments: vec![UserAttachment::file("note.txt", None)],
     }
 }
-fn running(host: &SessionHost) -> mpsc::UnboundedReceiver<In> {
+fn running(host: &SessionManager) -> mpsc::UnboundedReceiver<In> {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut live = host.live.lock().unwrap();
     live.status = SessionStatus::Running {
@@ -18,7 +18,7 @@ fn running(host: &SessionHost) -> mpsc::UnboundedReceiver<In> {
     live.inbox = Some(tx);
     rx
 }
-fn idle(host: &SessionHost) {
+fn idle(host: &SessionManager) {
     let mut live = host.live.lock().unwrap();
     live.status = SessionStatus::Idle;
     live.inbox = None;
@@ -37,11 +37,11 @@ async fn equal_messages_get_distinct_ids_and_keep_attachments_after_reopen() {
     assert_ne!(pending[0].id(), pending[1].id());
     let before = wire(&pending);
     assert_eq!(wire(&harness.close().await.unwrap()), before);
-    let reopened = SessionHost::open(
+    let reopened = SessionManager::open(
         host.dir.clone(),
         host.context(),
         host.agent.clone(),
-        HostConfig::default(),
+        SessionConfig::default(),
         "resume",
     )
     .await
@@ -133,11 +133,11 @@ async fn legacy_queue_ids_are_migrated_once_and_persisted() {
     let mut journal: Journal = read_json(&path).unwrap();
     journal.queue.push_back(attached("legacy"));
     atomic_write(&path, &journal).unwrap();
-    let reopened = SessionHost::open(
+    let reopened = SessionManager::open(
         host.dir.clone(),
         host.context(),
         host.agent.clone(),
-        HostConfig::default(),
+        SessionConfig::default(),
         "resume",
     )
     .await

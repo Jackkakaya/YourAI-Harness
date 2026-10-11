@@ -7,7 +7,6 @@ fn start_result(paths: Vec<&str>, initial: Option<&str>) -> HookDispatchResult {
     result.outcome = HookPointOutcome::SessionStart(SessionStartOutcome {
         initial_user_message: initial.map(String::from),
         watch_paths: paths.into_iter().map(String::from).collect(),
-        ..Default::default()
     });
     result
 }
@@ -130,7 +129,7 @@ async fn turn_completed_is_gated_on_new_history_rows() {
     assert!(rx.try_recv().is_err());
     fixture.close().await.unwrap();
 }
-async fn append_history(host: &SessionHost) {
+async fn append_history(host: &SessionManager) {
     let mut row = StoredMessage::new(ChatMessage::assistant("done"));
     row.seq = 9;
     host.agent()

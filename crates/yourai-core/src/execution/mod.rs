@@ -426,6 +426,7 @@ impl<'a> Turn<'a> {
         trigger: CompactionTrigger,
     ) -> Result<CompactionResult, YourAiError> {
         let mut request = CompactionRequest::new(trigger);
+        request.source = self.tc.info.options.source.unwrap_or("compact");
         request.deadline = self.deadline(self.op_timeout());
         request.tools = self
             .tc
@@ -462,21 +463,11 @@ impl<'a> Turn<'a> {
         self.model_calls += calls.load(std::sync::atomic::Ordering::Acquire);
         let usages = usage.lock().unwrap().clone();
         for u in usages {
-            let input = u.prompt_tokens.unwrap_or(0).max(0) as u64;
-            let output = u.completion_tokens.unwrap_or(0).max(0) as u64;
             if u.prompt_tokens.is_some()
                 || u.completion_tokens.is_some()
                 || u.total_tokens.is_some()
             {
-                self.record_usage(Usage {
-                    input_tokens: input,
-                    output_tokens: output,
-                    total_tokens: u
-                        .total_tokens
-                        .map(|n| n.max(0) as u64)
-                        .unwrap_or(input + output),
-                })
-                .await?;
+                self.record_usage(crate::model::usage(&u)).await?;
             }
         }
         let result = result?;
@@ -487,17 +478,16 @@ impl<'a> Turn<'a> {
             return Err(AbortReason::HookStopped(reason.clone()).into());
         }
         if trigger == CompactionTrigger::Overflow
-            && (result.action == CompactAction::Unchanged
-                || result.tokens_after >= result.tokens_before)
+            && (!result.compacted || result.tokens_after >= result.tokens_before)
         {
             return Err(ErrorKind::Loop("overflow compaction made no progress".into()).into());
         }
-        if result.action != CompactAction::Unchanged {
+        if result.compacted {
             self.notice(
                 Level::Info,
                 format!(
-                    "Context {:?}: {} -> {} tokens",
-                    result.action, result.tokens_before, result.tokens_after
+                    "Summarized: {} -> {} tokens",
+                    result.tokens_before, result.tokens_after
                 ),
             )?;
         }

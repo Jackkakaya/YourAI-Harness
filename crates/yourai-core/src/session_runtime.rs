@@ -1,13 +1,13 @@
-//! 会话环境与报告类型；具体控制流程由 core SessionHost 固定实现。
+//! 会话环境与报告类型；具体控制流程由 core SessionManager 固定实现。
 //!
-//! SessionManager 管元数据；SessionHost 管理活着的会话。创建/恢复由公开的
+//! SessionStore 管元数据；SessionManager 管理活着的会话。创建/恢复由公开的
 //! 构造入口完成：绑定历史、装配 Agent、触发 SessionStart 后才对外提供对象。
 //!
 //! ```
 //! use yourai_core::prelude::*;
-//! use yourai_core::runtime::SessionHost;
+//! use yourai_core::runtime::SessionManager;
 //!
-//! fn enqueue(runtime: &SessionHost, text: &str) -> Result<(), InputRejected> {
+//! fn enqueue(runtime: &SessionManager, text: &str) -> Result<(), InputRejected> {
 //!     runtime.submit(In::user_text(text))
 //! }
 //! ```

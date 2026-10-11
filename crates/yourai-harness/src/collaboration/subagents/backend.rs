@@ -9,10 +9,10 @@ pub(super) struct ChildFactory {
 impl SubagentFactory for ChildFactory {
     fn create<'a>(
         &'a self,
-        parent: &'a SessionHost,
+        parent: &'a SessionManager,
         id: SessionId,
         tc: &'a ToolContext<'_>,
-    ) -> BoxFuture<'a, Result<Arc<SessionHost>, YourAiError>> {
+    ) -> BoxFuture<'a, Result<Arc<SessionManager>, YourAiError>> {
         Box::pin(async move {
             let root = parent
                 .context()
@@ -47,10 +47,11 @@ impl SubagentFactory for ChildFactory {
                 .cloned()
                 .ok_or_else(|| crate::error("subagent", "model not configured"))?;
             let mut meta = catalog
+                .store
                 .create_session(id.clone(), &history.system_prompt())
                 .await?;
             meta.parent_session_id = Some(parent.context().id);
-            catalog.save_session(&meta).await?;
+            catalog.store.save_session(&meta).await?;
             let child = crate::runtime::restore(
                 &root,
                 id,

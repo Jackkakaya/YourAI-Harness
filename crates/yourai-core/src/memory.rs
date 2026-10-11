@@ -12,34 +12,13 @@ pub struct MemoryEntry {
     pub updated_at: i64,
 }
 
-pub trait MemoryManager: Send + Sync {
-    /// 存一条记忆；`category` 用于 [`list`](MemoryManager::list) 的分类筛选
-    fn store<'a>(
-        &'a self,
-        key: &'a str,
-        value: &'a str,
-        category: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), YourAiError>>;
-    fn retrieve<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<String>, YourAiError>>;
-    fn search<'a>(
-        &'a self,
-        query: &'a str,
-        limit: usize,
-    ) -> BoxFuture<'a, Result<Vec<MemoryEntry>, YourAiError>>;
-    fn list<'a>(
-        &'a self,
-        category: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Vec<MemoryEntry>, YourAiError>>;
-    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), YourAiError>>;
-    fn clear<'a>(&'a self) -> BoxFuture<'a, Result<(), YourAiError>>;
-}
-
-/// Optional memory capabilities and lifecycle callbacks. The framework adapts
-/// callbacks to HookRuntime; provider authors never register hooks themselves.
+/// Runtime memory recall and lifecycle interface. Local CRUD belongs to the concrete store,
+/// rather than a second core trait. The framework adapts
+/// callbacks to HookManager; provider authors never register hooks themselves.
 /// Construct ready-to-use connections before installation: system_prompt_block
 /// can run before on_session_start. Callbacks must be cancellation-safe; sync_turn
 /// implementations deduplicate writes using (session_id, turn_id).
-pub trait MemoryProvider: Send + Sync {
+pub trait MemoryManager: Send + Sync {
     fn on_session_start<'a>(
         &'a self,
         _session: &'a MemorySession,

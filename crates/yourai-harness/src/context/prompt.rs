@@ -83,7 +83,7 @@ pub async fn prepare(
     base: Option<&str>,
     instructions: &[PathBuf],
     skills: Option<&dyn SkillProvider>,
-    memory: Option<&dyn MemoryProvider>,
+    memory: Option<&dyn MemoryManager>,
     input_budget: Option<u64>,
     cancel: &CancellationToken,
 ) -> Result<PreparedPrompt, YourAiError> {

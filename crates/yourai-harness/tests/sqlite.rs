@@ -83,23 +83,21 @@ async fn compaction_preserves_unselected_messages_and_rolls_back_stale_candidate
         .await
         .unwrap();
     let first = summary("first summary");
-    let change = CompactionChange {
-        sources: vec![rows[1].id.clone()],
-        summary: first.clone(),
-    };
+    let sources = vec![rows[1].id.clone()];
     store
-        .save_context(&id, change.clone().into())
+        .save_summary(&id, sources.clone(), first.clone(), Default::default())
         .await
         .unwrap();
-    store.save_context(&id, change.into()).await.unwrap();
+    store
+        .save_summary(&id, sources, first.clone(), Default::default())
+        .await
+        .unwrap();
     assert!(store
-        .save_context(
+        .save_summary(
             &id,
-            CompactionChange {
-                sources: vec![rows[0].id.clone(), rows[1].id.clone()],
-                summary: summary("stale")
-            }
-            .into()
+            vec![rows[0].id.clone(), rows[1].id.clone()],
+            summary("stale"),
+            Default::default()
         )
         .await
         .is_err());
@@ -118,24 +116,20 @@ async fn compaction_preserves_unselected_messages_and_rolls_back_stale_candidate
     assert!(active.iter().any(|m| m.id == rows[0].id));
     // Omitting the previous active summary violates the unique index; source updates roll back.
     assert!(store
-        .save_context(
+        .save_summary(
             &id,
-            CompactionChange {
-                sources: vec![rows[2].id.clone()],
-                summary: summary("invalid")
-            }
-            .into()
+            vec![rows[2].id.clone()],
+            summary("invalid"),
+            Default::default()
         )
         .await
         .is_err());
     store
-        .save_context(
+        .save_summary(
             &id,
-            CompactionChange {
-                sources: vec![first.id, rows[2].id.clone()],
-                summary: summary("replacement"),
-            }
-            .into(),
+            vec![first.id, rows[2].id.clone()],
+            summary("replacement"),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -330,8 +324,12 @@ async fn legacy_import_preserves_sources_and_is_transactional() {
     );
     let catalog = yourai_harness::SessionCatalog::new(dir.path()).unwrap();
     let id = SessionId::from("legacy");
-    assert_eq!(catalog.load_session(&id).await.unwrap().created_at, 1000);
+    assert_eq!(
+        catalog.store.load_session(&id).await.unwrap().created_at,
+        1000
+    );
     let active = catalog
+        .store
         .read_messages(
             &id,
             MessageQuery {
@@ -350,6 +348,7 @@ async fn legacy_import_preserves_sources_and_is_transactional() {
     assert!(yourai_harness::storage::sqlite::import_json_sessions(dir.path()).is_err());
     assert_eq!(
         catalog
+            .store
             .read_messages(&id, MessageQuery::default())
             .await
             .unwrap()
@@ -531,4 +530,36 @@ async fn version_four_adds_tasks_without_changing_existing_session_history() {
     assert!(store.read_tasks(&id).unwrap().is_empty());
     store.save_tasks(&id, vec![task("task", "new", 1)]).unwrap();
     assert_eq!(store.read_tasks(&id).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn deletion_keeps_locked_session_and_history_intact() {
+    let dir = TempDir::new().unwrap();
+    let store = SqliteStore::open(&dir.path().join("history.sqlite3")).unwrap();
+    let id = store
+        .create_session(SessionId::new(), "system")
+        .await
+        .unwrap()
+        .id;
+    store
+        .append_messages(&id, vec![StoredMessage::new(ChatMessage::user("keep me"))])
+        .await
+        .unwrap();
+    let session_dir = dir.path().join(id.as_str());
+    let lease = yourai_core::runtime::SessionLease::acquire(session_dir.clone()).unwrap();
+    assert!(store.delete_session(&id).await.is_err());
+    assert_eq!(
+        store
+            .read_messages(&id, MessageQuery::default())
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+    assert!(session_dir.exists());
+    drop(lease);
+    store.delete_session(&id).await.unwrap();
+    assert!(store.load_session(&id).await.is_err());
+    assert!(!session_dir.exists());
 }

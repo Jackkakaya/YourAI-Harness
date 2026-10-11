@@ -60,11 +60,8 @@ impl ModelProvider for CustomProvider {
 }
 fn wrapped(class: ModelErrorClass, mode: Mode) -> (Arc<dyn ModelProvider>, Arc<ModelBudget>) {
     let budget = ModelBudget::new();
-    let inner = ConfiguredModel::new(
-        Arc::new(SourceModel {
-            inner: Arc::new(CustomProvider { class, mode }),
-            source: "test",
-        }),
+    let inner = settings_fixture::TestModel::new(
+        Arc::new(CustomProvider { class, mode }),
         ModelTokenBudget::default(),
         ModelTimeouts {
             headers: Duration::from_secs(1),

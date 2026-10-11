@@ -136,7 +136,7 @@ cwd/model/billing_route/runtime_lock/JSON config）+ `messages`（一表多列�
 ### 待讨论（提案倾向）
 
 1. **两表模型**（sessions 元数据 + messages 行存）——直接采纳，与架构 §5.4
-   "SessionManager 管 meta / cm 管历史"对齐
+   "SessionStore 管 meta / cm 管历史"对齐
 2. **列宽取舍**：hermes 22 列是平台总线（telegram/yuanbao/codex）长年积累；
    v1 收窄为 role/content_json/tool_call_id/token_count/status/created_at，
    genai ChatMessage 整体 JSON 序列化进 content_json 兜未来字段
@@ -254,7 +254,7 @@ CREATE TABLE pending_approvals (
 
 - 恢复 session = `SqliteContextManager::open(db, session_id)` 重建，构造时 load 活跃
   视图（D-CM7 读规则），没有特殊恢复路径（架构 §5.4）。
-- SessionManager 只管元数据（title/时间戳/model）。
+- SessionStore 只管元数据（title/时间戳/model）。
 
 ### 四个配套问题（提案）
 
@@ -526,20 +526,20 @@ compact 一次 = 前缀缓存全失效一次（请求前缀字节全变，全量
 
 SessionId ＝ 横切身份标识（不是对象、不是第二层）：
   cm 绑定 ↔ sessions 行 ↔ messages.session_id ↔ usage_events.session_id
-  ↔ prompt_cache_key 派生源 ↔ SessionManager 列表键
+  ↔ prompt_cache_key 派生源 ↔ SessionStore 列表键
 ```
 
-**SessionManager 与 ContextManager 的分工**：SessionManager 只碰 `sessions` 表的
+**SessionStore 与 ContextManager 的分工**：SessionStore 只碰 `sessions` 表的
 元数据列（title/model/created_at…），**永远不读写 messages**；ContextManager 只碰
 历史与 usage，不碰 title。两者靠 session_id 关联，无对象级耦合。
 
 **用户原始直觉的最终修正**："内存部分是 context，持久化是 session" →
 运行态与持久态是**同一个 ContextManager 的两种实现形态**（trait 一致、契约一致）；
-session 是横切其上的身份标识 + SessionManager 里的一行元数据。
+session 是横切其上的身份标识 + SessionStore 里的一行元数据。
 **Context（容器）≠ ContextManager（对话历史管理）**——架构 §4.2 命名澄清保留。
 
 ### 决策记录
 
 - **D-CM16（已决策 2026-09-02）**：概念模型定稿——ContextManager = 记忆本体管理者
-  （trait + 两实现）；SessionId = 横切身份；SessionManager = 纯元数据，与 cm
+  （trait + 两实现）；SessionId = 横切身份；SessionStore = 纯元数据，与 cm
   无对象级耦合；四层职责图（装配 / loop / cm / 存储）如上。

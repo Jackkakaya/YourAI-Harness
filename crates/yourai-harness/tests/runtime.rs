@@ -1,6 +1,7 @@
 #[path = "support/context.rs"]
 mod context_fixture;
 use context_fixture::DefaultContext;
+use context_fixture::TestModel;
 #[path = "support/loop.rs"]
 mod support;
 use serde_json::json;
@@ -16,9 +17,7 @@ use support::*;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use yourai_core::runtime::SessionLease;
-use yourai_core::{
-    context::DiscardSink, hooks::GenericOutcome, prelude::*, runtime_event::RuntimeEvent,
-};
+use yourai_core::{context::DiscardSink, prelude::*, runtime_event::RuntimeEvent};
 use yourai_harness::{collaboration::*, *};
 
 #[test]
@@ -41,7 +40,7 @@ fn context(
     id: SessionId,
     model: Arc<dyn ModelProvider>,
     store: Arc<SqliteStore>,
-    hooks: Option<Arc<dyn HookRuntime>>,
+    hooks: Option<Arc<dyn HookManager>>,
 ) -> Arc<DefaultContext> {
     let mut services = context_fixture::ContextServices::new(&id);
     services.store = Some(store.clone());
@@ -58,8 +57,8 @@ fn context(
 async fn host(
     dir: &std::path::Path,
     model: Arc<dyn ModelProvider>,
-    hooks: Option<Arc<dyn HookRuntime>>,
-) -> Arc<SessionHost> {
+    hooks: Option<Arc<dyn HookManager>>,
+) -> Arc<SessionManager> {
     let store = Arc::new(SqliteStore::open(&dir.join("sessions.sqlite3")).unwrap());
     let id = match store.list_sessions().await.unwrap().first() {
         Some(meta) => meta.id.clone(),
@@ -77,11 +76,11 @@ async fn host(
     if let Some(h) = hooks {
         b = b.hooks(h);
     }
-    SessionHost::open(
+    SessionManager::open(
         dir,
         SessionContext::new(id, dir),
         b.build(),
-        HostConfig::default(),
+        SessionConfig::default(),
         "startup",
     )
     .await
@@ -437,9 +436,7 @@ async fn invalid_task_hook_or_failed_effect_storage_prevents_task_save() {
         let dir = TempDir::new().unwrap();
         let hooks = Arc::new(Hooks::new(move |i, r| {
             if i.event.kind() == HookEventKind::TaskCreated {
-                r.outcome = HookPointOutcome::Generic(GenericOutcome {
-                    additional_contexts: vec!["context".into()],
-                });
+                r.common.additional_contexts = vec!["context".into()];
                 if invalid {
                     r.event = HookEventKind::Stop;
                 }
@@ -568,7 +565,24 @@ struct PausedTaskHook {
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
-impl HookRuntime for PausedTaskHook {
+impl HookManager for PausedTaskHook {
+    // This fixed-response fixture does not support dynamic registration.
+    fn register<'a>(
+        &'a self,
+        _: yourai_core::hooks::NativeHookRegistration,
+    ) -> yourai_core::BoxFuture<'a, Result<(), yourai_core::YourAiError>> {
+        panic!("registration is not used by this test hook")
+    }
+    fn unregister<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> yourai_core::BoxFuture<'a, Result<bool, yourai_core::YourAiError>> {
+        panic!("unregistration is not used by this test hook")
+    }
+    fn handler_ids<'a>(&'a self) -> yourai_core::BoxFuture<'a, Vec<String>> {
+        panic!("registry inspection is not used by this test hook")
+    }
+
     fn dispatch<'a>(
         &'a self,
         invocation: &'a HookInvocation,
@@ -973,7 +987,7 @@ async fn shared_budget_counts_main_stream_and_compaction_model() {
 #[tokio::test]
 async fn async_hook_completion_routes_to_own_session_and_wakes_host() {
     let dir = TempDir::new().unwrap();
-    let runtime = Arc::new(yourai_harness::hooks::DefaultHookRuntime::new());
+    let runtime = Arc::new(yourai_harness::hooks::DefaultHookManager::new());
     let config:yourai_harness::hooks::HooksConfig=serde_json::from_value(json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo background-feedback >&2; exit 2","asyncRewake":true}]}]}})).unwrap();
     runtime
         .register_config(&config, HookSource::Session)
@@ -1009,11 +1023,18 @@ async fn async_hook_completion_routes_to_own_session_and_wakes_host() {
 async fn catalog_create_fork_list_delete_are_persistent() {
     let dir = TempDir::new().unwrap();
     let catalog = SessionCatalog::new(dir.path()).unwrap();
-    let first = catalog.create_session(SessionId::new(), "").await.unwrap();
-    let fork = catalog.fork_session(&first.id).await.unwrap();
-    assert_eq!(catalog.list_sessions().await.unwrap().len(), 2);
-    catalog.delete_session(&fork).await.unwrap();
-    assert_eq!(catalog.load_session(&first.id).await.unwrap().id, first.id);
+    let first = catalog
+        .store
+        .create_session(SessionId::new(), "")
+        .await
+        .unwrap();
+    let fork = catalog.store.fork_session(&first.id).await.unwrap();
+    assert_eq!(catalog.store.list_sessions().await.unwrap().len(), 2);
+    catalog.store.delete_session(&fork).await.unwrap();
+    assert_eq!(
+        catalog.store.load_session(&first.id).await.unwrap().id,
+        first.id
+    );
 }
 
 #[tokio::test]
@@ -1151,6 +1172,7 @@ async fn harness_runs_real_task_tool_through_loop_and_restores_session() {
     let harness = Harness::open(config, model).await.unwrap();
     let frozen = SessionCatalog::new(dir.path().join("sessions"))
         .unwrap()
+        .store
         .load_session(&harness.host.context().id)
         .await
         .unwrap()
@@ -1210,39 +1232,32 @@ async fn harness_runs_real_task_tool_through_loop_and_restores_session() {
 }
 #[tokio::test]
 async fn agent_hook_uses_real_loop_and_shared_budget() {
-    use yourai_harness::hooks::{HookEvaluator, HookModelRequest};
     let budget = ModelBudget::new();
-    let executor = assembly::model_hooks::DefaultHookEvaluator {
-        model: Some(Arc::new(MeteredModel {
-            inner: Arc::new(Model::new(vec![
-                answer(r#"{"ok":false,"reason":"unfinished"}"#),
-                answer(r#"{"ok":true}"#),
-            ])),
-            budget: budget.clone(),
-        })),
-        tools: None,
-        usage: None,
-        timeout: Duration::from_secs(1),
-        steps: 2,
-    };
-    let request = HookModelRequest {
-        prompt: "evaluate".into(),
-        model: None,
-        agentic: true,
-        invocation: HookInvocation::new(
-            BaseInput::new("session", "."),
-            HookEvent::SessionEnd {
-                reason: "shutdown".into(),
-            },
-        ),
-    };
-    let result = executor.evaluate(request.clone()).await.unwrap();
-    assert!(!result.ok);
-    assert_eq!(result.reason.as_deref(), Some("unfinished"));
+    let model = Arc::new(MeteredModel {
+        inner: Arc::new(Model::new(vec![
+            answer(r#"{"ok":false,"reason":"unfinished"}"#),
+            answer(r#"{"ok":true}"#),
+        ])),
+        budget: budget.clone(),
+    });
+    let hooks = yourai_harness::hooks::DefaultHookManager::new().with_model(model);
+    let config = serde_json::from_value(serde_json::json!({"hooks":{"SessionEnd":[{"hooks":[{"type":"agent","prompt":"evaluate", "timeout":1}]}]}})).unwrap();
+    hooks
+        .register_config(&config, HookSource::Project)
+        .await
+        .unwrap();
+    let invocation = HookInvocation::new(
+        BaseInput::new("session", "."),
+        HookEvent::SessionEnd {
+            reason: "shutdown".into(),
+        },
+    );
+    let result = hooks.dispatch(&invocation).await.unwrap();
+    assert!(result.common.prevent_continuation);
+    assert_eq!(result.common.stop_reason.as_deref(), Some("unfinished"));
     assert_eq!(budget.snapshot().calls, 1);
-    // No shared call limit; a second evaluation also succeeds.
-    let result2 = executor.evaluate(request).await.unwrap();
-    assert!(result2.ok);
+    let result2 = hooks.dispatch(&invocation).await.unwrap();
+    assert!(!result2.common.prevent_continuation);
     assert_eq!(budget.snapshot().calls, 2);
 }
 #[tokio::test]
@@ -1292,7 +1307,7 @@ async fn watched_directory_detects_created_and_deleted_children() {
 async fn closing_session_cancels_its_background_command() {
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("should-not-exist");
-    let runtime = Arc::new(yourai_harness::hooks::DefaultHookRuntime::new());
+    let runtime = Arc::new(yourai_harness::hooks::DefaultHookManager::new());
     let config:yourai_harness::hooks::HooksConfig=serde_json::from_value(json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":format!("sleep 0.3; touch '{}'",marker.display()),"async":true}]}]}})).unwrap();
     runtime
         .register_config(&config, HookSource::Session)
@@ -1312,7 +1327,7 @@ async fn closing_session_cancels_its_background_command() {
 #[tokio::test]
 async fn shared_hook_runtime_keeps_background_contexts_session_local() {
     let dir = TempDir::new().unwrap();
-    let runtime = Arc::new(yourai_harness::hooks::DefaultHookRuntime::new());
+    let runtime = Arc::new(yourai_harness::hooks::DefaultHookManager::new());
     let config:yourai_harness::hooks::HooksConfig=serde_json::from_value(json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sleep 0.1; echo feedback >&2; exit 2","asyncRewake":true}]}]}})).unwrap();
     runtime
         .register_config(&config, HookSource::Session)
@@ -1529,11 +1544,11 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
             yourai_harness::default_loop::DefaultLoop::default(),
         ))
         .build();
-    let h = SessionHost::open(
+    let h = SessionManager::open(
         dir.path(),
         SessionContext::new(id.clone(), dir.path()),
         agent.clone(),
-        HostConfig::default(),
+        SessionConfig::default(),
         "startup",
     )
     .await
@@ -1563,7 +1578,7 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
         .await
         .unwrap();
     assert_eq!(result.tokens_before, before);
-    assert_eq!(result.action, CompactAction::Summarized);
+    assert!(result.compacted);
     assert_eq!(old.0.load(Ordering::SeqCst), 0);
     assert_eq!(new.0.load(Ordering::SeqCst), 1);
     assert!(!old_hooks
@@ -1721,7 +1736,7 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
         ..ContextPolicy::default()
     };
     h.switch_model_with_settings(
-        yourai_harness::model::ConfiguredModel::new(
+        TestModel::new(
             context_fixture::configured(new.clone(), Some(32_000), 2048),
             ModelTokenBudget::resolve(
                 ModelLimits {
@@ -1847,7 +1862,7 @@ async fn model_switch_publishes_chunk_timeout_with_model() {
         .unwrap();
     let next = Arc::new(Model::new(vec![hangs_after("partial")]));
     h.switch_model_with_settings(
-        yourai_harness::model::ConfiguredModel::new(
+        TestModel::new(
             next,
             ModelTokenBudget::default(),
             ModelTimeouts {
@@ -1884,7 +1899,24 @@ async fn model_switch_publishes_chunk_timeout_with_model() {
 #[tokio::test(start_paused = true)]
 async fn close_can_wait_for_cleanup_without_an_implicit_deadline() {
     struct SlowEnd;
-    impl HookRuntime for SlowEnd {
+    impl HookManager for SlowEnd {
+        // This fixed-response fixture does not support dynamic registration.
+        fn register<'a>(
+            &'a self,
+            _: yourai_core::hooks::NativeHookRegistration,
+        ) -> yourai_core::BoxFuture<'a, Result<(), yourai_core::YourAiError>> {
+            panic!("registration is not used by this test hook")
+        }
+        fn unregister<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> yourai_core::BoxFuture<'a, Result<bool, yourai_core::YourAiError>> {
+            panic!("unregistration is not used by this test hook")
+        }
+        fn handler_ids<'a>(&'a self) -> yourai_core::BoxFuture<'a, Vec<String>> {
+            panic!("registry inspection is not used by this test hook")
+        }
+
         fn dispatch<'a>(
             &'a self,
             i: &'a HookInvocation,
@@ -1927,7 +1959,7 @@ async fn harness_model_settings_are_inherited_by_child_default_loop() {
     ]));
     let h = Harness::open(
         config,
-        yourai_harness::model::ConfiguredModel::new(
+        TestModel::new(
             model.clone(),
             ModelTokenBudget::default(),
             ModelTimeouts {
@@ -1986,11 +2018,11 @@ async fn host_rejects_matching_event_with_wrong_hook_outcome() {
         .session(store)
         .hooks(hooks)
         .build();
-    let result = SessionHost::open(
+    let result = SessionManager::open(
         dir.path(),
         SessionContext::new(id, dir.path()),
         agent,
-        HostConfig::default(),
+        SessionConfig::default(),
         "startup",
     )
     .await;
@@ -2157,7 +2189,24 @@ struct LifecycleHooks {
     shutdowns: std::sync::atomic::AtomicUsize,
     ends: std::sync::atomic::AtomicUsize,
 }
-impl HookRuntime for LifecycleHooks {
+impl HookManager for LifecycleHooks {
+    // This fixed-response fixture does not support dynamic registration.
+    fn register<'a>(
+        &'a self,
+        _: yourai_core::hooks::NativeHookRegistration,
+    ) -> yourai_core::BoxFuture<'a, Result<(), yourai_core::YourAiError>> {
+        panic!("registration is not used by this test hook")
+    }
+    fn unregister<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> yourai_core::BoxFuture<'a, Result<bool, yourai_core::YourAiError>> {
+        panic!("unregistration is not used by this test hook")
+    }
+    fn handler_ids<'a>(&'a self) -> yourai_core::BoxFuture<'a, Vec<String>> {
+        panic!("registry inspection is not used by this test hook")
+    }
+
     fn dispatch<'a>(
         &'a self,
         invocation: &'a HookInvocation,
@@ -2190,7 +2239,7 @@ impl HookRuntime for LifecycleHooks {
         })
     }
 }
-fn startup_agent(id: SessionId, hooks: Arc<dyn HookRuntime>) -> Arc<Agent> {
+fn startup_agent(id: SessionId, hooks: Arc<dyn HookManager>) -> Arc<Agent> {
     Agent::builder()
         .context_manager(yourai_harness::DefaultContext::memory(id))
         .hooks(hooks)
@@ -2204,11 +2253,11 @@ async fn failed_startup_reclaims_hook_resources_and_releases_the_lease() {
         ..Default::default()
     });
     let id = SessionId::new();
-    let result = SessionHost::open(
+    let result = SessionManager::open(
         dir.path(),
         SessionContext::new(id.clone(), dir.path()),
         startup_agent(id, hooks.clone()),
-        HostConfig::default(),
+        SessionConfig::default(),
         "startup",
     )
     .await;
@@ -2225,11 +2274,11 @@ async fn abandoned_startup_keeps_an_owner_until_cleanup_finishes() {
         ..Default::default()
     });
     let id = SessionId::new();
-    let mut opening = Box::pin(SessionHost::open(
+    let mut opening = Box::pin(SessionManager::open(
         dir.path(),
         SessionContext::new(id.clone(), dir.path()),
         startup_agent(id, hooks.clone()),
-        HostConfig::default(),
+        SessionConfig::default(),
         "startup",
     ));
     tokio::select! { _ = hooks.entered.notified() => {}, _ = &mut opening => panic!("startup must remain pending") }
@@ -2295,9 +2344,7 @@ async fn subagent_start_context_goes_to_the_child_request() {
     let dir = TempDir::new().unwrap();
     let hooks = Arc::new(Hooks::new(|invocation, result| {
         if invocation.event.kind() == HookEventKind::SubagentStart {
-            result.outcome = HookPointOutcome::Generic(GenericOutcome {
-                additional_contexts: vec!["CHILD-START-INSTRUCTION".into()],
-            });
+            result.common.additional_contexts = vec!["CHILD-START-INSTRUCTION".into()];
         }
     }));
     let h = host(dir.path(), Arc::new(Model::new(vec![])), Some(hooks)).await;
@@ -2337,7 +2384,24 @@ async fn subagent_start_context_goes_to_the_child_request() {
     h.close(None).await.unwrap();
 }
 struct PauseConfigHook(tokio::sync::Notify);
-impl HookRuntime for PauseConfigHook {
+impl HookManager for PauseConfigHook {
+    // This fixed-response fixture does not support dynamic registration.
+    fn register<'a>(
+        &'a self,
+        _: yourai_core::hooks::NativeHookRegistration,
+    ) -> yourai_core::BoxFuture<'a, Result<(), yourai_core::YourAiError>> {
+        panic!("registration is not used by this test hook")
+    }
+    fn unregister<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> yourai_core::BoxFuture<'a, Result<bool, yourai_core::YourAiError>> {
+        panic!("unregistration is not used by this test hook")
+    }
+    fn handler_ids<'a>(&'a self) -> yourai_core::BoxFuture<'a, Vec<String>> {
+        panic!("registry inspection is not used by this test hook")
+    }
+
     fn dispatch<'a>(
         &'a self,
         invocation: &'a HookInvocation,
@@ -2514,7 +2578,24 @@ async fn parent_close_cancels_direct_subagent_and_reclaims_the_unique_child() {
     assert_eq!(h.status(), SessionStatus::Closed);
 }
 struct FileHookFailure;
-impl HookRuntime for FileHookFailure {
+impl HookManager for FileHookFailure {
+    // This fixed-response fixture does not support dynamic registration.
+    fn register<'a>(
+        &'a self,
+        _: yourai_core::hooks::NativeHookRegistration,
+    ) -> yourai_core::BoxFuture<'a, Result<(), yourai_core::YourAiError>> {
+        panic!("registration is not used by this test hook")
+    }
+    fn unregister<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> yourai_core::BoxFuture<'a, Result<bool, yourai_core::YourAiError>> {
+        panic!("unregistration is not used by this test hook")
+    }
+    fn handler_ids<'a>(&'a self) -> yourai_core::BoxFuture<'a, Vec<String>> {
+        panic!("registry inspection is not used by this test hook")
+    }
+
     fn dispatch<'a>(
         &'a self,
         invocation: &'a HookInvocation,
@@ -2572,11 +2653,11 @@ async fn abandoned_completed_startup_also_reclaims_unpublished_resources() {
         ..Default::default()
     });
     let id = SessionId::new();
-    let mut opening = Box::pin(SessionHost::open(
+    let mut opening = Box::pin(SessionManager::open(
         dir.path(),
         SessionContext::new(id.clone(), dir.path()),
         startup_agent(id, hooks.clone()),
-        HostConfig::default(),
+        SessionConfig::default(),
         "startup",
     ));
     tokio::select! { _ = hooks.entered.notified() => {}, _ = &mut opening => panic!("startup must remain pending") }
@@ -2662,18 +2743,34 @@ impl ContextManager for SuspendedRestore {
     fn records(&self) -> Vec<StoredMessage> {
         self.inner.records()
     }
-    fn prepare_compaction<'a>(
+    fn save_summary<'a>(
         &'a self,
-        request: &'a CompactionRequest,
-        model: &'a dyn ModelProvider,
-        cancel: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
-        self.inner.prepare_compaction(request, model, cancel)
+        expected: &'a [StoredMessage],
+        sources: Vec<String>,
+        summary: StoredMessage,
+        progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        self.inner
+            .save_summary(expected, sources, summary, progress)
+    }
+    fn project(
+        &self,
+        records: &[StoredMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<ChatRequest, YourAiError> {
+        self.inner.project(records, tools)
+    }
+    fn estimate(
+        &self,
+        request: &ChatRequest,
+        model: &dyn ModelProvider,
+    ) -> Result<u64, YourAiError> {
+        self.inner.estimate(request, model)
     }
 }
 async fn host_with_suspended_restore(
     dir: &std::path::Path,
-) -> (Arc<SessionHost>, Arc<SuspendedRestore>, Arc<Model>) {
+) -> (Arc<SessionManager>, Arc<SuspendedRestore>, Arc<Model>) {
     let history = Arc::new(SuspendedRestore::default());
     let model = Arc::new(Model::new(vec![answer("done")]));
     let agent = Agent::builder()
@@ -2681,11 +2778,11 @@ async fn host_with_suspended_restore(
         .model(model.clone())
         .context_manager(history.clone())
         .build();
-    let host = SessionHost::open(
+    let host = SessionManager::open(
         dir,
         SessionContext::new(history.session_id().clone(), dir),
         agent,
-        HostConfig::default(),
+        SessionConfig::default(),
         "startup",
     )
     .await

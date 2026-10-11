@@ -1,6 +1,6 @@
 # 公共执行入口与自定义 Loop
 
-当前 core 的公共对象直接拥有 Hook 流程：Tool.exec、Model.exec、Compactor.exec，以及 Turn、SessionHost、Workspace、TaskManager、Subagent 的语义操作。DefaultLoop 只决定调用顺序。完整对象划分见 [最终实现](hook-template-design.md)。
+当前 core 的公共对象直接拥有 Hook 流程：Tool.exec、Model.exec、Compactor.exec，以及 Turn、SessionManager、Workspace、TaskManager、Subagent 的语义操作。DefaultLoop 只决定调用顺序。完整对象划分见 [最终实现](hook-template-design.md)。
 
 ## 自定义调度
 
@@ -74,7 +74,7 @@ Model 私有 run 保存 emit 前的部分响应。业务恢复只发生在没有
 
 收到 End 后，在任何异步等待前接管完整内容、有效调用和已知用量。用量保存与自动维护后的 restore 都响应取消和超时；截断或身份非法的调用不发布，但保留已知用量。interaction::elicit 的同一绝对期限覆盖前后 Hook、Ask 和最终校验。
 
-ContextManager.prepare_compaction 返回 Complete 或持锁 Summary job。Compactor.exec 负责 prepare → PreCompact → private run → PostCompact；不变与只剪枝没有摘要 Hook。提交后的停止不回滚摘要。请求投影只依赖模型能力，不接收 Compactor。提交取消规则见 [最终实现](hook-template-design.md#必要的失败边界)。
+Compactor.exec 负责 PreCompact → private run → 已提交摘要的 PostCompact。private run 完成压缩，ContextManager 提供投影、估算和核对快照后的原子应用。Hook 与模型调用不持有上下文锁；没有安全旧历史时返回不变，只有提交摘要才发送 PostCompact。提交后的停止不回滚摘要。提交取消规则见 [最终实现](hook-template-design.md#必要的失败边界)。
 
 ## 28 个 Hook 的入口
 
@@ -88,9 +88,9 @@ ContextManager.prepare_compaction 返回 Complete 或持锁 Summary job。Compac
 | 6 | UserPromptSubmit | `Turn.accept_input` | 初始输入和 steer 共用接纳流程，通过后提交 |
 | 7 | Stop | `Turn.complete` | 决定完成或继续；Completed 后拒绝新业务操作 |
 | 8 | StopFailure | `Model.exec` | 最终模型故障报告；不用于普通工具错误或取消 |
-| 9 | SessionStart | `SessionHost.open / open_owned` | 初始化后应用上下文、初始输入和监视路径 |
-| 10 | SessionEnd | `SessionHost.close / finish_close` | 清理资源、结束通知、持久关闭与释放租约 |
-| 11 | TurnCompleted | `SessionHost.run_next` | 本轮有新提交行且成功后通知；不重复保存历史 |
+| 9 | SessionStart | `SessionManager.open / open_owned` | 初始化后应用上下文、初始输入和监视路径 |
+| 10 | SessionEnd | `SessionManager.close / finish_close` | 清理资源、结束通知、持久关闭与释放租约 |
+| 11 | TurnCompleted | `SessionManager.run_next` | 本轮有新提交行且成功后通知；不重复保存历史 |
 | 12 | SubagentStart | `Subagent.exec` | 先分配身份，Hook 通过后创建 child；上下文交给 child |
 | 13 | SubagentStop | `Subagent.exec` | 候选完成时检查；反馈在同一 child 中继续 |
 | 14 | PreCompact | `Compactor.exec` | 只在摘要阶段执行；可阻断或补充摘要指令 |
@@ -109,4 +109,4 @@ ContextManager.prepare_compaction 返回 Complete 或持锁 Summary job。Compac
 | 27 | CwdChanged | `Workspace.change_cwd` | 验证目录、Hook 检查、提交 cwd 与监视路径 |
 | 28 | FileChanged | `Workspace.file_changed` | 变化已发生；保留事实通知并报告 Hook 失败 |
 
-HookRuntime.dispatch 只匹配、运行、校验和聚合，不修改业务状态。Hook 结果由对应业务入口落实。外部 trait 方法是实现侧协议，直接调用原始 Provider 不获得公共对象的执行契约。
+HookManager.dispatch 只匹配、运行、校验和聚合，不修改业务状态。Hook 结果由对应业务入口落实。外部 trait 方法是实现侧协议，直接调用原始 Provider 不获得公共对象的执行契约。

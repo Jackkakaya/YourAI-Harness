@@ -381,8 +381,12 @@ async fn mcp_hook_answers_without_ui_and_can_replace_tool_output() {
 #[tokio::test]
 async fn compaction_and_retry_are_bounded_and_do_not_repeat_user_history() {
     let history = Arc::new(History::default());
-    history.tokens.store(100, Ordering::SeqCst);
-    let mut model = Model::new(vec![error_stream(), answer("done")]);
+    history.tokens.store(79, Ordering::SeqCst);
+    history
+        .append(vec![StoredMessage::new(ChatMessage::user("old task"))])
+        .await
+        .unwrap();
+    let mut model = Model::new(vec![error_stream(), answer("done")]).with_budget(12_000, 500);
     model.recovery = ModelRecovery::Compact;
     let model = Arc::new(model);
     let hooks = Arc::new(Hooks::new(|_, _| {}));
@@ -393,13 +397,13 @@ async fn compaction_and_retry_are_bounded_and_do_not_repeat_user_history() {
         .hooks(hooks.clone())
         .build();
     let result = agent.run(In::user_text("go")).await.unwrap();
-    assert_eq!(result.usage.unwrap().total_tokens, 11);
-    assert_eq!(history.compactions.lock().unwrap().len(), 2);
+    assert_eq!(result.usage.unwrap().total_tokens, 7);
+    assert_eq!(history.compactions.lock().unwrap().len(), 1);
     assert_eq!(
         history
             .messages()
             .iter()
-            .filter(|m| m.role == ChatRole::User)
+            .filter(|m| m.role == ChatRole::User && m.content.first_text() == Some("go"))
             .count(),
         1
     );
@@ -411,7 +415,7 @@ async fn compaction_and_retry_are_bounded_and_do_not_repeat_user_history() {
             .iter()
             .filter(|k| **k == HookEventKind::PostCompact)
             .count(),
-        2 // Replacement ContextManager summaries use the common hook wrapper too.
+        1 // Overflow retries use the real shared compactor.
     );
 }
 #[tokio::test]
@@ -926,7 +930,7 @@ async fn real_hook_runtime_registration_effect_is_consumed_by_loop() {
             })
         }
     }
-    let runtime = Arc::new(yourai_harness::hooks::runtime::DefaultHookRuntime::new());
+    let runtime = Arc::new(yourai_harness::hooks::runtime::DefaultHookManager::new());
     runtime
         .register(NativeHookRegistration {
             id: "context".into(),
@@ -1096,14 +1100,18 @@ async fn retry_respects_max_retries_limit() {
 async fn compaction_does_not_consume_step() {
     let history = Arc::new(History::default());
     history.tokens.store(100, Ordering::SeqCst);
-    let model = Arc::new(Model::new(vec![answer("ok")]));
+    history
+        .append(vec![StoredMessage::new(ChatMessage::user("old task"))])
+        .await
+        .unwrap();
+    let model = Arc::new(Model::new(vec![answer("ok")]).with_budget(12_000, 500));
     let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
     let mut options = TurnOptions::default();
     options.limits.steps = Some(1);
     let result = agent.run_with(In::user_text("go"), options).await.unwrap();
     assert_eq!(result.text, "ok");
     assert_eq!(history.compactions.lock().unwrap().len(), 1);
-    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -1338,7 +1346,24 @@ async fn default_approval_and_tool_questions_survive_long_user_waits() {
 #[tokio::test(start_paused = true)]
 async fn cancelled_tool_bounds_failure_hook_then_records_interruption() {
     struct StuckFailureHook;
-    impl HookRuntime for StuckFailureHook {
+    impl HookManager for StuckFailureHook {
+        // This fixed-response fixture does not support dynamic registration.
+        fn register<'a>(
+            &'a self,
+            _: yourai_core::hooks::NativeHookRegistration,
+        ) -> yourai_core::BoxFuture<'a, Result<(), yourai_core::YourAiError>> {
+            panic!("registration is not used by this test hook")
+        }
+        fn unregister<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> yourai_core::BoxFuture<'a, Result<bool, yourai_core::YourAiError>> {
+            panic!("unregistration is not used by this test hook")
+        }
+        fn handler_ids<'a>(&'a self) -> yourai_core::BoxFuture<'a, Vec<String>> {
+            panic!("registry inspection is not used by this test hook")
+        }
+
         fn dispatch<'a>(
             &'a self,
             i: &'a HookInvocation,

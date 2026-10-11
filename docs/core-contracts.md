@@ -3,26 +3,26 @@
 普通自定义调度使用 core 的 [AgentLoop 与公共执行层](./execution.md)。Core AgentLoop 保留为底层运输接口。
 
 
-运行时补充接口：`TurnOptions.events` 绑定内部事件队列；ContextManager 内部协调持久化并维护归档身份索引；`SecurityProvider::update_permissions` 消费权限变更；`HookRuntime::subscribe_background / shutdown_session` 提供按会话订阅和后台回收。`TurnHandle::abort` 用于协作取消超时后的任务回收，宿主必须记录被强制中止执行的不确定状态。
+运行时补充接口：`TurnOptions.events` 绑定内部事件队列；ContextManager 内部协调持久化并维护归档身份索引；`SecurityProvider::update_permissions` 消费权限变更；`HookManager::subscribe_background / shutdown_session` 提供按会话订阅和后台回收。`TurnHandle::abort` 用于协作取消超时后的任务回收，宿主必须记录被强制中止执行的不确定状态。
 
 Core 的 deadline watchdog（截止时间后 60 秒宽限）强制丢弃 Loop，或 Loop 在构造/执行 future 时 panic，统一返回 `ErrorKind::LoopTerminated` 并取消 turn token。它表示执行状态未知，与正常协作收尾的 `Aborted(DeadlineExceeded)` 区分。宿主必须隔离会话并保留活动输入供检查；不得自动重放。Core 仍回收 inbox 中未消费的输入，但无法恢复 Loop 已消费的局部状态。
 
-对应 [完整流程图](./default-loop-flow.md)。本文定义公共边界和运输机制。DefaultLoop、具体摘要 Provider 和业务扩展在 `yourai-harness`；公共执行模板、会话宿主与工作区操作在 `yourai-core`，见 [实现文档](./default-loop-implementation.md) 与 [Runtime 文档](./runtime-implementation.md)。下文出现的 `yourai-loop` / `yourai-runtime` 是合并前的历史包名。
+对应 [完整流程图](./default-loop-flow.md)。本文定义公共边界和运输机制。DefaultLoop、具体模型 Provider 和业务扩展在 `yourai-harness`；公共执行模板、会话宿主与工作区操作在 `yourai-core`，见 [实现文档](./default-loop-implementation.md) 与 [Runtime 文档](./runtime-implementation.md)。下文出现的 `yourai-loop` / `yourai-runtime` 是合并前的历史包名。
 
 ## 图与代码的对应
 
 | 流程 | 已定义的接口/类型 | 实现边界 |
 |---|---|---|
-| 图 1：会话宿主 | `SessionHost`、`SessionContext`、`SessionStatus`、`SessionTurn`、`InputRejected` | 具体宿主 SessionHost 在 core；不是 Context 的新 Provider 插槽 |
+| 图 1：会话宿主 | `SessionManager`、`SessionContext`、`SessionStatus`、`SessionTurn`、`InputRejected` | 具体宿主 SessionManager 在 core；不是 Context 的新 Provider 插槽 |
 | 图 2：主循环 | `AgentLoop`、`TurnResult`、`TurnFailure`、`TurnInfo`、`TurnOptions`、`TurnLimits` | core 传递环境与结果；AgentLoop 自主管理调度；Tool / Model / Compactor 管理各自执行流程 |
-| 图 2：compact | `CompactionRequest`、`CompactionResult`、`CompactionTrigger`；更新 `ContextManager::prepare_compaction` | Compactor::exec 触发 Hook；ContextManager 准备业务计划，CompactionJob 生成并提交摘要 |
+| 图 2：compact | `CompactionRequest`、`CompactionResult`、`CompactionTrigger`；`ContextManager::project / estimate / apply` | Compactor::exec 固定 Hook；private run 生成摘要；ContextManager 核对快照并应用；SessionStore 原子提交 |
 | 图 3：工具 | `ToolRegistry::resolve`；`ToolInteraction`、`InteractionRequest`、`InteractionKind`；`ToolContext::ask` | Tool::exec 位于 core tool 模块；AgentLoop 调用固定公共操作，交互桥和回复路由归公共执行层 |
-| 图 4：可选扩展 | 复用 ToolProvider、HookRuntime、SessionHost | 不预先增加工作区、多 Agent、协作任务的公共 Provider |
-| 图 5：Hook | 复用现有 HookRuntime / HookRegistry / HookHandler | 保持 Hook wire 协议；公共业务入口自动触发并消费 Hook，Core 底层运输接口不代替业务包装 |
+| 图 4：可选扩展 | 复用 ToolProvider、HookManager、SessionManager | 不预先增加工作区、多 Agent、协作任务的公共 Provider |
+| 图 5：Hook | 复用现有 HookManager / HookHandler | 保持 Hook wire 协议；公共业务入口自动触发并消费 Hook，Core 底层运输接口不代替业务包装 |
 
 ## 1. 会话宿主
 
-`SessionHost` 直接实现会话控制流程。创建/恢复由具体实现的构造入口负责，完成历史绑定、Agent 装配及 SessionStart 后才暴露实例。
+`SessionManager` 直接实现会话控制流程。创建/恢复由具体实现的构造入口负责，完成历史绑定、Agent 装配及 SessionStart 后才暴露实例。
 
 ```text
 submit(In)
@@ -59,7 +59,7 @@ run_next(limits, outbox, cancel)
 - `compact(request, cancel)`：手动压缩，与 Turn 写历史互斥；ContextManager 的摘要生命周期包装负责前后 Hook。
 - `close(timeout: Option<Duration>)`：拒绝新输入、清理当前执行、SessionEnd、释放资源，成功时归还剩余输入；None 等待清理完成，Some 显式限制整个关闭过程。
 
-`SessionManager` 继续负责元数据；`ContextManager` 负责历史；SessionHost 不通过监听 Out 重复保存历史。状态机、互斥、后台事件与恢复策略由 core SessionHost 实现。
+`SessionStore` 继续负责元数据；`ContextManager` 负责历史；SessionManager 不通过监听 Out 重复保存历史。状态机、互斥、后台事件与恢复策略由 core SessionManager 实现。
 
 ## 2. Turn 身份、环境和限制
 
@@ -118,12 +118,14 @@ Core 在 Loop 返回后，无论 Ok/Err，都先关闭 inbox，再把未接收�
 restore()                              同步已开始写入并恢复已提交视图
 append(Vec<StoredMessage>)              保存消息，成功后更新内存
 build_request(tools, model)             只读构造模型请求和用量估算
-prepare_compaction(request, model, cancel)  准备业务，返回 Complete / Summary job
+project(records, tools)                 与主请求一致的候选视图
+estimate(request, model)                模型容量与媒体估算
+apply(expected, change)                 核对快照后原子应用
 ```
 
-Compactor 持有选定的 context / model / hooks / usage 和 Hook 基础信息，exec 直接拥有 prepare → PreCompact → private run → PostCompact。ContextManager 的业务算法只接收需要的模型和计量能力，不接收 HookRuntime。它持有已冻结的基础 system prompt，不把 system 放入普通消息。
+Compactor 持有本次选定的 context / model / hooks / usage，公共 exec 固定执行 PreCompact → private run → 已提交摘要的 PostCompact。选区、分块、预算与校验都在 private run；ContextManager 不生成摘要，也不持有 HookManager。它保留冻结的 system prompt，并投影当前有效的工作区指令原文。
 
-CompactionJob 保留必要的锁与事务，PreCompact 通过后才调用 run 生成并提交摘要。不变和只剪枝的 Complete 路径不触发摘要 Hook。摘要提交进度由持久化实现立即确认；取消时区分未提交、未知提交和已提交后中断，未知状态须 restore，不能重放。PostCompact 的失败不撤销摘要。完整流程见 [ContextManager 设计](context-manager-design.md)。
+Hook 和模型请求不持有上下文写锁。apply 在提交前核对快照，避免覆盖并发追加。取消区分未提交、未知提交和已确认提交；未知状态必须 restore，不重放。已提交后的恢复或 PostCompact 失败返回 stop_reason，不撤销摘要。没有安全旧历史时返回不变；只有提交摘要才发送 PostCompact。完整流程见 [上下文设计](context-manager-design.md)。
 
 ## 5. 工具与交互
 
@@ -163,7 +165,7 @@ In::follow_up("稍后执行")    // mode = FollowUp
 1. Loop 实现改为返回 TurnResult；构造 YourAiError 后用 `.into()` 转为 TurnFailure，或显式提供部分输出。
 2. 错误消费者通过 `failure.error` 检查原因，通过 `failure.output` 读取部分结果。
 3. UserText 模式匹配使用 `{ text, .. }` 或显式处理 mode；构造优先使用 helper。
-4. ContextManager 实现 session_id、restore、append、build_request 与 prepare_compaction；摘要任务经 Compactor 执行。
+4. ContextManager 实现 session_id、restore、append、build_request 和原子 apply；需要定制投影或校准时覆盖 project / estimate；压缩经唯一 Compactor 执行。
 5. ToolRegistry 实现 register / unregister / snapshot；其余查询复用默认实现；ToolProvider 以 definition 作为唯一名字。
 6. 手工构造 TurnContext 需传入 info；正常使用 Agent 启动时由 core 完成装配。
 
@@ -175,7 +177,7 @@ core 直接实现执行、会话、工作区、任务和子会话的固定流程
 - ModelProvider::classify_error() 提供中立错误分类，默认 Unclassified；core 不解析厂商错误码。默认 recovery() 映射模型分类，Adapter 可独立覆盖。RateLimited 显式启用共享冷却，使用模型的 retry_after 或配置回退；其他分类不会触发共享冷却。GenaiModel 自行解释结构化 HTTP 错误。
 - OutSink::closed 默认保持 pending，core 通道实现提供真实关闭信号。
 - AbortReason::HookStopped 表示 Hook 通用停止请求。
-- ContextManager/SessionManager 工具结果提交按 call_id 防重复；ToolProvider 执行 future 须 cancellation-safe。
+- ContextManager/SessionStore 工具结果提交按 call_id 防重复；ToolProvider 执行 future 须 cancellation-safe。
 
 ### 模型传输层超时
 
@@ -191,7 +193,7 @@ Loop 对这类 Provider 只在外层监听总 deadline、取消和断连；否�
 模型默认时限由 `ModelProvider::timeouts()` 提供；LoopConfig 不再定义模型默认时限。
 包装 Provider 必须透传该值。主循环依次采用显式 TurnLimits、请求选项、模型默认值。
 
-默认 SessionHost 保留同步 `submit` 的持久化确认，同时提供 `submit_async`。
+默认 SessionManager 保留同步 `submit` 的持久化确认，同时提供 `submit_async`。
 异步入口等待 owned blocking transaction，取消等待不代表撤销已开始的提交。
 宿主状态查询和取消不持有 journal 写事务锁。详细设计见
 [代码质量整改](./architecture-quality-repairs.md)。

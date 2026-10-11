@@ -17,7 +17,7 @@ pub mod workspace;
 pub use assembly::{Harness, HarnessConfig};
 pub use context::{prompt::PromptConfig, DefaultContext};
 pub use model::{GenaiModel, MeteredModel, ModelBudget};
-pub use runtime::{HostConfig, SessionHost};
+pub use runtime::{SessionConfig, SessionManager};
 pub use security::PolicySecurity;
 pub use storage::{SessionCatalog, SqliteStore};
 pub use tools::ToolSet;

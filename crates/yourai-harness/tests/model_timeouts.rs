@@ -141,10 +141,15 @@ async fn server(mode: &'static str) -> (GenaiModel, tokio::task::JoinHandle<()>)
         .build()
         .unwrap();
     (
-        GenaiModel::new(client, "test").with_timeouts(
-            Some(Duration::from_millis(200)),
-            Some(Duration::from_millis(200)),
-        ),
+        GenaiModel::new(client, "test")
+            .with_settings(
+                ModelTokenBudget::default(),
+                ModelTimeouts {
+                    headers: Duration::from_millis(200),
+                    read: Duration::from_millis(200),
+                },
+            )
+            .unwrap(),
         task,
     )
 }
@@ -227,10 +232,15 @@ async fn headers_and_body_have_independent_deadlines() {
         } else {
             (200, 700)
         };
-        let model = model.with_timeouts(
-            Some(Duration::from_millis(header)),
-            Some(Duration::from_millis(read)),
-        );
+        let model = model
+            .with_settings(
+                ModelTokenBudget::default(),
+                ModelTimeouts {
+                    headers: Duration::from_millis(header),
+                    read: Duration::from_millis(read),
+                },
+            )
+            .unwrap();
         let response = tokio::time::timeout(Duration::from_secs(3), model.complete(request()))
             .await
             .unwrap()
@@ -381,15 +391,17 @@ async fn real_stream_errors_preserve_status_headers_and_retry_hint() {
 async fn configured_model_defaults_reach_collected_and_default_loop_requests() {
     for collected in [false, true] {
         let (model, task) = server("headers").await;
-        let model = yourai_harness::model::ConfiguredModel::new(
-            Arc::new(model),
-            ModelTokenBudget::default(),
-            ModelTimeouts {
-                headers: Duration::from_millis(40),
-                read: Duration::from_millis(70),
-            },
-        )
-        .unwrap();
+        let model = Arc::new(
+            model
+                .with_settings(
+                    ModelTokenBudget::default(),
+                    ModelTimeouts {
+                        headers: Duration::from_millis(40),
+                        read: Duration::from_millis(70),
+                    },
+                )
+                .unwrap(),
+        );
         let model = Arc::new(MeteredModel {
             inner: model,
             budget: ModelBudget::new(),

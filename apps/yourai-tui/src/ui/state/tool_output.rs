@@ -1,5 +1,5 @@
 //! Typed tool-output projections and bounded syntax/diff previews.
-use super::DiffRow;
+use super::{DiffRow, ToolKind};
 use crate::text::{bounded, clean, pretty, MAX_TEXT};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -386,7 +386,7 @@ pub(super) struct ToolResult {
 
 /// Typed projection of a finished tool's output: known tools get structured
 /// previews, unknown ones a bounded generic summary; error envelopes win.
-pub(super) fn tool_result(name: &str, output: &Value) -> ToolResult {
+pub(super) fn tool_result(kind: ToolKind, output: &Value) -> ToolResult {
     let mut r = ToolResult {
         body: String::new(),
         stderr: String::new(),
@@ -403,8 +403,8 @@ pub(super) fn tool_result(name: &str, output: &Value) -> ToolResult {
         r.body = format_error(error, output);
         return r;
     }
-    match name {
-        "shell" => {
+    match kind {
+        ToolKind::Process => {
             r.exit_code = output["exit_code"].as_i64();
             let mut out = clean(output["stdout"].as_str().unwrap_or(""));
             r.stderr = clean(output["stderr"].as_str().unwrap_or(""));
@@ -416,13 +416,13 @@ pub(super) fn tool_result(name: &str, output: &Value) -> ToolResult {
             }
             r.body = bounded(&out);
         }
-        "read" if output.get("content").is_some() => {
+        ToolKind::Read if output.get("content").is_some() => {
             let path = output["path"].as_str().unwrap_or("");
             let content = output["content"].as_str().unwrap_or("");
             r.content_hl = Some(hl_read(content, path));
             r.body = bounded(content);
         }
-        "edit" if output.get("diff").is_some() => {
+        ToolKind::Diff if output.get("diff").is_some() => {
             let diff = bounded(output["diff"].as_str().unwrap_or(""));
             let (a, d) = diff_stats(&diff);
             r.adds = Some(a);
@@ -433,16 +433,16 @@ pub(super) fn tool_result(name: &str, output: &Value) -> ToolResult {
             ));
             r.body = diff;
         }
-        "write" => {
+        ToolKind::Write => {
             r.created = output["created"] == true;
             // Content was highlighted at ToolStarted and survives the merge.
         }
-        "websearch" => {
+        ToolKind::Search if output["content"].is_string() => {
             let content = output["content"].as_str().unwrap_or("");
             r.brief = search_brief(content);
             r.body = bounded(content);
         }
-        "webfetch" => {
+        ToolKind::Fetch => {
             let content = output["content"].as_str().unwrap_or("");
             let format = output["format"].as_str().unwrap_or("text");
             r.content_format = Some(format.to_owned());

@@ -55,8 +55,9 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
-        compact = any(m.get('role') == 'system' and 'Summarize for continuation' in str(m.get('content'))
-                      for m in body.get('messages', []))
+        compact = not body.get('tools') and any(
+            m.get('role') == 'user' and '<previous-summary>' in str(m.get('content'))
+            and '<conversation>' in str(m.get('content')) for m in body.get('messages', []))
         if compact:
             delta = {'content': 'Prior task list is complete.'}
             reason = 'stop'
@@ -218,6 +219,8 @@ with tempfile.TemporaryDirectory() as tmp:
         assert termios.tcgetattr(slave) == original, 'terminal mode was not restored'
         assert len(requests) == 4
         assert requests[3][2].get('stream') is True, 'compaction must use a progressing stream'
+        assert not requests[3][2].get('tools'), 'summarization cannot execute tools'
+        assert all(m['role'] in ('system', 'user') for m in requests[3][2]['messages'])
         assert all(value == 'model' for value in config_headers)
         for _, _, body in requests:
             assert body.get('max_tokens', body.get('max_completion_tokens')) == 4096, body

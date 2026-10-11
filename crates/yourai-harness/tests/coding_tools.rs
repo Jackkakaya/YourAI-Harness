@@ -87,6 +87,7 @@ async fn coding_loop_modifies_tests_and_persists_results() {
     drop(h);
     let catalog = SessionCatalog::new(&root).unwrap();
     let rows = catalog
+        .store
         .read_messages(
             &id,
             MessageQuery {
@@ -112,7 +113,7 @@ async fn coding_loop_modifies_tests_and_persists_results() {
     cfg.resume = Some(id);
     let h = Harness::open(cfg, model.clone()).await.unwrap();
     // Approve any permission request so the resumed turn cannot stall.
-    HookRegistry::register(
+    HookManager::register(
         h.hooks.as_ref(),
         NativeHookRegistration {
             id: "allow-read".into(),
@@ -254,6 +255,7 @@ async fn child_restore_rebinds_builtin_working_directory() {
     .unwrap();
     let catalog = SessionCatalog::new(&root).unwrap();
     let id = catalog
+        .store
         .create_session(SessionId::new(), "child")
         .await
         .unwrap()
@@ -335,7 +337,7 @@ async fn yolo_skips_all_permissions_including_children_but_preserves_questions()
     let h = Harness::open(cfg, model).await.unwrap();
     h.tools
         .register(Arc::new(Handler::new("ask_user", Mode::Ask)));
-    HookRegistry::register(
+    HookManager::register(
         h.hooks.as_ref(),
         NativeHookRegistration {
             id: "force-ask".into(),

@@ -152,7 +152,7 @@ impl Workspace {
         self.run_remove_worktree(host, name.into(), registration, gate, activity)
             .await
     }
-    pub(super) async fn file_changed(&self, host: &Arc<SessionHost>, path: &Path, event: &str) {
+    pub(super) async fn file_changed(&self, host: &Arc<SessionManager>, path: &Path, event: &str) {
         let Ok(_activity) = host.activity() else {
             return;
         };

@@ -20,14 +20,14 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_loop::{AgentLoop, TurnFailure, TurnOutput, TurnResult};
 use crate::context_manager::ContextManager;
 use crate::error::{ErrorKind, YourAiError};
-use crate::hooks::HookRuntime;
-use crate::memory::MemoryProvider;
+use crate::hooks::HookManager;
+use crate::memory::MemoryManager;
 use crate::model::ModelProvider;
 use crate::observability::ObservabilityProvider;
 use crate::protocol::{In, Out};
 use crate::sandbox::SandboxProvider;
 use crate::security::SecurityProvider;
-use crate::session::SessionManager;
+use crate::session::SessionStore;
 use crate::skill::SkillProvider;
 use crate::tool::ToolRegistry;
 use crate::turn::{TurnInfo, TurnOptions};
@@ -134,15 +134,15 @@ provider_slots! {
     required   agent_loop:        try_agent_loop:        set_agent_loop:        AgentLoop,
     optional   model:             try_model:             set_model:             ModelProvider,
     optional   context_manager:   try_context_manager:   set_context_manager:   ContextManager,
-    optional   session:           try_session:           set_session:           SessionManager,
-    optional   memory:            try_memory:            set_memory:            MemoryProvider,
+    optional   session:           try_session:           set_session:           SessionStore,
+    optional   memory:            try_memory:            set_memory:            MemoryManager,
     optional   tools:             try_tools:             set_tools:             ToolRegistry,
     optional   skills:            try_skills:            set_skills:            SkillProvider,
     optional   sandbox:           try_sandbox:           set_sandbox:           SandboxProvider,
     optional   security:          try_security:          set_security:          SecurityProvider,
     optional   usage:             try_usage:             set_usage:             UsageTracker,
     optional   observability:     try_observability:     set_observability:     ObservabilityProvider,
-    optional   hooks:             try_hooks:             set_hooks:             HookRuntime,
+    optional   hooks:             try_hooks:             set_hooks:             HookManager,
 }
 
 // region:    --- Agent ---

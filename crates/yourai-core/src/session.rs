@@ -1,7 +1,8 @@
-//! SessionManager：会话元数据、历史与任务持久化；不负责执行调度。
+//! SessionStore：会话元数据、历史与任务持久化；不负责执行调度。
 
 use crate::error::YourAiError;
 use crate::future::BoxFuture;
+use std::sync::{atomic::AtomicU8, Arc};
 use uuid::Uuid;
 
 /// 会话标识（UUID v4，跨主机唯一）
@@ -57,7 +58,7 @@ pub struct SessionMeta {
     pub model: Option<String>,
 }
 
-pub trait SessionManager: Send + Sync {
+pub trait SessionStore: Send + Sync {
     /// Task rows belong to the session's existing persistence connection.
     /// Initialization reads synchronously; runtime writes use the host's owned blocking worker.
     fn read_tasks(&self, id: &SessionId) -> Result<Vec<crate::tasks::Task>, YourAiError>;
@@ -85,10 +86,15 @@ pub trait SessionManager: Send + Sync {
         id: &'a SessionId,
         messages: Vec<StoredMessage>,
     ) -> BoxFuture<'a, Result<Vec<StoredMessage>, YourAiError>>;
-    fn save_context<'a>(
+    /// Archive source messages and insert their replacement summary in one transaction.
+    /// Retries reuse the summary identity and content. Sources and progress are transient;
+    /// an owned worker must report Committed after SQL commit even if its waiter is cancelled.
+    fn save_summary<'a>(
         &'a self,
         id: &'a SessionId,
-        change: ContextChange,
+        sources: Vec<String>,
+        summary: StoredMessage,
+        progress: Arc<AtomicU8>,
     ) -> BoxFuture<'a, Result<(), YourAiError>>;
 
     /// Persist a session under the caller's identity; allocation itself has no side effects.
@@ -127,12 +133,23 @@ pub struct StoredMessage {
     pub summary: bool,
     /// Runtime/Hook context is not a user request, even when sent with role=user.
     pub runtime_context: bool,
+    /// A replaceable authoritative runtime context. Only the latest row for
+    /// this key is sent; its current value is retained verbatim across compaction.
+    pub context_key: Option<String>,
     pub status: MessageStatus,
     pub tool_output_pruned_at: Option<i64>,
-    /// Transient: the append is a successful model response, not partial cleanup.
-    pub model_response: bool,
     pub request_observation: Option<RequestObservation>,
 }
+/// Latest authoritative value for each runtime context key.
+pub fn current_context_ids(records: &[StoredMessage]) -> std::collections::HashSet<&str> {
+    records
+        .iter()
+        .filter_map(|m| m.context_key.as_deref().map(|key| (key, m.id.as_str())))
+        .collect::<std::collections::HashMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageStatus {
     Active,
@@ -177,9 +194,9 @@ impl StoredMessage {
             recall: vec![],
             summary: false,
             runtime_context: false,
+            context_key: None,
             status: MessageStatus::Active,
             tool_output_pruned_at: None,
-            model_response: false,
             request_observation: None,
         }
     }
@@ -205,31 +222,6 @@ pub struct MessagePage {
     pub messages: Vec<StoredMessage>,
     pub next: Option<i64>,
 }
-/// Source identities are transient transaction input, never a JSON column.
-#[derive(Debug, Clone)]
-pub struct CompactionChange {
-    pub sources: Vec<String>,
-    pub summary: StoredMessage,
-}
-
-/// One transaction: pruning alone, or pruning plus a replacement summary.
-#[derive(Debug, Clone, Default)]
-pub struct ContextChange {
-    /// Transient durable acknowledgement, never stored in the database.
-    pub progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
-    pub compaction: Option<CompactionChange>,
-    pub pruned: Vec<String>,
-}
-impl From<CompactionChange> for ContextChange {
-    fn from(compaction: CompactionChange) -> Self {
-        Self {
-            compaction: Some(compaction),
-            pruned: vec![],
-            ..Default::default()
-        }
-    }
-}
-
 /// Transient observation accompanying a successful assistant append; not a second usage ledger.
 #[derive(Debug, Clone)]
 pub struct RequestObservation {

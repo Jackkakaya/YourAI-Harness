@@ -2,24 +2,25 @@
 
 状态：SQLite 主链已实现，TUI/Harness 默认使用。此前的 JSON 历史实现已移除。
 
-ContextManager负责上下文变更流程，TaskManager负责任务转换，SessionManager负责记录读写和事务。内部清理与摘要可合并为一次`save_context`事务；任务复用同一SQLite，单次转换或旧数据导入原子提交。算法见[ContextManager设计](./context-manager-design.md)。
+ContextManager负责上下文变更流程，TaskManager负责任务转换，SessionStore负责记录读写和事务。来源归档与新摘要在一次`save_summary`事务中完成；任务复用同一SQLite，单次转换或旧数据导入原子提交。算法见[ContextManager设计](./context-manager-design.md)。
 
 ## 1. 组件与调用关系
 
 ```text
 TUI / API
     │
-SessionHost                         队列、恢复、执行互斥、Hook、关闭
+SessionManager                         队列、恢复、执行互斥、Hook、关闭
     │
 DefaultLoop                         模型 → 审批/工具 → 结果 → 继续
     │
-ContextManager / DefaultContext      内存上下文、清理/摘要、先保存后更新视图
-    └── SessionManager              持久化接口（core）
-          └── SessionCatalog        会话目录与宿主锁
-                └── SqliteStore     SQL、事务、历史分页
+ContextManager / DefaultContext      内存上下文与请求投影，先保存后更新视图
+    └── SessionStore / SqliteStore SQL、事务、历史分页、带宿主锁的删除
+
+SessionCatalog                      会话目录和工具原文仓库，持有 SqliteStore
+                                    不再实现整套 SessionStore 转发
 
 UsageTracker → LocalUsage → 同一个 SqliteStore 的 usage_events
-TaskManager → SessionManager → 同一个 SqliteStore 的 tasks
+TaskManager → SessionStore → 同一个 SqliteStore 的 tasks
 ```
 
 实现位置：
@@ -31,9 +32,9 @@ TaskManager → SessionManager → 同一个 SqliteStore 的 tasks
 - `crates/yourai-harness/src/context/`：上下文投影、压缩及提交协调。
 - `crates/yourai-harness/src/storage/usage.rs`：用量记录与统计。
 
-ContextManager 通过 SessionManager 保存消息和摘要，通过 UsageTracker 记账；没有 SQL 或连接。归档只保留身份索引，活跃消息原文用于模型请求。system 指令由宿主装配并冻结，由 ContextManager 持有并在 build_request 使用，不通过 append 保存。
+ContextManager 通过 SessionStore 保存消息和摘要，Compactor 通过 UsageTracker 记账；没有 SQL 或连接。归档只保留身份索引，活跃消息原文用于模型请求。system 指令由宿主装配并冻结，由 ContextManager 持有并在 build_request 使用，不通过 append 保存。
 
-## 2. SessionManager 接口
+## 2. SessionStore 接口
 
 | 方法 | 职责 |
 |---|---|
@@ -43,7 +44,7 @@ ContextManager 通过 SessionManager 保存消息和摘要，通过 UsageTracker
 | fork_session | 事务复制历史，新会话和新消息 ID；不复制用量、队列和工具副作用 |
 | read_messages(id, MessageQuery) | active/full 过滤，按 seq 升序，after 游标分页 |
 | append_messages(id, batch) | 原子追加普通消息，返回已存记录 |
-| save_context(id, ContextChange) | 单事务保存清理标记及可选摘要替换 |
+| save_summary(id, sources, summary, progress) | 单事务保存新摘要并标记来源消息 |
 | read_tasks(id) | 同步恢复该会话任务，按seq、task_id排序 |
 | save_tasks(id, tasks) | 同步提交整批任务并返回已保存数据；正常转换在host阻塞worker运行 |
 
@@ -51,7 +52,7 @@ ContextManager 通过 SessionManager 保存消息和摘要，通过 UsageTracker
 
 接纳后的用户记录 id 与 UserText.id 相同，原始输入写入 content_json 的可选 yourai_input 元数据；模型请求不携带这份存储元数据。它与冻结后的附件 / recall / skill 内容一起保存，用于确认丢回执的提交。同一身份的输入内容必须一致。fork 同时改写复制消息及其输入身份，其余冻结内容保持不变。
 
-ContextChange 包含 pruned 消息 ID、可选 CompactionChange 和暂存提交进度（不写入数据库）；后者只在内存中携带来源 ID 和新摘要。首次提交要求来源仍 active；任何验证、约束或写入失败都回滚。重试核对摘要身份和内容、来源已经 compacted；调用方必须复用原候选，数据库不保存来源集合，也不提供来源集合审计证明。
+save_summary 直接接收来源 ID、新摘要和暂存提交进度；来源集合及进度不作为数据库列保存。首次提交要求来源仍 active；任何验证、约束或写入失败都回滚。重试核对摘要身份和内容、来源已经 compacted；调用方必须复用原候选，数据库不保存来源集合，也不提供来源集合审计证明。
 
 不引入 tenant_id、租约、执行日志表或万能 commit 接口。会话 ID 全局唯一，授权与跨节点执行所有权由未来服务层负责。
 
@@ -94,7 +95,7 @@ v4→v5新增tasks表及会话顺序索引，不改既有会话和历史。任�
       宿主补记未配对工具的未知结果，禁止自动重放
 压缩：ContextManager.compact
         → 内部清理 → 必要时 PreCompact / 分批摘要
-        → save_context（清理 + 来源归档 + 新摘要，单事务）
+        → save_summary（来源归档 + 新摘要，单事务）
         → 更新内存 → PostCompact → 返回状态
 ```
 

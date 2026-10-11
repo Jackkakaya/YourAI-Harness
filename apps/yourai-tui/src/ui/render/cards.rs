@@ -2,7 +2,7 @@
 use super::spinner_frame;
 use crate::text::elide;
 use crate::ui::markdown::wrap_text;
-use crate::ui::state::{DiffRow, ToolStatus, ToolView};
+use crate::ui::state::{DiffRow, ToolKind, ToolStatus, ToolView};
 use crate::ui::theme::{
     mix, Theme, ACCENT, BG, DIFF_ADD_BG, DIFF_DEL_BG, FAINT, GREEN, MUTED, RED, TEXT, USER_SURFACE,
 };
@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthStr;
 /// Substantial artifacts get a surface; small read/search events remain inline.
 pub(super) fn block_tool(t: &ToolView, expanded: bool) -> bool {
     expanded
-        || matches!(t.name.as_str(), "shell" | "edit" | "write")
+        || matches!(t.kind, ToolKind::Process | ToolKind::Diff | ToolKind::Write)
         || t.status == ToolStatus::Failed
         || t.exit_code.is_some_and(|code| code != 0)
 }
@@ -42,7 +42,7 @@ pub(super) fn tool_title(t: &ToolView, selected: bool, width: usize, tick: u64) 
         ToolStatus::Failed => ("✗".into(), RED),
         ToolStatus::Interrupted => ("■".into(), MUTED),
     };
-    let changed = matches!(t.name.as_str(), "edit" | "write");
+    let changed = matches!(t.kind, ToolKind::Diff | ToolKind::Write);
     let mut meta = tool_meta(t);
     // Sub-second runs stay silent: "0s" is pure noise on fast tools.
     if let Some(n) = t.seconds.filter(|n| *n > 0) {
@@ -58,15 +58,7 @@ pub(super) fn tool_title(t: &ToolView, selected: bool, width: usize, tick: u64) 
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(t.name.as_str());
     // cursor(2) + glyph+space(2) + ≥2 pad + meta; subject gets the remainder.
-    let action = match t.name.as_str() {
-        "shell" => "$ ",
-        "read" => "Read ",
-        "edit" => "Edit ",
-        "write" => "Write ",
-        "glob" | "grep" | "search" | "websearch" => "Search ",
-        "webfetch" => "Fetch ",
-        _ => "",
-    };
+    let action = t.kind.action();
     let action = if failed {
         format!("Failed · {action}")
     } else {
@@ -75,7 +67,7 @@ pub(super) fn tool_title(t: &ToolView, selected: bool, width: usize, tick: u64) 
     // Reserve status/meta before the subject, even in very narrow viewports.
     meta = elide(&meta, width.saturating_sub(10));
     let budget = width.saturating_sub(6 + meta.width());
-    let subject = if matches!(t.name.as_str(), "read" | "edit" | "write") {
+    let subject = if matches!(t.kind, ToolKind::Read | ToolKind::Diff | ToolKind::Write) {
         if budget > action.width() + 3 {
             format!(
                 "{action}{}",
@@ -153,17 +145,17 @@ pub(super) fn tool_title_row(
 
 /// Right-hand title metadata, from structured state only (never parsed text).
 pub(super) fn tool_meta(t: &ToolView) -> String {
-    match t.name.as_str() {
-        "shell" if t.status != ToolStatus::Running => {
+    match t.kind {
+        ToolKind::Process if t.status != ToolStatus::Running => {
             t.exit_code.map(|c| format!("exit {c}")).unwrap_or_default()
         }
-        "edit" if t.status != ToolStatus::Running => match (t.adds, t.dels) {
+        ToolKind::Diff if t.status != ToolStatus::Running => match (t.adds, t.dels) {
             (Some(a), Some(d)) => format!("+{a} −{d}"),
             _ => String::new(),
         },
         // write knows its line count up front (content is in the input);
         // "new" only once the server confirmed creation.
-        "write" => {
+        ToolKind::Write => {
             let mut meta = t.adds.map(|a| format!("+{a}")).unwrap_or_default();
             if t.created && t.status == ToolStatus::Done {
                 if !meta.is_empty() {
@@ -173,13 +165,13 @@ pub(super) fn tool_meta(t: &ToolView) -> String {
             }
             meta
         }
-        "read" if t.status != ToolStatus::Running => {
+        ToolKind::Read if t.status != ToolStatus::Running => {
             format!("{} lines", t.output.lines().count())
         }
-        "websearch" if t.status != ToolStatus::Running && !t.brief.is_empty() => {
+        ToolKind::Search if t.status != ToolStatus::Running && !t.brief.is_empty() => {
             format!("{} results", t.brief.len())
         }
-        "webfetch" if t.status != ToolStatus::Running => {
+        ToolKind::Fetch if t.status != ToolStatus::Running => {
             t.content_format.as_deref().unwrap_or("text").to_owned()
         }
         _ => String::new(),
@@ -422,7 +414,7 @@ pub(super) fn tool_expanded(
     }
     // edit/write/webfetch already have fully structured bodies; repeating their
     // often-large JSON arguments before the useful content only adds noise.
-    if !matches!(t.name.as_str(), "edit" | "write" | "webfetch") {
+    if !matches!(t.kind, ToolKind::Diff | ToolKind::Write | ToolKind::Fetch) {
         for line in t.input.lines() {
             lines.extend(wrap_text(line, Style::default().fg(MUTED), width, prefix));
         }
@@ -436,12 +428,12 @@ pub(super) fn tool_expanded(
                 prefix,
             ));
         }
-        if t.name != "write" {
+        if t.kind != ToolKind::Write {
             return;
         }
     }
-    match t.name.as_str() {
-        "read" | "write" if t.content_hl.is_some() => {
+    match t.kind {
+        ToolKind::Read | ToolKind::Write if t.content_hl.is_some() => {
             for line in t.content_hl.as_ref().unwrap() {
                 lines.extend(crate::ui::markdown::wrap_spans(
                     line.spans.clone(),
@@ -450,7 +442,7 @@ pub(super) fn tool_expanded(
                 ));
             }
         }
-        "edit" => match &t.diff_rows {
+        ToolKind::Diff => match &t.diff_rows {
             Some(rows) => {
                 let (rendered, _) = diff_render(rows, width, theme, usize::MAX, true);
                 lines.extend(rendered);
@@ -461,7 +453,7 @@ pub(super) fn tool_expanded(
                 }
             }
         },
-        "webfetch" => {
+        ToolKind::Fetch => {
             // Highlighted structured content (json/xml/html) renders like code;
             // markdown/text pages stream as wrapped body lines.
             if let Some(hl) = &t.content_hl {
@@ -482,7 +474,7 @@ pub(super) fn tool_expanded(
                 );
             }
         }
-        "shell" => {
+        ToolKind::Process => {
             push_wrapped(
                 lines,
                 t.output.lines(),
@@ -532,8 +524,8 @@ pub(super) fn tool_preview(
     if tool_failure(t, lines, width, 5) {
         return;
     }
-    match t.name.as_str() {
-        "shell" if t.status == ToolStatus::Running => {
+    match t.kind {
+        ToolKind::Process if t.status == ToolStatus::Running => {
             // Last 3 progress lines, following scroll.
             let prog: Vec<&str> = t.progress.lines().collect();
             if prog.is_empty() {
@@ -553,7 +545,7 @@ pub(super) fn tool_preview(
                 );
             }
         }
-        "shell" => {
+        ToolKind::Process => {
             let out: Vec<&str> = if t.output.trim().is_empty() {
                 t.stderr.lines().collect()
             } else {
@@ -569,7 +561,7 @@ pub(super) fn tool_preview(
             );
             more_hint(lines, start, width);
         }
-        "edit" if t.status != ToolStatus::Running => match &t.diff_rows {
+        ToolKind::Diff if t.status != ToolStatus::Running => match &t.diff_rows {
             Some(rows) if !rows.is_empty() => {
                 let (rendered, shown) =
                     diff_render(rows, width, theme, edit_preview_rows.max(1), false);
@@ -611,7 +603,7 @@ pub(super) fn tool_preview(
                 }
             }
         },
-        "write" => {
+        ToolKind::Write => {
             // Ghost-diff of what is (about to be) written; highlighted at
             // ToolStarted, so this also streams while running.
             if let Some(hl) = &t.content_hl {
@@ -626,8 +618,8 @@ pub(super) fn tool_preview(
             }
         }
         // read: the title already says what was read; a content teaser is noise.
-        "read" => {}
-        "websearch" if !t.brief.is_empty() => {
+        ToolKind::Read => {}
+        ToolKind::Search if !t.brief.is_empty() => {
             push_wrapped(
                 lines,
                 t.brief.iter().take(3),
@@ -637,7 +629,7 @@ pub(super) fn tool_preview(
             );
             more_hint(lines, t.brief.len().saturating_sub(3), width);
         }
-        "webfetch" if !t.brief.is_empty() => {
+        ToolKind::Fetch if !t.brief.is_empty() => {
             push_wrapped(
                 lines,
                 t.brief.iter().take(3),

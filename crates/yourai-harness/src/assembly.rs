@@ -1,16 +1,13 @@
 //! One assembly path used equally by terminal and web drivers.
-pub mod model_hooks;
-use crate::hooks::{DefaultHookRuntime, HooksConfig};
+use crate::hooks::{DefaultHookManager, HooksConfig};
 use crate::{
     collaboration::*, memory::LocalMemory, skills::LocalSkills, storage::LocalUsage,
     workspace::Workspace, *,
 };
-use model_hooks::DefaultHookEvaluator;
 use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 use yourai_core::prelude::*;
 
@@ -31,7 +28,7 @@ pub struct HarnessConfig {
     pub yolo: bool,
     pub system_prompt: Option<String>,
     pub prompt: crate::PromptConfig,
-    pub memory_provider: Option<Arc<dyn MemoryProvider>>,
+    pub memory_manager: Option<Arc<dyn MemoryManager>>,
     pub skill_provider: Option<Arc<dyn SkillProvider>>,
     pub memory_search_limit: usize,
     pub request_policy: crate::model::RequestPolicy,
@@ -53,7 +50,7 @@ impl HarnessConfig {
             yolo: false,
             system_prompt: None,
             prompt: crate::PromptConfig::default(),
-            memory_provider: None,
+            memory_manager: None,
             skill_provider: None,
             memory_search_limit: 0,
             request_policy: Default::default(),
@@ -72,10 +69,10 @@ pub struct Harness {
     provider_budgets: Mutex<HashMap<(String, crate::model::RequestPolicy), Arc<ModelBudget>>>,
     current_budget: Mutex<Arc<ModelBudget>>,
     /// Shared persistence interface for frontends reading clean session history.
-    pub sessions: Arc<dyn SessionManager>,
-    pub host: Arc<SessionHost>,
+    pub sessions: Arc<dyn SessionStore>,
+    pub host: Arc<SessionManager>,
     pub tools: Arc<ToolSet>,
-    pub hooks: Arc<DefaultHookRuntime>,
+    pub hooks: Arc<DefaultHookManager>,
     pub budget: Arc<ModelBudget>,
     pub workspace: Option<Arc<Workspace>>,
     pub tasks: Option<Arc<TaskManager>>,
@@ -96,66 +93,11 @@ impl Harness {
         } else {
             "startup"
         };
-        // Existing snapshots must not depend on files or external services at resume.
-        let existing = match &config.resume {
-            Some(id) => Some(catalog.load_session(id).await?),
-            None => None,
-        };
-        // A refused resume must not initialize prompts, rewrite metadata or
-        // assemble providers for a session owned by another host.
-        let lease = match &existing {
-            Some(meta) => Some(crate::runtime::SessionLease::acquire(
-                catalog.directory(&meta.id)?,
-            )?),
-            None => None,
-        };
-        let mut prompt_notices = vec![];
-        let mut initial_instructions = Default::default();
-        let prepared = if existing.as_ref().is_none_or(|m| m.system_prompt.is_none()) {
-            let prepared = crate::context::prompt::prepare(
-                &config.prompt,
-                &config.cwd,
-                config.system_prompt.as_deref(),
-                &config.instructions,
-                config.skill_provider.as_deref(),
-                config.memory_provider.as_deref(),
-                config
-                    .context_policy
-                    .maintenance_threshold(model.token_budget()),
-                &tokio_util::sync::CancellationToken::new(),
-            )
-            .await?;
-            prompt_notices = prepared.notices;
-            initial_instructions = prepared.instructions;
-            Some(prepared.system)
-        } else {
-            None
-        };
-        let id = match existing {
-            Some(meta) => {
-                if let Some(system) = &prepared {
-                    catalog.initialize_system(&meta.id, system).await?;
-                }
-                meta.id
-            }
-            None => {
-                catalog
-                    .create_session(
-                        SessionId::new(),
-                        prepared.as_deref().expect("new session prompt"),
-                    )
-                    .await?
-                    .id
-            }
-        };
-        let lease = match lease {
-            Some(lease) => lease,
-            None => crate::runtime::SessionLease::acquire(catalog.directory(&id)?)?,
-        };
+        let (meta, lease, prepared) = prepare_session(&catalog, &config, model.as_ref()).await?;
+        let id = meta.id;
         let dir = lease.dir.clone();
-        let mut meta = catalog.load_session(&id).await?;
-        meta.model = Some(model.model_iden().into());
-        catalog.save_session(&meta).await?;
+        let prompt_notices = prepared.notices;
+        let initial_instructions = prepared.instructions;
         let budget =
             ModelBudget::configured(config.request_policy.clone(), (*catalog.store).clone())?;
         let model: Arc<dyn ModelProvider> = Arc::new(MeteredModel {
@@ -163,15 +105,7 @@ impl Harness {
             budget: budget.clone(),
         });
         let usage = Arc::new(LocalUsage((*catalog.store).clone()));
-        let hooks = Arc::new(DefaultHookRuntime::new().with_evaluator(Arc::new(
-            DefaultHookEvaluator {
-                model: None,
-                tools: None,
-                usage: None,
-                timeout: Duration::from_secs(60),
-                steps: 8,
-            },
-        )));
+        let hooks = Arc::new(DefaultHookManager::new().with_model(model.clone()));
         hooks
             .register_config(&config.hooks, HookSource::Project)
             .await?;
@@ -203,7 +137,7 @@ impl Harness {
         } else {
             None
         };
-        if let Some(provider) = config.memory_provider {
+        if let Some(provider) = config.memory_manager {
             agent.ctx().set_memory(provider);
         } else if let Some(memory) = &memory {
             agent.ctx().set_memory(memory.clone());
@@ -224,11 +158,11 @@ impl Harness {
         let mut context = SessionContext::new(id, config.cwd);
         context.transcript_path = Some(crate::SqliteStore::path(&config.root));
         context.instructions = initial_instructions;
-        let host = SessionHost::open_owned(
+        let host = SessionManager::open_owned(
             lease,
             context,
             agent,
-            HostConfig {
+            SessionConfig {
                 input,
                 // Preserve initial instruction lifecycle hooks; reopening uses the
                 // frozen snapshot and must not require the original files.
@@ -278,7 +212,7 @@ impl Harness {
                     budget.clone(),
                 )])),
                 current_budget: Mutex::new(budget.clone()),
-                sessions: catalog,
+                sessions: catalog.store.clone(),
                 host: host.clone(),
                 tools,
                 hooks,
@@ -359,11 +293,9 @@ impl Harness {
         let id = self.host.context().id;
         let history = DefaultContext::new(
             id.clone(),
-            crate::context::ContextServices {
-                store: Some(self.sessions.clone()),
-                policy,
-                ..Default::default()
-            },
+            String::new(),
+            Some(self.sessions.clone()),
+            policy,
         );
         // Prepare everything that can fail before publishing either provider.
         history.restore().await?;
@@ -405,7 +337,7 @@ pub(crate) async fn assemble(
     cwd: &std::path::Path,
     trusted_shell: bool,
     model: Arc<dyn ModelProvider>,
-    hooks: Option<Arc<dyn HookRuntime>>,
+    hooks: Option<Arc<dyn HookManager>>,
     usage: Option<Arc<dyn UsageTracker>>,
     inherited: Option<Arc<dyn ToolRegistry>>,
     policy: ContextPolicy,
@@ -425,12 +357,13 @@ pub(crate) async fn assemble(
         cwd,
         Some(catalog.tool_output.clone()),
     )?);
-    let services = crate::context::ContextServices {
-        store: Some(catalog.clone()),
+
+    let history = DefaultContext::new(
+        id.clone(),
+        String::new(),
+        Some(catalog.store.clone()),
         policy,
-        ..Default::default()
-    };
-    let history = DefaultContext::new(id.clone(), services);
+    );
     let mut builder = Agent::builder()
         .agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
             crate::default_loop::LoopConfig {
@@ -443,7 +376,7 @@ pub(crate) async fn assemble(
         )))
         .model(model)
         .context_manager(history)
-        .session(catalog.clone())
+        .session(catalog.store.clone())
         .tools(registry.clone())
         .security(PolicySecurity::open_for_workspace(
             dir.join("permissions.json"),
@@ -458,4 +391,78 @@ pub(crate) async fn assemble(
         builder = builder.usage(usage);
     }
     Ok((builder.build(), registry))
+}
+
+/// One initialization path for Harness, standalone hosts and child sessions.
+/// Resume acquires ownership before any prompt preparation or metadata write.
+pub(crate) async fn prepare_session(
+    catalog: &SessionCatalog,
+    config: &HarnessConfig,
+    model: &dyn ModelProvider,
+) -> Result<
+    (
+        SessionMeta,
+        crate::runtime::SessionLease,
+        crate::context::prompt::PreparedPrompt,
+    ),
+    YourAiError,
+> {
+    let existing = match &config.resume {
+        Some(id) => Some(catalog.store.load_session(id).await?),
+        None => None,
+    };
+    let lease = match &existing {
+        Some(meta) => Some(crate::runtime::SessionLease::acquire(
+            catalog.directory(&meta.id)?,
+        )?),
+        None => None,
+    };
+    let prepared = if let Some(system) = existing.as_ref().and_then(|m| m.system_prompt.as_ref()) {
+        // Frozen sessions must not depend on today's files or external services.
+        crate::context::prompt::PreparedPrompt {
+            system: system.clone(),
+            notices: vec![],
+            instructions: Default::default(),
+        }
+    } else {
+        crate::context::prompt::prepare(
+            &config.prompt,
+            &config.cwd,
+            config.system_prompt.as_deref(),
+            &config.instructions,
+            config.skill_provider.as_deref(),
+            config.memory_manager.as_deref(),
+            config
+                .context_policy
+                .maintenance_threshold(model.token_budget()),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await?
+    };
+    let mut meta = match existing {
+        Some(mut meta) => {
+            if meta.system_prompt.is_none() {
+                meta.system_prompt = Some(
+                    catalog
+                        .store
+                        .initialize_system(&meta.id, &prepared.system)
+                        .await?,
+                );
+            }
+            meta
+        }
+        None => {
+            catalog
+                .store
+                .create_session(SessionId::new(), &prepared.system)
+                .await?
+        }
+    };
+    let lease = match lease {
+        Some(lease) => lease,
+        None => crate::runtime::SessionLease::acquire(catalog.directory(&meta.id)?)?,
+    };
+    meta.model = Some(model.model_iden().into());
+    catalog.store.save_session(&meta).await?;
+    Ok((meta, lease, prepared))
 }

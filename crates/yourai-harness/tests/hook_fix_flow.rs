@@ -2,10 +2,7 @@
 mod support;
 use serde_json::json;
 use std::{
-    sync::{
-        atomic::{AtomicU8, Ordering},
-        Arc, Mutex,
-    },
+    sync::{atomic::Ordering, Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
@@ -15,7 +12,24 @@ struct TimedHooks {
     slow: HookEventKind,
     seen: Mutex<Vec<HookEventKind>>,
 }
-impl HookRuntime for TimedHooks {
+impl HookManager for TimedHooks {
+    // This fixed-response fixture does not support dynamic registration.
+    fn register<'a>(
+        &'a self,
+        _: yourai_core::hooks::NativeHookRegistration,
+    ) -> yourai_core::BoxFuture<'a, Result<(), yourai_core::YourAiError>> {
+        panic!("registration is not used by this test hook")
+    }
+    fn unregister<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> yourai_core::BoxFuture<'a, Result<bool, yourai_core::YourAiError>> {
+        panic!("unregistration is not used by this test hook")
+    }
+    fn handler_ids<'a>(&'a self) -> yourai_core::BoxFuture<'a, Vec<String>> {
+        panic!("registry inspection is not used by this test hook")
+    }
+
     fn dispatch<'a>(
         &'a self,
         invocation: &'a HookInvocation,
@@ -102,29 +116,6 @@ async fn direct_elicitation_deadline_covers_both_hooks_and_the_reply() {
     }
 }
 
-struct FailingJob(CommitStatus);
-impl CompactionJob for FailingJob {
-    fn run<'a>(
-        self: Box<Self>,
-        _: CompactionRequest,
-        _: &'a dyn ModelProvider,
-        _: Option<&'a dyn UsageTracker>,
-        _: &'a CancellationToken,
-        progress: Arc<AtomicU8>,
-    ) -> BoxFuture<'a, Result<(CompactionResult, String), YourAiError>>
-    where
-        Self: 'a,
-    {
-        Box::pin(async move {
-            progress.store(self.0 as u8, Ordering::Release);
-            Err(ErrorKind::Provider {
-                name: "replacement-context",
-                message: "business error".into(),
-            }
-            .into())
-        })
-    }
-}
 struct FailingCompaction {
     history: support::History,
     progress: CommitStatus,
@@ -153,17 +144,35 @@ impl ContextManager for FailingCompaction {
     ) -> Result<ContextRequest, YourAiError> {
         self.history.build_request(tools, model, suffix)
     }
-    fn prepare_compaction<'a>(
+    fn policy(&self) -> ContextPolicy {
+        self.history.policy()
+    }
+    fn estimate(
+        &self,
+        request: &ChatRequest,
+        model: &dyn ModelProvider,
+    ) -> Result<u64, YourAiError> {
+        self.history.estimate(request, model)
+    }
+    fn save_summary<'a>(
         &'a self,
-        _: &'a CompactionRequest,
-        _: &'a dyn ModelProvider,
-        _: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
-        Box::pin(async move { Ok(CompactionPlan::Summary(Box::new(FailingJob(self.progress)))) })
+        _: &'a [StoredMessage],
+        _sources: Vec<String>,
+        _summary: StoredMessage,
+        progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(async move {
+            progress.store(self.progress as u8, Ordering::Release);
+            Err(ErrorKind::Provider {
+                name: "replacement-context",
+                message: "business error".into(),
+            }
+            .into())
+        })
     }
 }
 #[tokio::test]
-async fn replacement_job_errors_report_the_confirmed_commit_stage() {
+async fn replacement_commit_errors_report_the_confirmed_commit_stage() {
     for (progress, expected) in [
         (CommitStatus::Pending, "business error"),
         (CommitStatus::Started, "commit state unknown"),
@@ -173,21 +182,36 @@ async fn replacement_job_errors_report_the_confirmed_commit_stage() {
             history: Default::default(),
             progress,
         });
+        context
+            .append(vec![
+                StoredMessage::new(ChatMessage::user("old history")),
+                StoredMessage::new(ChatMessage::user("current request")),
+            ])
+            .await
+            .unwrap();
+        context.history.tokens.store(1000, Ordering::Release);
         let compact = Compactor::new(
             context.clone(),
-            Arc::new(support::Model::new(vec![])),
+            Arc::new(support::Model::new(vec![]).with_budget(12_000, 500)),
             None,
             None,
             BaseInput::new(context.session_id().as_str(), ""),
         );
-        let error = compact
+        let result = compact
             .exec(
                 CompactionRequest::new(CompactionTrigger::Manual),
                 &CancellationToken::new(),
                 None,
             )
-            .await
-            .unwrap_err();
+            .await;
+        if matches!(progress, CommitStatus::Committed) {
+            let result = result.unwrap();
+            assert!(result.compacted);
+            let reason = result.stop_reason.unwrap();
+            assert!(reason.contains(expected) && reason.contains("business error"));
+            continue;
+        }
+        let error = result.unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
         assert!(
             error.to_string().contains("business error"),

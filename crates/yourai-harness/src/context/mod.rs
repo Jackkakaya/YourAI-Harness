@@ -1,5 +1,4 @@
-//! Active context and its durable mutation boundary. SQL lives in SessionManager.
-mod compact;
+//! Active context and its durable mutation boundary. SQL lives in SessionStore.
 mod projection;
 pub mod prompt;
 
@@ -7,20 +6,12 @@ use crate::error;
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
     },
 };
-use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
 
-#[derive(Default)]
-pub struct ContextServices {
-    /// Used only for ephemeral contexts; durable contexts restore their snapshot.
-    pub system_prompt: String,
-    pub store: Option<Arc<dyn SessionManager>>,
-    pub policy: ContextPolicy,
-}
 #[derive(Default)]
 struct View {
     last_seq: i64,
@@ -28,9 +19,6 @@ struct View {
     call_ids: HashSet<String>,
     result_ids: HashSet<String>,
     markers: Vec<String>,
-    consumed: HashSet<String>,
-    last_maintenance: Option<String>,
-    last_prune_tokens: u64,
     observation: Option<RequestObservation>,
 }
 pub struct DefaultContext {
@@ -39,21 +27,27 @@ pub struct DefaultContext {
     system: Mutex<String>,
     gate: tokio::sync::Mutex<()>,
     dirty: AtomicBool,
-    services: ContextServices,
+    store: Option<Arc<dyn SessionStore>>,
+    policy: ContextPolicy,
 }
 impl DefaultContext {
     pub fn memory(id: SessionId) -> Arc<Self> {
-        let services = ContextServices::default();
-        Self::new(id, services)
+        Self::new(id, String::new(), None, ContextPolicy::default())
     }
-    pub fn new(id: SessionId, services: ContextServices) -> Arc<Self> {
+    pub fn new(
+        id: SessionId,
+        system: String,
+        store: Option<Arc<dyn SessionStore>>,
+        policy: ContextPolicy,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id,
             view: Mutex::new(View::default()),
-            system: Mutex::new(services.system_prompt.clone()),
+            system: Mutex::new(system),
             gate: tokio::sync::Mutex::new(()),
-            dirty: AtomicBool::new(services.store.is_some()),
-            services,
+            dirty: AtomicBool::new(store.is_some()),
+            store,
+            policy,
         })
     }
     fn replace(&self, all: Vec<StoredMessage>) {
@@ -83,7 +77,7 @@ impl DefaultContext {
         self.dirty.store(false, Ordering::Release);
     }
     async fn reload(&self) -> Result<(), YourAiError> {
-        if let Some(store) = &self.services.store {
+        if let Some(store) = &self.store {
             let system = store
                 .load_session(&self.id)
                 .await?
@@ -124,41 +118,9 @@ impl DefaultContext {
         }
         Ok(())
     }
-    async fn commit(&self, change: ContextChange) -> Result<(), YourAiError> {
-        change
-            .progress
-            .store(CommitStatus::Started as u8, Ordering::Release);
-        if let Some(store) = &self.services.store {
-            // If the future is dropped during SQLite work, the next mutation reloads
-            // after the adapter's transaction gate. Reads reject the uncertain view.
-            self.dirty.store(true, Ordering::Release);
-            store.save_context(&self.id, change).await?;
-            self.reload().await
-        } else {
-            let mut records = self.records();
-            for m in &mut records {
-                if change.pruned.contains(&m.id) {
-                    m.tool_output_pruned_at = Some(crate::storage::sqlite::now());
-                }
-            }
-            if let Some(c) = change.compaction {
-                records.retain(|m| !c.sources.contains(&m.id));
-                records.push(c.summary);
-            }
-            // Preserve archival identities even in an ephemeral context.
-            let mut view = self.view.lock().unwrap();
-            records.sort_by_key(|m| (!m.summary, m.seq));
-            view.records = records;
-            change
-                .progress
-                .store(CommitStatus::Committed as u8, Ordering::Release);
-            Ok(())
-        }
-    }
     async fn append_locked(&self, messages: Vec<StoredMessage>) -> Result<(), YourAiError> {
         self.recover().await?;
         let mut ordinary = vec![];
-        let mut consumed = HashSet::new();
         let mut observation = None;
         {
             let view = self.view.lock().unwrap();
@@ -172,14 +134,8 @@ impl DefaultContext {
                         "system instructions belong in build_request, not append",
                     ));
                 }
-                if m.model_response {
+                if m.request_observation.is_some() {
                     observation = m.request_observation.clone();
-                    consumed.extend(
-                        view.records
-                            .iter()
-                            .flat_map(|r| r.message.content.tool_responses())
-                            .map(|r| r.call_id.clone()),
-                    );
                 }
                 // ToolDefinition completion is keyed by call_id across summaries/restarts.
                 if m.message
@@ -193,7 +149,7 @@ impl DefaultContext {
                 ordinary.push(m);
             }
         }
-        if let Some(store) = &self.services.store {
+        if let Some(store) = &self.store {
             if !ordinary.is_empty() {
                 self.dirty.store(true, Ordering::Release);
                 ordinary = store.append_messages(&self.id, ordinary).await?;
@@ -205,7 +161,7 @@ impl DefaultContext {
                 if view.records.iter().any(|r| r.id == m.id) {
                     continue;
                 }
-                if self.services.store.is_none() {
+                if self.store.is_none() {
                     m.seq = view.records.iter().map(|r| r.seq).max().unwrap_or(0) + 1;
                 }
                 view.last_seq = view.last_seq.max(m.seq);
@@ -237,28 +193,10 @@ impl DefaultContext {
         }
         let mut view = self.view.lock().unwrap();
         self.dirty.store(false, Ordering::Release);
-        view.consumed.extend(consumed);
         if let Some(observation) = observation {
             view.observation = Some(observation);
         }
         Ok(())
-    }
-    fn fingerprint(
-        records: &[StoredMessage],
-        system: Option<&str>,
-        tools: &[ToolDefinition],
-        model: &dyn ModelProvider,
-    ) -> String {
-        format!(
-            "{}:{:?}:{:?}:{system:?}:{}",
-            model.model_iden(),
-            model.token_budget(),
-            records
-                .iter()
-                .map(|m| (&m.id, m.tool_output_pruned_at))
-                .collect::<Vec<_>>(),
-            serde_json::to_string(tools).unwrap_or_default()
-        )
     }
 }
 impl ContextManager for DefaultContext {
@@ -272,7 +210,7 @@ impl ContextManager for DefaultContext {
         &self.id
     }
     fn policy(&self) -> ContextPolicy {
-        self.services.policy.clone()
+        self.policy.clone()
     }
     fn restore(&self) -> BoxFuture<'_, Result<(), YourAiError>> {
         Box::pin(async {
@@ -306,26 +244,20 @@ impl ContextManager for DefaultContext {
         model: &dyn ModelProvider,
         suffix: &[ChatMessage],
     ) -> Result<ContextRequest, YourAiError> {
-        self.services.policy.validate_for(model.token_budget())?;
+        self.policy.validate_for(model.token_budget())?;
         if self.dirty.load(Ordering::Acquire) {
             return Err(error(
                 "context",
                 "restore required after uncertain storage operation",
             ));
         }
-        let owned_system = self.system_prompt();
-        let system = Some(owned_system.as_str());
         let records = self.records();
-        let mut request = self.project(&records, system, tools)?;
+        let mut request = self.project(&records, tools)?;
+        let input_budget = self.policy.input_budget(model.token_budget());
         request.messages.extend_from_slice(suffix);
         let estimated_tokens = self.estimate(&request, model)?;
-        let input_budget = self.services.policy.input_budget(model.token_budget());
-        let unchanged = self.view.lock().unwrap().last_maintenance.as_ref()
-            == Some(&Self::fingerprint(&records, system, tools, model));
-        let maintenance_needed = !unchanged
-            && input_budget.is_some_and(|b| {
-                estimated_tokens >= b.saturating_sub(self.services.policy.advance_tokens)
-            });
+        let maintenance_needed = input_budget
+            .is_some_and(|b| estimated_tokens >= b.saturating_sub(self.policy.advance_tokens));
         Ok(ContextRequest {
             request,
             estimated_tokens,
@@ -333,12 +265,82 @@ impl ContextManager for DefaultContext {
             maintenance_needed,
         })
     }
-    fn prepare_compaction<'a>(
+    fn project(
+        &self,
+        records: &[StoredMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<ChatRequest, YourAiError> {
+        let mut request = ChatRequest::new(self.project_messages(records)?);
+        request.system = Some(self.system_prompt());
+        request.tools = Some(tools.to_vec());
+        Ok(request)
+    }
+    fn estimate(
+        &self,
+        request: &ChatRequest,
+        model: &dyn ModelProvider,
+    ) -> Result<u64, YourAiError> {
+        let raw = yourai_core::model::estimate_request(request, model)?;
+        let view = self.view.lock().unwrap();
+        if let Some(o) = &view.observation {
+            let n = o.request.messages.len();
+            if o.model == model.model_iden()
+                && n <= request.messages.len()
+                && o.request.system == request.system
+                && serde_json::to_value(&o.request.tools).ok()
+                    == serde_json::to_value(&request.tools).ok()
+                && serde_json::to_value(&o.request.messages).ok()
+                    == serde_json::to_value(&request.messages[..n]).ok()
+            {
+                return Ok(o.input_tokens.saturating_add(
+                    raw.saturating_sub(yourai_core::model::estimate_request(&o.request, model)?),
+                ));
+            }
+        }
+        Ok(raw)
+    }
+
+    fn save_summary<'a>(
         &'a self,
-        options: &'a CompactionRequest,
-        model: &'a dyn ModelProvider,
-        cancel: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
-        Box::pin(async move { self.prepare(options, model, cancel).await })
+        expected: &'a [StoredMessage],
+        sources: Vec<String>,
+        summary: StoredMessage,
+        progress: Arc<AtomicU8>,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        Box::pin(async move {
+            let _guard = self.gate.lock().await;
+            self.recover().await?;
+            let current = self.records();
+            if current.len() != expected.len()
+                || current.iter().zip(expected).any(|(a, b)| {
+                    a.id != b.id || a.tool_output_pruned_at != b.tool_output_pruned_at
+                })
+            {
+                return Err(error(
+                    "context",
+                    "context changed during compaction; discard stale summary",
+                ));
+            }
+            progress.store(CommitStatus::Started as u8, Ordering::Release);
+            if let Some(store) = &self.store {
+                // If the future is dropped during SQLite work, the next mutation reloads
+                // after the adapter's transaction gate. Reads reject the uncertain view.
+                self.dirty.store(true, Ordering::Release);
+                store
+                    .save_summary(&self.id, sources, summary, progress)
+                    .await?;
+                self.reload().await
+            } else {
+                let mut records = self.records();
+                records.retain(|m| !sources.contains(&m.id));
+                records.push(summary);
+                // Preserve archival identities even in an ephemeral context.
+                let mut view = self.view.lock().unwrap();
+                records.sort_by_key(|m| (!m.summary, m.seq));
+                view.records = records;
+                progress.store(CommitStatus::Committed as u8, Ordering::Release);
+                Ok(())
+            }
+        })
     }
 }

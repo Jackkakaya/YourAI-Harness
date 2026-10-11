@@ -1,6 +1,6 @@
 //! Optional modules own their effects and invoke hooks at actual lifecycle boundaries.
 //!
-//! `Workspace` intentionally holds a `Weak<SessionHost>` back-reference: every
+//! `Workspace` intentionally holds a `Weak<SessionManager>` back-reference: every
 //! mutation is a host operation (hook dispatch + journal gate + watch-set
 //! update), so the dependency is real, not incidental.
 mod backend;
@@ -8,7 +8,7 @@ mod operations;
 use crate::{
     error,
     file_store::{atomic_write, read_json},
-    runtime::SessionHost,
+    runtime::SessionManager,
 };
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -18,7 +18,7 @@ pub struct RuntimeConfig {
     pub memory_search_limit: usize,
 }
 impl RuntimeConfig {
-    pub(crate) fn apply(self, host: &SessionHost) {
+    pub(crate) fn apply(self, host: &SessionManager) {
         host.configure_input(self.skill_ids, self.memory_search_limit);
     }
 }
@@ -56,14 +56,14 @@ impl WorktreeRegistration {
 }
 
 pub struct Workspace {
-    host: Weak<SessionHost>,
+    host: Weak<SessionManager>,
     worktrees: Mutex<HashMap<String, WorktreeRegistration>>,
     watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stop: CancellationToken,
     snapshots: Mutex<WatchSnapshots>,
 }
 impl Workspace {
-    pub(crate) fn new(host: &Arc<SessionHost>) -> Result<Arc<Self>, YourAiError> {
+    pub(crate) fn new(host: &Arc<SessionManager>) -> Result<Arc<Self>, YourAiError> {
         let p = host.dir.join("worktrees.json");
         let worktrees = if p.exists() {
             read_json(&p)?
@@ -78,7 +78,7 @@ impl Workspace {
             snapshots: Mutex::new(HashMap::new()),
         }))
     }
-    fn host(&self) -> Result<Arc<SessionHost>, YourAiError> {
+    fn host(&self) -> Result<Arc<SessionManager>, YourAiError> {
         self.host
             .upgrade()
             .ok_or_else(|| error("workspace", "session gone"))

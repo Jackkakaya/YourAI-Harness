@@ -1,12 +1,12 @@
 //! Session lifecycle wrappers. Business initialization and cleanup are private host actions.
 use super::*;
 
-impl SessionHost {
+impl SessionManager {
     pub async fn open_owned(
         lease: SessionLease,
         context: SessionContext,
         agent: Arc<Agent>,
-        config: HostConfig,
+        config: SessionConfig,
         source: &str,
     ) -> Result<Arc<Self>, YourAiError> {
         let (host, interrupted) = Self::run_open(lease, context, agent, config)?;

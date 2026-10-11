@@ -1,11 +1,11 @@
 //! The single framework bridge between memory callbacks and the hook registry.
-//! Provider implementations do not depend on HookHandler or HookRegistry.
+//! Provider implementations do not depend on HookHandler or HookManager.
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
 
 pub(crate) async fn register(
-    hooks: &dyn HookRegistry,
+    hooks: &dyn HookManager,
     session_id: SessionId,
 ) -> Result<(), YourAiError> {
     let handler = Arc::new(MemoryHookAdapter { session_id });
@@ -36,7 +36,7 @@ struct MemoryHookAdapter {
 impl MemoryHookAdapter {
     async fn messages(
         &self,
-        sessions: &dyn SessionManager,
+        sessions: &dyn SessionStore,
         after: i64,
         through: i64,
         active_only: bool,
@@ -77,7 +77,7 @@ impl HookHandler for MemoryHookAdapter {
         invocation: &'a HookInvocation,
     ) -> BoxFuture<'a, Result<HookOutput, YourAiError>> {
         Box::pin(async move {
-            // Child agents can share a HookRuntime; never mirror another session.
+            // Child agents can share a HookManager; never mirror another session.
             if invocation.base.session_id != self.session_id.as_str() {
                 return Ok(HookOutput::Parsed(serde_json::json!({})));
             }

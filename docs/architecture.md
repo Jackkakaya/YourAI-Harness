@@ -1,4 +1,4 @@
-> 2026-10-09 更新：当前业务执行采用 [Hook 最终实现](hook-template-design.md)：Tool / Model / Compactor 的公共 exec 直接拥有流程，Turn 只管理本轮状态。Providers 是注册容器，ContextManager / SessionManager 保留原领域名。本文保留早期调研与运输示例；正常业务调用使用 [execution.md](execution.md)，完整协议以当前源码为准。
+> 2026-10-09 更新：当前业务执行采用 [Hook 最终实现](hook-template-design.md)：Tool / Model / Compactor 的公共 exec 直接拥有流程，Turn 只管理本轮状态。Providers 是注册容器，ContextManager / SessionStore 保留原领域名。本文保留早期调研与运输示例；正常业务调用使用 [execution.md](execution.md)，完整协议以当前源码为准。
 
 > Hook 执行采用模板方法模式：core 的具体执行对象固定公共 exec/操作流程，内部业务步骤私有；插件只实现业务 Provider。全部 28 个 Hook 的触发与结果处理在 core。Harness 负责默认 Loop、具体 Provider 和装配。历史“core 只含 trait”的表述以此更新为准。
 
@@ -8,7 +8,7 @@
 
 > 当前 workspace 已合并为 `yourai-core`、`yourai-harness`、`yourai-tui` 三个包。下文较早章节中的 `yourai-protocol`、`yourai-hooks`、`yourai-loop-default`、`yourai-runtime` 等名称表示历史 crate 或逻辑模块；当前实现分别位于 `yourai-core::protocol` 与 `crates/yourai-harness/src/` 的对应模块中。
 
-> 最新存储设计见 [会话存储与内存上下文](./session-storage-design.md)。ContextManager 管内存，SessionManager 管持久化，默认 SQLite，以全局唯一 session_id 定位，不引入 tenant_id。SQLite 主链已实现；下文早期示例仅展示运输接口，自持久化 ContextManager 示例已经废止，真实提交路径见存储文档。
+> 最新存储设计见 [会话存储与内存上下文](./session-storage-design.md)。ContextManager 管内存，SessionStore 管持久化，默认 SQLite，以全局唯一 session_id 定位，不引入 tenant_id。SQLite 主链已实现；下文早期示例仅展示运输接口，自持久化 ContextManager 示例已经废止，真实提交路径见存储文档。
 
 > 后续流程设计见 [DefaultLoop 完整执行流程与组件设计入口](./default-loop-flow.md)。
 > 该文档记录会话宿主、主循环、compact、工具审批和全部 Hook 的目标协作流程，
@@ -20,12 +20,12 @@
 
 后续对齐 OpenCode 的默认共享后台模式：所有本地 TUI 及其他前端默认连接同一用户级 Server；客户端自动发现已有 Server，未运行时启动它。会话运行与生命周期由 Server 全局统一管理。
 
-- Server 以全局唯一 `session_id` 查找会话，并复用已打开的 `SessionHost`。不同项目的会话由同一个 Server 管理，各会话可以独立并发执行。
+- Server 以全局唯一 `session_id` 查找会话，并复用已打开的 `SessionManager`。不同项目的会话由同一个 Server 管理，各会话可以独立并发执行。
 - 多个客户端可以同时打开同一个会话，共享历史、输入队列、执行状态、输出和交互审批；同一会话的执行由 Server 串行协调，不能因重复打开或恢复而创建第二份执行实例。
 - 前端通过统一协议提交输入、回复审批、请求中断并订阅事件。客户端连接生命周期与会话运行生命周期分离；关闭一个窗口不应自动关闭共享会话或中断其他客户端正在使用的执行。
 - `host.lock` 保留为 Server 对会话执行所有权的跨进程保护，不再通过拒绝第二个前端来实现互斥。共享存储本身不能替代统一的执行所有权。
 
-当前状态：尚未实现独立共享 Server；TUI 仍在本进程内通过 `Harness::open` 创建并驱动 `SessionHost`。下文早期关于 TUI 直接拥有执行、恢复时重建宿主及断连即取消的描述属于当前或历史模式，后续默认客户端模式以本决定为准。独立服务模式和远程连接选项在实现时另行设计。
+当前状态：尚未实现独立共享 Server；TUI 仍在本进程内通过 `Harness::open` 创建并驱动 `SessionManager`。下文早期关于 TUI 直接拥有执行、恢复时重建宿主及断连即取消的描述属于当前或历史模式，后续默认客户端模式以本决定为准。独立服务模式和远程连接选项在实现时另行设计。
 
 参考：[OpenCode 当前默认后台服务](https://opencode.ai/v2/docs/cli/#background-service)。
 
@@ -198,7 +198,7 @@ YourAI 是一个"乐高积木"式的 agent 框架。`yourai-core` 定义接口�
 ⑧ 交付          前端 recv()=None → join() → pending 非空则按序 start 逐条续 turn
 ⑨ 打断          任何时刻 cancel → select! 全场打断 → Aborted（半截文本入历史）
 
-横切：⑤⑥的调用链上，Usage 记账 / Observability 打点 / HookRegistry 拦截
+横切：⑤⑥的调用链上，Usage 记账 / Observability 打点 / HookManager 拦截
 变体：脚本用 run()（await 到底）；服务器每请求 start()，outbox 接 SSE
 ```
 
@@ -224,7 +224,7 @@ YourAI 是一个"乐高积木"式的 agent 框架。`yourai-core` 定义接口�
 > **现状（v0.1 漂移说明）**：下表是目标形态。当前 workspace 实际为 3 个
 > crate——`yourai-core`（trait + 运输机制）、`yourai-harness`（全部默认实现：
 > DefaultLoop / GenaiModel / DefaultContext / SqliteStore / 内置工具 / hooks /
-> SessionHost 宿主）、`apps/yourai-tui`（前端）。目标拆分等外部使用者出现再做。
+> SessionManager 宿主）、`apps/yourai-tui`（前端）。目标拆分等外部使用者出现再做。
 
 ```
 yourai/                              # workspace root
@@ -236,7 +236,7 @@ yourai/                              # workspace root
 │       ├── agent_loop.rs            # AgentLoop trait
 │       ├── model.rs                 # ModelProvider trait
 │       ├── context_manager.rs       # ContextManager trait
-│       ├── session.rs               # SessionManager trait
+│       ├── session.rs               # SessionStore trait
 │       ├── memory.rs                # MemoryManager trait
 │       ├── tool.rs                  # ToolProvider + ToolRegistry trait
 │       ├── skill.rs                 # SkillProvider trait
@@ -244,7 +244,7 @@ yourai/                              # workspace root
 │       ├── security.rs              # SecurityProvider trait
 │       ├── usage.rs                 # UsageTracker trait
 │       ├── observability.rs         # ObservabilityProvider trait
-│       ├── hooks.rs                 # HookHandler + HookRegistry trait
+│       ├── hooks.rs                 # HookHandler + HookManager trait
 │       ├── ui.rs                    # OutSink trait（机制）；词汇在 yourai-protocol
 │       ├── error.rs                 # YourAiError
 │       └── future.rs                # BoxFuture 类型别名
@@ -253,8 +253,8 @@ yourai/                              # workspace root
 ├── yourai-loop-default/               # 默认 AgentLoop 实现（讲 yourai-protocol）
 ├── yourai-model-genai/              # ModelProvider: 封装 genai::Client
 ├── yourai-context-inmemory/         # ContextManager: 内存实现
-├── yourai-session-sqlite/           # SessionManager: SQLite 持久化
-├── yourai-session-jsonl/            # SessionManager: JSONL 文件持久化
+├── yourai-session-sqlite/           # SessionStore: SQLite 持久化
+├── yourai-session-jsonl/            # SessionStore: JSONL 文件持久化
 ├── yourai-memory-sqlite/            # MemoryManager: SQLite + 语义搜索
 ├── yourai-tools-builtin/            # ToolRegistry + 内置工具（shell/read_file/...）
 ├── yourai-tools-mcp/                # ToolRegistry: MCP server 适配
@@ -266,7 +266,7 @@ yourai/                              # workspace root
 ├── yourai-usage-sqlite/             # UsageTracker: SQLite 持久化
 ├── yourai-observability-otel/       # ObservabilityProvider: OpenTelemetry 桥接
 ├── yourai-observability-tracing/    # ObservabilityProvider: tracing 日志
-├── yourai-hooks-inmemory/           # HookRegistry: 内存实现
+├── yourai-hooks-inmemory/           # HookManager: 内存实现
 │
 ├── yourai-tui/                      # TUI 前端
 ├── yourai-web/                      # Web 前端
@@ -285,7 +285,7 @@ Providers (容器)                          TurnContext (每次 turn 的交互�
 ├── agent_loop:      AgentLoop          ├── ctx:    &Providers
 ├── model:           ModelProvider      ├── outbox: &dyn OutSink       ← send(Out)
 ├── context_manager: ContextManager     ├── inbox:  &mut Receiver<In>  ← 外界 → loop
-├── session:         SessionManager     └── cancel: &CancellationToken ← 控制面
+├── session:         SessionStore     └── cancel: &CancellationToken ← 控制面
 ├── memory:          MemoryManager
 ├── tools:           ToolRegistry
 ├── skills:          SkillProvider
@@ -293,7 +293,7 @@ Providers (容器)                          TurnContext (每次 turn 的交互�
 ├── security:        SecurityProvider
 ├── usage:           UsageTracker
 ├── observability:   ObservabilityProvider
-└── hooks:           HookRegistry
+└── hooks:           HookManager
 ```
 
 **命名澄清：** `Providers`（容器）和 `ContextManager`（对话历史管理）是两个不同的东西。
@@ -421,14 +421,18 @@ pub trait ContextManager: Send + Sync {
     fn append(&self, rows: Vec<StoredMessage>) -> BoxFuture<'_, Result<(), YourAiError>>;
     fn build_request(&self, tools: &[ToolDefinition], model: &dyn ModelProvider)
         -> Result<ContextRequest, YourAiError>;
-    fn prepare_compaction<'a>(&'a self, request: &'a CompactionRequest,
-        model: &'a dyn ModelProvider, cancel: &'a CancellationToken)
-        -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>>;
+    fn project(&self, records: &[StoredMessage], tools: &[ToolDefinition])
+        -> Result<ChatRequest, YourAiError>;
+    fn estimate(&self, request: &ChatRequest, model: &dyn ModelProvider)
+        -> Result<u64, YourAiError>;
+    fn save_summary<'a>(&'a self, expected: &'a [StoredMessage], sources: Vec<String>,
+        summary: StoredMessage, progress: Arc<AtomicU8>)
+        -> BoxFuture<'a, Result<(), YourAiError>>;
     fn records(&self) -> Vec<StoredMessage>;
 }
 ```
 
-### 4.4 SessionManager
+### 4.4 SessionStore
 
 **职责：** 会话生命周期管理（创建/加载/保存/fork/列表/删除）
 
@@ -442,7 +446,7 @@ pub struct SessionMeta {
     pub model: Option<String>,
 }
 
-pub trait SessionManager: Send + Sync {
+pub trait SessionStore: Send + Sync {
     fn create_session(&self) -> BoxFuture<'_, Result<SessionMeta>>;
     fn load_session(&self, id: &SessionId) -> BoxFuture<'_, Result<SessionMeta>>;
     fn save_session(&self, session: &SessionMeta) -> BoxFuture<'_, Result<()>>;
@@ -454,26 +458,9 @@ pub trait SessionManager: Send + Sync {
 
 ### 4.5 MemoryManager
 
-**职责：** 跨会话的长期记忆（用户偏好、项目上下文、事实等）
+core 只保留一个记忆接口，负责召回、提示内容及会话生命周期回调；默认实现是 `LocalMemory`。框架把回调接入 HookManager，具体实现无需自行注册 Hook。
 
-```rust
-pub struct MemoryEntry {
-    pub key: String,
-    pub value: String,
-    pub category: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-pub trait MemoryManager: Send + Sync {
-    fn store(&self, key: &str, value: &str, category: Option<&str>) -> BoxFuture<'_, Result<()>>;
-    fn retrieve(&self, key: &str) -> BoxFuture<'_, Result<Option<String>>>;
-    fn search(&self, query: &str, limit: usize) -> BoxFuture<'_, Result<Vec<MemoryEntry>>>;
-    fn list(&self, category: Option<&str>) -> BoxFuture<'_, Result<Vec<MemoryEntry>>>;
-    fn delete(&self, key: &str) -> BoxFuture<'_, Result<()>>;
-    fn clear(&self) -> BoxFuture<'_, Result<()>>;
-}
-```
+`LocalMemory` 直接提供 `store / retrieve / search / list / delete / clear` 方法。增删改查不再另建 core trait，也不要求只提供召回的实现具备本地存储能力。接口完整签名见 `crates/yourai-core/src/memory.rs`。
 
 ### 4.6 Tool / ToolRegistry / ToolProvider
 
@@ -639,7 +626,7 @@ pub trait ObservabilityProvider: Send + Sync {
 }
 ```
 
-### 4.12 HookRegistry + HookHandler
+### 4.12 HookManager + HookHandler
 
 **职责：** 事件驱动的拦截点
 
@@ -674,7 +661,7 @@ pub trait HookHandler: Send + Sync {
     fn handle(&self, event: &HookEvent) -> BoxFuture<'_, Result<HookOutcome>>;
 }
 
-pub trait HookRegistry: Send + Sync {
+pub trait HookManager: Send + Sync {
     fn register(&self, handler: Arc<dyn HookHandler>);
     fn unregister(&self, id: &str);
     fn dispatch(&self, event: HookEvent) -> BoxFuture<'_, Result<HookOutcome>>;
@@ -767,10 +754,10 @@ YourAI 是开箱即用的 agent，用户可以零定制直接跑，也可以替�
 
 ### 5.4 Session 与 ContextManager 关系
 
-**决策：** ContextManager 管理一个会话的内存上下文；SessionManager 管理会话持久化记录，默认 SQLite。新方案替代原方案 D。
+**决策：** ContextManager 管理一个会话的内存上下文；SessionStore 管理会话持久化记录，默认 SQLite。新方案替代原方案 D。
 
-- `SessionManager` 管会话元数据、消息与摘要持久化；调度、队列和执行所有权属于宿主，不公开为 SessionManager 方法。沿用 sessions/messages/usage_events 三主表，用量由 UsageTracker 管理。
-- ContextManager 管理内存上下文及其变更流程，通过 SessionManager 执行记录读写；不实现 SQL、不管理连接。
+- `SessionStore` 管会话元数据、消息与摘要持久化；调度、队列和执行所有权属于宿主，不公开为 SessionStore 方法。沿用 sessions/messages/usage_events 三主表，用量由 UsageTracker 管理。
+- ContextManager 管理内存上下文及其变更流程，通过 SessionStore 执行记录读写；不实现 SQL、不管理连接。
 - 公共操作收敛为 restore / append / build_request / compact。append 和 compact 内部先持久化、后更新内存；compact 内化工具清理、摘要和摘要 Hook，返回执行状态，不暴露候选或 reset 步骤。
 - SessionHistory 已移除，提交协调收进 ContextManager。设计见 [ContextManager 设计](./context-manager-design.md)。
 - core 已定义记录接口，数据库实现位于 runtime Adapter；完整表结构与迁移说明见 [存储设计](./session-storage-design.md)。
@@ -1236,7 +1223,7 @@ impl AgentLoop for MyLoop {
 
 ### 8.1 快速开始（用默认实现）
 
-当前默认实现都在 `yourai-harness`；`Harness::open` 完成装配，`SessionHost`
+当前默认实现都在 `yourai-harness`；`Harness::open` 完成装配，`SessionManager`
 管理会话（可执行示例见 `crates/yourai-harness/examples/run.rs`）：
 
 ```rust

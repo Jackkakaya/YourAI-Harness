@@ -55,7 +55,7 @@
 
 ### 会话存储与 title（/sessions 相关）
 
-- `SessionManager::list_sessions()` 现成（crates/yourai-core/src/session.rs:79），返回 `Vec<SessionMeta>`；SQLite 查询已按 `updated_at DESC` 排序（storage/sqlite.rs 约 298 行）。`SessionMeta` 含 `title: Option<String>`、`model`、`created_at/updated_at`、`parent_session_id`（session.rs:31-41）。
+- `SessionStore::list_sessions()` 现成（crates/yourai-core/src/session.rs:79），返回 `Vec<SessionMeta>`；SQLite 查询已按 `updated_at DESC` 排序（storage/sqlite.rs 约 298 行）。`SessionMeta` 含 `title: Option<String>`、`model`、`created_at/updated_at`、`parent_session_id`（session.rs:31-41）。
 - **session title 持久化已实现**：第一条用户输入触发 `view.note_title()`，后台任务 `load_session` → `save_session` 写回（ui.rs 约 556 行起）。`/sessions` 列表有真实数据，不是新需求。
 - TUI 访问入口：`h.sessions`（ui.rs 已有用法）。
 - `delete_session()`、`fork_session()` 也已存在（session.rs 80-85），v1 不暴露。
@@ -440,7 +440,7 @@ pub fn model_choices(config: &Config) -> Vec<ModelChoice>;
 ### 6.2 启动选择器（`--resume` 不带 ID）
 
 - CLI 解析：`--resume` 后**无值或下一个参数以 `--` 开头** → 进入选择器；`--resume <ID>` 保留现状直接恢复。`--help` 与 usage 文案改为 `[--resume [SESSION_ID]]`。
-- 实现位置：`Harness::open` **之前**的独立轻量 alternate-screen 循环，新文件 `apps/yourai-tui/src/launcher.rs`（约 150-200 行），只需 `SessionCatalog::new(&config.session_dir)` + `list_sessions()`，不依赖 harness。
+- 实现位置：`Harness::open` **之前**的独立轻量 alternate-screen 循环，新文件 `apps/yourai-tui/src/launcher.rs`（约 150-200 行），只需 `SessionCatalog::new(&config.session_dir)` + `store.list_sessions()`，不依赖 harness。
   - 流程：`Config::load`（及 `--check-config` 等早退分支）之后、`Harness::open` 之前：picker 模式 → `launcher::pick(&config) -> Result<Option<SessionId>, Error>`：`Some(id)` → `hc.resume = Some(id)` 正常启动；`None`（Esc）→ 全新会话继续。
   - 键位：字符输入 = 过滤、Backspace 删除、`↑↓`/`Ctrl-P/N` 移动、`Enter` 选择、`Esc` = 新建会话、`Ctrl-Q` = 直接退出进程。
   - 空数据提示：`No sessions yet — Esc to start fresh`。
@@ -496,7 +496,7 @@ pub fn model_choices(config: &Config) -> Vec<ModelChoice>;
 | `apps/yourai-tui/src/config.rs`（或新 `models.rs`） | `ModelChoice` + `model_choices()`（遍历 provider/models/variants，过滤 disabled） | ~50 行 |
 | `apps/yourai-tui/src/launcher.rs`（新文件） | 启动会话选择器（独立 TUI 循环 + `filter_sessions()` 纯函数） | ~200 行 |
 | `apps/yourai-tui/src/main.rs` | 构建 choices、config 共享所有权、`ui::run` 新参数；`--resume` 可选值解析 + launcher 调用点；`Theme::System` 启动解析调用；usage 字符串更新 | ~50 行 |
-| `crates/yourai-harness/src/default_loop/mod.rs` + `runtime/mod.rs` | 模型句柄可换（RwLock）；`SessionHost::set_model()`（含 context 预算更新） | ~40 行 |
+| `crates/yourai-harness/src/default_loop/mod.rs` + `runtime/mod.rs` | 模型句柄可换（RwLock）；`SessionManager::set_model()`（含 context 预算更新） | ~40 行 |
 | `apps/yourai-tui/tests/smoke.py` | 断言对齐新 UI（见 §9） | ~20 行 |
 | `docs/tui.md` | 操作表新增 `^T`/`^B`/`/status`/`/models`/`/sessions` 行，删除侧栏描述，`--resume` 说明改可选 | ~15 行 |
 | 测试（render.rs / 新增） | 见 §9 | ~250 行 |

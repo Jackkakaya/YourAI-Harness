@@ -2,7 +2,7 @@
 
 # DefaultLoop 完整执行流程与组件设计入口
 
-> ContextManager 完成提交协调；公共 context.compact 完成摘要 Hook；SessionManager 负责 SQLite 读写和事务。职责见 [存储设计](./session-storage-design.md)。
+> ContextManager 完成提交协调；公共 context.compact 完成摘要 Hook；SessionStore 负责 SQLite 读写和事务。职责见 [存储设计](./session-storage-design.md)。
 
 记录日期：2026-09-18。
 
@@ -16,7 +16,7 @@ ContextManager 的接口与维护流程见 [压缩算法设计](./context-manage
 
 本文保存会话宿主、DefaultLoop、工具执行和 Hook 的完整协作流程，作为后续逐图设计组件的依据。图中的组件名是职责名称，不代表现在已经存在对应的 struct 或 crate，也不要求每个内部模块都成为可替换 Provider。
 
-`Harness::open` 提供统一装配入口；`SessionHost` 实现 SessionRuntime。公共 execution 接入 10 个事件，ContextManager 接入 2 个，宿主与扩展接入另外 16 个。DefaultLoop 只调度公共操作，原图中的“Loop 工具执行”属于公共执行层。实际组件与逐图验证见 [Runtime 实现与验收](./runtime-implementation.md)。
+`Harness::open` 提供统一装配入口；`SessionManager` 实现 SessionRuntime。公共 execution 接入 10 个事件，ContextManager 接入 2 个，宿主与扩展接入另外 16 个。DefaultLoop 只调度公共操作，原图中的“Loop 工具执行”属于公共执行层。实际组件与逐图验证见 [Runtime 实现与验收](./runtime-implementation.md)。
 
 ## 阅读导航
 
@@ -47,7 +47,7 @@ Core / Agent：装配、Provider 快照、通道、启动、取消、结果交�
 DefaultLoop：输入 -> 上下文 -> 模型 -> 审批与工具 -> 继续或结束
     |
     +-- Provider：模型、上下文、权限、沙箱、工具等具体能力
-    +-- HookRuntime：在规定节点执行扩展并返回效果
+    +-- HookManager：在规定节点执行扩展并返回效果
     +-- 扩展工具：工作区、子 Agent、协作任务等可选能力
 ```
 
@@ -68,11 +68,11 @@ DefaultLoop：输入 -> 上下文 -> 模型 -> 审批与工具 -> 继续或结�
 
 | 图 | 主要组件 | 定位 | 当前状态 |
 |---|---|---|---|
-| 图 1 | SessionRuntime（暂名） | 长期存在的会话宿主，跨 Turn 协调状态与调度 | SessionHost 已实现，SessionCatalog 另管元数据 |
+| 图 1 | SessionRuntime（暂名） | 长期存在的会话宿主，跨 Turn 协调状态与调度 | SessionManager 已实现，SqliteStore 管元数据，SessionCatalog 管目录 |
 | 图 2 | DefaultLoop | 实现 AgentLoop，推进当前一次执行 | 已在 yourai-loop 实现 |
 | 图 3 | ToolExecutor（暂名） | 完成一次工具调用的编排流程 | 建议先作为 DefaultLoop 内部模块，不新增公共 Provider |
 | 图 4 | 工作区、配置、子 Agent、协作任务等模块 | 通过工具或宿主事件接入；任务为默认能力 | Workspace、TaskManager、SubagentTool 已实现 |
-| 图 5 | DefaultHookRuntime | 注册、匹配、执行、解析与聚合 Hook | yourai-hooks 执行；Loop、宿主、扩展调用点均已接入 |
+| 图 5 | DefaultHookManager | 注册、匹配、执行、解析与聚合 Hook | yourai-hooks 执行；Loop、宿主、扩展调用点均已接入 |
 
 ```text
 TUI / Web
@@ -96,7 +96,7 @@ SessionRuntime                         图 1：会话宿主
     +-- 注册工具，供 DefaultLoop 调用
     +-- 向 SessionRuntime 投递事件
 
-DefaultHookRuntime                    图 5
+DefaultHookManager                    图 5
     +-- 供会话宿主、Loop、工具流程和扩展模块在规定节点调用
 ```
 
@@ -114,13 +114,13 @@ DefaultHookRuntime                    图 5
 | inbox 与请求回复路由 | DefaultLoop 独占消费；ToolExecutor 通过内部交互接口等待对应回复 |
 | 何时写入历史、何时 compact | DefaultLoop 协调，包括调用工具内部流程；不在多个模块重复提交同一结果 |
 | 历史如何保存、compact 如何实现 | ContextManager 的具体实现 |
-| Hook 注册与执行 | DefaultHookRuntime |
+| Hook 注册与执行 | DefaultHookManager |
 | Hook 返回效果如何影响业务 | 当前触发 Hook 的组件 |
 
 <a id="flow-session"></a>
 ## 图 1：会话宿主
 
-### 对应组件：SessionHost（实现 SessionRuntime）
+### 对应组件：SessionManager（实现 SessionRuntime）
 
 管理一段持续存在的对话，生命周期跨越多次 Turn。
 
@@ -139,7 +139,7 @@ SessionRuntime
 - **Hook：** 直接负责 SessionStart / SessionEnd；通过装配的模块接入指令加载、配置等事件。
 - **边界：** 不执行模型—工具循环，不重复保存 Loop 已提交的历史。
 
-现有 SessionManager 管会话元数据生命周期；SessionRuntime 管活着的会话及其运行。它们不是同一个组件，也不应仅因名字相近而合并。
+现有 SessionStore 管会话元数据生命周期；SessionRuntime 管活着的会话及其运行。它们不是同一个组件，也不应仅因名字相近而合并。
 
 ```text
 TUI / Web
@@ -148,7 +148,7 @@ TUI / Web
 创建 / 恢复会话
     |
     +-- 打开会话历史，绑定 ContextManager
-    +-- 装配模型、工具、权限、HookRuntime
+    +-- 装配模型、工具、权限、HookManager
     +-- 加载指令 --------------------> [Hook: InstructionsLoaded]
     |
     v
@@ -268,11 +268,11 @@ DefaultLoop
                      +-- 是                      |        |
                           |                      |        |
                           v                      |        |
-                   ContextManager.prepare_compaction()
+                   Compactor.exec()
                           |                      |        |
-                          +-- Complete: 内部清理  |        |
-                          +-- Summary: 需要摘要时 │        |
-                          |    PreCompact         |        |
+                          +-- PreCompact: 可阻断  |        |
+                          +-- private run: 维护 │        |
+                          |    读取最新视图         |        |
                           |    选区 → 分批摘要    |        |
                           +-- 单事务保存 → 内存更新       |
                           +-- 摘要后 PostCompact  |        |
@@ -367,7 +367,7 @@ Loop 决定检查和调用时机，ContextManager 实现压缩和存储。模型
 - 压缩失败且上下文无法发送时，结束并报告错误，不能无限压缩。
 - 手动压缩由会话宿主协调到安全边界，复用同一流程，不与当前历史写入并发。
 
-当前接口为 `compact(CompactionRequest, &CancellationToken) -> Result<CompactionResult, YourAiError>`，请求携带触发原因、完整请求环境和执行预算，结果只返回执行状态、前后估算与提示。摘要 Hook 在 Compactor.exec；算法在 ContextManager.prepare_compaction / CompactionJob.run，原子事务在 SessionManager。
+当前接口为 `compact(CompactionRequest, &CancellationToken) -> Result<CompactionResult, YourAiError>`，请求携带触发原因、完整请求环境和执行预算，结果只返回执行状态、前后估算与提示。摘要 Hook 在 Compactor.exec；算法在 Compactor 的 private run，ContextManager 核对快照并应用，原子事务在 SessionStore。
 
 ### 模型、继续与失败
 
@@ -396,7 +396,7 @@ ToolExecutor
 
 - **输入：** ToolCall、本次执行的 Provider、取消与时间约束、进度和交互接口。
 - **输出：** 标准化工具结果或 Turn 终止状态，以及工具执行事件。
-- **依赖：** ToolRegistry、ToolProvider、SecurityProvider、SandboxProvider、HookRuntime。
+- **依赖：** ToolRegistry、ToolProvider、SecurityProvider、SandboxProvider、HookManager。
 - **边界：** Registry 查找工具，Handler 实现动作，Executor 组织完整调用流程。它不发起下一次模型调用，不直接消费 inbox。
 - **历史提交：** Executor 产出最终结果，由 Loop 的历史提交路径保存一次；结果持久化与 ToolDone 的先后顺序在本图接口设计中落实。
 
@@ -524,7 +524,7 @@ Loop 仍是 inbox 的唯一消费者。MCP 适配器通过内部请求与回复�
 | 子 Agent 模块 | 创建、管理和回收子会话 | 注册工具；子会话使用自己的宿主与 Loop |
 | 协作任务模块 | 任务状态、队友状态 | 工具调用与宿主事件 |
 
-各模块持有自己的资源和业务状态。DefaultLoop 只调用通用工具接口，SessionRuntime 接收需要调度的事件；两者不集中实现扩展业务。图中所有事件共用图 5 的 HookRuntime。
+各模块持有自己的资源和业务状态。DefaultLoop 只调用通用工具接口，SessionRuntime 接收需要调度的事件；两者不集中实现扩展业务。图中所有事件共用图 5 的 HookManager。
 
 ```text
 触发模块                     事件与 Hook
@@ -577,9 +577,9 @@ RuntimeEvents 提供事件 ID 去重，宿主持久化事件并在 Loop 检查�
 <a id="flow-hooks"></a>
 ## 图 5：Hook 注册、执行与结果消费
 
-### 对应组件：DefaultHookRuntime（已有）
+### 对应组件：DefaultHookManager（已有）
 
-位于 yourai-hooks，实现 core 的 HookRuntime 和 HookRegistry 接口。
+位于 yourai-hooks，实现 core 的 HookManager 接口。
 
 - **持有：** Hook 注册表、执行配置与相关执行能力。
 - **输入：** 管理方的注册/注销请求，以及业务调用方构造的 HookInvocation。
@@ -593,7 +593,7 @@ RuntimeEvents 提供事件 ID 去重，宿主持久化事件并在 Loop 检查�
 应用装配
     |
     +-- 配置 --> register_config ---------+
-    +-- Rust --> HookRegistry.register ---+
+    +-- Rust --> HookManager.register ---+
                                          |
                                          v
                                   Hook 注册表
@@ -604,7 +604,7 @@ Loop / 会话宿主 / 扩展模块                 |
 构造 HookInvocation                      |
     |                                    |
     v                                    |
-HookRuntime.dispatch() <------------------+
+HookManager.dispatch() <------------------+
     |
     +-- 按事件、matcher、条件筛选；无匹配则返回空效果
     +-- 并行执行 Command / HTTP / Native / Prompt / Agent
@@ -628,7 +628,7 @@ HookDispatchResult：common + outcome + runs
 ### 执行与效果边界
 
 - Hook runtime 负责匹配、执行、超时、解析、校验与聚合，不直接修改主循环历史、执行目标工具或向用户提问。
-- Command/HTTP/Native 已有执行实现；Prompt/Agent 的模型与 Agent 能力需注入 HookEvaluator。
+- Command/HTTP/Native 已有执行实现；Prompt/Agent 的模型与 Agent 能力需注入 ModelProvider。
 - 同一 dispatch 的处理器并行运行，结果按规则聚合；不是前一个处理器的修改自动成为后一个处理器输入的 waterfall。
 - PreToolUse 权限聚合为 `Deny > Ask > Allow > Pass`，最终仍需与 Security 决策组合。
 - `FailurePolicy::Open` 记录非阻断错误，`Closed` 生成阻断效果，调用方按对应节点消费。
@@ -717,11 +717,11 @@ inbox（Loop 独占消费）
 
 | 图 | 组件/内部模块 | 必须确定的边界与接口 |
 |---|---|---|
-| 图 1 | core SessionHost | 会话身份、历史绑定、运行互斥、TurnHandle 所有权、事件转发、恢复点、后续调度、关闭流程 |
+| 图 1 | core SessionManager | 会话身份、历史绑定、运行互斥、TurnHandle 所有权、事件转发、恢复点、后续调度、关闭流程 |
 | 图 2 | DefaultLoop、Turn、Compactor、Model | 状态转换、检查点、steer 接纳、预算与时间、压缩输入输出、模型重试、统一收尾 |
 | 图 3 | core Tool、permission::authorize、interaction::elicit | handler 绑定、权限合并、request_id、批准范围、取消传播、结果持久化与消息顺序 |
 | 图 4 | 工作区、子 Agent、协作任务等扩展 | 事件归属、工具与宿主入口、后台任务生命周期、内部事件与唤醒，不扩大默认 Loop 职责 |
-| 图 5 | DefaultHookRuntime（已有）与调用方的效果消费连接 | 哪个组件 dispatch、每种事件允许的效果、失败策略、通知展示、背景执行与主流程的隔离 |
+| 图 5 | DefaultHookManager（已有）与调用方的效果消费连接 | 哪个组件 dispatch、每种事件允许的效果、失败策略、通知展示、背景执行与主流程的隔离 |
 | 跨图 | 已定义接口的接入与剩余协议细节 | InputMode、TurnResult 的实际消费；RuntimeEvents 身份、增量用量与中断恢复记录已接入 |
 
 上述边界已落实；后续修改保持状态所有权，不为每个方框增加公共 trait。

@@ -46,8 +46,7 @@ cargo run -p yourai-tui
   },
   "context": {
     "keep_recent_tokens": 20000,
-    "summary_tokens": 2000,
-    "prune_enabled": false
+    "summary_tokens": 2000
   }
 }
 ```
@@ -130,7 +129,7 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --resume 会话ID
 
 `--resume` 不带 ID 时进入启动会话选择器（launcher）：搜索框过滤 title/id/model，`↑↓`/`Ctrl-P/N` 移动，`Enter` 恢复选中会话，`Esc` 开启全新会话，`Ctrl-Q` 直接退出。恢复会话会继续使用原历史；界面恢复原始历史消息（不重复展示压缩摘要）。退出时尚未处理的输入由 close 交还，打印在终端，由调用者决定是否再次提交。
 
-TUI 复用 Harness → SessionHost → DefaultLoop，默认安装 read/write/edit、shell、Web 工具和任务板；`extensions = true` 安装子代理、工作区、记忆和技能扩展。TUI 可通过 Ctrl+V 剪贴板发送图片，或 `@` 引用文件/目录（前端只传引用，文本行窗口/图片归一化/目录列表由 harness 在提交时解析）。请求错误显示在界面，修改配置后退出重启即可。真实模型连通性由你配置服务后验证。
+TUI 复用 Harness → SessionManager → DefaultLoop，默认安装 read/write/edit、shell、Web 工具和任务板；`extensions = true` 安装子代理、工作区、记忆和技能扩展。TUI 可通过 Ctrl+V 剪贴板发送图片，或 `@` 引用文件/目录（前端只传引用，文本行窗口/图片归一化/目录列表由 harness 在提交时解析）。请求错误显示在界面，修改配置后退出重启即可。真实模型连通性由你配置服务后验证。
 
 离线终端冒烟测试使用本地模拟 HTTP 服务和伪终端，不调用外部模型：
 
@@ -186,3 +185,5 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --import-json-sessions
 会话标题来自已写入历史的首条可生成标题的用户消息；仅入队或随后被拒绝的输入不会命名会话。标题保存失败会提示并在后台刷新时重试。切换会话只替换对话和运行状态，草稿、主题及模型选择保留。
 
 对话分为三层：用户问题的底色、留白与回复标题构成主层，不显示说话者标签；文件修改、当前操作和失败构成操作层；成功的探索与思考记录为可展开的细节层。成功 shell 去掉额外空白和无输出占位，失败明确标注 Failed 并保留诊断。Todo 侧栏不再重复 context；Ctrl-B 仪表盘说明该数字为下一次请求估算，包含系统提示词、工具定义与历史。
+
+工具展示由 ToolView.kind 标识内容形式；工具名称只在入口映射一次，标题、预览、展开和折叠复用同一标识。

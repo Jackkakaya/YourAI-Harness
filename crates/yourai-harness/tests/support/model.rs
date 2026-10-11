@@ -1,14 +1,13 @@
 use std::{sync::Arc, time::Duration};
 use yourai_core::prelude::*;
 
-/// Applies model-wide defaults to any provider, including complete calls and child loops.
-/// Request options remain explicit overrides. No execution policy is stored in the loop.
-pub struct ConfiguredModel {
+/// Test-only provider settings for deterministic scripted backends.
+pub struct TestModel {
     inner: Arc<dyn ModelProvider>,
     timeouts: ModelTimeouts,
     budget: ModelTokenBudget,
 }
-impl ConfiguredModel {
+impl TestModel {
     pub fn new(
         inner: Arc<dyn ModelProvider>,
         budget: ModelTokenBudget,
@@ -49,7 +48,7 @@ impl ConfiguredModel {
         Ok(request)
     }
 }
-impl ModelProvider for ConfiguredModel {
+impl ModelProvider for TestModel {
     fn token_budget(&self) -> ModelTokenBudget {
         self.budget
     }

@@ -1,4 +1,4 @@
-> 当前 core 直接拥有 Tool、Model、Turn、SessionHost、Workspace、TaskManager、Subagent 和 Compactor 的执行模板。下表中的 Harness runtime / execution / workspace 路径是兼容再导出；Provider、SQLite及装配仍在Harness，任务JSON适配已并入core TaskManager。当前接口见 [execution.md](./execution.md)。
+> 当前 core 直接拥有 Tool、Model、Turn、SessionManager、Workspace、TaskManager、Subagent 和 Compactor 的执行模板。下表中的 Harness runtime / execution / workspace 路径是兼容再导出；Provider、SQLite及装配仍在Harness，任务JSON适配已并入core TaskManager。当前接口见 [execution.md](./execution.md)。
 
 # Runtime 实现与验收
 
@@ -12,8 +12,8 @@
 
 | 图 | 实现 | 验证 |
 |---|---|---|
-| 1 会话宿主 | `runtime/mod.rs`：SessionHost 业务；`runtime/lifecycle.rs`：会话生命周期包装 | runtime 测试：队列恢复、驱动取消、并发关闭、跨会话事件隔离 |
-| 2 主循环与 compact | `default_loop/`：调度；`execution/`：共享执行；Harness `context/`：算法；core `Compactor`：摘要生命周期 | loop 测试：压缩调度、限制、重试与收尾；runtime/context 测试：真实摘要、完整归档、手动与自定义调度压缩 |
+| 1 会话宿主 | `runtime/mod.rs`：SessionManager 业务；`runtime/lifecycle.rs`：会话生命周期包装 | runtime 测试：队列恢复、驱动取消、并发关闭、跨会话事件隔离 |
+| 2 主循环与 compact | `default_loop/`：调度；`execution/`：共享执行；Harness `context/`：投影与应用；core `Compactor`：摘要算法与生命周期 | loop 测试：压缩调度、限制、重试与收尾；runtime/context 测试：真实摘要、完整归档、手动与自定义调度压缩 |
 | 3 工具、审批、MCP | core `tool.rs` / `permission.rs` / `interaction.rs`；Harness 的 ToolSet 与 PolicySecurity | loop/execution 测试：参数重检、审批、MCP、批次中断；runtime 测试：权限持久化、完整 tasks 调用 |
 | 4 扩展 | core `workspace/` / `subagent.rs` / `tasks.rs`；Harness `collaboration/` / `memory/` / `skills/` | runtime 测试：Git worktree、配置恢复、任务状态、独立子会话 |
 | 5 Hook | `crates/yourai-harness/src/hooks/`；`assembly/model_hooks.rs` 模型执行器 | Hook、Loop 与 runtime 测试：注册、匹配、聚合、agent Hook、后台唤醒、关闭进程 |
@@ -24,9 +24,9 @@
 
 ```text
 Harness::open(config, model)
-  +-- SessionCatalog + DefaultContext + SessionHost
+  +-- SessionCatalog + DefaultContext + SessionManager
   +-- AgentLoop + 公共 execution + ToolSet + PolicySecurity
-  +-- DefaultHookRuntime + DefaultHookEvaluator
+  +-- DefaultHookManager + ModelHookHandler
   +-- MeteredModel / ModelBudget
   +-- LocalUsage
   +-- extensions=true 时：LocalMemory / LocalSkills / Workspace / tasks / subagent
@@ -76,7 +76,7 @@ RuntimeEvents 按 ID 去重，运行中在 Loop 检查点消费。空闲时的 a
 
 | 调用方 | Hook |
 |---|---|
-| SessionHost | SessionStart、SessionEnd、TurnCompleted |
+| SessionManager | SessionStart、SessionEnd、TurnCompleted |
 | 公共 Compactor.exec | PreCompact、PostCompact（自动/overflow/手动共用） |
 | 公共 execution 完成、输入和模型入口 | UserPromptSubmit、Stop、StopFailure |
 | 公共 execution 工具、审批和交互入口 | PreToolUse、PostToolUse、PostToolUseFailure、PermissionRequest、PermissionDenied、Elicitation、ElicitationResult |
@@ -84,12 +84,12 @@ RuntimeEvents 按 ID 去重，运行中在 Loop 检查点消费。空闲时的 a
 | SubagentTool | SubagentStart、SubagentStop |
 | TaskManager | TaskCreated、TaskCompleted、TeammateIdle |
 
-DefaultHookRuntime 支持 command/http/native/prompt/agent。DefaultHookEvaluator 提供 prompt 和 agent 的模型执行；评估 Agent 不装配 HookRuntime，避免递归。异步 command 归属于会话，显式关闭时回收；Unix 使用独立进程组终止 shell 及组内子进程。
+DefaultHookManager 支持 command/http/native/prompt/agent。ModelHookHandler 提供 prompt 和 agent 的模型执行；评估 Agent 不装配 HookManager，避免递归。异步 command 归属于会话，显式关闭时回收；Unix 使用独立进程组终止 shell 及组内子进程。
 
 ## 默认策略的保证边界
 
 - Harness 的共享 ModelBudget 对主模型、compact、模型 Hook、子 Agent 统一记录调用次数并累计已知 token，但只做观测与限速（RequestPolicy 的 RPM/cooldown），不再设调用次数或 token 准入上限——与 OpenCode 一致：执行边界由 per-turn 的 `steps`、deadline 和各超时构成，没有跨 turn 费用硬上限。用量按当前装配生命周期累计，恢复后重新计数，历史用量仍保存。
-- 超时策略以 OpenCode `70a24697ea0028e19f22712fd63059538cb4bee7` 为参照：普通 provider 操作、用户审批、Hook 调度、压缩和持久化清理不再默认设置总时限；相应配置为 `Option<Duration>`，`None` 不启动计时器。显式 turn/compaction deadline、取消和断连仍生效。模型 HTTP 响应头和后续原始字节读取默认各 300 秒，覆盖主循环、压缩、模型 Hook 和子 Agent；SSE 心跳与尚未解析完成的事件也属于读取进展，持续输出不受总耗时限制。压缩通过流式请求收集最终回复。传输层使用上游 genai 已合并的超时支持，Cargo.toml 固定提交 `ad351eaebf8e4bf9bcc17ecab4e3152676aa6f5a`（上游 PR321）；不依赖本地 vendor 补丁。ModelProvider 声明 `uses_transport_timeouts()` 后，主循环只保留显式总 deadline/取消/断连，不再叠加模型事件间隔计时。默认 Loop/TurnLimits 的模型时限通过 ChatOptions 传给传输层，MeteredModel 与 SourceModel 保留该能力。未提供传输层计时的自定义 ModelProvider 继续使用原事件级计时兜底。模型底层显式 HTTP 请求 timeout 仍独立生效。
+- 超时策略以 OpenCode `70a24697ea0028e19f22712fd63059538cb4bee7` 为参照：普通 provider 操作、用户审批、Hook 调度、压缩和持久化清理不再默认设置总时限；相应配置为 `Option<Duration>`，`None` 不启动计时器。显式 turn/compaction deadline、取消和断连仍生效。模型 HTTP 响应头和后续原始字节读取默认各 300 秒，覆盖主循环、压缩、模型 Hook 和子 Agent；SSE 心跳与尚未解析完成的事件也属于读取进展，持续输出不受总耗时限制。压缩通过流式请求收集最终回复。传输层使用上游 genai 已合并的超时支持，Cargo.toml 固定提交 `ad351eaebf8e4bf9bcc17ecab4e3152676aa6f5a`（上游 PR321）；不依赖本地 vendor 补丁。ModelProvider 声明 `uses_transport_timeouts()` 后，主循环只保留显式总 deadline/取消/断连，不再叠加模型事件间隔计时。默认 Loop/TurnLimits 的模型时限通过 ChatOptions 传给传输层，MeteredModel 保留该能力。未提供传输层计时的自定义 ModelProvider 继续使用原事件级计时兜底。模型底层显式 HTTP 请求 timeout 仍独立生效。
 - 工具不再默认被统一的 610 秒外层计时器截断；由工具自己负责默认超时（shell 默认 120 秒、最大 600 秒，webfetch 自有网络时限），宿主仍可用 `LoopConfig.tool_timeout` / `TurnLimits.tool_timeout` 增加上限。工具内部问题没有 deadline 时也可等待用户回复。
 - 重试最多 5 次，初始 2 秒、指数倍率 2、最多 25% 抖动；无响应头时上限 30 秒，服务端 Retry-After 优先，所有重试等待封顶 `i32::MAX` 毫秒。计量包装层不再把缺失的提示变成零秒提示；共享 provider cooldown 默认关闭（`cooldown_seconds = 0`），不再额外等待 60 秒；用户显式配置的 cooldown/RPM 和服务端提示仍可施加共享准入限制。[OpenCode retry.ts](https://github.com/anomalyco/opencode/blob/70a24697ea0028e19f22712fd63059538cb4bee7/packages/opencode/src/session/retry.ts)
 - 取消收尾区分工具宽限和历史写入：先取消工具 token，再给工具 `tool_cleanup_timeout`（默认 250 毫秒）完成收尾；保留宽限期内返回的真实结果，超时后丢弃 future 并记录中断。取消后的失败 Hook 只使用同一宽限期的剩余时间，不再另加等待。Host 对 cancel 只消费一次，避免无总清理超时时忙循环；可选 `cleanup_timeout` 仍支持隔离不合作的执行。正常 Harness/子 Agent 关闭使用 `close(None)` 等待收尾，调用方可用 `close(Some(duration))` 显式限制关闭期限。[OpenCode cleanup](https://github.com/anomalyco/opencode/blob/70a24697ea0028e19f22712fd63059538cb4bee7/packages/opencode/src/session/processor.ts#L553-L610)

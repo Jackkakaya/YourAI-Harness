@@ -2,7 +2,7 @@
 use super::cards::{block_tool, surface_row, tool_expanded, tool_preview, tool_title_row};
 use crate::text::elide;
 use crate::ui::markdown::wrap_text;
-use crate::ui::state::{Item, Role, ToolStatus, View};
+use crate::ui::state::{Item, Role, ToolKind, ToolStatus, View};
 use crate::ui::theme::{
     Theme, ACCENT, CODE_SURFACE, FAINT, MUTED, RED, TEXT, USER_SURFACE, YELLOW,
 };
@@ -201,7 +201,7 @@ impl TimelineCache {
 fn quiet_exploration(item: &Item) -> bool {
     matches!(item, Item::Tool(t) if t.status == ToolStatus::Done
         && t.exit_code.is_none_or(|code| code == 0)
-        && matches!(t.name.as_str(), "read" | "glob" | "grep" | "search" | "websearch" | "webfetch"))
+        && matches!(t.kind, ToolKind::Read | ToolKind::Search | ToolKind::Fetch))
 }
 
 fn item_lines(
@@ -318,7 +318,7 @@ fn item_lines(
             if block_tool(t, expanded) {
                 lines.push(tool_title_row(t, selected, expanded, width, tick));
                 let quiet = !expanded
-                    && t.name == "shell"
+                    && t.kind == ToolKind::Process
                     && t.status == ToolStatus::Done
                     && t.exit_code.is_none_or(|c| c == 0);
                 if !body.is_empty() {

@@ -9,7 +9,7 @@
 - 授权、MCP 交互是实际普通函数，没有额外 Executor。
 - LoopConfig 只包含 steps 与 ExecutionConfig，默认值定义一次。
 - TaskManager 直接实现 ToolProvider，复用 SQLite；删除独立 TaskTool / TaskStore / JsonTasks。
-- Subagent 直接实现 ToolProvider；SessionHost 唯一 children 集合；SubagentFactory 只装配 child。
+- Subagent 直接实现 ToolProvider；SessionManager 唯一 children 集合；SubagentFactory 只装配 child。
 - Workspace / TaskManager 每个 host 唯一；初始化、关闭和 owned 写入维持资源所有权。
 - Hook 注册即编译为 handler，删除重复注册来源分支；once 在执行前原子认领。
 - 原审查发现的重复执行、取消提交、无效设置、动态指令和候选清理问题同步修复。

@@ -5,7 +5,7 @@ use crate::runtime::Activity;
 impl Workspace {
     pub(super) async fn run_load_instructions(
         &self,
-        host: Arc<SessionHost>,
+        host: Arc<SessionManager>,
         path: PathBuf,
         content: String,
         gate: tokio::sync::OwnedMutexGuard<()>,
@@ -36,9 +36,9 @@ impl Workspace {
                 })
                 .is_some_and(|row| row.message.content.first_text() == Some(note.as_str()));
             if !indexed && !recorded {
-                history
-                    .append(vec![StoredMessage::runtime_context(note)])
-                    .await?;
+                let mut row = StoredMessage::runtime_context(note);
+                row.context_key = Some(format!("instructions:{}", path.display()));
+                history.append(vec![row]).await?;
             }
             host.context
                 .lock()
@@ -55,7 +55,7 @@ impl Workspace {
     }
     pub(super) async fn run_notify(
         &self,
-        host: &Arc<SessionHost>,
+        host: &Arc<SessionManager>,
         message: &str,
     ) -> Result<(), YourAiError> {
         host.post_event_async(RuntimeEvent {
@@ -69,7 +69,7 @@ impl Workspace {
     }
     pub(super) async fn run_config(
         &self,
-        host: &Arc<SessionHost>,
+        host: &Arc<SessionManager>,
         config: RuntimeConfig,
         value: Value,
         gate: tokio::sync::OwnedMutexGuard<()>,
@@ -87,7 +87,7 @@ impl Workspace {
     }
     pub(super) async fn run_create_worktree(
         &self,
-        host: Arc<SessionHost>,
+        host: Arc<SessionManager>,
         name: String,
         custom: Option<String>,
         gate: tokio::sync::OwnedMutexGuard<()>,
@@ -137,7 +137,7 @@ impl Workspace {
     }
     pub(super) async fn run_remove_worktree(
         &self,
-        host: Arc<SessionHost>,
+        host: Arc<SessionManager>,
         name: String,
         registration: WorktreeRegistration,
         gate: tokio::sync::OwnedMutexGuard<()>,

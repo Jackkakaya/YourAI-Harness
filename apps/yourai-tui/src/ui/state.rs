@@ -25,7 +25,43 @@ pub enum ToolStatus {
     Failed,
     Interrupted,
 }
+/// Rendering follows the content shape; tool names are interpreted only here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolKind {
+    Process,
+    Read,
+    Write,
+    Diff,
+    Search,
+    Fetch,
+    Generic,
+}
+impl ToolKind {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "shell" => Self::Process,
+            "read" => Self::Read,
+            "write" => Self::Write,
+            "edit" => Self::Diff,
+            "glob" | "grep" | "search" | "websearch" => Self::Search,
+            "webfetch" => Self::Fetch,
+            _ => Self::Generic,
+        }
+    }
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::Process => "$ ",
+            Self::Read => "Read ",
+            Self::Write => "Write ",
+            Self::Diff => "Edit ",
+            Self::Search => "Search ",
+            Self::Fetch => "Fetch ",
+            Self::Generic => "",
+        }
+    }
+}
 pub struct ToolView {
+    pub kind: ToolKind,
     pub id: String,
     pub name: String,
     pub input: String,
@@ -660,7 +696,8 @@ impl View {
                 self.session.thinking = None;
                 // write previews the incoming content right away so the card
                 // shows the change (with + gutters) while it runs.
-                let is_write = name == "write";
+                let kind = ToolKind::from_name(&name);
+                let is_write = kind == ToolKind::Write;
                 let content_hl = is_write.then(|| {
                     hl_lines(
                         input["content"].as_str().unwrap_or(""),
@@ -671,6 +708,7 @@ impl View {
                 let adds =
                     is_write.then(|| input["content"].as_str().unwrap_or("").lines().count());
                 self.push(Item::Tool(Box::new(ToolView {
+                    kind,
                     id,
                     name,
                     summary: bounded(
@@ -726,8 +764,9 @@ impl View {
                 output,
                 is_error,
             } => {
-                let failed = is_error || (name == "shell" && output["ok"] == false);
-                let result = tool_result(&name, &output);
+                let kind = ToolKind::from_name(&name);
+                let failed = is_error || (kind == ToolKind::Process && output["ok"] == false);
+                let result = tool_result(kind, &output);
                 let status = if failed {
                     ToolStatus::Failed
                 } else {
@@ -759,6 +798,7 @@ impl View {
                 } else {
                     // Orphan result (history replay): synthesize a finished card.
                     self.push(Item::Tool(Box::new(ToolView {
+                        kind,
                         id: id.clone(),
                         name: name.clone(),
                         input: String::new(),

@@ -1,13 +1,13 @@
 # 代码质量整改：策略归属与持久化
 
-本次保留 core / harness / TUI 三个包，以及 SessionHost / DefaultLoop /
+本次保留 core / harness / TUI 三个包，以及 SessionManager / DefaultLoop /
 DefaultContext / SQLite 的分工。整理的单位是职责和不变量，不按文件行数新增公共 trait。
 
 ## 模型执行策略
 
 - `ModelProvider::timeouts()` 是所选模型的默认响应头/读取时限，默认各 300 秒。
-- `GenaiModel` 在传输端执行时限；`ConfiguredModel` 统一持有所选模型的容量、输出预算和显式时限，
-  `MeteredModel`、`SourceModel` 透传默认值。LoopConfig 不再持有另一份模型默认超时。
+- `GenaiModel` 持有所选模型的容量、输出预算和传输时限，
+  `MeteredModel` 透传默认值。LoopConfig 不再持有另一份模型默认超时。
 - 主循环优先级：TurnLimits.model_timeout > 请求 ChatOptions > 模型默认值。
   complete、compact、模型 Hook 和子 Agent 共享所持模型的默认值。
   Hook evaluation 自身的总时限仍独立存在。
@@ -37,7 +37,7 @@ SDK 的 WebStream、WebModelCall、WebAdapterCall 经过 harness 的统一原始
 | `model/control.rs` | 接收分类和提示，维护共享准入与冷却，不解析原始错误 |
 | `metrics::Attempt` | 只记账；首次失败返回 true，防止重复通知 |
 
-ConfiguredModel、SourceModel、MeteredModel 均透传 classify_error 和已有 recovery override。
+GenaiModel 实现厂商错误分类，MeteredModel 透传底层 classify_error 和 recovery override。
 Loop 仍调用 provider 的 recovery/retry_after；它不会用厂商解析代替插件的决定。
 只有 RateLimited 表示应触发共享冷却，使用内部 provider 的 retry_after，缺少提示时使用
 配置的 cooldown_seconds。其他分类的提示只影响本次重试。额度耗尽、上下文溢出、服务端
@@ -114,3 +114,21 @@ Attempt::Drop 只入队，不写数据库、不等待锁。不同 provider budge
 - 取消启动再关闭会话，未开始输入可归还；模型 Drop 日志能经 flush 确认。
 - Host 对错误 Hook outcome 的拒绝与 Loop / compact 一致。
 - 原有工作区测试、SDK 测试、静态检查和 TUI smoke 继续通过。
+
+## 简化重复包装
+
+- 删除 ConfiguredModel、SourceModel 和 HookUsage。GenaiModel.with_settings 直接配置容量及传输时限，MeteredModel 只负责共享准入、统计与请求日志。TurnOptions.source 同时传入 ModelRequest 和 UsageEvent；Hook 内的压缩也继承来源。
+- 模型 Hook 由 ModelHookHandler 直接执行，没有额外 evaluator trait、请求包装或决定包装。DefaultHookManager.with_model 提供缺省模型，本次 HookInvocation 的冻结模型优先。评估 Agent 不装配 HookManager，避免递归。
+- additional_contexts 集中于 HookCommonOutcome；UserPromptSubmit 和 Generic 为不带数据的事件标识，专属结果只携带权限、输入、watch paths 等专属数据。wire 协议与逐事件校验保留。
+- SessionCatalog 只管理目录及工具原文，不再转发 SessionStore。SqliteStore 是唯一存储实现，删除由 owned worker 持有 SessionLease 完成，拒绝删除正在使用的会话。
+- 主会话、独立会话和子会话共用 prepare_session 完成冻结提示词、所有权获取和元数据初始化；继续共用 assemble 装配 Agent，不增加初始化类。
+- ToolView 在入口识别 ToolKind，渲染按内容形式工作，不反复匹配工具名称。不引入各工具的 renderer 类或工厂。
+
+测试中的 TestModel 只为脚本化模型声明容量和超时，不属于生产实现。
+
+## 管理接口收敛（2026-10-11）
+
+- SessionHost 改名为 SessionManager，HostConfig 改名为 SessionConfig；原持久化 SessionManager trait 改名为 SessionStore。会话运行与数据存储职责保持分离。
+- HookRuntime 与 HookRegistry 合并为 HookManager；DefaultHookManager 同时实现注册、注销、分发及会话后台清理，不保留兼容 trait。
+- MemoryProvider 改名为 MemoryManager；删除原 CRUD trait，LocalMemory 直接提供异步增删改查。HarnessConfig.memory_manager 安装召回及生命周期实现。
+- ModelProvider 的 GenaiModel 与 MeteredModel 保留：实际网络调用与跨调用入口的统一限流、统计、日志分别负责。主任务、Hook、压缩都经过同一包装。

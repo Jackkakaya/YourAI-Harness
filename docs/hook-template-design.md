@@ -15,7 +15,7 @@ Loop：决定顺序
   → Turn.complete：Stop → 继续或结束
 
 Compactor.exec：prepare → PreCompact → private run → 提交 → PostCompact
-SessionHost / Workspace / TaskManager / Subagent：各自公共操作拥有相应 Hook 流程
+SessionManager / Workspace / TaskManager / Subagent：各自公共操作拥有相应 Hook 流程
 ```
 
 ## 正交的职责
@@ -26,16 +26,16 @@ SessionHost / Workspace / TaskManager / Subagent：各自公共操作拥有相�
 | Model | 请求、流式响应、模型恢复、失败报告与响应提交 | 部分响应保存在 Turn，emit 前更新 |
 | Turn | 本轮输入、输出、取消、限额、调用账本、输入接纳与完成 | 不再实现工具、模型、授权或 MCP 算法 |
 | Compactor | 压缩准备、摘要前后 Hook、执行和提交状态报告 | 请求投影不再依赖整个执行对象 |
-| SessionHost | 会话运行、资源所有权与关闭 | 唯一 TaskManager、Workspace 和 children 登记 |
+| SessionManager | 会话运行、资源所有权与关闭 | 唯一 TaskManager、Workspace 和 children 登记 |
 | Workspace | 配置、指令、cwd、Git worktree 与变化检测 | 不允许为同一 host 公开构造第二份状态 |
 | TaskManager | 任务规则、查询、工具参数和 SQLite 保存 | 没有 TaskTool、TaskStore、JsonTasks 或第二份序号 |
 | Subagent | 子会话创建、运行、继续与清理 | 没有 SubagentTool 或另一份 children map |
 | permission::authorize | 校验参数和审批 | 普通函数，没有 PermissionExecutor |
 | interaction::elicit | 普通 / MCP 提问、Hook 答案、schema 校验 | 普通函数，复用 Turn 的唯一输入路由 |
 
-ContextManager 和 SessionManager 保留原领域名字：前者管理上下文，后者管理持久化。Providers 是注册槽容器，ProviderSnapshot 是本次选择的依赖快照，Agent 是装配后的启动入口；它们不再兼任 Hook 执行器。
+ContextManager 管理上下文；SessionManager 管理会话运行，SessionStore 管理持久化。Providers 是注册槽容器，ProviderSnapshot 是本次选择的依赖快照，Agent 是装配后的启动入口；它们不再兼任 Hook 执行器。
 
-HookRuntime、HookRegistry、HookHandler 分别表示分发能力、注册管理和具体处理。默认实现 DefaultHookRuntime 在注册时把配置编译成实际 handler；dispatch 不再按注册来源临时造 handler。once 在注册写锁内先认领；失败、超时或取消也不自动恢复。
+HookManager 统一注册、注销与分发，HookHandler 表示具体处理。默认实现 DefaultHookManager 在注册时把配置编译成实际 handler；dispatch 不再按注册来源临时造 handler。once 在注册写锁内先认领；失败、超时或取消也不自动恢复。
 
 ## 工具实现和公共调用
 
@@ -78,7 +78,7 @@ enqueue 只登记调用，exec 只执行已登记调用。模型生成的调用�
 - 工具调用只有一条记录：call、固定 Tool、Pending / Running / Observed、稳定结果 ID。开始后禁止重放；多个调用各自保存结果，post 或保存失败不能互相覆盖。
 - 部分模型响应和延迟 Hook 上下文带稳定消息身份。保存成功后才删除；失败时 finish 继续保存。Completed 是终态，finish 同时检查未结调用和未提交消息。
 - LoopConfig 只有 steps 和 ExecutionConfig；默认值只定义一次。DefaultLoop 自己持有调度步数，Turn 持有执行额度。
-- SessionHost 每个会话只初始化一个 TaskManager 和 Workspace。children 的唯一强引用集合也在 host；确认 child 关闭后才取消登记。
+- SessionManager 每个会话只初始化一个 TaskManager 和 Workspace。children 的唯一强引用集合也在 host；确认 child 关闭后才取消登记。
 
 ## Task 就是一个具体工具
 
@@ -90,7 +90,7 @@ Tool.exec("tasks")
   → TaskManager.run
       → create / complete / idle
       → 任务 Hook
-      → private save → SessionManager → SqliteStore
+      → private save → SessionStore → SqliteStore
   → 工具 post 与结果保存
 ```
 
@@ -100,11 +100,11 @@ Tool.exec("tasks")
 
 ## 必要的失败边界
 
-压缩计划和 CompactionJob 保留：它们用于在 PreCompact 前准备并持锁、在通过后才摘要提交，不是 Hook 转发层。ContextManager 的请求构建只接收 tools 和 model；摘要任务只接收 model / usage，不接收 HookRuntime。
+压缩只有一个 Compactor：public exec 管理 Hook，private run 完成选区、摘要与校验。ContextManager 只负责投影、估算和原子 apply。Hook 与模型请求不持有写锁；提交前核对快照，过期候选不覆盖新消息。
 
 提交进度只有 Pending、Started、Committed。SQLite 在真正事务提交后立即确认 Committed。取消时分别报告未提交、提交状态未知、已提交后中断；未知状态必须 restore，不能自动重放。Turn 和宿主只转发取消，由 Compactor 结算提交状态。
 
-SessionHost 的初始化任务保留所有权直到调用者接收成功实例；启动失败或调用者丢弃启动结果仍清理资源。关闭等待操作与存储结算，再结束 Hook 和释放租约；Hook 清理报错仍进入资源释放。已确认的 SessionEnd 不因保存失败的重试重复发送，未知效果明确报告。
+SessionManager 的初始化任务保留所有权直到调用者接收成功实例；启动失败或调用者丢弃启动结果仍清理资源。关闭等待操作与存储结算，再结束 Hook 和释放租约；Hook 清理报错仍进入资源释放。已确认的 SessionEnd 不因保存失败的重试重复发送，未知效果明确报告。
 
 Workspace 的候选配置文件由私有 Drop guard 清理；实际 Git 变化与登记保存分开确认，next-map 保存成功才替换内存。动态指令进入实际模型上下文并去重；system_prompt 不再作为无效运行设置被接受。FileChanged 是已发生事实，Hook 失败可见，不能声称撤销文件变化。
 
@@ -124,9 +124,9 @@ ToolContext.cwd 与审批使用同一本轮目录；子会话启动前继承安�
 | 6 | UserPromptSubmit | `Turn.accept_input` | 初始输入和 steer 共用接纳流程，通过后提交 |
 | 7 | Stop | `Turn.complete` | 决定完成或继续；Completed 后拒绝新业务操作 |
 | 8 | StopFailure | `Model.exec` | 最终模型故障报告；不用于普通工具错误或取消 |
-| 9 | SessionStart | `SessionHost.open / open_owned` | 初始化后应用上下文、初始输入和监视路径 |
-| 10 | SessionEnd | `SessionHost.close / finish_close` | 清理资源、结束通知、持久关闭与释放租约 |
-| 11 | TurnCompleted | `SessionHost.run_next` | 本轮有新提交行且成功后通知；不重复保存历史 |
+| 9 | SessionStart | `SessionManager.open / open_owned` | 初始化后应用上下文、初始输入和监视路径 |
+| 10 | SessionEnd | `SessionManager.close / finish_close` | 清理资源、结束通知、持久关闭与释放租约 |
+| 11 | TurnCompleted | `SessionManager.run_next` | 本轮有新提交行且成功后通知；不重复保存历史 |
 | 12 | SubagentStart | `Subagent.exec` | 先分配身份，Hook 通过后创建 child；上下文交给 child |
 | 13 | SubagentStop | `Subagent.exec` | 候选完成时检查；反馈在同一 child 中继续 |
 | 14 | PreCompact | `Compactor.exec` | 只在摘要阶段执行；可阻断或补充摘要指令 |

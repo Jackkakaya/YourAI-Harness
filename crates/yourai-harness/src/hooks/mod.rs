@@ -11,11 +11,11 @@
 //!   ├── HookEvent, HookInvocation, BaseInput        (输入类型)
 //!   ├── HookCommonOutcome, HookPermission, HookPointOutcome (结果类型)
 //!   ├── HookDispatchResult, HookRun, HookRunStatus   (返回类型)
-//!   ├── HookHandler trait, HookRuntime trait          (接口)
+//!   ├── HookHandler trait, HookManager trait          (接口)
 //!   └── HookSource, FailurePolicy, HookOutput         (元数据)
 //!
 //! yourai-harness::hooks (实现)
-//!   ├── DefaultHookRuntime  impl HookRuntime         (运行时)
+//!   ├── DefaultHookManager  impl HookManager         (运行时)
 //!   ├── CommandHandler       impl HookHandler          (command 执行器)
 //!   ├── HttpHandler          impl HookHandler          (HTTP 执行器)
 //!   ├── NativeHandler        impl HookHandler          (Rust 闭包)
@@ -32,7 +32,7 @@
 //! use yourai_harness::hooks::*;
 //!
 //! # async fn example() {
-//! let runtime = DefaultHookRuntime::new();
+//! let runtime = DefaultHookManager::new();
 //!
 //! // 从 Claude 兼容的 settings.json 注册
 //! let config: HooksConfig = serde_json::from_str(r#"{
@@ -46,7 +46,7 @@
 //! }"#).unwrap();
 //! runtime.register_config(&config, HookSource::Project).await.unwrap();
 //!
-//! // 分发（通过 HookRuntime trait）
+//! // 分发（通过 HookManager trait）
 //! let inv = HookInvocation::new(
 //!     BaseInput::new("sess_01", "/workspace"),
 //!     HookEvent::PreToolUse {
@@ -55,7 +55,7 @@
 //!         tool_use_id: "call_01".to_string(),
 //!     },
 //! );
-//! let result = HookRuntime::dispatch(&runtime, &inv).await.unwrap();
+//! let result = HookManager::dispatch(&runtime, &inv).await.unwrap();
 //!
 //! match result.outcome {
 //!     HookPointOutcome::PreToolUse(o) => match o.permission {
@@ -88,20 +88,20 @@ pub use command::{BackgroundHookEvent, CommandHandler};
 pub use config::{
     build_registrations, HandlerConfig, HookMatcherGroup, HookRegistration, HookShell, HooksConfig,
 };
-pub use handler::{HookEvaluator, HookModelDecision, HookModelRequest, NativeHandler};
+pub use handler::NativeHandler;
 pub use http::{HttpHandler, HttpHookPolicy};
 pub use matcher::CompiledMatcher;
-pub use runtime::DefaultHookRuntime;
+pub use runtime::DefaultHookManager;
 
 // ── Re-exports：从 yourai-core 透传协议类型 ─────────────────────────
 // 用户只需 `use crate::hooks::*` 即可拿到全部类型，不必同时 depend yourai-core
 
 pub use yourai_core::hooks::{
-    BaseInput, ElicitationOutcome, FailurePolicy, GenericOutcome, HookBlockingError,
-    HookCommonOutcome, HookDispatchResult, HookEvent, HookEventKind, HookHandler, HookInvocation,
-    HookMessage, HookMessageKind, HookOutput, HookPermission, HookPointOutcome, HookRegistry,
-    HookRun, HookRunStatus, HookRuntime, HookSource, NativeHookRegistration,
-    PermissionDeniedOutcome, PermissionRequestBehavior, PermissionRequestDecision,
-    PermissionRequestOutcome, PostToolUseOutcome, PreToolUseOutcome, SessionStartOutcome,
-    UserPromptSubmitOutcome, WatchPathsOutcome, WorktreeCreateOutcome,
+    BaseInput, ElicitationOutcome, FailurePolicy, HookBlockingError, HookCommonOutcome,
+    HookDispatchResult, HookEvent, HookEventKind, HookHandler, HookInvocation, HookManager,
+    HookMessage, HookMessageKind, HookOutput, HookPermission, HookPointOutcome, HookRun,
+    HookRunStatus, HookSource, NativeHookRegistration, PermissionDeniedOutcome,
+    PermissionRequestBehavior, PermissionRequestDecision, PermissionRequestOutcome,
+    PostToolUseOutcome, PreToolUseOutcome, SessionStartOutcome, WatchPathsOutcome,
+    WorktreeCreateOutcome,
 };

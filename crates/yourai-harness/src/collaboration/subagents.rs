@@ -1,5 +1,5 @@
 mod backend;
-use crate::SessionHost;
+use crate::SessionManager;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -9,7 +9,7 @@ pub use yourai_core::subagent::Subagent;
 
 /// Assemble the one core subagent tool without another execution object.
 pub fn subagent(
-    host: &Arc<SessionHost>,
+    host: &Arc<SessionManager>,
     model: Option<Arc<dyn ModelProvider>>,
     tools: Option<Arc<dyn ToolRegistry>>,
 ) -> Arc<Subagent> {

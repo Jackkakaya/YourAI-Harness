@@ -5,7 +5,7 @@
 //! 选项由 ContextManager 组装请求时带出，不再断链。
 
 mod budget;
-pub use budget::{ModelLimits, ModelTokenBudget};
+pub use budget::{estimate_request, ModelLimits, ModelTokenBudget};
 
 use crate::chat::ChatStreamEvent;
 use crate::chat::{ChatOptions, ChatRequest, ChatResponse, ToolCall};
@@ -205,13 +205,17 @@ impl Model {
         let mut retries = 0;
         let mut overflow = 0;
         let mut force_compact = false;
+        let mut auto_compacted = false;
         loop {
             turn.checkpoint().await?;
             if force_compact {
                 turn.compact(CompactionTrigger::Overflow).await?;
                 force_compact = false;
+                auto_compacted = true;
             }
-            let attempt = self.run(turn, retries + 1, options).await;
+            let attempt = self
+                .run(turn, retries + 1, options, &mut auto_compacted)
+                .await;
             let calls = match attempt {
                 Ok(value) => value,
                 Err((error, visible)) => {
@@ -313,6 +317,7 @@ impl Model {
         turn: &mut crate::execution::Turn<'_>,
         attempt: u32,
         model_options: &ModelOptions,
+        auto_compacted: &mut bool,
     ) -> Result<Vec<ToolCall>, (YourAiError, bool)> {
         let mut visible = false;
         let result = async {
@@ -329,7 +334,8 @@ impl Model {
             // Workspace instruction updates are already part of persisted history.
             let suffix: Vec<_> = model_options.prefill.iter().map(|s| ChatMessage::assistant(s.clone())).collect();
             let mut prepared = turn.history.build_request(&tools, self.backend.as_ref(), &suffix)?;
-            if prepared.maintenance_needed {
+            if prepared.maintenance_needed && (!*auto_compacted || !prepared.fits()) {
+                *auto_compacted = true;
                 if let Err(e) = turn.compact(CompactionTrigger::Threshold).await {
                     if matches!(e, YourAiError::Aborted(_)) || !prepared.fits() {
                         return Err(e);
@@ -368,6 +374,7 @@ impl Model {
                 .unwrap_or(model.timeouts().read);
             turn.model_calls += 1;
             let mut request = ModelRequest::new(request, options);
+            request.source = turn.tc.info.options.source.unwrap_or("main");
             request.session_id = Some(turn.history.session_id().as_str().to_owned());
             request.turn_id = Some(turn.tc.info.id.to_string());
             request.attempt = attempt;
@@ -504,17 +511,17 @@ impl Model {
                         let mut record = turn.partial_message.clone()
                             .unwrap_or_else(|| StoredMessage::new(message.clone()));
                         record.message = message.clone();
-                        record.model_response = validation.is_ok();
+
                         record.request_observation = observation;
                         turn.partial_message = Some(record);
                         if validation.is_ok() { turn.register_calls(calls.clone(), &bindings); }
                         if let Some(u) = &end.captured_usage {
-                            turn.record_usage(model_usage(u)).await?;
+                            turn.record_usage(crate::model::usage(u)).await?;
                         }
                         if let Some(tracker) = turn.tc.snap.usage.clone() {
                             let session_id = turn.history.session_id().clone();
                             let event = UsageEvent::new(
-                                Some(model.model_iden().into()), "main",
+                                Some(model.model_iden().into()), turn.tc.info.options.source.unwrap_or("main"),
                                 end.captured_usage.clone().unwrap_or_default(),
                             );
                             match turn.wait_operation(async { Ok(tracker.record_response(&session_id, &event).await) }, turn.op_timeout(), "usage").await {
@@ -573,7 +580,7 @@ pub(crate) fn retry_cause(error: &YourAiError) -> String {
     reason
 }
 
-fn model_usage(u: &GenaiUsage) -> Usage {
+pub fn usage(u: &GenaiUsage) -> Usage {
     let input = u.prompt_tokens.unwrap_or(0).max(0) as u64;
     let output = u.completion_tokens.unwrap_or(0).max(0) as u64;
     Usage {

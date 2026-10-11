@@ -1,4 +1,4 @@
-//! DefaultHookRuntime：HookRuntime trait 的实现。
+//! DefaultHookManager：HookManager trait 的实现。
 //!
 //! 注册表 + 匹配 + 并行执行 + 输出解析 + 聚合。
 //!
@@ -15,7 +15,7 @@ mod outcomes;
 use outcomes::*;
 
 use crate::hooks::config::{HookRegistration, HookSource, HooksConfig};
-use crate::hooks::handler::{execute_with_timeout, handler_from_config, HookEvaluator};
+use crate::hooks::handler::{execute_with_timeout, handler_from_config};
 use crate::hooks::wire_output::{
     ElicitationAction, HookJsonOutput, HookSpecificOutput, LegacyDecision, PermissionBehavior,
     SyncOutput,
@@ -28,9 +28,9 @@ use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use yourai_core::hooks::{
     FailurePolicy, HookBlockingError, HookCommonOutcome, HookDispatchResult, HookHandler,
-    HookInvocation, HookMessage, HookMessageKind, HookOutput, HookPermission, HookPointOutcome,
-    HookRegistry, HookRun, HookRunStatus, HookRuntime, NativeHookRegistration,
-    PermissionRequestBehavior, PermissionRequestDecision,
+    HookInvocation, HookManager, HookMessage, HookMessageKind, HookOutput, HookPermission,
+    HookPointOutcome, HookRun, HookRunStatus, NativeHookRegistration, PermissionRequestBehavior,
+    PermissionRequestDecision,
 };
 use yourai_core::{ErrorKind, YourAiError};
 
@@ -72,18 +72,18 @@ struct RegisteredHook {
     status_message: Option<String>,
 }
 
-// ── DefaultHookRuntime ─────────────────────────────────────────────
+// ── DefaultHookManager ─────────────────────────────────────────────
 
-/// HookRuntime 的具体实现：线程安全的注册表 + 分发。
-pub struct DefaultHookRuntime {
+/// HookManager 的具体实现：线程安全的注册表 + 分发。
+pub struct DefaultHookManager {
     registrations: RwLock<Vec<RegisteredHook>>,
     http_policy: crate::hooks::http::HttpHookPolicy,
-    evaluator: Option<Arc<dyn HookEvaluator>>,
+    model: Option<Arc<dyn yourai_core::model::ModelProvider>>,
     background_tx: tokio::sync::broadcast::Sender<crate::hooks::command::BackgroundHookEvent>,
     background_tasks: crate::hooks::command::BackgroundTasks,
 }
 
-impl DefaultHookRuntime {
+impl DefaultHookManager {
     pub fn new() -> Self {
         Self::with_http_policy(Default::default())
     }
@@ -93,15 +93,15 @@ impl DefaultHookRuntime {
         Self {
             registrations: RwLock::new(Vec::new()),
             http_policy,
-            evaluator: None,
+            model: None,
             background_tx,
             background_tasks: Default::default(),
         }
     }
 
     /// 注入 Prompt/Agent Hook 所需的模型能力。
-    pub fn with_evaluator(mut self, evaluator: Arc<dyn HookEvaluator>) -> Self {
-        self.evaluator = Some(evaluator);
+    pub fn with_model(mut self, model: Arc<dyn yourai_core::model::ModelProvider>) -> Self {
+        self.model = Some(model);
         self
     }
 
@@ -115,7 +115,7 @@ impl DefaultHookRuntime {
         let handler = handler_from_config(
             &reg.handler,
             self.http_policy.clone(),
-            self.evaluator.clone(),
+            self.model.clone(),
             crate::hooks::command::BackgroundCommandContext {
                 tasks: self.background_tasks.clone(),
                 hook_id: reg.id.clone(),
@@ -156,7 +156,7 @@ impl DefaultHookRuntime {
         Ok(())
     }
 
-    /// 测试辅助：注入已经构造好的注册项。生产代码走 `register_config` 或 `HookRegistry`。
+    /// 测试辅助：注入已经构造好的注册项。生产代码走 `register_config` 或 `HookManager`。
     #[cfg(test)]
     async fn register(&self, reg: HookRegistration) {
         let reg = self.compile(reg).expect("test registration must compile");
@@ -334,13 +334,13 @@ impl DefaultHookRuntime {
     }
 }
 
-impl Default for DefaultHookRuntime {
+impl Default for DefaultHookManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl HookRuntime for DefaultHookRuntime {
+impl HookManager for DefaultHookManager {
     fn subscribe_background(
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<yourai_core::hooks::HookBackgroundEvent>> {
@@ -373,9 +373,6 @@ impl HookRuntime for DefaultHookRuntime {
     ) -> yourai_core::BoxFuture<'a, Result<HookDispatchResult, YourAiError>> {
         Box::pin(self.dispatch_inner(invocation))
     }
-}
-
-impl HookRegistry for DefaultHookRuntime {
     fn register<'a>(
         &'a self,
         registration: NativeHookRegistration,
@@ -605,7 +602,7 @@ async fn run_handlers_parallel(
     results
 }
 
-impl Drop for DefaultHookRuntime {
+impl Drop for DefaultHookManager {
     fn drop(&mut self) {
         for tasks in self.background_tasks.lock().unwrap().values() {
             for task in tasks {
@@ -619,26 +616,55 @@ impl Drop for DefaultHookRuntime {
 mod tests {
     use super::*;
     use crate::hooks::config::HandlerConfig;
-    use crate::hooks::handler::{HookEvaluator, HookModelDecision, HookModelRequest};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::Notify;
     use yourai_core::hooks::{BaseInput, HookEvent};
+    use yourai_core::prelude::*;
     use yourai_core::BoxFuture;
 
-    struct RecordingEvaluator {
-        requests: Mutex<Vec<HookModelRequest>>,
-        decision: HookModelDecision,
+    struct RecordingModel {
+        requests: Mutex<Vec<(bool, ModelRequest)>>,
+        decision: serde_json::Value,
     }
-
-    impl HookEvaluator for RecordingEvaluator {
-        fn evaluate<'a>(
+    impl RecordingModel {
+        fn response(&self) -> ChatResponse {
+            let id = genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "fast");
+            ChatResponse {
+                content: MessageContent::from_text(self.decision.to_string()),
+                model_iden: id.clone(),
+                provider_model_iden: id,
+                reasoning_content: None,
+                stop_reason: None,
+                usage: GenaiUsage::default(),
+                captured_raw_body: None,
+                response_id: None,
+            }
+        }
+    }
+    impl ModelProvider for RecordingModel {
+        fn model_iden(&self) -> &str {
+            "fast"
+        }
+        fn complete<'a>(
             &'a self,
-            request: HookModelRequest,
-        ) -> BoxFuture<'a, Result<HookModelDecision, YourAiError>> {
-            self.requests.lock().unwrap().push(request);
-            let decision = self.decision.clone();
-            Box::pin(async move { Ok(decision) })
+            request: ModelRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
+            self.requests.lock().unwrap().push((false, request));
+            Box::pin(async move { Ok(self.response()) })
+        }
+        fn stream_events<'a>(
+            &'a self,
+            request: ModelRequest,
+        ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
+            self.requests.lock().unwrap().push((true, request));
+            Box::pin(async move {
+                let end = ChatStreamEvent::End(StreamEnd {
+                    captured_content: Some(self.response().content),
+                    ..Default::default()
+                });
+                Ok(Box::pin(futures_util::stream::iter([Ok(end)])) as ModelEventStream)
+            })
         }
     }
 
@@ -672,7 +698,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_empty_when_no_handlers() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         let inv = HookInvocation::new(
             BaseInput::new("sess", "/tmp"),
             HookEvent::UserPromptSubmit {
@@ -682,23 +708,20 @@ mod tests {
         let result = rt.dispatch(&inv).await.unwrap();
         assert!(result.runs.is_empty());
         match result.outcome {
-            HookPointOutcome::UserPromptSubmit(o) => {
-                assert!(o.additional_contexts.is_empty());
+            HookPointOutcome::UserPromptSubmit => {
+                assert!(result.common.additional_contexts.is_empty());
             }
             _ => panic!("expected UserPromptSubmit outcome"),
         }
     }
 
     #[tokio::test]
-    async fn prompt_and_agent_handlers_use_injected_evaluator() {
-        let executor = Arc::new(RecordingEvaluator {
+    async fn prompt_and_agent_handlers_use_injected_model() {
+        let executor = Arc::new(RecordingModel {
             requests: Mutex::new(Vec::new()),
-            decision: HookModelDecision {
-                ok: true,
-                reason: None,
-            },
+            decision: serde_json::json!({"ok":true}),
         });
-        let rt = DefaultHookRuntime::new().with_evaluator(executor.clone());
+        let rt = DefaultHookManager::new().with_model(executor.clone());
         let config: HooksConfig = serde_json::from_value(serde_json::json!({
             "hooks": {
                 "UserPromptSubmit": [{
@@ -730,17 +753,19 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests
             .iter()
-            .all(|request| request.prompt.contains("UserPromptSubmit")));
-        assert!(requests.iter().any(|request| request.agentic));
-        assert!(requests.iter().any(|request| !request.agentic));
-        assert!(requests
-            .iter()
-            .any(|request| request.model.as_deref() == Some("fast")));
+            .all(|(_, request)| request.request.messages.iter().any(|m| m
+                .content
+                .texts()
+                .join("")
+                .contains("UserPromptSubmit"))));
+        assert!(requests.iter().any(|(agentic, _)| *agentic));
+        assert!(requests.iter().any(|(agentic, _)| !*agentic));
+        assert!(requests.iter().all(|(_, request)| request.source == "hook"));
     }
 
     #[tokio::test]
-    async fn prompt_handler_requires_evaluator_at_registration() {
-        let rt = DefaultHookRuntime::new();
+    async fn prompt_handler_requires_model_at_registration() {
+        let rt = DefaultHookManager::new();
         let config: HooksConfig = serde_json::from_value(serde_json::json!({
             "hooks": {
                 "UserPromptSubmit": [{
@@ -753,12 +778,12 @@ mod tests {
             .register_config(&config, HookSource::Project)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("HookEvaluator"));
+        assert!(error.to_string().contains("requires a model"));
     }
 
     #[tokio::test]
     async fn failed_configuration_compilation_keeps_existing_registrations() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         rt.register(command_registration(
             "existing",
             "UserPromptSubmit",
@@ -779,20 +804,17 @@ mod tests {
             .register_config(&config, HookSource::Project)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("HookEvaluator"));
+        assert!(error.to_string().contains("requires a model"));
         assert_eq!(rt.handler_ids().await, ["existing"]);
     }
 
     #[tokio::test]
     async fn rejected_prompt_handler_blocks_with_reason() {
-        let executor = Arc::new(RecordingEvaluator {
+        let executor = Arc::new(RecordingModel {
             requests: Mutex::new(Vec::new()),
-            decision: HookModelDecision {
-                ok: false,
-                reason: Some("model rejected prompt".to_string()),
-            },
+            decision: serde_json::json!({"ok":false,"reason":"model rejected prompt"}),
         });
-        let rt = DefaultHookRuntime::new().with_evaluator(executor);
+        let rt = DefaultHookManager::new().with_model(executor);
         let config: HooksConfig = serde_json::from_value(serde_json::json!({
             "hooks": {
                 "UserPromptSubmit": [{
@@ -826,14 +848,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_pretool_prompt_denies_tool_without_stopping_turn() {
-        let executor = Arc::new(RecordingEvaluator {
+        let executor = Arc::new(RecordingModel {
             requests: Mutex::new(Vec::new()),
-            decision: HookModelDecision {
-                ok: false,
-                reason: Some("tool rejected by model hook".to_string()),
-            },
+            decision: serde_json::json!({"ok":false,"reason":"tool rejected by model hook"}),
         });
-        let rt = DefaultHookRuntime::new().with_evaluator(executor);
+        let rt = DefaultHookManager::new().with_model(executor);
         let config: HooksConfig = serde_json::from_value(serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
@@ -871,7 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_command_handler_echo_context() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         rt.register(command_registration(
             "echo-1",
             "UserPromptSubmit",
@@ -889,8 +908,11 @@ mod tests {
         let result = rt.dispatch(&inv).await.unwrap();
         assert_eq!(result.runs.len(), 1);
         match result.outcome {
-            HookPointOutcome::UserPromptSubmit(o) => {
-                assert_eq!(o.additional_contexts, vec!["hello from hook".to_string()]);
+            HookPointOutcome::UserPromptSubmit => {
+                assert_eq!(
+                    result.common.additional_contexts,
+                    vec!["hello from hook".to_string()]
+                );
             }
             _ => panic!("expected UserPromptSubmit outcome"),
         }
@@ -898,7 +920,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_config_handlers_from_same_source_run_once() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         rt.register(command_registration(
             "duplicate-1",
             "UserPromptSubmit",
@@ -929,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_command_handler_exit2_blocks() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         rt.register(command_registration(
             "block-1",
             "UserPromptSubmit",
@@ -954,7 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_pretooluse_deny_overrides_allow() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         rt.register(command_registration(
             "allow-1",
             "PreToolUse",
@@ -994,7 +1016,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_name_mismatch_errors() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         rt.register(command_registration(
             "mismatch-1",
             "PreToolUse",
@@ -1018,7 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn completion_order_preserves_registration_identity() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         rt.register(command_registration(
             "slow",
             "UserPromptSubmit",
@@ -1051,7 +1073,7 @@ mod tests {
 
     #[tokio::test]
     async fn aggregation_uses_registration_order_not_completion_order() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         rt.register(command_registration(
             "slow-first",
             "UserPromptSubmit",
@@ -1079,8 +1101,8 @@ mod tests {
 
         assert_eq!(result.runs[0].hook_id, "fast-second");
         match result.outcome {
-            HookPointOutcome::UserPromptSubmit(outcome) => {
-                assert_eq!(outcome.additional_contexts, ["first", "second"]);
+            HookPointOutcome::UserPromptSubmit => {
+                assert_eq!(result.common.additional_contexts, ["first", "second"]);
             }
             _ => panic!("expected UserPromptSubmit outcome"),
         }
@@ -1088,7 +1110,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_text_is_message_not_additional_context() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         rt.register(command_registration(
             "plain",
             "UserPromptSubmit",
@@ -1109,8 +1131,8 @@ mod tests {
         assert_eq!(result.common.messages.len(), 1);
         assert_eq!(result.common.messages[0].content, "remembered");
         match result.outcome {
-            HookPointOutcome::UserPromptSubmit(outcome) => {
-                assert!(outcome.additional_contexts.is_empty());
+            HookPointOutcome::UserPromptSubmit => {
+                assert!(result.common.additional_contexts.is_empty());
             }
             _ => panic!("expected UserPromptSubmit"),
         }
@@ -1118,7 +1140,7 @@ mod tests {
 
     #[tokio::test]
     async fn common_fields_survive_typed_outcome() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         rt.register(command_registration(
             "common",
             "UserPromptSubmit",
@@ -1143,7 +1165,7 @@ mod tests {
 
     #[tokio::test]
     async fn once_hook_is_consumed_by_execution() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         let mut registration = command_registration(
             "once",
             "UserPromptSubmit",
@@ -1215,9 +1237,9 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_dispatches_claim_once_before_handler_finishes() {
-        let rt = Arc::new(DefaultHookRuntime::new());
+        let rt = Arc::new(DefaultHookManager::new());
         let handler = WaitingHandler::new();
-        HookRegistry::register(rt.as_ref(), native_once(handler.clone(), None))
+        HookManager::register(rt.as_ref(), native_once(handler.clone(), None))
             .await
             .unwrap();
         let first_runtime = rt.clone();
@@ -1238,9 +1260,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_dispatch_does_not_restore_a_claimed_once_handler() {
-        let rt = Arc::new(DefaultHookRuntime::new());
+        let rt = Arc::new(DefaultHookManager::new());
         let handler = WaitingHandler::new();
-        HookRegistry::register(rt.as_ref(), native_once(handler.clone(), None))
+        HookManager::register(rt.as_ref(), native_once(handler.clone(), None))
             .await
             .unwrap();
         let first_runtime = rt.clone();
@@ -1260,9 +1282,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn timed_out_once_handler_is_consumed() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         let handler = WaitingHandler::new();
-        HookRegistry::register(
+        HookManager::register(
             &rt,
             native_once(handler.clone(), Some(Duration::from_secs(1))),
         )
@@ -1281,9 +1303,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_once_handler_does_not_remove_another_registration_with_the_same_id() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         let failing = crate::hooks::handler::NativeHandler::new(|_| Err("failed once".into()));
-        HookRegistry::register(&rt, native_once(Arc::new(failing), None))
+        HookManager::register(&rt, native_once(Arc::new(failing), None))
             .await
             .unwrap();
         let mut remaining = native_once(
@@ -1294,7 +1316,7 @@ mod tests {
         );
         remaining.event = yourai_core::hooks::HookEventKind::Stop;
         remaining.once = false;
-        HookRegistry::register(&rt, remaining).await.unwrap();
+        HookManager::register(&rt, remaining).await.unwrap();
         let result = rt.dispatch(&prompt_invocation("first")).await.unwrap();
         assert_eq!(result.runs[0].status, HookRunStatus::Failed);
         assert_eq!(rt.handler_ids().await, ["once"]);
@@ -1312,14 +1334,14 @@ mod tests {
             },
         );
         assert_eq!(rt.dispatch(&stop).await.unwrap().runs.len(), 1);
-        assert!(HookRegistry::unregister(&rt, "once").await.unwrap());
-        assert!(!HookRegistry::unregister(&rt, "once").await.unwrap());
+        assert!(HookManager::unregister(&rt, "once").await.unwrap());
+        assert!(!HookManager::unregister(&rt, "once").await.unwrap());
     }
 
     #[tokio::test]
     async fn compiled_background_command_uses_each_invocations_session() {
         for command in ["printf done", "printf '{\"async\":true}\\n'; printf done"] {
-            let rt = DefaultHookRuntime::new();
+            let rt = DefaultHookManager::new();
             let mut events = rt.subscribe_background().unwrap();
             let mut registration = command_registration(
                 "shared",
@@ -1355,7 +1377,7 @@ mod tests {
 
     #[tokio::test]
     async fn if_condition_filters_before_spawn() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         let mut registration = command_registration(
             "git-only",
             "PreToolUse",
@@ -1379,7 +1401,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_rewake_backgrounds_and_reports_completion() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         let mut receiver = rt.subscribe_background().unwrap();
         let mut registration = command_registration(
             "async",
@@ -1413,7 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn stdout_async_handshake_backgrounds_running_process() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         let mut receiver = rt.subscribe_background().unwrap();
         rt.register(command_registration(
             "handshake",
@@ -1442,7 +1464,7 @@ mod tests {
 
     #[tokio::test]
     async fn stdout_async_timeout_starts_before_process_exit() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         let mut receiver = rt.subscribe_background().unwrap();
         rt.register(command_registration(
             "handshake-timeout",
@@ -1471,7 +1493,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_failure_policy_prevents_continuation() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         let mut registration = command_registration(
             "closed",
             "UserPromptSubmit",
@@ -1495,7 +1517,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_registration_uses_core_registry_contract() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         let handler = crate::hooks::handler::NativeHandler::new(|_| {
             Ok(HookJsonOutput::Sync(SyncOutput {
                 hook_specific_output: Some(HookSpecificOutput::UserPromptSubmit {
@@ -1504,7 +1526,7 @@ mod tests {
                 ..SyncOutput::default()
             }))
         });
-        HookRegistry::register(
+        HookManager::register(
             &rt,
             NativeHookRegistration {
                 id: "native".to_string(),
@@ -1529,8 +1551,8 @@ mod tests {
             .await
             .unwrap();
         match result.outcome {
-            HookPointOutcome::UserPromptSubmit(outcome) => {
-                assert_eq!(outcome.additional_contexts, vec!["native context"]);
+            HookPointOutcome::UserPromptSubmit => {
+                assert_eq!(result.common.additional_contexts, vec!["native context"]);
             }
             _ => panic!("expected UserPromptSubmit"),
         }
@@ -1538,12 +1560,12 @@ mod tests {
 
     #[tokio::test]
     async fn panicking_native_handler_produces_failed_run() {
-        let rt = DefaultHookRuntime::new();
+        let rt = DefaultHookManager::new();
         let handler =
             crate::hooks::handler::NativeHandler::new(|_| -> Result<HookJsonOutput, String> {
                 panic!("native hook panic")
             });
-        HookRegistry::register(
+        HookManager::register(
             &rt,
             NativeHookRegistration {
                 id: "panicking-native".to_string(),

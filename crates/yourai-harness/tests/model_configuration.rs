@@ -1,4 +1,6 @@
 //! End-to-end contracts for settings, inherited models and paid response accounting.
+#[path = "support/model.rs"]
+mod model_fixture;
 #[path = "support/loop.rs"]
 mod support;
 use std::{
@@ -7,7 +9,7 @@ use std::{
     time::Duration,
 };
 use yourai_core::{context::DiscardSink, prelude::*};
-use yourai_harness::{model::ConfiguredModel, Harness, HarnessConfig};
+use yourai_harness::{Harness, HarnessConfig};
 
 struct Capture {
     name: &'static str,
@@ -70,7 +72,7 @@ impl ModelProvider for Capture {
     }
 }
 fn configured(model: Arc<dyn ModelProvider>, output: u32) -> Arc<dyn ModelProvider> {
-    ConfiguredModel::new(
+    model_fixture::TestModel::new(
         model,
         ModelTokenBudget::resolve(
             ModelLimits {

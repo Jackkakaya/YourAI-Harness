@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 use yourai_core::prelude::{ModelLimits, ModelProvider, ModelTimeouts, ModelTokenBudget};
-use yourai_harness::{model::ConfiguredModel, GenaiModel};
+use yourai_harness::GenaiModel;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// Borrowed option maps for one picker entry: (model options, variant options).
 type EntryOptions<'a> = (&'a Map<String, Value>, Option<&'a Map<String, Value>>);
@@ -424,14 +424,17 @@ impl Config {
         let client = provider.client(provider_id, chat)?;
         let (header_timeout, chunk_timeout) = self.model_timeouts()?;
         let defaults = ModelTimeouts::default();
-        let model = ConfiguredModel::new(
-            Arc::new(GenaiModel::new(client, name).with_headers(headers.into())),
-            budget,
-            ModelTimeouts {
-                headers: header_timeout.unwrap_or(defaults.headers),
-                read: chunk_timeout.unwrap_or(defaults.read),
-            },
-        )?;
+        let model = Arc::new(
+            GenaiModel::new(client, name)
+                .with_headers(headers.into())
+                .with_settings(
+                    budget,
+                    ModelTimeouts {
+                        headers: header_timeout.unwrap_or(defaults.headers),
+                        read: chunk_timeout.unwrap_or(defaults.read),
+                    },
+                )?,
+        );
         Ok(ResolvedModel {
             model,
             settings: yourai_harness::assembly::ModelSettings {

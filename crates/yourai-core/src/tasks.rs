@@ -3,7 +3,7 @@ use crate::{
     error,
     file_store::{atomic_write, read_json},
     prelude::*,
-    runtime::SessionHost,
+    runtime::SessionManager,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -28,8 +28,8 @@ pub struct Task {
 }
 
 pub struct TaskManager {
-    host: Weak<SessionHost>,
-    sessions: Arc<dyn SessionManager>,
+    host: Weak<SessionManager>,
+    sessions: Arc<dyn SessionStore>,
     tasks: Mutex<HashMap<String, Task>>,
     gate: Arc<tokio::sync::Mutex<()>>,
     version: AtomicU64,
@@ -37,7 +37,7 @@ pub struct TaskManager {
 }
 impl TaskManager {
     /// The host owns initialization and publishes only one manager per session.
-    pub(crate) fn open(host: &Arc<SessionHost>, team: String) -> Result<Arc<Self>, YourAiError> {
+    pub(crate) fn open(host: &Arc<SessionManager>, team: String) -> Result<Arc<Self>, YourAiError> {
         let sessions = host.agent().ctx().session()?;
         let id = host.context().id;
         let mut tasks: HashMap<_, _> = sessions
@@ -75,7 +75,7 @@ impl TaskManager {
         }))
     }
 
-    fn host(&self) -> Result<Arc<SessionHost>, YourAiError> {
+    fn host(&self) -> Result<Arc<SessionManager>, YourAiError> {
         let host = self
             .host
             .upgrade()
@@ -185,7 +185,7 @@ impl TaskManager {
 
     async fn save(
         &self,
-        host: &Arc<SessionHost>,
+        host: &Arc<SessionManager>,
         task: Task,
         guard: tokio::sync::OwnedMutexGuard<()>,
         activity: crate::runtime::Activity,

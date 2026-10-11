@@ -8,7 +8,6 @@ use std::{
         Arc, Mutex,
     },
 };
-use tokio_util::sync::CancellationToken;
 use yourai_core::{
     model::{ModelEventStream, ModelRecovery},
     prelude::*,
@@ -20,11 +19,8 @@ pub struct History {
     pub id: SessionId,
     pub messages: Mutex<Vec<ChatMessage>>,
     pub compactions: Mutex<Vec<CompactionTrigger>>,
-    pub summary_instructions: Mutex<Vec<Option<String>>>,
-    pub compaction_action: Mutex<Option<CompactAction>>,
     pub tokens: AtomicU64,
     pub append_failures: AtomicU64,
-    pub usage: Mutex<Vec<Usage>>,
 }
 impl ContextManager for History {
     fn system_prompt(&self) -> String {
@@ -89,71 +85,50 @@ impl ContextManager for History {
             maintenance_needed: self.tokens.load(Ordering::SeqCst) >= 80,
         })
     }
-    fn prepare_compaction<'a>(
-        &'a self,
-        req: &'a CompactionRequest,
-        _: &'a dyn ModelProvider,
-        _: &'a CancellationToken,
-    ) -> BoxFuture<'a, Result<CompactionPlan<'a>, YourAiError>> {
-        Box::pin(async move {
-            let action = *self.compaction_action.lock().unwrap();
-            if let Some(action @ (CompactAction::Unchanged | CompactAction::Pruned)) = action {
-                self.compactions.lock().unwrap().push(req.trigger);
-                let before = self.tokens.load(Ordering::SeqCst);
-                let after = if action == CompactAction::Pruned {
-                    self.tokens.store(1, Ordering::SeqCst);
-                    1
-                } else {
-                    before
-                };
-                return Ok(CompactionPlan::Complete(CompactionResult::new(
-                    action,
-                    before,
-                    after,
-                    "no summary",
-                )));
-            }
-            Ok(CompactionPlan::Summary(Box::new(HistorySummary(self))))
-        })
+    fn policy(&self) -> ContextPolicy {
+        ContextPolicy {
+            keep_recent_tokens: 0,
+            summary_min_savings: 1,
+            safety_margin: 0,
+            ..Default::default()
+        }
     }
-}
-struct HistorySummary<'a>(&'a History);
-impl CompactionJob for HistorySummary<'_> {
-    fn run<'a>(
-        self: Box<Self>,
-        req: CompactionRequest,
-        _: &'a dyn ModelProvider,
-        _: Option<&'a dyn UsageTracker>,
-        _: &'a CancellationToken,
-        committed: Arc<std::sync::atomic::AtomicU8>,
-    ) -> BoxFuture<'a, Result<(CompactionResult, String), YourAiError>>
-    where
-        Self: 'a,
-    {
+    fn estimate(&self, request: &ChatRequest, _: &dyn ModelProvider) -> Result<u64, YourAiError> {
+        Ok(
+            if serde_json::to_value(&request.messages).unwrap()
+                == serde_json::to_value(self.messages()).unwrap()
+            {
+                self.tokens.load(Ordering::SeqCst)
+            } else {
+                1
+            },
+        )
+    }
+    fn save_summary<'a>(
+        &'a self,
+        expected: &'a [StoredMessage],
+        sources: Vec<String>,
+        summary: StoredMessage,
+        progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
         Box::pin(async move {
-            self.0
-                .summary_instructions
-                .lock()
-                .unwrap()
-                .push(req.custom_instructions.clone());
-            self.0.compactions.lock().unwrap().push(req.trigger);
-            let before = self.0.tokens.swap(1, Ordering::SeqCst);
-            req.calls.fetch_add(1, Ordering::SeqCst);
-            req.usage.lock().unwrap().push(GenaiUsage {
-                prompt_tokens: Some(3),
-                completion_tokens: Some(1),
-                total_tokens: Some(4),
-                ..Default::default()
-            });
-            let mut r =
-                CompactionResult::new(CompactAction::Summarized, before.max(2), 1, "test summary");
-            r.usage = Some(Usage {
-                input_tokens: 3,
-                output_tokens: 1,
-                total_tokens: 4,
-            });
-            committed.store(CommitStatus::Committed as u8, Ordering::Release);
-            Ok((r, "test summary".into()))
+            {
+                let mut messages = vec![summary.message];
+                messages.extend(
+                    expected
+                        .iter()
+                        .filter(|m| !sources.contains(&m.id))
+                        .map(StoredMessage::model_message),
+                );
+                *self.messages.lock().unwrap() = messages;
+                self.tokens.store(1, Ordering::SeqCst);
+                self.compactions
+                    .lock()
+                    .unwrap()
+                    .push(CompactionTrigger::Threshold);
+            }
+            progress.store(CommitStatus::Committed as u8, Ordering::Release);
+            Ok(())
         })
     }
 }
@@ -162,6 +137,7 @@ pub struct Model {
     pub steps: Mutex<VecDeque<ModelEventStream>>,
     pub requests: Mutex<Vec<ModelRequest>>,
     pub recovery: ModelRecovery,
+    budget: ModelTokenBudget,
 }
 impl Model {
     pub fn new(steps: Vec<ModelEventStream>) -> Self {
@@ -169,14 +145,49 @@ impl Model {
             steps: Mutex::new(steps.into()),
             requests: Mutex::new(vec![]),
             recovery: ModelRecovery::Fatal,
+            budget: ModelTokenBudget::default(),
         }
+    }
+    pub fn with_budget(mut self, context: u64, output: u32) -> Self {
+        self.budget = ModelTokenBudget::resolve(
+            ModelLimits {
+                context: Some(context),
+                ..Default::default()
+            },
+            Some(output),
+        )
+        .unwrap();
+        self
     }
 }
 impl ModelProvider for Model {
-    fn complete<'a>(&'a self, _: ModelRequest) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
-        Box::pin(async { Err(ErrorKind::Config("unused".into()).into()) })
+    fn token_budget(&self) -> ModelTokenBudget {
+        self.budget
     }
-
+    fn complete<'a>(
+        &'a self,
+        request: ModelRequest,
+    ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
+        Box::pin(async move {
+            self.requests.lock().unwrap().push(request);
+            let iden = genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "test-model");
+            Ok(ChatResponse {
+                content: MessageContent::from_text("test summary"),
+                model_iden: iden.clone(),
+                provider_model_iden: iden,
+                reasoning_content: None,
+                stop_reason: None,
+                usage: GenaiUsage {
+                    prompt_tokens: Some(3),
+                    completion_tokens: Some(1),
+                    total_tokens: Some(4),
+                    ..Default::default()
+                },
+                captured_raw_body: None,
+                response_id: None,
+            })
+        })
+    }
     fn stream_events<'a>(
         &'a self,
         r: ModelRequest,
@@ -370,7 +381,24 @@ impl Hooks {
         }
     }
 }
-impl HookRuntime for Hooks {
+impl HookManager for Hooks {
+    // This fixed-response fixture does not support dynamic registration.
+    fn register<'a>(
+        &'a self,
+        _: yourai_core::hooks::NativeHookRegistration,
+    ) -> yourai_core::BoxFuture<'a, Result<(), yourai_core::YourAiError>> {
+        panic!("registration is not used by this test hook")
+    }
+    fn unregister<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> yourai_core::BoxFuture<'a, Result<bool, yourai_core::YourAiError>> {
+        panic!("unregistration is not used by this test hook")
+    }
+    fn handler_ids<'a>(&'a self) -> yourai_core::BoxFuture<'a, Vec<String>> {
+        panic!("registry inspection is not used by this test hook")
+    }
+
     fn dispatch<'a>(
         &'a self,
         i: &'a HookInvocation,

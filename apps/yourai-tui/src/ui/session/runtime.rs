@@ -193,8 +193,15 @@ impl Runtime {
                     (
                         Level::Info,
                         format!(
-                            "Context {:?}: {} -> {} estimated tokens. {}",
-                            r.action, r.tokens_before, r.tokens_after, r.reason
+                            "Context {}: {} -> {} estimated tokens. {}",
+                            if r.compacted {
+                                "Summarized"
+                            } else {
+                                "Unchanged"
+                            },
+                            r.tokens_before,
+                            r.tokens_after,
+                            r.reason
                         ),
                     )
                 }

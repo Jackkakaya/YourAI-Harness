@@ -19,7 +19,7 @@ use std::{
     io::{self},
     time::{SystemTime, UNIX_EPOCH},
 };
-use yourai_core::prelude::{SessionId, SessionManager};
+use yourai_core::prelude::{SessionId, SessionStore};
 use yourai_harness::SessionCatalog;
 
 pub enum Choice {
@@ -29,7 +29,7 @@ pub enum Choice {
 }
 
 pub async fn pick(catalog: &SessionCatalog, theme: Theme) -> Result<Choice, Error> {
-    let metas = catalog.list_sessions().await?;
+    let metas = catalog.store.list_sessions().await?;
     let mut rows = rows_from(metas, None);
     // Stable secondary sort by title for ties on updated_at.
     rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.title.cmp(&b.title)));

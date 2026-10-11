@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! Loop 构造 HookInvocation（类型化）
-//!   → HookRuntime::dispatch（trait，实现方在 yourai-harness::hooks）
+//!   → HookManager::dispatch（trait，实现方在 yourai-harness::hooks）
 //!   → 返回 HookDispatchResult（类型化）
 //!   → Loop 消费 outcome
 //! ```
@@ -296,8 +296,8 @@ impl HookEvent {
 pub struct HookInvocation {
     /// Frozen native capabilities; these are never serialized into hook wire input.
     pub model: Option<std::sync::Arc<dyn crate::model::ModelProvider>>,
-    pub memory: Option<std::sync::Arc<dyn crate::memory::MemoryProvider>>,
-    pub sessions: Option<std::sync::Arc<dyn crate::session::SessionManager>>,
+    pub memory: Option<std::sync::Arc<dyn crate::memory::MemoryManager>>,
+    pub sessions: Option<std::sync::Arc<dyn crate::session::SessionStore>>,
     pub usage: Option<std::sync::Arc<dyn crate::usage::UsageTracker>>,
     pub base: BaseInput,
     pub event: HookEvent,
@@ -373,6 +373,7 @@ pub struct HookBlockingError {
 /// `PreToolUse permissionDecision=deny` 不得隐式设置 `prevent_continuation`。
 #[derive(Debug, Clone, Default)]
 pub struct HookCommonOutcome {
+    pub additional_contexts: Vec<String>,
     pub prevent_continuation: bool,
     pub stop_reason: Option<String>,
     pub system_messages: Vec<String>,
@@ -422,26 +423,18 @@ impl HookPermission {
 // ── 事件专属 Outcome 结构体 ──────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
-pub struct UserPromptSubmitOutcome {
-    pub additional_contexts: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
 pub struct PreToolUseOutcome {
     pub permission: HookPermission,
     pub updated_input: Option<Value>,
-    pub additional_contexts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct PostToolUseOutcome {
-    pub additional_contexts: Vec<String>,
     pub updated_mcp_tool_output: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionStartOutcome {
-    pub additional_contexts: Vec<String>,
     pub initial_user_message: Option<String>,
     pub watch_paths: Vec<String>,
 }
@@ -488,11 +481,6 @@ pub struct WorktreeCreateOutcome {
     pub worktree_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct GenericOutcome {
-    pub additional_contexts: Vec<String>,
-}
-
 // ── Outcome enum ────────────────────────────────────────────────────
 
 /// 事件专属结果（聚合后）。Loop 按 `event_name` 取对应变体。
@@ -501,7 +489,7 @@ pub struct GenericOutcome {
 pub enum HookPointOutcome {
     PreToolUse(PreToolUseOutcome),
     PostToolUse(PostToolUseOutcome),
-    UserPromptSubmit(UserPromptSubmitOutcome),
+    UserPromptSubmit,
     SessionStart(SessionStartOutcome),
     PermissionDenied(PermissionDeniedOutcome),
     PermissionRequest(PermissionRequestOutcome),
@@ -511,7 +499,7 @@ pub enum HookPointOutcome {
     ElicitationResult(ElicitationOutcome),
     WorktreeCreate(WorktreeCreateOutcome),
     /// 没有专属 outcome 变体的事件（Stop, SessionEnd, Notification 等）。
-    Generic(GenericOutcome),
+    Generic,
 }
 
 impl HookPointOutcome {
@@ -520,7 +508,7 @@ impl HookPointOutcome {
         match self {
             HookPointOutcome::PreToolUse(_) => "PreToolUse",
             HookPointOutcome::PostToolUse(_) => "PostToolUse",
-            HookPointOutcome::UserPromptSubmit(_) => "UserPromptSubmit",
+            HookPointOutcome::UserPromptSubmit => "UserPromptSubmit",
             HookPointOutcome::SessionStart(_) => "SessionStart",
             HookPointOutcome::PermissionDenied(_) => "PermissionDenied",
             HookPointOutcome::PermissionRequest(_) => "PermissionRequest",
@@ -529,7 +517,7 @@ impl HookPointOutcome {
             HookPointOutcome::Elicitation(_) => "Elicitation",
             HookPointOutcome::ElicitationResult(_) => "ElicitationResult",
             HookPointOutcome::WorktreeCreate(_) => "WorktreeCreate",
-            HookPointOutcome::Generic(_) => "Generic",
+            HookPointOutcome::Generic => "Generic",
         }
     }
 }
@@ -553,7 +541,7 @@ impl HookDispatchResult {
         {
             return Err(crate::ErrorKind::Provider {
                 name: "hook",
-                message: "HookRuntime returned a mismatched event or outcome".into(),
+                message: "HookManager returned a mismatched event or outcome".into(),
             }
             .into());
         }
@@ -561,14 +549,7 @@ impl HookDispatchResult {
     }
     /// Structured context has the same meaning at every hook entry.
     pub fn additional_contexts(&self) -> &[String] {
-        match &self.outcome {
-            HookPointOutcome::SessionStart(o) => &o.additional_contexts,
-            HookPointOutcome::UserPromptSubmit(o) => &o.additional_contexts,
-            HookPointOutcome::PreToolUse(o) => &o.additional_contexts,
-            HookPointOutcome::PostToolUse(o) => &o.additional_contexts,
-            HookPointOutcome::Generic(o) => &o.additional_contexts,
-            _ => &[],
-        }
+        &self.common.additional_contexts
     }
     pub fn blocking_messages(&self) -> Vec<String> {
         self.common
@@ -619,9 +600,7 @@ impl HookDispatchResult {
         let outcome = match event.as_str() {
             "PreToolUse" => HookPointOutcome::PreToolUse(PreToolUseOutcome::default()),
             "PostToolUse" => HookPointOutcome::PostToolUse(PostToolUseOutcome::default()),
-            "UserPromptSubmit" => {
-                HookPointOutcome::UserPromptSubmit(UserPromptSubmitOutcome::default())
-            }
+            "UserPromptSubmit" => HookPointOutcome::UserPromptSubmit,
             "SessionStart" => HookPointOutcome::SessionStart(SessionStartOutcome::default()),
             "PermissionDenied" => {
                 HookPointOutcome::PermissionDenied(PermissionDeniedOutcome::default())
@@ -636,7 +615,7 @@ impl HookDispatchResult {
                 HookPointOutcome::ElicitationResult(ElicitationOutcome::default())
             }
             "WorktreeCreate" => HookPointOutcome::WorktreeCreate(WorktreeCreateOutcome::default()),
-            _ => HookPointOutcome::Generic(GenericOutcome::default()),
+            _ => HookPointOutcome::Generic,
         };
         Self {
             event,
@@ -717,17 +696,27 @@ pub enum FailurePolicy {
 //  Trait 接口
 // ════════════════════════════════════════════════════════════════════
 
-/// Hook 运行时接口。
+/// Hook 注册与执行的统一管理接口。
 ///
-/// 实现方在 `yourai-harness::hooks` crate（`DefaultHookRuntime`）。
+/// 实现方在 `yourai-harness::hooks` crate（`DefaultHookManager`）。
 /// 业务操作的框架包装通过此 trait 分发 Hook 调用并消费类型化结果。
 ///
 /// ## 职责边界
 ///
-/// - **HookRuntime 负责**：匹配、执行、超时、取消、解析、校验、聚合
-/// - **HookRuntime 不负责**：修改 ContextManager、执行工具、向用户提问
+/// - **HookManager 负责**：注册、注销、匹配、执行、超时、取消、解析、校验、聚合
+/// - **HookManager 不负责**：修改 ContextManager、执行工具、向用户提问
 /// - **业务操作包装负责**：消费 `HookDispatchResult`，应用效果到业务流程；Loop 只调度操作
-pub trait HookRuntime: Send + Sync {
+pub trait HookManager: Send + Sync {
+    /// 注册一个带完整匹配和执行元数据的原生 handler。
+    fn register<'a>(
+        &'a self,
+        registration: NativeHookRegistration,
+    ) -> BoxFuture<'a, Result<(), YourAiError>>;
+    /// 按 ID 注销。
+    fn unregister<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<bool, YourAiError>>;
+    /// 返回所有已注册 handler 的 ID。
+    fn handler_ids<'a>(&'a self) -> BoxFuture<'a, Vec<String>>;
+
     fn subscribe_background(
         &self,
     ) -> Option<tokio::sync::broadcast::Receiver<HookBackgroundEvent>> {
@@ -784,26 +773,10 @@ pub struct NativeHookRegistration {
     pub once: bool,
 }
 
-/// Hook 注册接口（运行期热注册/热注销）。
-///
-/// 与 [`HookRuntime`] 分离：`HookRuntime` 是 Loop 消费的执行接口，
-/// `HookRegistry` 是管理方的注册接口。一个实现可以同时实现两者。
-pub trait HookRegistry: Send + Sync {
-    /// 注册一个带完整匹配和执行元数据的原生 handler。
-    fn register<'a>(
-        &'a self,
-        registration: NativeHookRegistration,
-    ) -> BoxFuture<'a, Result<(), YourAiError>>;
-    /// 按 ID 注销。
-    fn unregister<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<bool, YourAiError>>;
-    /// 返回所有已注册 handler 的 ID。
-    fn handler_ids<'a>(&'a self) -> BoxFuture<'a, Vec<String>>;
-}
-
 /// Hook handler 接口。
 ///
 /// 实现方在 `yourai-harness::hooks` crate（`CommandHandler`、`HttpHandler`、`NativeHandler`）。
-/// `HookRuntime` 实现方持有 `Arc<dyn HookHandler>` 并在 dispatch 时调用。
+/// `HookManager` 实现方持有 `Arc<dyn HookHandler>` 并在 dispatch 时调用。
 pub trait HookHandler: Send + Sync {
     /// 执行 handler，返回原始输出（由 runtime 解析为类型化结果）。
     fn execute<'a>(

@@ -568,7 +568,7 @@ Wire JSON (camelCase)           YourAI Rust 类型
 | `agent` | `prompt` | `timeout`、`model`、`if`、`statusMessage`、`once` |
 
 YourAI Runtime 内建 `command` 和 `http` capability。`prompt` / `agent` 通过
-`HookEvaluator` 由宿主注入；未注入时配置在注册阶段明确失败，不允许延迟到首次
+`ModelProvider` 由宿主注入；未注入时配置在注册阶段明确失败，不允许延迟到首次
 dispatch 才报错。
 
 Runtime 不自行判断 workspace 是否可信。宿主配置层只能把已经通过 trust policy 的
@@ -604,7 +604,7 @@ pub enum HookSource {
 ### 9.1 dispatch 完整流程
 
 ```text
-Loop 调用 HookRuntime::dispatch(invocation)
+Loop 调用 HookManager::dispatch(invocation)
   │
   ├── 1. 从事件提取 event_name + match_query
   ├── 2. 快照注册项，按 event_name + matcher 过滤
@@ -612,7 +612,7 @@ Loop 调用 HookRuntime::dispatch(invocation)
   ├── 4. 并行执行所有匹配 handler（JoinSet + timeout）
   │      ├── CommandHandler: spawn → stdin JSON+\n → 读 stdout/stderr → exit code
   │      ├── HttpHandler: POST JSON → 读 response body → status code
-  │      ├── Prompt/Agent: 调用宿主注入的 HookEvaluator
+  │      ├── Prompt/Agent: 调用宿主注入的 ModelProvider
   │      └── NativeHandler: 直接调用 Rust handler
   ├── 5. 解析每个 handler 输出
   │      ├── exit 0 + JSON → parse_hook_json → Contribution
@@ -644,7 +644,7 @@ pub struct HookDispatchResult {
 pub enum HookPointOutcome {
     PreToolUse(PreToolUseOutcome),
     PostToolUse(PostToolUseOutcome),
-    UserPromptSubmit(UserPromptSubmitOutcome),
+    UserPromptSubmit,
     SessionStart(SessionStartOutcome),
     PermissionDenied(PermissionDeniedOutcome),
     PermissionRequest(PermissionRequestOutcome),
@@ -653,7 +653,7 @@ pub enum HookPointOutcome {
     Elicitation(ElicitationOutcome),
     ElicitationResult(ElicitationOutcome),
     WorktreeCreate(WorktreeCreateOutcome),
-    Generic(GenericOutcome),  // 无专属 outcome 的事件
+    Generic,  // 无专属 outcome 的事件
 }
 
 pub struct HookRun {
@@ -673,7 +673,7 @@ pub struct HookRun {
 
 ### 9.3 公共业务入口消费规则
 
-HookRuntime 返回类型化数据。Harness 的公共 execution 和生命周期入口负责消费；AgentLoop 只调度业务操作：
+HookManager 返回类型化数据。Harness 的公共 execution 和生命周期入口负责消费；AgentLoop 只调度业务操作：
 
 | 事件 | 公共入口消费动作 |
 |---|---|
@@ -683,7 +683,7 @@ HookRuntime 返回类型化数据。Harness 的公共 execution 和生命周期�
 | `SessionStart` | `additionalContexts` 注入；`watchPaths` 注册文件监听 |
 | 其他 | Block → 阻断；`additionalContexts` 收集 |
 
-关键边界：**HookRuntime 负责解析、校验和聚合；公共业务执行入口负责应用结果，调度程序无需接触 Hook 协议。**
+关键边界：**HookManager 负责解析、校验和聚合；公共业务执行入口负责应用结果，调度程序无需接触 Hook 协议。**
 
 生产 DefaultLoop 和自定义 AgentLoop 已共用 execution 模块。`ProviderSnapshot.hooks` 仍是底层 turn 快照的运行时依赖；普通自定义调度通过 [公共业务入口](./execution.md) 使用它，不自行 dispatch。
 
@@ -776,10 +776,11 @@ HookDispatchResult {
 ```rust
 HookDispatchResult {
     event: HookEventKind::UserPromptSubmit,
-    common: HookCommonOutcome::default(),
-    outcome: HookPointOutcome::UserPromptSubmit(UserPromptSubmitOutcome {
-        additional_contexts: ["项目架构文档位于 docs/ARCHITECTURE.md，请优先参考。"],
-    }),
+    common: HookCommonOutcome {
+        additional_contexts: vec!["项目架构文档位于 docs/ARCHITECTURE.md，请优先参考。".into()],
+        ..Default::default()
+    },
+    outcome: HookPointOutcome::UserPromptSubmit,
     runs: [...],
 }
 ```
@@ -829,7 +830,7 @@ permission: HookPermission::Deny { reason: "no rm -rf" }
 | 并行执行 | 是，按完成顺序产生结果 | 相同，保留 registration 身份 | 已对齐 |
 | 同来源重复 Handler | 执行前去重 | 相同 | 已对齐 |
 | async/asyncRewake | 后台执行 + 完成事件 | 后台执行 + 完成事件；宿主按会话路由并唤醒 | 已接入并测试 |
-| prompt/agent handler | 内置模型能力 | 宿主注入 `HookEvaluator`；缺失时注册失败 | 部分对齐 |
+| prompt/agent handler | 内置模型能力 | 宿主注入 `ModelProvider`；缺失时注册失败 | 部分对齐 |
 | Workspace trust | 未信任项目 Hook 不执行 | 注册前由宿主策略层检查 | 待宿主验收 |
 | 事件数量 | 27 | 27 个兼容事件 + TurnCompleted 扩展 | 共 28 个 |
 | hookSpecificOutput 变体 | 15 | 15 | 已对齐 |

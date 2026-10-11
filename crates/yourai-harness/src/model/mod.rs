@@ -1,11 +1,12 @@
-mod configured;
 mod control;
 pub mod failure;
 mod metrics;
 #[cfg(test)]
 mod policy_tests;
 pub(crate) mod retry;
-pub use configured::ConfiguredModel;
+#[cfg(test)]
+#[path = "../../tests/support/model.rs"]
+mod settings_fixture;
 pub use control::RequestPolicy;
 use futures_util::StreamExt;
 use metrics::Attempt;
@@ -14,24 +15,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use yourai_core::prelude::*;
 
-pub fn usage(u: &GenaiUsage) -> Usage {
-    let input = u.prompt_tokens.unwrap_or(0).max(0) as u64;
-    let output = u.completion_tokens.unwrap_or(0).max(0) as u64;
-    Usage {
-        input_tokens: input,
-        output_tokens: output,
-        total_tokens: u
-            .total_tokens
-            .map(|n| n.max(0) as u64)
-            .unwrap_or(input + output),
-    }
-}
+pub use yourai_core::model::usage;
 /// Real network adapter. Client configuration controls endpoints and credentials.
 pub struct GenaiModel {
     client: genai::Client,
     model: String,
     headers: genai::Headers,
     timeouts: ModelTimeouts,
+    budget: ModelTokenBudget,
 }
 impl GenaiModel {
     pub fn new(client: genai::Client, model: impl Into<String>) -> Self {
@@ -40,6 +31,7 @@ impl GenaiModel {
             model: model.into(),
             headers: genai::Headers::default(),
             timeouts: ModelTimeouts::default(),
+            budget: ModelTokenBudget::default(),
         }
     }
     /// Defaults applied to every request, including compaction and child agents.
@@ -47,25 +39,39 @@ impl GenaiModel {
         self.headers = headers;
         self
     }
-    /// Applied to every network call, including collected compaction responses.
-    pub fn with_timeouts(
+    /// Capacity and transport defaults belong to this provider, without a decorator.
+    pub fn with_settings(
         mut self,
-        header: Option<std::time::Duration>,
-        chunk: Option<std::time::Duration>,
-    ) -> Self {
-        if let Some(header) = header {
-            self.timeouts.headers = header;
+        budget: ModelTokenBudget,
+        timeouts: ModelTimeouts,
+    ) -> Result<Self, YourAiError> {
+        self.budget.validate_output(budget.max_output_tokens())?;
+        let old = self.budget.limits();
+        let new = budget.limits();
+        for (declared, bound) in [
+            (new.context, old.context),
+            (new.input, old.input),
+            (new.output.map(u64::from), old.output.map(u64::from)),
+        ] {
+            if bound.is_some_and(|bound| declared.is_none_or(|n| n > bound)) {
+                return Err(ErrorKind::Config(
+                    "model configuration cannot broaden an existing capacity".into(),
+                )
+                .into());
+            }
         }
-        if let Some(chunk) = chunk {
-            self.timeouts.read = chunk;
+        if timeouts.headers.is_zero() || timeouts.read.is_zero() {
+            return Err(ErrorKind::Config("model timeouts must be positive".into()).into());
         }
-        self
+        self.budget = budget;
+        self.timeouts = timeouts;
+        Ok(self)
     }
     async fn open_stream(
         &self,
         request: ModelRequest,
     ) -> Result<(genai::ModelIden, ModelEventStream), YourAiError> {
-        let request = self.request(request);
+        let request = self.request(request)?;
         let response = self
             .client
             .exec_chat_stream(&self.model, request.request, Some(&request.options))
@@ -80,17 +86,25 @@ impl GenaiModel {
             ),
         ))
     }
-    fn request(&self, mut request: ModelRequest) -> ModelRequest {
+    fn request(&self, mut request: ModelRequest) -> Result<ModelRequest, YourAiError> {
+        let output = *request
+            .options
+            .max_tokens
+            .get_or_insert(self.budget.max_output_tokens());
+        self.budget.validate_output(output)?;
         let mut headers = self.headers.clone();
         if let Some(overrides) = &request.options.extra_headers {
             headers.merge_with(overrides);
         }
         request.options.extra_headers = Some(headers);
         self.timeouts.apply(&mut request.options);
-        request
+        Ok(request)
     }
 }
 impl ModelProvider for GenaiModel {
+    fn token_budget(&self) -> ModelTokenBudget {
+        self.budget
+    }
     fn classify_error(&self, error: &YourAiError) -> ModelErrorClass {
         failure::classify(error)
     }
@@ -400,52 +414,6 @@ impl ModelProvider for MeteredModel {
     }
 }
 
-/// Labels agentic hook calls too, while preserving their session IDs and shared admission.
-pub(crate) struct SourceModel {
-    pub inner: Arc<dyn ModelProvider>,
-    pub source: &'static str,
-}
-impl ModelProvider for SourceModel {
-    fn token_budget(&self) -> ModelTokenBudget {
-        self.inner.token_budget()
-    }
-    fn timeouts(&self) -> ModelTimeouts {
-        self.inner.timeouts()
-    }
-    fn uses_transport_timeouts(&self) -> bool {
-        self.inner.uses_transport_timeouts()
-    }
-    fn complete<'a>(
-        &'a self,
-        mut r: ModelRequest,
-    ) -> BoxFuture<'a, Result<ChatResponse, YourAiError>> {
-        r.source = self.source;
-        self.inner.complete(r)
-    }
-    fn stream_events<'a>(
-        &'a self,
-        mut r: ModelRequest,
-    ) -> BoxFuture<'a, Result<ModelEventStream, YourAiError>> {
-        r.source = self.source;
-        self.inner.stream_events(r)
-    }
-    fn model_iden(&self) -> &str {
-        self.inner.model_iden()
-    }
-    fn classify_error(&self, error: &YourAiError) -> ModelErrorClass {
-        self.inner.classify_error(error)
-    }
-    fn recovery(&self, e: &YourAiError) -> ModelRecovery {
-        self.inner.recovery(e)
-    }
-    fn retry_after(&self, e: &YourAiError) -> Option<std::time::Duration> {
-        self.inner.retry_after(e)
-    }
-    fn media_tokens(&self, part: &ContentPart) -> Result<u64, YourAiError> {
-        self.inner.media_tokens(part)
-    }
-}
-
 #[cfg(test)]
 mod media_tokens_tests {
     use super::*;
@@ -463,6 +431,46 @@ mod media_tokens_tests {
             .unwrap();
         let data = base64::engine::general_purpose::STANDARD.encode(&buf);
         ContentPart::from_binary_base64("image/png", data.as_str(), None)
+    }
+
+    #[tokio::test]
+    async fn provider_settings_reject_oversize_output_before_network() {
+        let budget = ModelTokenBudget::resolve(
+            ModelLimits {
+                context: Some(8192),
+                output: Some(32),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let model = model()
+            .with_settings(budget, ModelTimeouts::default())
+            .unwrap();
+        assert_eq!(model.token_budget().max_output_tokens(), 32);
+        let mut request = ModelRequest::new(ChatRequest::from_user("test"), ChatOptions::default());
+        request.options.max_tokens = Some(33);
+        for error in [
+            model.complete(request.clone()).await.unwrap_err(),
+            model.stream_events(request).await.err().unwrap(),
+        ] {
+            assert!(
+                matches!(error, YourAiError::Error(ErrorKind::Config(_))),
+                "{error}"
+            );
+        }
+        let wider = ModelTokenBudget::resolve(
+            ModelLimits {
+                context: Some(16384),
+                output: Some(32),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(model
+            .with_settings(wider, ModelTimeouts::default())
+            .is_err());
     }
 
     #[test]

@@ -32,7 +32,7 @@ Agent.start / run
 | core `model.rs` | Model.exec 的请求、流、恢复和响应提交 |
 | core `tool.rs` | Tool.exec 的 Hook、授权、业务 run 与结果保存 |
 | core `permission.rs` / `interaction.rs` | 授权与 MCP 交互的实际普通函数 |
-| core `context_manager.rs` | Compactor.exec 的摘要前后事件与提交状态 |
+| core `compactor.rs` | Compactor.exec 的摘要前后事件与提交状态 |
 
 Turn 持有共享控制和账本。DefaultLoop 用 turn.model()?.exec、turn.tool(id)?.exec、accept_input、compact、complete；不 dispatch Hook，也不创建子执行器。完整用法见 [公共执行入口](execution.md)。
 
@@ -98,13 +98,13 @@ MCP 请求依次经过 Elicitation、用户回复（或 Hook 答复）、Elicita
 
 core 的 Turn / Model / Tool 及授权、交互函数接入 10 个操作 Hook，DefaultLoop 和自定义 AgentLoop 无需触发或消费：UserPromptSubmit、Stop、StopFailure、PreToolUse、PostToolUse、PostToolUseFailure、PermissionRequest、PermissionDenied、Elicitation、ElicitationResult。
 
-SessionStart/SessionEnd、工作区、配置、指令文件、子 Agent、协作任务等事件仍归会话宿主或对应扩展。DefaultHookRuntime 自主管理后台 Hook；宿主订阅其完成事件与唤醒策略不属于 DefaultLoop。Loop 的内部 Notice 不递归触发 Notification。
+SessionStart/SessionEnd、工作区、配置、指令文件、子 Agent、协作任务等事件仍归会话宿主或对应扩展。DefaultHookManager 自主管理后台 Hook；宿主订阅其完成事件与唤醒策略不属于 DefaultLoop。Loop 的内部 Notice 不递归触发 Notification。
 
-core 提供 SessionHost 与宿主后台事件订阅；`yourai-harness` 提供 GenaiModel、SQLite、默认摘要算法和装配。它们与 DefaultLoop 在模块层分离，完整装配入口是 `Harness::open`。
+core 提供 SessionManager 与宿主后台事件订阅；`yourai-harness` 提供 GenaiModel、SQLite、默认摘要算法和装配。它们与 DefaultLoop 在模块层分离，完整装配入口是 `Harness::open`。
 
 ## 验证
 
-`crates/yourai-harness/tests/loop_flow.rs` 使用可控制事件流和内存历史验证完整主链，覆盖审批、Hook 参数修改、硬拒绝、JSON Schema、普通/MCP 交互、压缩、有限重试、Stop、steer/follow-up、取消、断开、超时、预算以及批次收尾；包含真实 DefaultHookRuntime 注册与效果消费测试。不依赖在线模型或 API Key。
+`crates/yourai-harness/tests/loop_flow.rs` 使用可控制事件流和内存历史验证完整主链，覆盖审批、Hook 参数修改、硬拒绝、JSON Schema、普通/MCP 交互、压缩、有限重试、Stop、steer/follow-up、取消、断开、超时、预算以及批次收尾；包含真实 DefaultHookManager 注册与效果消费测试。不依赖在线模型或 API Key。
 
 
 ## 工具输出存储与重复调用保护

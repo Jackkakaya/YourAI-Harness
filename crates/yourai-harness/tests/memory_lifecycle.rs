@@ -1,3 +1,5 @@
+#[path = "support/model.rs"]
+mod model_fixture;
 #[path = "support/loop.rs"]
 mod support;
 use std::sync::{
@@ -17,7 +19,7 @@ struct Provider {
     compact: Mutex<Vec<ChatMessage>>,
     fail_sync: bool,
 }
-impl MemoryProvider for Provider {
+impl MemoryManager for Provider {
     fn system_prompt_block<'a>(
         &'a self,
         _: &'a CancellationToken,
@@ -120,7 +122,7 @@ async fn callbacks_are_auto_registered_scoped_and_sync_once_after_stop_settles()
     let d = TempDir::new().unwrap();
     let provider = Arc::new(Provider::default());
     let mut config = HarnessConfig::new(d.path().join("sessions"), d.path().into());
-    config.memory_provider = Some(provider.clone());
+    config.memory_manager = Some(provider.clone());
     config.memory_search_limit = 2;
     let h = Harness::open(
         config,
@@ -137,7 +139,7 @@ async fn callbacks_are_auto_registered_scoped_and_sync_once_after_stop_settles()
         vec!["system", "start:startup"]
     );
     let stop = Arc::new(StopOnce(AtomicUsize::new(0)));
-    HookRegistry::register(
+    HookManager::register(
         h.hooks.as_ref(),
         NativeHookRegistration {
             id: "continue-once".into(),
@@ -204,7 +206,7 @@ async fn callback_errors_do_not_undo_a_completed_turn_and_failed_turns_do_not_sy
         ..Default::default()
     });
     let mut config = HarnessConfig::new(d.path().join("sessions"), d.path().into());
-    config.memory_provider = Some(provider.clone());
+    config.memory_manager = Some(provider.clone());
     let h = Harness::open(config, Arc::new(Model::new(vec![answer("success")])))
         .await
         .unwrap();
@@ -220,9 +222,9 @@ async fn compact_callback_uses_clean_active_history_without_rebuilding_system() 
     let root = d.path().join("sessions");
     let provider = Arc::new(Provider::default());
     let mut config = HarnessConfig::new(root.clone(), d.path().into());
-    config.memory_provider = Some(provider.clone());
+    config.memory_manager = Some(provider.clone());
     config.context_policy.keep_recent_tokens = 0;
-    let model = yourai_harness::model::ConfiguredModel::new(
+    let model = model_fixture::TestModel::new(
         Arc::new(Model::new(vec![])),
         ModelTokenBudget::resolve(
             ModelLimits {
@@ -237,7 +239,7 @@ async fn compact_callback_uses_clean_active_history_without_rebuilding_system() 
     )
     .unwrap();
     let h = Harness::open(config, model).await.unwrap();
-    let store = SessionCatalog::new(root).unwrap();
+    let store = SessionCatalog::new(root).unwrap().store;
     let id = h.host.context().id;
     let mut user = StoredMessage::new(ChatMessage::user("CLEAN ".repeat(1000)));
     user.attach_recall(vec![RecalledMemory {
@@ -253,8 +255,7 @@ async fn compact_callback_uses_clean_active_history_without_rebuilding_system() 
         )
         .await
         .unwrap();
-    // Model has no summary completion implementation; the pre-compact callback
-    // must still run at the boundary before the attempted summary call.
+    // The callback sees the clean pre-compaction history, before the summary is committed.
     assert!(h
         .host
         .compact(
@@ -262,7 +263,7 @@ async fn compact_callback_uses_clean_active_history_without_rebuilding_system() 
             &CancellationToken::new()
         )
         .await
-        .is_err());
+        .is_ok());
     assert!(provider
         .events
         .lock()
@@ -287,7 +288,7 @@ async fn compact_callback_uses_clean_active_history_without_rebuilding_system() 
 
 #[derive(Default)]
 struct WaitingProvider(Mutex<Option<CancellationToken>>);
-impl MemoryProvider for WaitingProvider {
+impl MemoryManager for WaitingProvider {
     fn on_session_start<'a>(
         &'a self,
         _: &'a MemorySession,
@@ -308,7 +309,7 @@ async fn cancelling_hook_dispatch_cancels_provider_callback_token() {
     let d = TempDir::new().unwrap();
     let provider = Arc::new(WaitingProvider::default());
     let mut config = HarnessConfig::new(d.path().join("sessions"), d.path().into());
-    config.memory_provider = Some(provider.clone());
+    config.memory_manager = Some(provider.clone());
     let h = Harness::open(config, Arc::new(Model::new(vec![])))
         .await
         .unwrap();
@@ -353,11 +354,11 @@ async fn completion_notification_cannot_veto_result_and_resume_gets_start_callba
     let root = d.path().join("sessions");
     let provider = Arc::new(Provider::default());
     let mut config = HarnessConfig::new(root.clone(), d.path().into());
-    config.memory_provider = Some(provider.clone());
+    config.memory_manager = Some(provider.clone());
     let h = Harness::open(config, Arc::new(Model::new(vec![answer("complete")])))
         .await
         .unwrap();
-    HookRegistry::register(
+    HookManager::register(
         h.hooks.as_ref(),
         NativeHookRegistration {
             id: "try-veto-completed".into(),
@@ -377,7 +378,7 @@ async fn completion_notification_cannot_veto_result_and_resume_gets_start_callba
     h.close().await.unwrap();
     drop(h);
     let mut config = HarnessConfig::new(root, d.path().into());
-    config.memory_provider = Some(provider.clone());
+    config.memory_manager = Some(provider.clone());
     config.resume = Some(id);
     let h = Harness::open(config, Arc::new(Model::new(vec![])))
         .await

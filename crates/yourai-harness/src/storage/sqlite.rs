@@ -19,6 +19,7 @@ fn sql(e: impl std::fmt::Display) -> YourAiError {
 }
 #[derive(Clone)]
 pub struct SqliteStore {
+    session_root: Option<PathBuf>,
     connection: Arc<Mutex<Connection>>,
     gate: Arc<tokio::sync::Mutex<()>>,
 }
@@ -78,6 +79,12 @@ impl SqliteStore {
             .map_err(sql)?;
         }
         Ok(Self {
+            session_root: (path != Path::new(":memory:")).then(|| {
+                path.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."))
+                    .to_owned()
+            }),
             connection: Arc::new(Mutex::new(c)),
             gate: Arc::new(tokio::sync::Mutex::new(())),
         })
@@ -147,6 +154,29 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
         .get("yourai_runtime_context")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let context_key = value
+        .get("yourai_context_key")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        // Existing sessions predate context keys; preserve their instruction rows too.
+        .or_else(|| {
+            if runtime_context {
+                value
+                    .get("content")
+                    .and_then(|content| {
+                        serde_json::from_value::<MessageContent>(content.clone()).ok()
+                    })
+                    .and_then(|content| {
+                        content.first_text().and_then(|text| {
+                            text.strip_prefix("[Instructions: ")
+                                .and_then(|text| text.split_once("]\n"))
+                                .map(|(path, _)| format!("instructions:{path}"))
+                        })
+                    })
+            } else {
+                None
+            }
+        });
     let api_content = value
         .get("yourai_api_content")
         .cloned()
@@ -183,10 +213,10 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
         message,
         summary: r.get::<_, String>(3)? == "summary",
         runtime_context,
+        context_key,
         api_content,
         recall,
         tool_output_pruned_at: r.get(6)?,
-        model_response: false,
         request_observation: None,
         status: match status.as_str() {
             "active" => MessageStatus::Active,
@@ -232,6 +262,12 @@ fn stored_json(m: &StoredMessage) -> Result<String, YourAiError> {
     }
     if m.runtime_context {
         value["yourai_runtime_context"] = true.into();
+    }
+    if let Some(key) = &m.context_key {
+        if !m.runtime_context || m.summary || m.message.role != ChatRole::User {
+            return Err(sql("context keys require an ordinary runtime context"));
+        }
+        value["yourai_context_key"] = key.clone().into();
     }
     if let Some(content) = &m.api_content {
         if m.message.role != ChatRole::User || m.runtime_context || m.summary {
@@ -291,7 +327,7 @@ fn insert(
     .map_err(sql)?;
     Ok(m)
 }
-impl SessionManager for SqliteStore {
+impl SessionStore for SqliteStore {
     fn read_tasks(&self, id: &SessionId) -> Result<Vec<Task>, YourAiError> {
         self.with(|c| {
             let mut stmt = c.prepare("SELECT task_id,subject,description,owner,completed,seq FROM tasks WHERE session_id=?1 ORDER BY seq,task_id").map_err(sql)?;
@@ -379,9 +415,29 @@ impl SessionManager for SqliteStore {
     }
     fn delete_session<'a>(&'a self, id: &'a SessionId) -> BoxFuture<'a, Result<(), YourAiError>> {
         let id = id.clone();
+        let directory = self
+            .session_root
+            .as_ref()
+            .map(|root| root.join(id.as_str()));
         Box::pin(self.run(move |c| {
+            if id.as_str().is_empty()
+                || !id
+                    .as_str()
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            {
+                return Err(sql("invalid session id"));
+            }
+            // The worker retains ownership through SQL and directory cleanup, even if its waiter leaves.
+            let _lease = directory
+                .as_ref()
+                .map(|dir| yourai_core::runtime::SessionLease::acquire(dir.clone()))
+                .transpose()?;
             c.execute("DELETE FROM sessions WHERE session_id=?1", [id.as_str()])
                 .map_err(sql)?;
+            if let Some(dir) = directory {
+                std::fs::remove_dir_all(dir).map_err(sql)?;
+            }
             Ok(())
         }))
     }
@@ -436,51 +492,50 @@ impl SessionManager for SqliteStore {
             Ok(result)
         }))
     }
-    fn save_context<'a>(
+    fn save_summary<'a>(
         &'a self,
         id: &'a SessionId,
-        change: ContextChange,
+        sources: Vec<String>,
+        summary: StoredMessage,
+        progress: std::sync::Arc<std::sync::atomic::AtomicU8>,
     ) -> BoxFuture<'a, Result<(), YourAiError>> {
         let id = id.clone();
-        let progress = change.progress.clone();
         Box::pin(self.run(move |c| {
-            progress.store(CommitStatus::Started as u8, std::sync::atomic::Ordering::Release);
-            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
-            let is_retry = if let Some(summary) = &change.compaction {
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE message_id=?1 AND session_id=?2)",params![summary.summary.id,id.as_str()],|r|r.get::<_,bool>(0)).map_err(sql)?
-            } else { false };
-            for source in &change.pruned {
-                let n = tx.execute("UPDATE messages SET tool_output_pruned_at=COALESCE(tool_output_pruned_at,?3) WHERE session_id=?1 AND message_id=?2 AND (status='active' OR (?4 AND status='compacted')) AND role='tool'", params![id.as_str(),source,now(),is_retry]).map_err(sql)?;
-                if n != 1 { return Err(sql("stale pruning source")); }
+            progress.store(
+                CommitStatus::Started as u8,
+                std::sync::atomic::Ordering::Release,
+            );
+            let tx = c
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            tx.execute(
+                "UPDATE sessions SET updated_at=?2 WHERE session_id=?1",
+                params![id.as_str(), now()],
+            )
+            .map_err(sql)?;
+            if !summary.summary || summary.status != MessageStatus::Active || sources.is_empty() {
+                return Err(sql("invalid compaction candidate"));
             }
-            tx.execute("UPDATE sessions SET updated_at=?2 WHERE session_id=?1",params![id.as_str(),now()]).map_err(sql)?;
-            let Some(change) = change.compaction else {
-                tx.commit().map_err(sql)?;
-                progress.store(CommitStatus::Committed as u8, std::sync::atomic::Ordering::Release);
-                return Ok(());
-            };
-            if !change.summary.summary || change.summary.status != MessageStatus::Active || change.sources.is_empty() { return Err(sql("invalid compaction candidate")); }
-            let unique: std::collections::HashSet<_> = change.sources.iter().collect();
-            if unique.len() != change.sources.len() { return Err(sql("duplicate compaction source")); }
+            let unique: std::collections::HashSet<_> = sources.iter().collect();
+            if unique.len() != sources.len() {
+                return Err(sql("duplicate compaction source"));
+            }
             // A completed retry is accepted only for the same summary identity/content and compacted sources.
             let existing: Option<(String, String, String)> = tx
                 .query_row(
                     "SELECT session_id,content_json,kind FROM messages WHERE message_id=?1",
-                    [&change.summary.id],
+                    [&summary.id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()
                 .map_err(sql)?;
             let retry = existing.is_some();
             if let Some((sid, raw, kind)) = existing {
-                if sid != id.as_str()
-                    || kind != "summary"
-                    || raw != stored_json(&change.summary)?
-                {
+                if sid != id.as_str() || kind != "summary" || raw != stored_json(&summary)? {
                     return Err(sql("summary identity conflict"));
                 }
             }
-            for source in &change.sources {
+            for source in &sources {
                 let status: Option<String> = tx
                     .query_row(
                         "SELECT status FROM messages WHERE session_id=?1 AND message_id=?2",
@@ -495,17 +550,20 @@ impl SessionManager for SqliteStore {
                 }
             }
             if !retry {
-                for source in &change.sources {
+                for source in &sources {
                     tx.execute(
                         "UPDATE messages SET status='compacted' WHERE message_id=?1",
                         [source],
                     )
                     .map_err(sql)?;
                 }
-                insert(&tx, &id, change.summary)?;
+                insert(&tx, &id, summary)?;
             }
             tx.commit().map_err(sql)?;
-                progress.store(CommitStatus::Committed as u8, std::sync::atomic::Ordering::Release);
+            progress.store(
+                CommitStatus::Committed as u8,
+                std::sync::atomic::Ordering::Release,
+            );
             Ok(())
         }))
     }

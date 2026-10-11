@@ -8,71 +8,111 @@ use std::time::Duration;
 use yourai_core::hooks::{HookHandler, HookInvocation, HookOutput};
 use yourai_core::BoxFuture;
 
-#[derive(Debug, Clone)]
-pub struct HookModelRequest {
-    pub prompt: String,
-    pub model: Option<String>,
-    pub agentic: bool,
-    pub invocation: HookInvocation,
-}
-
-#[derive(Debug, Clone)]
-pub struct HookModelDecision {
-    pub ok: bool,
-    pub reason: Option<String>,
-}
-
-/// Prompt/Agent Hook 所需的宿主模型能力。具体模型与多轮 Agent 实现在独立 crate 注入。
-pub trait HookEvaluator: Send + Sync {
-    fn evaluate<'a>(
-        &'a self,
-        request: HookModelRequest,
-    ) -> BoxFuture<'a, Result<HookModelDecision, yourai_core::YourAiError>>;
-}
-
+/// One model hook owns prompt expansion, execution and decision parsing.
 struct ModelHookHandler {
     prompt: String,
     model: Option<String>,
     agentic: bool,
-    executor: std::sync::Arc<dyn HookEvaluator>,
+    fallback: Arc<dyn yourai_core::model::ModelProvider>,
 }
-
+impl ModelHookHandler {
+    async fn run(
+        &self,
+        invocation: &HookInvocation,
+    ) -> Result<serde_json::Value, yourai_core::YourAiError> {
+        use yourai_core::prelude::*;
+        let model = invocation.model.as_ref().unwrap_or(&self.fallback).clone();
+        if self
+            .model
+            .as_ref()
+            .is_some_and(|name| name != model.model_iden())
+        {
+            return Err(crate::error(
+                "hook_model",
+                "requested model is not configured",
+            ));
+        }
+        let prompt = self.prompt.replace(
+            "$ARGUMENTS",
+            &crate::hooks::event::to_wire_json(invocation).to_string(),
+        );
+        let instructions = r#"Evaluate the condition. Return exactly JSON {"ok":true} or {"ok":false,"reason":"..."}."#;
+        let text = if self.agentic {
+            let history = crate::DefaultContext::new(
+                SessionId::from(invocation.base.session_id.clone()),
+                instructions.into(),
+                None,
+                ContextPolicy::default(),
+            );
+            // Evaluator agents have no HookManager, so evaluation cannot recurse.
+            let mut builder = Agent::builder()
+                .model(model.clone())
+                .context_manager(history)
+                .agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
+                    crate::default_loop::LoopConfig {
+                        steps: Some(8),
+                        ..Default::default()
+                    },
+                )));
+            if let Some(usage) = &invocation.usage {
+                builder = builder.usage(usage.clone());
+            }
+            let mut options = TurnOptions::default();
+            options.source = Some("hook");
+            builder
+                .build()
+                .run_with(In::user_text(prompt), options)
+                .await
+                .map_err(|failure| *failure.error)?
+                .text
+        } else {
+            let response = model
+                .complete(
+                    ModelRequest::new(
+                        ChatRequest::from_user(prompt).with_system(instructions),
+                        ChatOptions::default(),
+                    )
+                    .with_context("hook", invocation.base.session_id.clone()),
+                )
+                .await?;
+            if let Some(usage) = &invocation.usage {
+                let id = SessionId::from(invocation.base.session_id.clone());
+                let event = UsageEvent::new(
+                    Some(model.model_iden().into()),
+                    "hook",
+                    response.usage.clone(),
+                );
+                if let Some(warning) = usage.record_response(&id, &event).await {
+                    eprintln!("{warning}");
+                }
+            }
+            response.content.texts().join("")
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| crate::error("hook_model", e))?;
+        if !value["ok"].is_boolean() {
+            return Err(crate::error("hook_model", "missing boolean ok"));
+        }
+        Ok(value)
+    }
+}
 impl HookHandler for ModelHookHandler {
     fn execute<'a>(
         &'a self,
         invocation: &'a HookInvocation,
     ) -> BoxFuture<'a, Result<HookOutput, yourai_core::YourAiError>> {
-        let wire_input = crate::hooks::event::to_wire_json(invocation).to_string();
-        let event = invocation.event_kind();
-        let request = HookModelRequest {
-            prompt: self.prompt.replace("$ARGUMENTS", &wire_input),
-            model: self.model.clone(),
-            agentic: self.agentic,
-            invocation: invocation.clone(),
-        };
         Box::pin(async move {
-            let decision = self.executor.evaluate(request).await?;
-            let output = if decision.ok {
+            let decision = self.run(invocation).await?;
+            let output = if decision["ok"] == true {
                 serde_json::json!({})
             } else {
-                let reason = decision
-                    .reason
-                    .unwrap_or_else(|| "hook condition was not met".to_string());
-                if event == yourai_core::hooks::HookEventKind::PreToolUse {
-                    serde_json::json!({
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "deny",
-                            "permissionDecisionReason": reason,
-                        }
-                    })
+                let reason = decision["reason"]
+                    .as_str()
+                    .unwrap_or("hook condition was not met");
+                if invocation.event_kind() == yourai_core::hooks::HookEventKind::PreToolUse {
+                    serde_json::json!({"hookSpecificOutput": {"hookEventName":"PreToolUse", "permissionDecision":"deny", "permissionDecisionReason":reason}})
                 } else {
-                    serde_json::json!({
-                        "continue": false,
-                        "stopReason": reason,
-                        "decision": "block",
-                        "reason": reason,
-                    })
+                    serde_json::json!({"continue":false,"stopReason":reason,"decision":"block","reason":reason})
                 }
             };
             Ok(HookOutput::Parsed(output))
@@ -125,7 +165,7 @@ where
 pub(crate) fn handler_from_config(
     config: &crate::hooks::config::HandlerConfig,
     http_policy: crate::hooks::http::HttpHookPolicy,
-    evaluator: Option<Arc<dyn HookEvaluator>>,
+    provider: Option<Arc<dyn yourai_core::model::ModelProvider>>,
     background: crate::hooks::command::BackgroundCommandContext,
 ) -> Result<Arc<dyn HookHandler>, yourai_core::YourAiError> {
     let handler: Arc<dyn HookHandler> = match config {
@@ -148,14 +188,14 @@ pub(crate) fn handler_from_config(
         ),
         crate::hooks::config::HandlerConfig::Prompt { prompt, model, .. }
         | crate::hooks::config::HandlerConfig::Agent { prompt, model, .. } => {
-            let executor = evaluator.ok_or_else(|| {
-                yourai_core::ErrorKind::Config("prompt/agent hook requires a HookEvaluator".into())
+            let fallback = provider.ok_or_else(|| {
+                yourai_core::ErrorKind::Config("prompt/agent hook requires a model".into())
             })?;
             Arc::new(ModelHookHandler {
                 prompt: prompt.clone(),
                 model: model.clone(),
                 agentic: matches!(config, crate::hooks::config::HandlerConfig::Agent { .. }),
-                executor,
+                fallback,
             })
         }
     };

@@ -4,44 +4,16 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
-use yourai_core::runtime::SessionLease;
 pub async fn create(
     root: &Path,
     cwd: PathBuf,
     model: Arc<dyn ModelProvider>,
-    hooks: Option<Arc<dyn HookRuntime>>,
+    hooks: Option<Arc<dyn HookManager>>,
     tools: Option<Arc<dyn ToolRegistry>>,
-) -> Result<Arc<SessionHost>, YourAiError> {
-    let catalog = Arc::new(crate::SessionCatalog::new(root)?);
-    let prompt = crate::context::prompt::prepare(
-        &crate::PromptConfig::default(),
-        &cwd,
-        None,
-        &[],
-        None,
-        None,
-        ContextPolicy::default().maintenance_threshold(model.token_budget()),
-        &CancellationToken::new(),
-    )
-    .await?;
-    let meta = catalog
-        .create_session(SessionId::new(), &prompt.system)
-        .await?;
-    restore(
-        root,
-        meta.id,
-        cwd,
-        model,
-        hooks,
-        tools,
-        None,
-        None,
-        ContextPolicy::default(),
-        "startup",
-    )
-    .await
+) -> Result<Arc<SessionManager>, YourAiError> {
+    let config = crate::HarnessConfig::new(root.to_owned(), cwd);
+    open(config, model, hooks, tools, None, None, "startup").await
 }
 #[allow(clippy::too_many_arguments)]
 pub async fn restore(
@@ -49,43 +21,44 @@ pub async fn restore(
     id: SessionId,
     cwd: PathBuf,
     model: Arc<dyn ModelProvider>,
-    hooks: Option<Arc<dyn HookRuntime>>,
+    hooks: Option<Arc<dyn HookManager>>,
     tools: Option<Arc<dyn ToolRegistry>>,
     security: Option<Arc<dyn SecurityProvider>>,
     sandbox: Option<Arc<dyn SandboxProvider>>,
     policy: ContextPolicy,
     source: &str,
-) -> Result<Arc<SessionHost>, YourAiError> {
-    let catalog = Arc::new(crate::SessionCatalog::new(root)?);
-    let lease = SessionLease::acquire(catalog.directory(&id)?)?;
-    let mut meta = catalog.load_session(&id).await?;
-    if meta.system_prompt.is_none() {
-        let prompt = crate::context::prompt::prepare(
-            &crate::PromptConfig::default(),
-            &cwd,
-            None,
-            &[],
-            None,
-            None,
-            policy.maintenance_threshold(model.token_budget()),
-            &CancellationToken::new(),
-        )
-        .await?;
-        meta.system_prompt = Some(catalog.initialize_system(&id, &prompt.system).await?);
-    }
-    meta.model = Some(model.model_iden().into());
-    catalog.save_session(&meta).await?;
+) -> Result<Arc<SessionManager>, YourAiError> {
+    let mut config = crate::HarnessConfig::new(root.to_owned(), cwd);
+    config.resume = Some(id);
+    config.context_policy = policy;
+    open(config, model, hooks, tools, security, sandbox, source).await
+}
+#[allow(clippy::too_many_arguments)]
+async fn open(
+    config: crate::HarnessConfig,
+    model: Arc<dyn ModelProvider>,
+    hooks: Option<Arc<dyn HookManager>>,
+    tools: Option<Arc<dyn ToolRegistry>>,
+    security: Option<Arc<dyn SecurityProvider>>,
+    sandbox: Option<Arc<dyn SandboxProvider>>,
+    source: &str,
+) -> Result<Arc<SessionManager>, YourAiError> {
+    config.context_policy.validate_for(model.token_budget())?;
+    let catalog = Arc::new(crate::SessionCatalog::new(&config.root)?);
+    let (meta, lease, prepared) =
+        crate::assembly::prepare_session(&catalog, &config, model.as_ref()).await?;
+    let id = meta.id;
     let usage = Arc::new(crate::storage::LocalUsage((*catalog.store).clone()));
     let (agent, _) = crate::assembly::assemble(
         &catalog,
         &id,
-        &cwd,
+        &config.cwd,
         false,
         model,
         hooks,
         Some(usage),
         tools,
-        policy,
+        config.context_policy,
     )
     .await?;
     if let Some(security) = security {
@@ -94,7 +67,8 @@ pub async fn restore(
     if let Some(sandbox) = sandbox {
         agent.ctx().set_sandbox(sandbox);
     }
-    let mut context = SessionContext::new(id, cwd);
-    context.transcript_path = Some(crate::SqliteStore::path(root));
-    SessionHost::open_owned(lease, context, agent, HostConfig::default(), source).await
+    let mut context = SessionContext::new(id, config.cwd);
+    context.instructions = prepared.instructions;
+    context.transcript_path = Some(crate::SqliteStore::path(&config.root));
+    SessionManager::open_owned(lease, context, agent, SessionConfig::default(), source).await
 }

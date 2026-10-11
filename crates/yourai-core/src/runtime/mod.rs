@@ -1,3 +1,6 @@
+//! SessionManager owns one live session: input queues, execution, children and shutdown.
+//! Persistent records are accessed through SessionStore; storage does not schedule turns.
+
 #[cfg(test)]
 mod input_tests;
 mod journal;
@@ -27,7 +30,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
-pub struct HostConfig {
+pub struct SessionConfig {
     pub input: crate::turn::InputOptions,
     pub hook_timeout: Option<Duration>,
     /// Optional supervisor quarantine bound after cancellation.
@@ -37,7 +40,7 @@ pub struct HostConfig {
     pub instruction_paths: Vec<PathBuf>,
     pub workspace_enabled: bool,
 }
-impl Default for HostConfig {
+impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             input: crate::turn::InputOptions::default(),
@@ -104,12 +107,13 @@ enum CloseNotification {
     Started,
     Finished(Option<String>),
 }
-pub struct SessionHost {
-    self_ref: std::sync::OnceLock<std::sync::Weak<SessionHost>>,
+/// Manages the execution and lifecycle of one session.
+pub struct SessionManager {
+    self_ref: std::sync::OnceLock<std::sync::Weak<SessionManager>>,
     pub(crate) context: Mutex<SessionContext>,
     agent: Arc<Agent>,
     pub(crate) dir: PathBuf,
-    config: HostConfig,
+    config: SessionConfig,
     input_options: Mutex<crate::turn::InputOptions>,
     live: Mutex<Live>,
     journal_gate: Mutex<()>,
@@ -117,7 +121,7 @@ pub struct SessionHost {
     operation: Arc<tokio::sync::Mutex<()>>,
     workspace: std::sync::OnceLock<Arc<crate::workspace::Workspace>>,
     pub(crate) tasks: std::sync::OnceLock<Arc<crate::tasks::TaskManager>>,
-    children: Mutex<HashMap<SessionId, Arc<SessionHost>>>,
+    children: Mutex<HashMap<SessionId, Arc<SessionManager>>>,
     active: Mutex<usize>,
     settled: Notify,
     notify: Notify,
@@ -126,7 +130,7 @@ pub struct SessionHost {
     _lock: File,
 }
 pub(crate) struct Activity {
-    host: Arc<SessionHost>,
+    host: Arc<SessionManager>,
 }
 impl Drop for Activity {
     fn drop(&mut self) {
@@ -134,7 +138,7 @@ impl Drop for Activity {
         self.host.settled.notify_waiters();
     }
 }
-struct StatusGuard(Arc<SessionHost>);
+struct StatusGuard(Arc<SessionManager>);
 impl Drop for StatusGuard {
     fn drop(&mut self) {
         let mut l = self.0.live.lock().unwrap();
@@ -152,7 +156,7 @@ pub struct ContextUsage {
     pub output_reserve: u64,
 }
 
-impl SessionHost {
+impl SessionManager {
     pub fn agent(&self) -> &Arc<Agent> {
         &self.agent
     }
@@ -205,7 +209,7 @@ impl SessionHost {
         dir: impl Into<PathBuf>,
         context: SessionContext,
         agent: Arc<Agent>,
-        config: HostConfig,
+        config: SessionConfig,
         source: &str,
     ) -> Result<Arc<Self>, YourAiError> {
         let lease = SessionLease::acquire(dir.into())?;
@@ -216,7 +220,7 @@ impl SessionHost {
         lease: SessionLease,
         context: SessionContext,
         agent: Arc<Agent>,
-        config: HostConfig,
+        config: SessionConfig,
     ) -> Result<(Arc<Self>, bool), YourAiError> {
         let SessionLease { dir, lock } = lease;
         let history = agent.ctx().context_manager()?;
@@ -600,7 +604,7 @@ impl SessionHost {
         Ok(())
     }
 }
-impl SessionHost {
+impl SessionManager {
     /// Synchronous compatibility entry point; async callers use submit_async.
     pub fn submit(&self, mut input: In) -> Result<(), InputRejected> {
         input.ensure_id();
@@ -720,6 +724,7 @@ impl SessionHost {
                         return Err(AbortReason::Cancelled.into());
                     }
                     let options = TurnOptions {
+                        source: None,
                         session: Some(Arc::new(host.context())),
                         limits,
                         events: Some(host.events.clone()),
@@ -876,9 +881,9 @@ impl SessionHost {
         }
     }
     /// 手动压缩，与 Turn 历史写入互斥。实现必须经由公共入口
-    /// [`crate::context_manager::Compactor::exec`] 执行——它固定持有 Hook 生命周期、
+    /// [`crate::compactor::Compactor::exec`] 执行——它固定持有 Hook 生命周期、
     /// 阻断与取消/提交竞态语义；内部调用 ContextManager 的业务计划与摘要提交。
-    /// 直接调用 `prepare_compaction` / `CompactionJob::run` 属于实现协议，不获得该契约。
+    /// ContextManager 只提供投影、估算与原子应用；公共压缩统一经过 Compactor.exec。
     pub async fn compact(
         &self,
         mut request: CompactionRequest,
@@ -946,7 +951,7 @@ impl SessionHost {
         Ok(self.take_closed_inputs())
     }
 }
-impl SessionHost {
+impl SessionManager {
     pub fn take_closed_inputs(&self) -> Vec<In> {
         std::mem::take(&mut self.live.lock().unwrap().closed_pending)
     }
@@ -1003,7 +1008,7 @@ impl SessionHost {
         .await?
     }
 }
-impl Drop for SessionHost {
+impl Drop for SessionManager {
     fn drop(&mut self) {
         self.closing.cancel();
         if let Some(c) = &self.live.get_mut().unwrap().cancel {
