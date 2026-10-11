@@ -1,133 +1,146 @@
-<p align="center"><strong>YourAI Harness</strong> is a modular Rust foundation for building pluggable AI agents.</p>
+# YourAI Harness
 
-<p align="center">
-  English · <a href="./README.zh-CN.md">简体中文</a>
-</p>
+A coding agent for your terminal, built on a modular Rust agent runtime. Connect your model service, open a project, and ask the agent to read code, make changes, and run commands.
 
----
+English · [简体中文](./README.zh-CN.md)
 
-YourAI separates an agent harness into three responsibilities:
+![YourAI TUI showing a code diff and test results](./docs/screenshots/conversation.png)
 
-- the frontend owns **pace** — when a turn starts and how events are rendered;
-- `yourai-core` owns **transport** — turn lifecycle, channels, cancellation, and provider snapshots;
-- `AgentLoop` owns **interpretation** — how messages, models, tools, approvals, memory, and hooks compose.
+*Actual TUI terminal output, captured with a local demo model. The agent really edits the demo file and runs its tests. [Screenshot capture instructions](./docs/screenshots/README.md).*
 
-Everything behind the core seams is replaceable. The loop itself is a provider, not a hard-coded framework policy.
+## Install
 
-> [!IMPORTANT]
-> YourAI implements the core contracts, hooks, DefaultLoop, session hosting, durable history, model-backed compaction and optional extensions. The included TUI supports streaming, approvals, model/session switching, SQLite resume, Markdown, syntax highlighting and themes; a Web frontend and OS sandbox are not included.
+You need a recent stable Rust toolchain, Git, and a UTF-8 terminal on macOS or Linux.
 
-## Highlights
+```sh
+git clone https://github.com/Jackkakaya/YourAI-Harness.git
+cd YourAI-Harness
+cargo install --path apps/yourai-tui --locked
+```
 
-- **Pluggable by design** — model, context, session, memory, tools, skills, sandbox, security, usage, observability, hooks, and the agent loop are trait-based providers.
-- **Turn-scoped transport** — `Agent::start` returns a `TurnHandle` with inbox, outbox, cancellation, and join semantics.
-- **Stable provider snapshots** — providers can be hot-swapped without changing the implementation seen by an in-flight turn.
-- **Typed interaction vocabulary** — `yourai-core::protocol` defines the complete `In` / `Out` language shared by loops and frontends.
-- **Claude-compatible Hooks** — 28 hook events, typed outcomes, command and HTTP transports, parallel execution, deterministic aggregation, async completion, and runtime registration.
-- **Small object-safe interfaces** — boxed futures keep provider traits usable behind `Arc<dyn Trait>` without `async_trait`.
+Cargo installs `yourai-tui` into its bin directory, normally `~/.cargo/bin`. You can also run from source with `cargo run -p yourai-tui -- …`.
 
-## Workspace
+## Configure your model
+
+Copy the example configuration:
+
+```sh
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/yourai"
+cp yourai.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/yourai/yourai.json"
+```
+
+Edit that file. Replace **all three** occurrences of `YOUR_MODEL_NAME` with your service's model ID, set `baseURL`, and set the context/output limits to the model's actual capacities:
+
+```json
+{
+  "model": "gateway/YOUR_MODEL_NAME",
+  "provider": {
+    "gateway": {
+      "api": "openai-compatible",
+      "options": {
+        "baseURL": "https://api.openai.com/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": {
+        "YOUR_MODEL_NAME": {
+          "id": "YOUR_MODEL_NAME",
+          "limit": { "context": 128000, "output": 4096 }
+        }
+      }
+    }
+  }
+}
+```
+
+The limits above are examples. `baseURL` is the API base, such as `/v1`, rather than the complete `/chat/completions` URL. Keep the API key in the referenced environment variable:
+
+```sh
+export OPENAI_API_KEY='your-api-key'
+yourai-tui --check-config
+```
+
+`--check-config` validates configuration without making a model request. The default config location is `$XDG_CONFIG_HOME/yourai/yourai.json`, falling back to `~/.config/yourai/yourai.json`; use `--config PATH` to override it.
+
+The client also supports `openai-responses`, `anthropic`, `gemini`, and `ollama` APIs. See [model configuration](./docs/tui.md#模型配置) for provider settings, multiple models, thinking effort, and variants.
+
+## Use it in a project
+
+Start in the directory you want the agent to work on:
+
+```sh
+cd /path/to/your/project
+yourai-tui
+```
+
+For example, ask: “Find the failing test, fix the bug, and run the relevant tests.” The agent can read/write/edit files, run shell commands, search/fetch web content, and track tasks. Set `"extensions": true` in the config to enable subagents, workspace management, memory, and skills.
+
+| Action | How |
+|---|---|
+| Send a message | Type and press **Enter**. While a task is running, new messages queue for the next turn. |
+| Guide the current task | Click **Steer** on the queued message. |
+| Add a file or image | Type **@** for file/directory completion; **Ctrl-V** attaches a clipboard image. |
+| Write multiple lines | **Ctrl-J** or **Alt-Enter**; **Ctrl-X** opens the draft in `$VISUAL` / `$EDITOR`. |
+| Approve a tool | **y** allows once, **a** also remembers approval for that tool in this session, **n** denies. |
+| Stop the current task | **Esc** or **Ctrl-C**. Later queued messages are retained. |
+| Inspect results | Click tool/thinking blocks to expand; **PgUp/PgDn** scroll, **Ctrl-End** follows the latest output. |
+| Switch models | **/models**, then **Enter** to choose thinking effort and **Enter** again to apply; **F2** cycles configured entries. |
+| Show statistics / tasks | **Ctrl-B** / **Ctrl-T**. |
+| Start fresh / compact | **/new** starts a session; **/clear** starts fresh while retaining the old session; **/compact** summarizes history. |
+| Change appearance / get help | **/theme dark**, **/theme light**, **/help**. |
+| Quit | **Ctrl-Q** or **/quit**. |
+
+Model/session switching and manual compact require the current turn to finish or be stopped first. [Full controls and behavior](./docs/tui.md#操作).
+
+### Tool approval
+
+![YourAI asking for approval before running a shell command](./docs/screenshots/approval.png)
+
+### Model selection
+
+![YourAI model picker showing configured models, variants, and thinking effort](./docs/screenshots/models.png)
+
+## Resume a session
+
+```sh
+yourai-tui --resume              # Open the saved-session picker
+yourai-tui --resume SESSION_ID   # Resume a specific session
+```
+
+You can also switch with **/sessions** inside the app. The session ID is printed on exit.
+
+Agent data is stored in SQLite: messages, summaries, queued inputs, runtime state, tasks, usage, extensions, and full tool outputs. Fresh installations use `${XDG_DATA_HOME:-$HOME/.local/share}/yourai/sessions/sessions.sqlite3`; `session_dir` overrides the directory. Relative custom paths resolve from the config file's directory. Existing legacy locations are retained when detected.
+
+Before calling the model, the context manager limits large tool outputs and replaces eligible older tool bodies with status and retrieval references. If the request still approaches capacity, `Compactor` generates a rolling history summary. Original messages remain in SQLite; the agent can retrieve tool output through `read`. [Context and compaction](./docs/context-manager-design.md).
+
+For old JSON sessions, close the old client and import once:
+
+```sh
+yourai-tui --import-json-sessions
+```
+
+## Build on the runtime
 
 | Package | Responsibility |
 |---|---|
-| `yourai-core` | Typed `In` / `Out` protocol, provider interfaces, and turn transport, lifecycle, cancellation, and snapshots. |
-| `yourai-harness` | DefaultLoop, hooks, model adapters and metering, context/session persistence, tools, workspace, tasks, and subagents. |
-| `yourai-tui` | Terminal client with streaming, approvals, model/session pickers, SQLite resume, themes, Markdown, and JSON model configuration. |
+| `yourai-core` | Protocol and provider interfaces, public execution templates with hooks, turn/session lifecycle, cancellation, and provider snapshots. |
+| `yourai-harness` | DefaultLoop, model adapters and metering, SQLite storage, context projection, tools, tasks, and optional extensions. |
+| `yourai-tui` | Terminal client, streaming, approvals, model/session pickers, themes, and Markdown/diff rendering. |
 
-Dependency direction stays one-way:
+Dependency direction: `yourai-core ← yourai-harness ← yourai-tui`. `AgentLoop` is replaceable; concrete tools implement business execution while public core operations own the hook flow. A Web frontend and OS sandbox are not included.
 
-```text
-yourai-core  ←  yourai-harness  ←  yourai-tui
-```
-
-## Quick start
-
-To test a real model, copy `yourai.example.json` to `$XDG_CONFIG_HOME/yourai/yourai.json` (or `~/.config/yourai/yourai.json` by default), configure the model, endpoint and key environment variable, then run `cargo run -p yourai-tui`. Override the location with `--config PATH`. See [TUI usage](./docs/tui.md).
-
-See [Runtime implementation and verification](./docs/runtime-implementation.md) for all five flow diagrams and the runnable example.
-
-See [DefaultLoop implementation and integration](./docs/default-loop-implementation.md) for configuration and assembly.
-Use [AgentLoop and public business operations](./docs/execution.md) for custom scheduling; business code does not dispatch hooks.
-
-Install a recent stable Rust toolchain, then clone and verify the workspace:
-
-```shell
-git clone https://github.com/Jackkakaya/YourAI-Harness.git
-cd YourAI-Harness
-cargo test --workspace
-```
-
-The smallest custom loop receives one `TurnContext`, consumes the turn inbox, and emits typed output:
-
-```rust
-use std::sync::Arc;
-use yourai_core::prelude::*;
-
-struct EchoLoop;
-
-impl AgentLoop for EchoLoop {
-    fn run_turn<'a>(
-        &'a self,
-        tc: TurnContext<'a>,
-    ) -> BoxFuture<'a, TurnResult> {
-        Box::pin(async move {
-            match tc.inbox.recv().await {
-                Some(In::UserText { text, .. }) => {
-                    if !tc.outbox.send(Out::Chunk { text: text.clone() }) {
-                        return Err(YourAiError::Aborted(AbortReason::Disconnected).into());
-                    }
-                    Ok(TurnOutput::new(text))
-                }
-                _ => Err(ErrorKind::Loop("expected user text".into()).into()),
-            }
-        })
-    }
-}
-
-let agent = Agent::builder()
-    .agent_loop(Arc::new(EchoLoop))
-    .build();
-```
-
-For Hook configuration and dispatch examples, see the [Hook protocol reference](./docs/hook-protocol.md).
-
-## Architecture
-
-```text
-Frontend
-  │  In / Out
-  ▼
-Agent + TurnHandle ── transport, cancellation, lifecycle
-  │
-  ▼
-AgentLoop ─────────── interpretation and orchestration
-  │
-  ├── model / context / session / memory
-  ├── tools / skills / sandbox / security
-  └── usage / observability / hooks
-```
-
-The core deliberately does not choose a model vendor, persistence engine, tool set, UI, or ReAct policy. See the [architecture document](./docs/architecture.md) for the complete rationale and turn model.
-
-## Documentation
-
-- [TUI usage and JSON model configuration](./docs/tui.md)
-- [TUI redesign implementation notes (Chinese)](./docs/tui-redesign.md)
-- [Runtime implementation and verification](./docs/runtime-implementation.md)
-- [Session storage design](./docs/session-storage-design.md)
-- [Architecture and design decisions](./docs/architecture.md)
-- [DefaultLoop flow and component design baseline (Chinese)](./docs/default-loop-flow.md)
-- [Core component contracts and API migration (Chinese)](./docs/core-contracts.md)
-- [Hook protocol and runtime contract](./docs/hook-protocol.md)
-- [Claude Code Hook compatibility research](./docs/claude-code-hook-protocol.md)
-- [Historical Hook design](./docs/hooks.md)
+- [Runnable integration example](./crates/yourai-harness/examples/run.rs)
+- [Architecture](./docs/architecture.md) · [Public execution API](./docs/execution.md)
+- [Hooks](./docs/hook-protocol.md) · [SQLite storage and cloud direction](./docs/cloud-storage.md)
+- [TUI usage](./docs/tui.md) · [Type inventory](./docs/current-type-inventory.md)
 
 ## Development
 
-```shell
+```sh
 cargo test --workspace
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+cargo build -p yourai-tui
+python3 apps/yourai-tui/tests/smoke.py
 ```
 
-The repository uses Rust 2021 and declares `MIT OR Apache-2.0` in workspace package metadata.
+Rust 2021; workspace package metadata declares `MIT OR Apache-2.0`.

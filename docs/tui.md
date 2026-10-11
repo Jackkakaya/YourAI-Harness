@@ -71,7 +71,7 @@ cargo run -p yourai-tui
 - 覆盖写入内存中的配置，随 `/models` 更新主对话与压缩模型；Hook 和新建子任务默认继承当前模型，显式指定模型的子任务保留自己的选择。不回写 `yourai.json`，重启后回到文件配置。
 - 当前 effort 显示在三处：`/models` 行内（如 `gateway/kimi-k3 · high`）、输入框左侧模型标签、`Ctrl-B` 仪表盘首行；切换成功也会提示 `Model switched to … · thinking high`。
 
-未配置窗口时会提示预算未知，自动摘要关闭，手动摘要报配置错误。工具输出预览默认 16000 字符，超限内容仅保留在会话记录中（投影层是唯一上限）。
+未配置窗口时会提示预算未知，自动摘要关闭，手动摘要报配置错误。工具结果先经过 50 KiB / 2000 行限幅，完整大输出保存到 SQLite；模型请求投影默认再限制为 16000 字符。旧工具正文可按保护窗口和净节省阈值清理，原文通过 `read` 回看。`context.tool_prune_keep_tokens` 默认 40000，`context.tool_prune_min_savings` 默认 20000，后者设为 0 关闭旧正文清理。
 
 仅验证配置、不请求模型：
 
@@ -102,7 +102,7 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --check-config
 
 ### 上下文压缩
 
-`/compact` 沿用当前核心的压缩流程，完成后显示动作、压缩前后 token 估算和原因。分阶段进度、保留消息明细和新的 compactor 协议由后续独立改动实现。
+`/compact` 调用 `Compactor.exec`，执行 PreCompact、模型摘要、原子提交和 PostCompact，完成后显示压缩前后 token 估算和原因。普通请求先由 DefaultContext 做无需模型调用的旧工具正文清理；如果仍接近容量上限，才自动生成历史摘要。原始历史消息保留在 SQLite。
 
 “本会话始终允许”仅保存在 `PolicySecurity` 内存中，不写入权限文件；开启或恢复另一个会话后重新审批。界面只提交 `behavior` 和可选 `scope: session`，核心用当前审批请求中的工具名记录授权，不能通过回复改写工具名、参数或任意规则。
 
@@ -145,7 +145,7 @@ python3 apps/yourai-tui/tests/smoke_ui.py
 
 ## SQLite 会话存储
 
-默认使用 `<session_dir>/sessions.sqlite3`（sessions、messages、usage_events 三张表）。`--resume` 从数据库恢复。宿主队列和扩展配置仍在会话子目录。
+默认使用 `<session_dir>/sessions.sqlite3`，schema v6。消息、摘要、任务、用量和请求诊断、运行队列与恢复状态、扩展配置、会话租约和工具输出都保存在 SQLite。全新安装的默认目录是 `${XDG_DATA_HOME:-$HOME/.local/share}/yourai/sessions`；检测到已有旧位置时继续使用它。`--resume` 从数据库恢复。详细表结构与迁移规则见 [Agent 数据库存储](./cloud-storage.md)。
 
 旧 JSON 会话先关闭再显式导入；命令不调用模型，保留原文件：
 

@@ -11,10 +11,13 @@
       "models": {
         "YOUR_MODEL_NAME": {
           "id": "YOUR_MODEL_NAME",
-          "limit": { "context": 128000, "output": 4096 },
-          "pricing": { "input": 5.0, "output": 15.0 }
+          "limit": {
+            "context": 128000,
+            "output": 4096
+          }
         }
-      }
+      },
+      "api": "openai-compatible"
     }
   }
 }
