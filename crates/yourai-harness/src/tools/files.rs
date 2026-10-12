@@ -206,7 +206,7 @@ constructor!(Write);
 constructor!(Edit);
 impl ToolProvider for Read {
     fn definition(&self) -> ToolDefinition {
-        schema("read","Read a UTF-8 text file with line numbers. offset is 1-based; use next_offset for subsequent pages. For tool-output:// references (including tool-output://message/SEQ for archived tool results), use byte_offset (0-based) and byte_limit (max 1048576); use next_byte_offset to continue. No images or binary files.",json!({"path":{"type":"string","minLength":1},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":2000},"byte_offset":{"type":"integer","minimum":0},"byte_limit":{"type":"integer","minimum":1,"maximum":1048576}}), &["path"])
+        schema("read","Read a UTF-8 text file with line numbers. offset is 1-based; use next_offset for subsequent pages. For tool-output:// references (including tool-output://message/SEQ for archived tool results), use byte_offset (0-based) and byte_limit (max 1048576); use next_byte_offset to continue. A page may exceed byte_limit by up to 3 bytes to complete a UTF-8 character; offsets must be character boundaries. No images or binary files.",json!({"path":{"type":"string","minLength":1},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":2000},"byte_offset":{"type":"integer","minimum":0},"byte_limit":{"type":"integer","minimum":1,"maximum":1048576}}), &["path"])
     }
     fn security_context(&self, input: &Value, cwd: Option<&Path>) -> SecurityContext {
         if input
@@ -241,10 +241,43 @@ impl ToolProvider for Read {
                     .ok_or_else(|| error("read", "output storage unavailable"))?;
                 let offset = i.byte_offset.unwrap_or(0);
                 let limit = i.byte_limit.unwrap_or(50 * 1024);
-                let bytes = store.read(&i.path, offset, limit).await?;
+                let mut bytes = store.read(&i.path, offset, limit).await?;
+                let mut has_more = false;
+                if bytes.len() == limit {
+                    let lookahead = store.read(&i.path, offset + bytes.len() as u64, 4).await?;
+                    if let Err(e) = std::str::from_utf8(&bytes) {
+                        if e.error_len().is_some() {
+                            return Err(error(
+                                "read",
+                                "output is not UTF-8 or byte_offset is inside a character",
+                            ));
+                        }
+                        // Complete the final character, even with a one-byte page.
+                        let mut completed = false;
+                        for (index, byte) in lookahead.iter().enumerate() {
+                            bytes.push(*byte);
+                            if std::str::from_utf8(&bytes).is_ok() {
+                                has_more = index + 1 < lookahead.len();
+                                completed = true;
+                                break;
+                            }
+                        }
+                        if !completed {
+                            return Err(error("read", "output contains incomplete UTF-8"));
+                        }
+                    } else {
+                        has_more = !lookahead.is_empty();
+                    }
+                }
+                let content = std::str::from_utf8(&bytes).map_err(|_| {
+                    error(
+                        "read",
+                        "output is not UTF-8 or byte_offset is inside a character",
+                    )
+                })?;
                 check_cancel(&tc)?;
                 return Ok(
-                    json!({"ok":true,"path":i.path,"byte_offset":offset,"next_byte_offset":(bytes.len()==limit).then_some(offset+bytes.len() as u64),"content":String::from_utf8_lossy(&bytes),"bytes":bytes.len()}),
+                    json!({"ok":true,"path":i.path,"byte_offset":offset,"next_byte_offset":has_more.then_some(offset+bytes.len() as u64),"content":content,"bytes":bytes.len()}),
                 );
             }
             if i.byte_offset.is_some() || i.byte_limit.is_some() {

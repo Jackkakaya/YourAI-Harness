@@ -28,6 +28,8 @@ pub struct Config {
     #[serde(rename = "$schema")]
     pub _schema: Option<String>,
     pub model: String,
+    /// Optional provider/model for history summaries; main model is the default.
+    pub compaction_model: Option<String>,
     /// Runtime selection; persisted configuration still uses CLI / picker variants.
     #[serde(skip)]
     pub selected_variant: Option<String>,
@@ -443,6 +445,17 @@ impl Config {
             },
         })
     }
+
+    pub fn resolve_compaction(&self) -> Result<Option<ResolvedModel>, Error> {
+        self.compaction_model
+            .as_ref()
+            .map(|id| {
+                let mut selected = self.clone();
+                selected.model = id.clone();
+                selected.resolve(None)
+            })
+            .transpose()
+    }
 }
 /// Resolves the XDG base directory for configuration.
 ///
@@ -608,6 +621,21 @@ mod tests {
             },
             "soul_file": "./SOUL.md", "yolo": true
         })).unwrap()
+    }
+    #[test]
+    fn compaction_selection_is_optional_independent_and_validated() {
+        let mut cfg = config();
+        assert!(cfg.resolve_compaction().unwrap().is_none());
+        cfg.compaction_model = Some("gateway/alias/with/slash".into());
+        cfg.model = "unused/main".into();
+        let summary = cfg.resolve_compaction().unwrap().unwrap();
+        assert_eq!(summary.model.model_iden(), "actual-api-model");
+        assert_eq!(summary.model.token_budget().limits().context, Some(64_000));
+        assert_eq!(summary.model.token_budget().max_output_tokens(), 8000);
+        assert_eq!(summary.settings.provider, "gateway");
+        assert_eq!(cfg.model, "unused/main");
+        cfg.compaction_model = Some("missing/model".into());
+        assert!(cfg.resolve_compaction().is_err());
     }
     #[test]
     fn config_effort_restores_original_values_after_repeated_overrides() {

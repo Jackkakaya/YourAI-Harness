@@ -112,9 +112,8 @@ pub(super) async fn switch_model(
 ) -> Result<ModelInfo, String> {
     let mut candidate = config.lock().map_err(|e| e.to_string())?.clone();
     candidate.model = model_id.to_string();
-    // Resolve the in-memory override before switching the main model and
-    // compaction model. Already-bound hooks and child factories retain their
-    // models; a newly opened session uses this selection. Disk is untouched.
+    // Compaction follows this selection unless a summary model was pinned.
+    // Resolve all settings before publishing the main-model switch.
     if let Some(effort) = &effort {
         candidate
             .set_entry_effort(model_id, variant.as_deref(), effort)

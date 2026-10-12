@@ -165,7 +165,7 @@ impl Tool {
             name: call.fn_name.clone(),
             input: call.fn_arguments.clone(),
         })?;
-        let result = async {
+        let mut result = async {
             let pre = turn
                 .hook(HookEvent::PreToolUse {
                     tool_name: call.fn_name.clone(),
@@ -235,7 +235,7 @@ impl Tool {
             .iter_mut()
             .find(|record| record.call.call_id == call_id)
             .unwrap();
-        let (mut output, is_error) = match &record.state {
+        let (mut output, mut is_error) = match &record.state {
             CallState::Observed { output, is_error } => (output.clone(), *is_error),
             _ => match &result {
                 Ok(value) => (value.clone(), false),
@@ -243,11 +243,31 @@ impl Tool {
             },
         };
         turn.observe_tool_result(&call, output.clone(), is_error);
+        if !aborted {
+            if let Some(store) = turn.config.tool_output.clone() {
+                match turn
+                    .wait_operation(store.bound(&output), turn.op_timeout(), "tool-output")
+                    .await
+                {
+                    Ok(bounded) => output = bounded,
+                    Err(error) => {
+                        output = json!({"error": error.to_string()});
+                        is_error = true;
+                        result = Err(error);
+                    }
+                }
+            }
+        }
+        let aborted = result
+            .as_ref()
+            .err()
+            .is_some_and(|e| matches!(e, YourAiError::Aborted(_)));
+        turn.observe_tool_result(&call, output.clone(), is_error);
         let event = match &result {
-            Ok(value) => HookEvent::PostToolUse {
+            Ok(_) => HookEvent::PostToolUse {
                 tool_name: call.fn_name.clone(),
                 tool_input: call.fn_arguments.clone(),
-                tool_response: value.clone(),
+                tool_response: output.clone(),
                 tool_use_id: call.call_id.clone(),
             },
             Err(error) => HookEvent::PostToolUseFailure {
@@ -304,14 +324,7 @@ impl Tool {
             }
         }
         turn.defer_context(contexts);
-        turn.observe_tool_result(&call, output.clone(), is_error);
-        if !aborted {
-            if let Some(store) = turn.config.tool_output.clone() {
-                output = turn
-                    .wait_operation(store.bound(&output), turn.op_timeout(), "tool-output")
-                    .await?;
-            }
-        }
+        // After-hook output is final: persist/return it without another transformation.
         turn.observe_tool_result(&call, output.clone(), is_error);
         if aborted {
             return Err(result.expect_err("aborted tool must have an error"));

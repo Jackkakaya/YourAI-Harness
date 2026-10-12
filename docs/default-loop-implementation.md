@@ -109,14 +109,9 @@ core 提供 SessionManager 与宿主后台事件订阅；`yourai-harness` 提供
 
 ## 工具输出存储与重复调用保护
 
-Harness 装配为同一 SessionCatalog 的会话共享不可变的 ToolOutputStore，目录为
-`<root>/tool-output`。每次落盘使用独立 UUID 文件并排他创建，不依赖模型 call_id；
-不同 Harness root 不共享可变配置。后台每小时清理超过七天的受管理普通文件。
+Harness 为会话装配 ToolOutputStore，完整输出保存在 SQLite，并使用独立 UUID 数据库引用。启动时及每小时清理超过七天的工具输出 BLOB。
 
-Tool.exec 在 PostToolUse（含 MCP 输出改写）之后统一处理超长结果：默认 2000 行、
-50 KiB，完整 JSON 落盘，头尾预览带 `output_paths`。DefaultContext 仍独立执行请求的
-`tool_output_chars` 限额，但缩减及 prune 都保留文件路径和状态，不裁掉回看入口。
-过期文件不再保证可读；无需额外的 read_tool_result 工具。
+Tool.exec 在 PostToolUse 之前统一处理超长结果：默认 2000 行、50 KiB，完整 JSON 存 SQLite，头尾预览带 `output_refs`。DefaultContext 直接使用已保存的结果，不再二次限幅或按年龄清空正文。过期输出不再保证可读，但不会自动重新执行工具；现有 Read 工具支持数据库引用和分段读取。
 
 已装配的 Shell 为 stdout/stderr 分别流式保存完整字节，每路仅保留固定开头和滚动结尾，返回有界头尾预览。
 输出量本身不终止命令，超时、取消和进程组清理仍生效。`capture_complete` 表示两路采集到 EOF，

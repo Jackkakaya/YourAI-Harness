@@ -148,7 +148,7 @@ impl ToolOutputStore {
             .cleanup_outputs(&self.session, now - RETENTION_MS)
             .await
     }
-    /// Called after tool hooks, so every result receives the same bounded projection.
+    /// Called before the after hook; the hook receives this bounded result.
     pub(crate) async fn bound(&self, value: &Value) -> Result<Value, YourAiError> {
         let text = serde_json::to_string_pretty(value).map_err(|e| error("tool-output", e))?;
         if text.len() <= MAX_BYTES

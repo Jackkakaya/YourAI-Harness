@@ -461,3 +461,45 @@ async fn read_clips_lines_without_losing_separators_and_pages_by_bytes() {
         .unwrap()
         .starts_with(&format!("{next}|")));
 }
+
+#[tokio::test]
+async fn output_pages_complete_utf8_characters_and_report_exact_eof() {
+    let d = TempDir::new().unwrap();
+    let (db, id) = storage_fixture::store().await;
+    let outputs = ToolOutputStore::new(db, id);
+    let reference = outputs.create();
+    let text = "中文🙂abc";
+    outputs
+        .append(&reference, 0, text.as_bytes())
+        .await
+        .unwrap();
+    let read = Read::with_output(d.path().to_owned(), Some(outputs));
+    for limit in [1, 2, 3, 4, 5, text.len()] {
+        let mut offset = 0;
+        let mut result = String::new();
+        loop {
+            let page = call(
+                &read,
+                json!({"path":reference,"byte_offset":offset,"byte_limit":limit}),
+            )
+            .await
+            .unwrap();
+            result.push_str(page["content"].as_str().unwrap());
+            assert!(page["bytes"].as_u64().unwrap() <= limit as u64 + 3);
+            match page["next_byte_offset"].as_u64() {
+                Some(next) => {
+                    assert!(next > offset);
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(result, text);
+    }
+    assert!(call(
+        &read,
+        json!({"path":reference,"byte_offset":1,"byte_limit":2})
+    )
+    .await
+    .is_err());
+}

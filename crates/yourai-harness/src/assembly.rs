@@ -34,6 +34,9 @@ pub struct HarnessConfig {
     pub request_policy: crate::model::RequestPolicy,
     /// Stable provider key used to retain admission state across model switches.
     pub model_provider: String,
+    /// Optional pinned summary model and its provider admission settings.
+    /// Without this, compaction follows the currently selected main model.
+    pub compaction_model: Option<(Arc<dyn ModelProvider>, ModelSettings)>,
 }
 impl HarnessConfig {
     pub fn new(root: PathBuf, cwd: PathBuf) -> Self {
@@ -55,6 +58,7 @@ impl HarnessConfig {
             memory_search_limit: 0,
             request_policy: Default::default(),
             model_provider: String::new(),
+            compaction_model: None,
         }
     }
 }
@@ -87,6 +91,10 @@ impl Harness {
         model: Arc<dyn ModelProvider>,
     ) -> Result<Self, YourAiError> {
         config.context_policy.validate_for(model.token_budget())?;
+        if let Some((summary, settings)) = &config.compaction_model {
+            config.context_policy.validate_for(summary.token_budget())?;
+            settings.requests.validate()?;
+        }
         let catalog = Arc::new(SessionCatalog::new(&config.root)?);
         let source = if config.resume.is_some() {
             "resume"
@@ -99,6 +107,10 @@ impl Harness {
         let initial_instructions = prepared.instructions;
         let budget =
             ModelBudget::configured(config.request_policy.clone(), (*catalog.store).clone())?;
+        let mut provider_budgets = HashMap::from([(
+            (config.model_provider.clone(), config.request_policy.clone()),
+            budget.clone(),
+        )]);
         let model: Arc<dyn ModelProvider> = Arc::new(MeteredModel {
             inner: model,
             budget: budget.clone(),
@@ -121,6 +133,18 @@ impl Harness {
             config.context_policy,
         )
         .await?;
+        if let Some((summary, settings)) = config.compaction_model {
+            let key = (settings.provider, settings.requests.clone());
+            let summary_budget = match provider_budgets.get(&key) {
+                Some(existing) => existing.clone(),
+                None => budget.for_provider(settings.requests)?,
+            };
+            provider_budgets.insert(key, summary_budget.clone());
+            agent.ctx().set_compaction_model(Arc::new(MeteredModel {
+                inner: summary,
+                budget: summary_budget,
+            }));
+        }
         let normal_security = agent.ctx().security()?;
         if config.yolo {
             agent
@@ -207,10 +231,7 @@ impl Harness {
             }
             Ok(Self {
                 normal_security,
-                provider_budgets: Mutex::new(HashMap::from([(
-                    (config.model_provider, config.request_policy),
-                    budget.clone(),
-                )])),
+                provider_budgets: Mutex::new(provider_budgets),
                 current_budget: Mutex::new(budget.clone()),
                 sessions: catalog.store.clone(),
                 host: host.clone(),

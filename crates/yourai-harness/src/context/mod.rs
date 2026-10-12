@@ -21,8 +21,9 @@ struct View {
     markers: Vec<String>,
     observation: Option<RequestObservation>,
 }
-/// Owns the active history and builds model requests, including cheap output pruning.
-/// It persists mutations but never calls the model or dispatches compaction hooks.
+/// Owns the active history and builds model requests without altering tool output bodies.
+/// Tool.exec already bounds new results. History reduction belongs to Compactor.
+/// This context persists mutations but never calls the model or dispatches compaction hooks.
 pub struct DefaultContext {
     id: SessionId,
     view: Mutex<View>,
@@ -52,25 +53,12 @@ impl DefaultContext {
             policy,
         })
     }
-    fn replace(&self, all: Vec<StoredMessage>) {
+    fn replace(&self, all: Vec<StoredMessage>, index: HistoryIndex) {
         let mut view = self.view.lock().unwrap();
-        view.last_seq = all.iter().map(|m| m.seq).max().unwrap_or(0);
-        view.call_ids = all
-            .iter()
-            .flat_map(|m| m.message.content.tool_calls())
-            .map(|c| c.call_id.clone())
-            .collect();
-        view.result_ids = all
-            .iter()
-            .flat_map(|m| m.message.content.tool_responses())
-            .map(|r| r.call_id.clone())
-            .collect();
-        view.markers = all
-            .iter()
-            .filter_map(|m| m.message.content.first_text())
-            .filter(|s| s.starts_with("[Runtime event "))
-            .map(str::to_owned)
-            .collect();
+        view.last_seq = index.last_seq;
+        view.call_ids = index.call_ids.into_iter().collect();
+        view.result_ids = index.result_ids.into_iter().collect();
+        view.markers = index.markers;
         view.records = all
             .into_iter()
             .filter(|m| m.status == MessageStatus::Active)
@@ -97,7 +85,7 @@ impl DefaultContext {
                     .read_messages(
                         &self.id,
                         MessageQuery {
-                            active_only: false,
+                            active_only: true,
                             after,
                             limit: 1000,
                         },
@@ -109,8 +97,9 @@ impl DefaultContext {
                     None => break,
                 }
             }
+            let index = store.history_index(&self.id).await?;
             *self.system.lock().unwrap() = system;
-            self.replace(records);
+            self.replace(records, index);
         }
         Ok(())
     }
@@ -258,8 +247,10 @@ impl ContextManager for DefaultContext {
         let input_budget = self.policy.input_budget(model.token_budget());
         request.messages.extend_from_slice(suffix);
         let estimated_tokens = self.estimate(&request, model)?;
-        let maintenance_needed = input_budget
-            .is_some_and(|b| estimated_tokens >= b.saturating_sub(self.policy.advance_tokens));
+        let maintenance_needed = self
+            .policy
+            .maintenance_threshold(model.token_budget())
+            .is_some_and(|threshold| estimated_tokens >= threshold);
         Ok(ContextRequest {
             request,
             estimated_tokens,

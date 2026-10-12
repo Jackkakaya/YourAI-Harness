@@ -838,7 +838,7 @@ impl ModelProvider for SummaryModel {
         Box::pin(async {
             let id = genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "summary-model");
             Ok(ChatResponse {
-                content: MessageContent::from_text("summary retains completed work"),
+                content: MessageContent::from_text("## Goal\nsummary retains completed work\n## Constraints and decisions\nNone\n## Completed and verified\nNone\n## Current work\nNone\n## Next steps\nNone\n## Files and commands\nNone"),
                 reasoning_content: None,
                 model_iden: id.clone(),
                 provider_model_iden: id,
@@ -1800,6 +1800,71 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
         .messages
         .iter()
         .any(|m| m.content.first_text() == Some("first")));
+    h.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn pinned_summary_model_keeps_its_binding_and_shared_accounting_after_main_switch() {
+    let dir = TempDir::new().unwrap();
+    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+    config.system_prompt = Some("test".into());
+    config.context_policy.keep_recent_tokens = 0;
+    let summary = Arc::new(Model::new(vec![]));
+    config.compaction_model = Some((
+        context_fixture::configured(summary.clone(), Some(100_000), 8000),
+        yourai_harness::assembly::ModelSettings {
+            provider: "summary-provider".into(),
+            requests: Default::default(),
+        },
+    ));
+    let main = Arc::new(Model::new(vec![]));
+    let h = Harness::open(
+        config,
+        context_fixture::configured(main.clone(), Some(64_000), 4096),
+    )
+    .await
+    .unwrap();
+    let pinned = h.host.agent().ctx().compaction_model().unwrap();
+    h.switch_model(
+        context_fixture::configured(Arc::new(Model::new(vec![])), Some(32_000), 2048),
+        ContextPolicy {
+            keep_recent_tokens: 0,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(Arc::ptr_eq(
+        &pinned,
+        &h.host.agent().ctx().compaction_model().unwrap()
+    ));
+    let history = h.host.agent().ctx().context_manager().unwrap();
+    history
+        .append(vec![
+            StoredMessage::new(ChatMessage::user("older work ".repeat(1000))),
+            StoredMessage::new(ChatMessage::user("current task")),
+        ])
+        .await
+        .unwrap();
+    let result = h
+        .host
+        .compact(
+            CompactionRequest::new(CompactionTrigger::Manual),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(result.compacted);
+    assert_eq!(summary.requests.lock().unwrap().len(), 1);
+    assert!(main.requests.lock().unwrap().is_empty());
+    assert_eq!(h.budget.snapshot().calls, 1);
+    let usage = h
+        .usage
+        .session_usage(&h.host.environment().id)
+        .await
+        .unwrap();
+    assert_eq!(usage.request_count, 1);
+    assert_eq!(usage.total_tokens, 4);
     h.close().await.unwrap();
 }
 

@@ -1608,7 +1608,7 @@ async fn repeated_calls_allow_hook_rewrites_and_yolo_without_extra_gate() {
 }
 
 #[tokio::test]
-async fn managed_output_bounds_post_hook_mcp_results_and_preserves_original_file() {
+async fn after_hook_mcp_output_is_final_and_is_not_truncated_again() {
     let (db, output_id) = storage_fixture::store().await;
     let store = yourai_harness::tools::ToolOutputStore::new(db, output_id);
     let h = Arc::new(Handler::new("mcp__large", Mode::Return));
@@ -1643,13 +1643,5 @@ async fn managed_output_bounds_post_hook_mcp_results_and_preserves_original_file
         .content
         .tool_responses()[0];
     let value: serde_json::Value = serde_json::from_str(&response.content).unwrap();
-    assert_eq!(value["truncated"], true);
-    let saved: serde_json::Value = serde_json::from_slice(
-        &store
-            .read(value["output_refs"][0].as_str().unwrap(), 0, 1024 * 1024)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(saved["content"].as_str().unwrap().len(), 100_000);
+    assert_eq!(value, json!({"ok":true,"content":"large".repeat(20_000)}));
 }

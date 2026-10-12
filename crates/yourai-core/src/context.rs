@@ -133,6 +133,7 @@ provider_slots! {
     //      字段            可选读取            热替换             trait
     required   agent_loop:        try_agent_loop:        set_agent_loop:        AgentLoop,
     optional   model:             try_model:             set_model:             ModelProvider,
+    optional   compaction_model:  try_compaction_model:  set_compaction_model:  ModelProvider,
     optional   context_manager:   try_context_manager:   set_context_manager:   ContextManager,
     optional   session:           try_session:           set_session:           SessionStore,
     optional   memory:            try_memory:            set_memory:            MemoryManager,

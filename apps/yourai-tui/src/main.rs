@@ -152,6 +152,7 @@ async fn run() -> Result<(), Error> {
         return Ok(());
     }
     let selection = config.resolve(variant.as_deref())?;
+    let compaction = config.resolve_compaction()?;
     let model = selection.model.clone();
     config.selected_variant = variant;
     if config.context.input_budget(model.token_budget()).is_none() {
@@ -180,6 +181,7 @@ async fn run() -> Result<(), Error> {
     }
     let mut hc = HarnessConfig::new(config.session_dir.clone(), std::env::current_dir()?);
     selection.apply_to(&mut hc);
+    hc.compaction_model = compaction.map(|selection| (selection.model, selection.settings));
     hc.resume = resume.take();
     hc.system_prompt = config.system_prompt.clone();
     hc.prompt = config.prompt.clone();

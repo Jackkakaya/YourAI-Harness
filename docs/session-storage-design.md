@@ -46,6 +46,7 @@ ContextManager 通过 SessionStore 保存消息和摘要，Compactor 通过 Usag
 | fork_session | 事务复制历史，新会话和新消息 ID；不复制用量、队列和工具副作用 |
 | read_messages(id, MessageQuery) | active/full 过滤，按 seq 升序，after 游标分页 |
 | append_messages(id, batch) | 原子追加普通消息，返回已存记录 |
+| history_index(id) | 查询历史身份元数据，不加载归档正文 |
 | save_summary(id, sources, summary, progress) | 单事务保存新摘要并标记来源消息 |
 | read_tasks(id) | 同步恢复该会话任务，按seq、task_id排序 |
 | save_tasks(id, tasks) | 同步提交整批任务并返回已保存数据；正常转换在host阻塞worker运行 |
@@ -83,7 +84,7 @@ save_summary 直接接收来源 ID、新摘要和暂存提交进度；来源集�
 
 没有 source_message_ids_json、compactions、session_operations、session_leases 或 tool_executions。
 
-`tool_output_pruned_at` 是 nullable UTC 毫秒；清理后消息仍 active，content_json 不变。只有被摘要替代的消息设为 compacted。v1 → v2 启动时事务迁移，恢复和 fork 保留标记。
+`tool_output_pruned_at` 是旧版本留下的 nullable UTC 毫秒兼容列，恢复和 fork 保留其数据，但不再根据它隐藏工具正文。只有被摘要替代的消息设为 compacted。保留 v1 → v2 迁移以便打开旧数据库。
 
 SQLite 使用 WAL、foreign_keys=ON、synchronous=FULL、5 秒 busy timeout。用 PRAGMA user_version 管理版本，不增加迁移表。普通异步数据库调用在阻塞工作线程执行；同一 adapter 的工作按锁串行，调用方取消等待不意味着已提交事务能够回滚。
 
@@ -96,7 +97,7 @@ v4→v5新增tasks表及会话顺序索引，不改既有会话和历史。任�
 恢复：ContextManager.restore → 读取已提交记录 → 重建活跃视图/身份索引
       宿主补记未配对工具的未知结果，禁止自动重放
 压缩：ContextManager.compact
-        → 内部清理 → 必要时 PreCompact / 分批摘要
+        → 容量估算 → 必要时 PreCompact / 分批摘要
         → save_summary（来源归档 + 新摘要，单事务）
         → 更新内存 → PostCompact → 返回状态
 ```
@@ -128,7 +129,7 @@ host.json、配置、权限、任务、记忆、技能仍由各自模块保存�
 
 ## 6. 验证
 
-SQLite 专项测试覆盖事务追加/重试/冲突、游标恢复、压缩选区与回滚、摘要替换、fork/delete、并发 seq、NULL 用量与去重、三表约束和旧 JSON 导入。Context 测试覆盖预览和原文分页、清理/fork/恢复、原子失败、用量记账、工具配对与长 Turn、分批调用额度、Hook、usage 基线、不确定提交恢复。
+SQLite 专项测试覆盖事务追加/重试/冲突、游标恢复、压缩选区与回滚、摘要替换、fork/delete、并发 seq、NULL 用量与去重、三表约束和旧 JSON 导入。Context 测试覆盖一次预览和原文分页、预览保持/fork/恢复、原子失败、用量记账、工具配对与长 Turn、分批调用额度、Hook、usage 基线、不确定提交恢复。
 
 历史依据见 [2026-09-02 讨论原文](./references/context-manager-2026-09-02.md)。旧文中的 ContextManager 自持久化分工已经废止。
 

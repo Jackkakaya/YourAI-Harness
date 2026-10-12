@@ -67,6 +67,9 @@ impl SubagentFactory for ChildFactory {
                 "startup",
             )
             .await?;
+            if let Some(summary) = snapshot.compaction_model {
+                child.agent().ctx().set_compaction_model(summary);
+            }
             Ok(child)
         })
     }

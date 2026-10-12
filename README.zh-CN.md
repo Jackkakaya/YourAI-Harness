@@ -110,7 +110,9 @@ yourai --resume SESSION_ID   # 直接恢复指定会话
 
 Agent 数据统一保存到 SQLite：消息、摘要、排队输入、运行状态、任务、用量、扩展数据和完整工具输出。全新安装默认保存到 `${XDG_DATA_HOME:-$HOME/.local/share}/yourai/sessions/sessions.sqlite3`，可通过 `session_dir` 指定目录。自定义相对路径以配置文件目录为基准；检测到已有旧存储位置时会继续沿用。
 
-调用模型前，上下文管理器先限制大工具输出，再将符合条件的旧工具正文替换为状态和回看引用。如果请求仍接近容量上限，`Compactor` 才调用模型生成滚动历史摘要。原始消息仍在 SQLite，Agent 可以通过 `read` 找回工具输出。详见[上下文与压缩](./docs/context-manager-design.md)。
+工具执行后，超过 50 KiB / 2000 行的最终结果生成一次头尾预览，完整内容保存在 SQLite。正常模型请求直接使用已保存的结果，不再二次截断或按年龄清空旧正文。请求接近容量上限时，`Compactor` 调用模型生成滚动历史摘要。原始消息仍在 SQLite，Agent 可以通过 `read` 找回工具输出。详见[上下文与压缩](./docs/context-manager-design.md)。
+
+自动压缩默认留下模型窗口的 10%；窗口至少 32,000 token 时至少留下 16,000 token，同时保证回答的输出预算。在 `yourai.json` 中设置可选的 `"compaction_model": "provider/model"`，可单独指定摘要模型；不设置则跟随主模型。摘要模型的容量与连接仍在 `provider` 中定义。超长摘要请求先缩短工具日志、缩小批次；必须省略旧历史时会明确提示。
 
 旧 JSON 会话需要先关闭旧客户端，再导入一次：
 

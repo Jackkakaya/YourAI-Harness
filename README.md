@@ -110,7 +110,9 @@ You can also switch with **/sessions** inside the app. The session ID is printed
 
 Agent data is stored in SQLite: messages, summaries, queued inputs, runtime state, tasks, usage, extensions, and full tool outputs. Fresh installations use `${XDG_DATA_HOME:-$HOME/.local/share}/yourai/sessions/sessions.sqlite3`; `session_dir` overrides the directory. Relative custom paths resolve from the config file's directory. Existing legacy locations are retained when detected.
 
-Before calling the model, the context manager limits large tool outputs and replaces eligible older tool bodies with status and retrieval references. If the request still approaches capacity, `Compactor` generates a rolling history summary. Original messages remain in SQLite; the agent can retrieve tool output through `read`. [Context and compaction](./docs/context-manager-design.md).
+After a tool executes, final results exceeding 50 KiB / 2,000 lines receive one head/tail preview, with the full content saved in SQLite. Normal model requests reuse the stored results without truncating them again or clearing old output bodies by age. Near the context limit, `Compactor` calls the model to produce a rolling history summary. Original messages remain in SQLite, and the agent can retrieve tool output through `read`. See [context and compaction](./docs/context-manager-design.md).
+
+Automatic compaction reserves 10% of the model window, at least 16,000 tokens for windows of 32,000 tokens or more, while respecting the configured answer budget. Set optional `"compaction_model": "provider/model"` in `yourai.json` to use a separate summary model; otherwise summaries follow the main model. Define its capacity and connection settings under `provider` as usual. Oversized summary requests shorten tool logs, retry smaller batches, and report any omitted older history.
 
 For old JSON sessions, close the old client and import once:
 

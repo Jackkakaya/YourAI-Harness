@@ -241,7 +241,7 @@ impl ModelProvider for SummaryCapture {
         Box::pin(async {
             let id = genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "summary");
             Ok(ChatResponse {
-                content: MessageContent::from_text("Retained facts"),
+                content: MessageContent::from_text("## Goal\nRetained facts\n## Constraints and decisions\nNone\n## Completed and verified\nNone\n## Current work\nNone\n## Next steps\nNone\n## Files and commands\nNone"),
                 reasoning_content: None,
                 model_iden: id.clone(),
                 provider_model_iden: id,

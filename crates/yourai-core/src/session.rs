@@ -138,6 +138,59 @@ pub trait SessionStore: Send + Sync {
         id: &'a SessionId,
         query: MessageQuery,
     ) -> BoxFuture<'a, Result<MessagePage, YourAiError>>;
+    /// Identity metadata across active and archived history, without loading bodies.
+    /// Adapters may override the compatibility implementation with a narrow query.
+    fn history_index<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> BoxFuture<'a, Result<HistoryIndex, YourAiError>> {
+        Box::pin(async move {
+            let mut index = HistoryIndex::default();
+            let mut after = 0;
+            loop {
+                let page = self
+                    .read_messages(
+                        id,
+                        MessageQuery {
+                            active_only: false,
+                            after,
+                            limit: 1000,
+                        },
+                    )
+                    .await?;
+                for row in page.messages {
+                    index.last_seq = index.last_seq.max(row.seq);
+                    index.call_ids.extend(
+                        row.message
+                            .content
+                            .tool_calls()
+                            .iter()
+                            .map(|c| c.call_id.clone()),
+                    );
+                    index.result_ids.extend(
+                        row.message
+                            .content
+                            .tool_responses()
+                            .iter()
+                            .map(|r| r.call_id.clone()),
+                    );
+                    if let Some(text) = row
+                        .message
+                        .content
+                        .first_text()
+                        .filter(|t| t.starts_with("[Runtime event "))
+                    {
+                        index.markers.push(text.to_owned());
+                    }
+                }
+                match page.next {
+                    Some(next) => after = next,
+                    None => break,
+                }
+            }
+            Ok(index)
+        })
+    }
     fn append_messages<'a>(
         &'a self,
         id: &'a SessionId,
@@ -194,6 +247,7 @@ pub struct StoredMessage {
     /// this key is sent; its current value is retained verbatim across compaction.
     pub context_key: Option<String>,
     pub status: MessageStatus,
+    /// Legacy storage metadata, preserved on restore/fork; does not hide output bodies.
     pub tool_output_pruned_at: Option<i64>,
     pub request_observation: Option<RequestObservation>,
 }
@@ -258,6 +312,15 @@ impl StoredMessage {
         }
     }
 }
+/// Recovery metadata; message bodies are loaded separately from active history only.
+#[derive(Debug, Default)]
+pub struct HistoryIndex {
+    pub last_seq: i64,
+    pub call_ids: Vec<String>,
+    pub result_ids: Vec<String>,
+    pub markers: Vec<String>,
+}
+
 /// Ascending sequence cursor. A page never silently truncates without a next cursor.
 #[derive(Debug, Clone)]
 pub struct MessageQuery {

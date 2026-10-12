@@ -172,7 +172,7 @@ impl ModelProvider for Model {
             self.requests.lock().unwrap().push(request);
             let iden = genai::ModelIden::new(genai::adapter::AdapterKind::OpenAI, "test-model");
             Ok(ChatResponse {
-                content: MessageContent::from_text("test summary"),
+                content: MessageContent::from_text("## Goal\ntest summary\n## Constraints and decisions\nNone\n## Completed and verified\nNone\n## Current work\nNone\n## Next steps\nNone\n## Files and commands\nNone"),
                 model_iden: iden.clone(),
                 provider_model_iden: iden,
                 reasoning_content: None,

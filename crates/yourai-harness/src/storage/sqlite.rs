@@ -627,6 +627,28 @@ impl SessionStore for SqliteStore {
             Ok(MessagePage{messages,next})
         }))
     }
+    fn history_index<'a>(
+        &'a self,
+        id: &'a SessionId,
+    ) -> BoxFuture<'a, Result<yourai_core::session::HistoryIndex, YourAiError>> {
+        let id = id.clone();
+        Box::pin(self.run(move |c| {
+            let mut index = yourai_core::session::HistoryIndex {
+                last_seq: c.query_row("SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=?1", [id.as_str()], |r| r.get(0)).map_err(sql)?,
+                ..Default::default()
+            };
+            // Extract identifiers in SQLite; never transfer archived tool bodies/media.
+            let mut query = c.prepare("SELECT json_extract(p.value,'$.ToolCall.call_id'), json_extract(p.value,'$.ToolResponse.call_id') FROM messages m, json_each(m.content_json,'$.content') p WHERE m.session_id=?1 AND (json_type(p.value,'$.ToolCall') IS NOT NULL OR json_type(p.value,'$.ToolResponse') IS NOT NULL)").map_err(sql)?;
+            for row in query.query_map([id.as_str()], |r| Ok((r.get::<_,Option<String>>(0)?,r.get::<_,Option<String>>(1)?))).map_err(sql)? {
+                let (call, result) = row.map_err(sql)?;
+                index.call_ids.extend(call);
+                index.result_ids.extend(result);
+            }
+            let mut query = c.prepare("SELECT json_extract(content_json,'$.content[0].Text') FROM messages WHERE session_id=?1 AND json_extract(content_json,'$.content[0].Text') LIKE '[Runtime event %' ORDER BY seq").map_err(sql)?;
+            index.markers = query.query_map([id.as_str()], |r| r.get(0)).map_err(sql)?.collect::<Result<Vec<_>,_>>().map_err(sql)?;
+            Ok(index)
+        }))
+    }
     fn append_messages<'a>(
         &'a self,
         id: &'a SessionId,

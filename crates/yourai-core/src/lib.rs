@@ -140,8 +140,8 @@ pub mod prelude {
         ApprovalDecision, PolicyDecision, SecurityContext, SecurityProvider,
     };
     pub use crate::session::{
-        CommitStatus, MessagePage, MessageQuery, MessageStatus, RequestObservation, SessionId,
-        SessionMeta, SessionState, SessionStore, StoredMessage,
+        CommitStatus, HistoryIndex, MessagePage, MessageQuery, MessageStatus, RequestObservation,
+        SessionId, SessionMeta, SessionState, SessionStore, StoredMessage,
     };
     pub use crate::session_runtime::{
         InputRejected, SessionEnvironment, SessionStatus, SessionTurn,
