@@ -16,6 +16,7 @@ tokio-util = "0.7"
 genai = { git = "https://github.com/jeremychone/rust-genai", rev = "ad351eaebf8e4bf9bcc17ecab4e3152676aa6f5a" }
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
+tracing = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Keep local `cargo run` responsive without optimizing the entire application.

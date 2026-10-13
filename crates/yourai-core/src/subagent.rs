@@ -1,6 +1,6 @@
 //! A child lifecycle is one public exec around private business work.
 use crate::{prelude::*, runtime::SessionManager};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::sync::{Arc, Weak};
 
 /// Only session assembly varies. The core owns running, hooks and cleanup.
@@ -85,7 +85,6 @@ impl Subagent {
             if !start.additional_contexts().is_empty() {
                 child
                     .agent()
-                    .ctx()
                     .context_manager()?
                     .append(vec![StoredMessage::runtime_context(format!(
                         "[SubagentStart context]\n{}",
@@ -167,32 +166,6 @@ impl Subagent {
                     .map_err(|error| *error.error)
             })
             .transpose()
-    }
-}
-impl ToolProvider for Subagent {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new("subagent").with_schema(json!({"type":"object","properties":{"prompt":{"type":"string"}},"required":["prompt"],"additionalProperties":false}))
-    }
-    fn security_context(&self, input: &Value, _cwd: Option<&std::path::Path>) -> SecurityContext {
-        SecurityContext {
-            action: "subagent".into(),
-            input: input.clone(),
-            is_destructive: false,
-            is_network: true,
-        }
-    }
-    fn run<'a>(
-        &'a self,
-        tc: ToolContext<'a>,
-        input: Value,
-    ) -> BoxFuture<'a, Result<Value, YourAiError>> {
-        Box::pin(async move {
-            let prompt = input["prompt"]
-                .as_str()
-                .ok_or_else(|| crate::error("subagent", "prompt required"))?;
-            let (id, text) = self.exec(tc, prompt.into()).await?;
-            Ok(json!({"agent_id": id.to_string(), "text": text}))
-        })
     }
 }
 struct ChildCleanup {

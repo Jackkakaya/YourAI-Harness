@@ -1,3 +1,4 @@
+pub(crate) mod configured;
 mod control;
 pub mod failure;
 mod metrics;

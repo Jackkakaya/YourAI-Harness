@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use yourai_core::{context::DiscardSink, model::ModelEventStream, prelude::*};
-use yourai_harness::{DefaultContext, Harness, HarnessConfig, SessionConfig, SessionManager};
+use yourai_harness::{DefaultContext, ExecutionOptions, Harness, SessionManager, SessionOptions};
 
 struct BrokenLoop {
     panic: bool,
@@ -40,7 +40,7 @@ async fn loop_host(dir: &std::path::Path, loop_: Arc<dyn AgentLoop>) -> Arc<Sess
         dir,
         SessionEnvironment::new(id, dir),
         agent,
-        SessionConfig::default(),
+        Default::default(),
         "startup",
     )
     .await
@@ -183,13 +183,13 @@ async fn rejected_resume_and_restore_do_not_change_active_session_metadata() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("sessions");
     let harness = Harness::open(
-        HarnessConfig::new(root.clone(), dir.path().into()),
+        SessionOptions::new(root.clone(), dir.path().into()),
         NamedModel::new("first"),
     )
     .await
     .unwrap();
     let id = harness.host.environment().id;
-    let mut config = HarnessConfig::new(root.clone(), dir.path().into());
+    let mut config = SessionOptions::new(root.clone(), dir.path().into());
     config.resume = Some(id.clone());
     assert!(Harness::open(config, NamedModel::new("second"))
         .await
@@ -208,12 +208,11 @@ async fn rejected_resume_and_restore_do_not_change_active_session_metadata() {
         &root,
         id.clone(),
         dir.path().into(),
-        NamedModel::new("third"),
-        None,
-        None,
-        None,
-        None,
-        ContextPolicy::default(),
+        Agent::builder().model(NamedModel::new("third")),
+        ExecutionOptions {
+            context_policy: ContextPolicy::default(),
+            ..Default::default()
+        },
         "resume",
     )
     .await
@@ -250,7 +249,7 @@ async fn rejected_resume_and_restore_do_not_change_active_session_metadata() {
 #[tokio::test]
 async fn oversized_hook_first_line_and_combined_stdout_are_rejected() {
     use yourai_core::hooks::{BaseInput, HookEvent, HookInvocation, HookRunStatus, HookSource};
-    use yourai_harness::hooks::{DefaultHookManager, HooksConfig};
+    use yourai_harness::hooks::DefaultHookManager;
     for (command, failure_policy, stopped) in [
         ("head -c 2097152 /dev/zero | tr '\\0' x", "open", false),
         (
@@ -260,7 +259,7 @@ async fn oversized_hook_first_line_and_combined_stdout_are_rejected() {
         ),
     ] {
         let runtime = DefaultHookManager::new();
-        let config: HooksConfig = serde_json::from_value(serde_json::json!({
+        let config: serde_json::Value = serde_json::from_value(serde_json::json!({
             "hooks": {"UserPromptSubmit": [{"hooks": [{"type":"command", "command":command, "failurePolicy":failure_policy}]}]}
         }))
         .unwrap();
@@ -291,9 +290,9 @@ async fn oversized_hook_first_line_and_combined_stdout_are_rejected() {
 #[tokio::test]
 async fn hook_stdout_exactly_at_shared_limit_is_preserved() {
     use yourai_core::hooks::{BaseInput, HookEvent, HookInvocation, HookRunStatus, HookSource};
-    use yourai_harness::hooks::{DefaultHookManager, HooksConfig};
+    use yourai_harness::hooks::DefaultHookManager;
     let runtime = DefaultHookManager::new();
-    let config: HooksConfig = serde_json::from_value(serde_json::json!({
+    let config: serde_json::Value = serde_json::from_value(serde_json::json!({
         "hooks": {"UserPromptSubmit": [{"hooks": [{
             "type":"command", "command":"printf 'hi\\n'; head -c 1048573 /dev/zero | tr '\\0' x"
         }]}]}
@@ -322,16 +321,16 @@ async fn failed_assembly_releases_execution_lease_for_the_next_open() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("sessions");
     let harness = Harness::open(
-        HarnessConfig::new(root.clone(), dir.path().into()),
+        SessionOptions::new(root.clone(), dir.path().into()),
         NamedModel::new("first"),
     )
     .await
     .unwrap();
     let id = harness.host.environment().id;
     harness.close().await.unwrap();
-    let mut config = HarnessConfig::new(root.clone(), dir.path().into());
+    let mut config = SessionOptions::new(root.clone(), dir.path().into());
     config.resume = Some(id.clone());
-    config.hooks = serde_json::from_value(serde_json::json!({
+    config.config.hooks.events = serde_json::from_value(serde_json::json!({
         "hooks": {"UnknownEvent": [{"hooks": [{"type":"command", "command":"true"}]}]}
     }))
     .unwrap();
@@ -342,12 +341,11 @@ async fn failed_assembly_releases_execution_lease_for_the_next_open() {
         &root,
         id,
         dir.path().into(),
-        NamedModel::new("restored"),
-        None,
-        None,
-        None,
-        None,
-        ContextPolicy::default(),
+        Agent::builder().model(NamedModel::new("restored")),
+        ExecutionOptions {
+            context_policy: ContextPolicy::default(),
+            ..Default::default()
+        },
         "resume",
     )
     .await

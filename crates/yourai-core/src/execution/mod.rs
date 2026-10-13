@@ -2,12 +2,13 @@
 //! AgentLoop implementations call these operations without dispatching hooks.
 mod admission;
 mod attachment;
-mod config;
+
 mod control;
 mod hooks;
 
+mod options;
 use crate::prelude::*;
-pub use config::{AttachmentImageConfig, ExecutionConfig};
+pub use options::{ExecutionOptions, ImagePolicy};
 use std::{
     collections::{HashSet, VecDeque},
     sync::Arc,
@@ -19,7 +20,7 @@ pub use crate::model::{ModelOptions, ModelOutput};
 /// One turn owns its state and fixed execution templates.
 pub struct Turn<'a> {
     pub(crate) tc: TurnContext<'a>,
-    pub(crate) config: ExecutionConfig,
+    pub(crate) config: ExecutionOptions,
     pub(crate) history: Arc<dyn ContextManager>,
     pub(crate) model: Option<crate::model::Model>,
     pub(crate) output: TurnOutput,
@@ -34,7 +35,6 @@ pub struct Turn<'a> {
     pub(crate) partial_message: Option<StoredMessage>,
     pub(crate) accepted: bool,
     pub(crate) completed: bool,
-    pub(crate) span: Option<Arc<dyn crate::observability::Span>>,
 }
 
 #[derive(Clone)]
@@ -63,6 +63,9 @@ impl CallRecord {
 }
 
 impl<'a> Turn<'a> {
+    pub fn config(&self) -> &ExecutionOptions {
+        &self.config
+    }
     pub fn model(&self) -> Result<crate::model::Model, YourAiError> {
         self.model
             .clone()
@@ -222,14 +225,6 @@ impl<'a> Turn<'a> {
         &self.tc.info.id
     }
 
-    pub fn limits(&self) -> &TurnLimits {
-        &self.tc.info.options.limits
-    }
-
-    pub fn check_control(&self) -> Result<(), YourAiError> {
-        self.tc.check_control()
-    }
-
     pub async fn wait<T>(
         &mut self,
         future: impl std::future::Future<Output = Result<T, YourAiError>>,
@@ -267,9 +262,7 @@ impl<'a> Turn<'a> {
                 Err(ErrorKind::Loop("complete the turn before reporting success".into()).into());
         }
         if let Err(error) = &result {
-            if let Some(span) = &self.span {
-                span.record_error(&error.to_string());
-            }
+            tracing::warn!(turn_id = %self.tc.info.id, %error, "turn failed");
             self.cleanup(error).await;
         }
         self.output.pending.extend(self.queued);
@@ -279,28 +272,15 @@ impl<'a> Turn<'a> {
         }
     }
 
-    pub async fn open(
-        tc: TurnContext<'a>,
-        mut config: ExecutionConfig,
-    ) -> Result<Self, TurnFailure> {
-        if let Some(input) = &tc.info.options.input {
-            config.skill_ids = input.skill_ids.clone();
-            config.memory_search_limit = input.memory_search_limit;
-        }
+    pub async fn open(tc: TurnContext<'a>) -> Result<Self, TurnFailure> {
+        let config = tc.config.resolve(&tc.info.options.limits);
         let history = tc
             .snap
             .context_manager
             .clone()
             .ok_or_else(|| ErrorKind::Config("execution requires ContextManager".into()))?;
         let model = tc.snap.model.clone().map(crate::model::Model::new);
-        let span = tc
-            .snap
-            .observability
-            .as_ref()
-            .map(|o| o.span("execution.turn"));
-        if let Some(span) = &span {
-            span.record("turn_id", tc.info.id.as_str());
-        }
+        tracing::debug!(turn_id = %tc.info.id, "turn opened");
         let mut execution = Self {
             tc,
             config,
@@ -318,7 +298,6 @@ impl<'a> Turn<'a> {
             deferred_context: vec![],
             accepted: false,
             completed: false,
-            span,
         };
         match execution.initialize().await {
             Ok(accepted) => {
@@ -441,13 +420,7 @@ impl<'a> Turn<'a> {
         let _guard = cancel.clone().drop_guard();
         let execution =
             Compactor::from_snapshot(&self.tc.snap, self.tc.info.options.session.as_deref())?;
-        let hook_timeout = self
-            .tc
-            .info
-            .options
-            .limits
-            .hook_timeout
-            .or(self.config.hook_timeout);
+        let hook_timeout = self.config.hook_timeout;
         self.ensure_active()?;
         let future = execution.exec(request, &cancel, hook_timeout);
         tokio::pin!(future);

@@ -23,25 +23,14 @@ impl Turn<'_> {
             return Ok(HookDispatchResult::empty(kind));
         };
         let invocation = self.invocation(event);
-        let timeout = self
-            .tc
-            .info
-            .options
-            .limits
-            .hook_timeout
-            .or(self.config.hook_timeout);
+        let timeout = self.config.hook_timeout;
         let result = self
             .wait_operation(hooks.dispatch(&invocation), timeout, "hook")
             .await?;
         result.validate_for(kind)?;
-        if let Some(obs) = &self.tc.snap.observability {
-            for run in &result.runs {
-                obs.timing(
-                    "loop.hook",
-                    run.duration.as_secs_f64(),
-                    &[("event", kind.as_str()), ("hook", &run.hook_id)],
-                );
-            }
+        for run in &result.runs {
+            tracing::debug!(event = kind.as_str(), hook = %run.hook_id,
+                duration_seconds = run.duration.as_secs_f64(), "hook completed");
         }
         Ok(result)
     }

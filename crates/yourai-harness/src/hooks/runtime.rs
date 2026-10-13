@@ -14,7 +14,7 @@
 mod outcomes;
 use outcomes::*;
 
-use crate::hooks::config::{HookRegistration, HookSource, HooksConfig};
+use crate::hooks::config::{HookRegistration, HookSource};
 use crate::hooks::handler::{execute_with_timeout, handler_from_config};
 use crate::hooks::wire_output::{
     ElicitationAction, HookJsonOutput, HookSpecificOutput, LegacyDecision, PermissionBehavior,
@@ -143,7 +143,7 @@ impl DefaultHookManager {
     /// 从配置批量注册。
     pub async fn register_config(
         &self,
-        config: &HooksConfig,
+        config: &serde_json::Value,
         source: HookSource,
     ) -> Result<(), YourAiError> {
         let regs =
@@ -170,7 +170,6 @@ impl DefaultHookManager {
         invocation: &HookInvocation,
     ) -> Result<HookDispatchResult, YourAiError> {
         let event = invocation.event_kind();
-        let event_name = event.as_str();
         let match_query = invocation.event.match_query();
 
         let matched: Vec<RegisteredHook> = {
@@ -232,7 +231,7 @@ impl DefaultHookManager {
             match result {
                 HandlerExecResult::Success { output, duration } => {
                     run.duration = duration;
-                    match parse_handler_output(&output, event_name) {
+                    match parse_handler_output(&output, event) {
                         Ok(mut contrib) => {
                             contrib.hook_id = reg.id.clone();
                             run.suppress_output = contrib.suppress_output;
@@ -324,7 +323,7 @@ impl DefaultHookManager {
             .map(|(_, contribution)| contribution)
             .collect();
         let common = aggregate_common(&contributions);
-        let outcome = aggregate(event_name, contributions);
+        let outcome = aggregate(event, contributions);
         Ok(HookDispatchResult {
             event,
             common,
@@ -722,7 +721,7 @@ mod tests {
             decision: serde_json::json!({"ok":true}),
         });
         let rt = DefaultHookManager::new().with_model(executor.clone());
-        let config: HooksConfig = serde_json::from_value(serde_json::json!({
+        let config: serde_json::Value = serde_json::from_value(serde_json::json!({
             "hooks": {
                 "UserPromptSubmit": [{
                     "hooks": [
@@ -766,7 +765,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_handler_requires_model_at_registration() {
         let rt = DefaultHookManager::new();
-        let config: HooksConfig = serde_json::from_value(serde_json::json!({
+        let config: serde_json::Value = serde_json::from_value(serde_json::json!({
             "hooks": {
                 "UserPromptSubmit": [{
                     "hooks": [{"type": "prompt", "prompt": "review"}]
@@ -791,7 +790,7 @@ mod tests {
             "printf existing",
         ))
         .await;
-        let config: HooksConfig = serde_json::from_value(serde_json::json!({
+        let config: serde_json::Value = serde_json::from_value(serde_json::json!({
             "hooks": {
                 "UserPromptSubmit": [{"hooks": [
                     {"type": "command", "command": "printf new"},
@@ -815,7 +814,7 @@ mod tests {
             decision: serde_json::json!({"ok":false,"reason":"model rejected prompt"}),
         });
         let rt = DefaultHookManager::new().with_model(executor);
-        let config: HooksConfig = serde_json::from_value(serde_json::json!({
+        let config: serde_json::Value = serde_json::from_value(serde_json::json!({
             "hooks": {
                 "UserPromptSubmit": [{
                     "hooks": [{"type": "prompt", "prompt": "review $ARGUMENTS"}]
@@ -853,7 +852,7 @@ mod tests {
             decision: serde_json::json!({"ok":false,"reason":"tool rejected by model hook"}),
         });
         let rt = DefaultHookManager::new().with_model(executor);
-        let config: HooksConfig = serde_json::from_value(serde_json::json!({
+        let config: serde_json::Value = serde_json::from_value(serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
                     "matcher": "Bash",

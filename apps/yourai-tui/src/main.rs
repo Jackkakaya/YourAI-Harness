@@ -11,7 +11,7 @@ mod ui;
 use config::{Config, Error};
 use std::{io::IsTerminal, path::PathBuf, sync::Arc};
 use yourai_core::prelude::*;
-use yourai_harness::{Harness, HarnessConfig, SessionCatalog};
+use yourai_harness::{Harness, SessionCatalog, SessionOptions};
 
 #[tokio::main]
 async fn main() {
@@ -135,72 +135,85 @@ async fn run() -> Result<(), Error> {
         None => config::default_config_path()?,
     };
     let mut config = Config::load(&path)?;
+    let theme = serde_json::from_value::<crate::ui::theme::Theme>(serde_json::Value::String(
+        config.ui.theme.clone(),
+    ))?;
     // Resolve `theme: "system"` once at startup (v1: no runtime watch).
-    if config.theme == crate::ui::theme::Theme::System {
+    if theme == crate::ui::theme::Theme::System {
         crate::ui::theme::resolve_system_from_os();
     }
-    if let Some(model) = selected_model {
-        config.model = model;
+    if let Some(model) = &selected_model {
+        config.models.selected = model.clone();
+        config.models.variant = None;
     }
-    let yolo = yolo || config.yolo;
+    let yolo = yolo || config.security.yolo;
+    config.security.yolo = yolo;
     if import_json {
-        let count = yourai_harness::storage::sqlite::import_json_sessions(&config.session_dir)?;
+        let count = yourai_harness::storage::sqlite::import_json_sessions(&config.session_dir())?;
         println!(
             "Imported {count} sessions into {}. Original JSON files retained.",
-            yourai_harness::SqliteStore::path(&config.session_dir).display()
+            yourai_harness::SqliteStore::path(&config.session_dir()).display()
         );
         return Ok(());
     }
-    let selection = config.resolve(variant.as_deref())?;
-    let compaction = config.resolve_compaction()?;
-    let model = selection.model.clone();
-    config.selected_variant = variant;
-    if config.context.input_budget(model.token_budget()).is_none() {
-        eprintln!("Context window unknown: configure provider.<id>.models.<id>.limit.context to enable automatic/manual summarization.");
-    }
     if check {
+        let selection = config.resolve(variant.as_deref().or(config.models.variant.as_deref()))?;
+        config.resolve_compaction()?;
         println!(
             "Config OK: {} / {} (no network request)",
-            config.model,
-            model.model_iden()
+            config.models.selected,
+            selection.model.model_iden()
         );
         return Ok(());
     }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("TUI requires an interactive terminal".into());
     }
-    let choices = crate::models::model_choices(&config);
     // Bare `--resume` opens the launcher; Esc there falls through to a fresh session.
     if resume.as_ref().is_some_and(|id| id.as_str().is_empty()) {
-        let catalog = SessionCatalog::new(&config.session_dir)?;
-        match launcher::pick(&catalog, config.theme).await? {
+        let catalog = SessionCatalog::new(config.session_dir())?;
+        match launcher::pick(&catalog, theme).await? {
             launcher::Choice::Resume(picked) => resume = Some(picked),
             launcher::Choice::New => resume = None,
             launcher::Choice::Quit => return Ok(()),
         }
     }
-    let mut hc = HarnessConfig::new(config.session_dir.clone(), std::env::current_dir()?);
+    // CLI choices override the loaded config in memory for this invocation.
+    if let Some(model) = selected_model {
+        config.models.selected = model;
+        config.models.variant = None;
+    }
+    if variant.is_some() {
+        config.models.variant = variant;
+    }
+    let selection = config.resolve(config.models.variant.as_deref())?;
+    let compaction = config.resolve_compaction()?;
+    let model = selection.model.clone();
+    if config
+        .execution
+        .context_policy
+        .input_budget(model.token_budget())
+        .is_none()
+    {
+        eprintln!("Context window unknown: configure models.providers.<id>.models.<id>.limit.context to enable automatic/manual summarization.");
+    }
+    let choices = crate::models::model_choices(&config);
+    let mut hc = SessionOptions::new(config.session_dir(), std::env::current_dir()?);
     selection.apply_to(&mut hc);
-    hc.compaction_model = compaction.map(|selection| (selection.model, selection.settings));
+    hc.compaction_model = compaction;
     hc.resume = resume.take();
-    hc.system_prompt = config.system_prompt.clone();
-    hc.prompt = config.prompt.clone();
-    hc.context_policy = config.context.clone();
-    hc.memory_search_limit = config.memory_search_limit;
-    hc.extensions = config.extensions;
-    hc.trusted_shell = config.trusted_shell;
-    hc.yolo = yolo;
+    config.apply_to(&mut hc);
+    hc.config.security.yolo = yolo;
     let mut config_template = hc.clone();
     config_template.resume = None;
     let harness = Harness::open(hc, model).await?;
-    let mut limits = TurnLimits::default();
-    limits.steps = config.steps;
-    let config_clone_model = match &config.selected_variant {
-        Some(variant) => format!("{} · {variant}", config.model),
-        None => config.model.clone(),
+    let limits = TurnLimits::default();
+    let config_clone_model = match &config.models.variant {
+        Some(variant) => format!("{} · {variant}", config.models.selected),
+        None => config.models.selected.clone(),
     };
-    let config_clone_trusted = config.trusted_shell;
-    let config_clone_theme = config.theme;
+    let config_clone_trusted = config.security.trusted_shell;
+    let config_clone_theme = theme;
     let config = Arc::new(std::sync::Mutex::new(config));
     let (session_id, pending) = ui::run(
         harness,

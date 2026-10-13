@@ -66,19 +66,11 @@ pub trait SessionStore: Send + Sync {
         _id: &SessionId,
         _owner: &str,
         _ttl_ms: u64,
-    ) -> Result<Arc<dyn SessionStore>, YourAiError> {
-        Err(crate::error("storage", "session ownership unsupported"))
-    }
-    fn renew_session(&self, _ttl_ms: u64) -> Result<(), YourAiError> {
-        Err(crate::error("storage", "session ownership unsupported"))
-    }
-    fn release_session(&self) -> Result<(), YourAiError> {
-        Err(crate::error("storage", "session ownership unsupported"))
-    }
+    ) -> Result<Arc<dyn SessionStore>, YourAiError>;
+    fn renew_session(&self, _ttl_ms: u64) -> Result<(), YourAiError>;
+    fn release_session(&self) -> Result<(), YourAiError>;
     /// Runtime/extension documents are separate from model-facing messages.
-    fn read_state(&self, _id: &SessionId, _key: &str) -> Result<Option<SessionState>, YourAiError> {
-        Err(crate::error("storage", "session state unsupported"))
-    }
+    fn read_state(&self, _id: &SessionId, _key: &str) -> Result<Option<SessionState>, YourAiError>;
     /// Compare-and-set. None expects absence; stale revisions must fail.
     fn save_state(
         &self,
@@ -86,9 +78,7 @@ pub trait SessionStore: Send + Sync {
         _key: &str,
         _expected: Option<i64>,
         _value: serde_json::Value,
-    ) -> Result<i64, YourAiError> {
-        Err(crate::error("storage", "session state unsupported"))
-    }
+    ) -> Result<i64, YourAiError>;
     /// Append immutable output chunks. Offset makes uncertain retries idempotent.
     fn append_output<'a>(
         &'a self,
@@ -96,25 +86,19 @@ pub trait SessionStore: Send + Sync {
         _output: &'a str,
         _offset: u64,
         _bytes: Vec<u8>,
-    ) -> BoxFuture<'a, Result<(), YourAiError>> {
-        Box::pin(async { Err(crate::error("storage", "tool output unsupported")) })
-    }
+    ) -> BoxFuture<'a, Result<(), YourAiError>>;
     fn read_output<'a>(
         &'a self,
         _id: &'a SessionId,
         _output: &'a str,
         _offset: u64,
         _limit: usize,
-    ) -> BoxFuture<'a, Result<Vec<u8>, YourAiError>> {
-        Box::pin(async { Err(crate::error("storage", "tool output unsupported")) })
-    }
+    ) -> BoxFuture<'a, Result<Vec<u8>, YourAiError>>;
     fn cleanup_outputs<'a>(
         &'a self,
         _id: &'a SessionId,
         _older_than_ms: i64,
-    ) -> BoxFuture<'a, Result<(), YourAiError>> {
-        Box::pin(async { Err(crate::error("storage", "tool output unsupported")) })
-    }
+    ) -> BoxFuture<'a, Result<(), YourAiError>>;
 
     /// Task rows belong to the session's existing persistence connection.
     /// Initialization reads synchronously; runtime writes use the host's owned blocking worker.

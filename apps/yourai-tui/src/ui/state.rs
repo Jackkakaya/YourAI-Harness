@@ -333,13 +333,7 @@ impl Todos {
     }
 }
 /// Model label and pricing travel as one pair through switches and restores.
-#[derive(Default)]
-pub struct ModelInfo {
-    pub label: String,
-    pub pricing: Option<(f64, f64)>,
-    /// Effective reasoning effort for the current entry, when set.
-    pub effort: Option<String>,
-}
+pub use yourai_harness::controller::ModelSelection as ModelInfo;
 impl View {
     pub fn model_activity(&self) -> &'static str {
         if self.session.assistant.is_some() {

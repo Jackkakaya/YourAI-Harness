@@ -287,13 +287,13 @@ async fn cancellation_bounds_a_custom_loop_wait() {
 
 #[tokio::test]
 async fn harness_configuration_keeps_the_custom_loop_and_lifecycle_hooks() {
-    use yourai_harness::{Harness, HarnessConfig};
+    use yourai_harness::{Harness, SessionOptions};
     let dir = tempfile::tempdir().unwrap();
     let program = direct_program();
-    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
     config.agent_loop = Some(program.clone());
-    config.yolo = true;
-    config.system_prompt = Some("test".into());
+    config.config.security.yolo = true;
+    config.config.prompt.system_prompt = Some("test".into());
     let harness = Harness::open(config, Arc::new(Model::new(vec![])))
         .await
         .unwrap();
@@ -301,9 +301,7 @@ async fn harness_configuration_keeps_the_custom_loop_and_lifecycle_hooks() {
     harness.tools.register(tool.clone());
     harness
         .host
-        .workspace()
-        .unwrap()
-        .change_config("project_settings", json!({"memory_search_limit":0}))
+        .check_config_change("project_settings", json!({"memory_search_limit":0}))
         .await
         .unwrap();
     let observed = Arc::new(std::sync::Mutex::new(vec![]));
@@ -405,7 +403,7 @@ async fn replacement_context_summary_gets_hooks_and_preserves_commit_after_post_
         .model(model.clone())
         .hooks(hooks.clone())
         .build();
-    let snapshot = agent.ctx().snapshot().unwrap();
+    let snapshot = agent.snapshot().unwrap();
     let execution = Compactor::from_snapshot(&snapshot, None).unwrap();
     let mut request = CompactionRequest::new(CompactionTrigger::Manual);
     request.custom_instructions = Some("original instructions".into());
@@ -669,8 +667,7 @@ async fn failed_result_saves_keep_each_call_result_and_prevent_replay() {
     impl AgentLoop for RecoverLoop {
         fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
             Box::pin(async move {
-                let mut turn =
-                    Turn::open(tc, yourai_core::execution::ExecutionConfig::default()).await?;
+                let mut turn = Turn::open(tc).await?;
                 let response = turn
                     .model()?
                     .exec(&mut turn, ModelOptions::default())
@@ -732,8 +729,7 @@ async fn completion_is_terminal_for_new_model_tool_and_input_operations() {
     impl AgentLoop for FinishedLoop {
         fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
             Box::pin(async move {
-                let mut turn =
-                    Turn::open(tc, yourai_core::execution::ExecutionConfig::default()).await?;
+                let mut turn = Turn::open(tc).await?;
                 let result = async {
                     assert_eq!(turn.complete("done").await?, Completion::Completed);
                     assert!(turn
@@ -766,8 +762,7 @@ async fn dropping_a_model_execution_future_keeps_the_visible_partial_message() {
     impl AgentLoop for PartialLoop {
         fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
             Box::pin(async move {
-                let mut turn =
-                    Turn::open(tc, yourai_core::execution::ExecutionConfig::default()).await?;
+                let mut turn = Turn::open(tc).await?;
                 let model = turn.model()?;
                 assert!(tokio::time::timeout(
                     std::time::Duration::from_millis(20),
@@ -798,8 +793,7 @@ async fn failed_checkpoint_keeps_deferred_hook_context_for_cleanup() {
     impl AgentLoop for ContextLoop {
         fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
             Box::pin(async move {
-                let mut turn =
-                    Turn::open(tc, yourai_core::execution::ExecutionConfig::default()).await?;
+                let mut turn = Turn::open(tc).await?;
                 let result = async {
                     let call = turn.enqueue("tool", json!({"value":1})).await?;
                     turn.tool(&call.call_id)?
@@ -882,9 +876,7 @@ async fn registration_freezes_the_definition_used_by_the_model_and_execution() {
     assert!(registry.resolve("changed-name").is_err());
     let model = Arc::new(Model::new(vec![calls(&["tool"]), answer("done")]));
     let agent = Agent::builder()
-        .agent_loop(Arc::new(
-            yourai_harness::default_loop::DefaultLoop::default(),
-        ))
+        .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
         .context_manager(Arc::new(History::default()))
         .model(model.clone())
         .tools(registry)

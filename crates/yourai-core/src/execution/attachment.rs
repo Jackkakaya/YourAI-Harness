@@ -82,7 +82,7 @@ fn encode_error(error: image::ImageError) -> ResolveError {
 pub(crate) fn message(
     text: &str,
     attachments: &[UserAttachment],
-    config: &super::ExecutionConfig,
+    config: &crate::execution::ExecutionOptions,
     cwd: Option<&Path>,
 ) -> Result<ChatMessage, ResolveError> {
     if attachments.is_empty() {
@@ -106,7 +106,7 @@ pub(crate) fn message(
 /// Resolve one attachment into a model-visible content part.
 pub(crate) fn resolve_attachment(
     att: &UserAttachment,
-    config: &super::ExecutionConfig,
+    config: &crate::execution::ExecutionOptions,
 ) -> Result<ContentPart, ResolveError> {
     match &att.data {
         AttachmentData::Base64(data) => {
@@ -137,7 +137,7 @@ fn size_error(
     width: u32,
     height: u32,
     bytes: usize,
-    cfg: &super::AttachmentImageConfig,
+    cfg: &crate::execution::ImagePolicy,
 ) -> ResolveError {
     ResolveError::Invalid(format!(
         "Image {width}x{height} with base64 size {bytes} exceeds configured limits and could not be resized below {}x{}/{} bytes",
@@ -150,7 +150,7 @@ fn size_error(
 fn normalize_image(
     data: &str,
     ct: &str,
-    cfg: &super::AttachmentImageConfig,
+    cfg: &crate::execution::ImagePolicy,
 ) -> Result<(String, String), ResolveError> {
     let bytes = BASE64
         .decode(data.as_bytes())
@@ -356,7 +356,7 @@ fn classify_path(path: &Path) -> FileKind {
 
 fn resolve_file(
     file: &FileRef,
-    config: &super::ExecutionConfig,
+    config: &crate::execution::ExecutionOptions,
 ) -> Result<ContentPart, ResolveError> {
     let path = PathBuf::from(&file.path);
     std::fs::metadata(&path).map_err(|e| io_error("file", &file.path, e))?;
@@ -502,16 +502,16 @@ fn directory_listing(
 mod tests {
     use super::*;
 
-    fn config() -> super::super::ExecutionConfig {
-        super::super::ExecutionConfig::default()
+    fn config() -> crate::execution::ExecutionOptions {
+        crate::execution::ExecutionOptions::default()
     }
 
     fn att(content_type: &str, data: &str) -> UserAttachment {
         UserAttachment::base64(content_type, data, Some("test.bin".into()))
     }
 
-    fn limits() -> super::super::AttachmentImageConfig {
-        super::super::AttachmentImageConfig {
+    fn limits() -> crate::execution::ImagePolicy {
+        crate::execution::ImagePolicy {
             auto_resize: true,
             max_width: 64,
             max_height: 64,
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn byte_limit_drives_further_shrinking() {
         let mut cfg = config();
-        cfg.attachment_image = super::super::AttachmentImageConfig {
+        cfg.attachment_image = crate::execution::ImagePolicy {
             auto_resize: true,
             max_width: 64,
             max_height: 64,
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn oversized_image_without_auto_resize_is_rejected() {
         let mut cfg = config();
-        cfg.attachment_image = super::super::AttachmentImageConfig {
+        cfg.attachment_image = crate::execution::ImagePolicy {
             auto_resize: false,
             ..limits()
         };

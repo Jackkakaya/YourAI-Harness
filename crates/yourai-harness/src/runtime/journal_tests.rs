@@ -22,8 +22,8 @@ mod tests {
     }
     async fn fixture() -> (tempfile::TempDir, crate::Harness) {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
-        config.system_prompt = Some("test".into());
+        let mut config = crate::SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+        config.config.prompt.system_prompt = Some("test".into());
         let harness = crate::Harness::open(config, Arc::new(Model)).await.unwrap();
         (dir, harness)
     }

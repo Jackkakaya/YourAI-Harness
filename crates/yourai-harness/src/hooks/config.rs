@@ -13,24 +13,8 @@
 
 use crate::hooks::matcher::CompiledMatcher;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 pub use yourai_core::hooks::{FailurePolicy, HookSource};
-
-/// 顶层 hooks 配置。
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct HooksConfig {
-    #[serde(default)]
-    pub hooks: HashMap<String, Vec<HookMatcherGroup>>,
-}
-
-/// 一个 matcher group：可选 matcher + 一组 handler。
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct HookMatcherGroup {
-    #[serde(default)]
-    pub matcher: Option<String>,
-    pub hooks: Vec<HandlerConfig>,
-}
 
 /// Handler 配置（discriminated union on `type`）。
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -172,16 +156,6 @@ impl From<FailurePolicyConfig> for FailurePolicy {
 }
 
 impl HandlerConfig {
-    pub fn timeout(&self) -> Option<Duration> {
-        let secs = match self {
-            HandlerConfig::Command { timeout, .. }
-            | HandlerConfig::Http { timeout, .. }
-            | HandlerConfig::Prompt { timeout, .. }
-            | HandlerConfig::Agent { timeout, .. } => *timeout,
-        };
-        secs.map(Duration::from_secs_f64)
-    }
-
     pub fn if_condition(&self) -> Option<&str> {
         match self {
             HandlerConfig::Command { if_condition, .. }
@@ -237,17 +211,26 @@ impl HandlerConfig {
         }
     }
 
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(timeout) = match self {
+    /// Validate once and return the resolved timeout for registration.
+    pub fn validate(&self) -> Result<Option<Duration>, String> {
+        let timeout = match self {
             HandlerConfig::Command { timeout, .. }
             | HandlerConfig::Http { timeout, .. }
             | HandlerConfig::Prompt { timeout, .. }
             | HandlerConfig::Agent { timeout, .. } => *timeout,
-        } {
-            if !timeout.is_finite() || timeout <= 0.0 {
+        }
+        .map(|seconds| {
+            if !seconds.is_finite() || seconds <= 0.0 {
                 return Err("hook timeout must be a positive finite number".to_string());
             }
-        }
+            let duration = Duration::try_from_secs_f64(seconds)
+                .map_err(|_| "hook timeout exceeds Duration range".to_string())?;
+            if duration.is_zero() {
+                return Err("hook timeout is below Duration resolution".to_string());
+            }
+            Ok(duration)
+        })
+        .transpose()?;
         match self {
             HandlerConfig::Http { url, .. } => {
                 let parsed = reqwest::Url::parse(url)
@@ -260,7 +243,7 @@ impl HandlerConfig {
             | HandlerConfig::Prompt { .. }
             | HandlerConfig::Agent { .. } => {}
         }
-        Ok(())
+        Ok(timeout)
     }
 }
 
@@ -279,23 +262,34 @@ pub struct HookRegistration {
 
 /// 从配置构建注册项列表。
 pub fn build_registrations(
-    config: &HooksConfig,
+    config: &serde_json::Value,
     source: HookSource,
 ) -> Result<Vec<HookRegistration>, String> {
     let mut regs = Vec::new();
-    for (event_name, groups) in &config.hooks {
+    let groups = config
+        .get("hooks")
+        .unwrap_or(config)
+        .as_object()
+        .ok_or("hooks must be an object")?;
+    for (event_name, groups) in groups {
+        let groups = groups
+            .as_array()
+            .ok_or_else(|| format!("invalid hook groups for {event_name}"))?;
         let Some(event) = yourai_core::hooks::HookEventKind::from_name(event_name) else {
             return Err(format!("unknown hook event: {event_name}"));
         };
         for (gi, group) in groups.iter().enumerate() {
-            let matcher = match group.matcher.as_deref() {
+            let pattern: Option<String> = serde_json::from_value(group["matcher"].clone())
+                .map_err(|_| format!("invalid hook matcher for {event_name}"))?;
+            let handlers: Vec<HandlerConfig> = serde_json::from_value(group["hooks"].clone())
+                .map_err(|_| format!("invalid hook handlers for {event_name}"))?;
+            let matcher = match pattern.as_deref() {
                 Some(pattern) => CompiledMatcher::try_compile(pattern)?,
                 None => CompiledMatcher::All,
             };
-            for (hi, handler) in group.hooks.iter().enumerate() {
-                handler.validate()?;
+            for (hi, handler) in handlers.iter().enumerate() {
+                let timeout = handler.validate()?;
                 let id = format!("{}:{}:{}:{}", source.as_str(), event_name, gi, hi);
-                let timeout = handler.timeout();
                 let failure_policy = handler.failure_policy();
                 let once = handler.once();
                 regs.push(HookRegistration {
@@ -334,18 +328,18 @@ mod tests {
             ]
           }
         }"#;
-        let config: HooksConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.hooks.len(), 2);
-        let pre = config.hooks.get("PreToolUse").unwrap();
-        assert_eq!(pre.len(), 1);
-        assert_eq!(pre[0].matcher.as_deref(), Some("Read|Write"));
-        assert_eq!(pre[0].hooks.len(), 1);
+        let config: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(config["hooks"].as_object().unwrap().len(), 2);
+        let pre = config["hooks"].get("PreToolUse").unwrap();
+        assert_eq!(pre.as_array().unwrap().len(), 1);
+        assert_eq!(pre[0]["matcher"].as_str(), Some("Read|Write"));
+        assert_eq!(pre[0]["hooks"].as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn build_regs() {
         let json = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo hi"}]}]}}"#;
-        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let config: serde_json::Value = serde_json::from_str(json).unwrap();
         let regs = build_registrations(&config, HookSource::User).unwrap();
         assert_eq!(regs.len(), 1);
         assert_eq!(regs[0].event, yourai_core::hooks::HookEventKind::PreToolUse);
@@ -374,11 +368,13 @@ mod tests {
             }]}]
           }
         }"#;
-        let config: HooksConfig = serde_json::from_str(json).unwrap();
-        let command = &config.hooks["PreToolUse"][0].hooks[0];
+        let config: serde_json::Value = serde_json::from_str(json).unwrap();
+        let command: HandlerConfig =
+            serde_json::from_value(config["hooks"]["PreToolUse"][0]["hooks"][0].clone()).unwrap();
         assert!(command.is_async());
         assert!(command.once());
-        let http = &config.hooks["PostToolUse"][0].hooks[0];
+        let http: HandlerConfig =
+            serde_json::from_value(config["hooks"]["PostToolUse"][0]["hooks"][0].clone()).unwrap();
         assert_eq!(http.if_condition(), Some("Bash(git *)"));
         match http {
             HandlerConfig::Http {
@@ -413,16 +409,49 @@ mod tests {
 
     #[test]
     fn registration_builder_rejects_invalid_matcher_and_timeout() {
-        let bad_matcher: HooksConfig = serde_json::from_str(
+        let bad_matcher: serde_json::Value = serde_json::from_str(
             r#"{"hooks":{"PreToolUse":[{"matcher":"[","hooks":[{"type":"command","command":"check"}]}]}}"#,
         )
         .unwrap();
         assert!(build_registrations(&bad_matcher, HookSource::Project).is_err());
 
-        let bad_timeout: HooksConfig = serde_json::from_str(
+        let bad_timeout: serde_json::Value = serde_json::from_str(
             r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"check","timeout":-1}]}]}}"#,
         )
         .unwrap();
         assert!(build_registrations(&bad_timeout, HookSource::Project).is_err());
+    }
+
+    #[test]
+    fn registration_resolves_timeouts_and_rejects_unrepresentable_values() {
+        for handler in [
+            serde_json::json!({"type":"command", "command":"check"}),
+            serde_json::json!({"type":"http", "url":"https://example.com/hook"}),
+            serde_json::json!({"type":"prompt", "prompt":"check"}),
+            serde_json::json!({"type":"agent", "prompt":"check"}),
+        ] {
+            for (seconds, expected) in [
+                (None, Ok(None)),
+                (Some(1.25), Ok(Some(Duration::from_millis(1250)))),
+                (Some(0.0), Err(())),
+                (Some(-1.0), Err(())),
+                (Some(1e300), Err(())),
+                (Some(1e-300), Err(())),
+            ] {
+                let mut handler = handler.clone();
+                if let Some(seconds) = seconds {
+                    handler["timeout"] = serde_json::json!(seconds);
+                }
+                let config: serde_json::Value = serde_json::from_value(serde_json::json!({
+                    "hooks": {"PreToolUse": [{"hooks": [handler]}]}
+                }))
+                .unwrap();
+                let result = build_registrations(&config, HookSource::Project);
+                match expected {
+                    Ok(timeout) => assert_eq!(result.unwrap()[0].timeout, timeout),
+                    Err(()) => assert!(result.is_err(), "invalid timeout {seconds:?} accepted"),
+                }
+            }
+        }
     }
 }

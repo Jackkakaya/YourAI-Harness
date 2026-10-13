@@ -1,7 +1,6 @@
 //! Default scheduling policy. Hooks belong to the business operation wrappers.
-mod config;
+
 use crate::execution::{Completion, ModelOptions, Turn};
-pub use config::{AttachmentImageConfig, LoopConfig};
 use yourai_core::prelude::*;
 // Verbatim from opencode `packages/core/src/session/runner/max-steps.ts`.
 pub(super) const MAX_STEPS_PROMPT: &str = r#"CRITICAL - MAXIMUM STEPS REACHED
@@ -25,29 +24,12 @@ Any attempt to use tools is a critical violation. Respond with text ONLY."#;
 pub(super) const MAX_FORCED_FINAL_CONTINUATIONS: u32 = 3;
 
 #[derive(Debug, Clone, Default)]
-pub struct DefaultLoop {
-    config: LoopConfig,
-}
-impl DefaultLoop {
-    pub fn new(config: LoopConfig) -> Self {
-        Self { config }
-    }
-    pub fn config(&self) -> &LoopConfig {
-        &self.config
-    }
-}
+pub struct DefaultLoop;
 impl AgentLoop for DefaultLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
-            let steps = match tc.info.options.limits.steps {
-                Some(limit) => Some(
-                    self.config
-                        .steps
-                        .map_or(limit, |configured| configured.min(limit)),
-                ),
-                None => self.config.steps,
-            };
-            let mut execution = Turn::open(tc, self.config.execution.clone()).await?;
+            let mut execution = Turn::open(tc).await?;
+            let steps = execution.config().steps;
             let result = async {
                 if !execution.input_accepted() {
                     return Ok(());

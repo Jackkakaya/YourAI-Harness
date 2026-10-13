@@ -1,3 +1,5 @@
+> 配置与启动接口已收敛，当前迁移说明见 [配置与运行职责收敛](orthogonal-runtime.md)。
+
 # Core 组件接口契约
 
 > 当前存储已改为 SQLite schema v6：队列、扩展状态和工具原文使用 SessionStore；SessionLease 使用数据库租约。旧章节中的状态 JSON、输出文件和文件锁描述已被 [云端存储实现](cloud-storage.md) 替代。
@@ -71,7 +73,7 @@ options.session = Some(Arc::new(SessionEnvironment::new(session_id, cwd)));
 options.limits.max_model_calls = Some(32);
 options.limits.deadline = Some(Instant::now() + Duration::from_secs(120));
 
-let handle = agent.start_with(In::user_text("任务"), options)?;
+let handle = agent.start_with(In::user_text("任务"), ExecutionOptions::default(), options)?;
 // handle.info.id 与 Loop 中 tc.info.id 对应同一次执行。
 ```
 
@@ -193,10 +195,70 @@ Loop 对这类 Provider 只在外层监听总 deadline、取消和断连；否�
 
 ### 模型默认值和宿主异步提交
 
-模型默认时限由 `ModelProvider::timeouts()` 提供；LoopConfig 不再定义模型默认时限。
+模型默认时限由 `ModelProvider::timeouts()` 提供；模型传输默认时限不放进调度策略。
 包装 Provider 必须透传该值。主循环依次采用显式 TurnLimits、请求选项、模型默认值。
 
 默认 SessionManager 保留同步 `submit` 的持久化确认，同时提供 `submit_async`。
 异步入口等待 owned blocking transaction，取消等待不代表撤销已开始的提交。
 宿主状态查询和取消不持有 journal 写事务锁。详细设计见
 [代码质量整改](./architecture-quality-repairs.md)。
+
+## 配置读写与持久化契约（2026-10-13）
+
+配置入口统一为一个共享 `Config`。它按类别组织数据；各类别不读写文件、不拥有独立全局实例，全部通过 config::update 修改。没有 ConfigManager、设置服务或额外 Repository。
+
+| 类别/字段 | 数据 struct | 用途和来源 |
+|---|---|---|
+| models | ModelSettings | selected、compaction、variant、effort_overrides、providers；主配置 |
+| execution | ExecutionOptions | steps、超时、重试、context、附件、技能/记忆执行数据；主配置 |
+| security | SecuritySettings | yolo、trusted_shell；主配置 |
+| ui | UiSettings | theme；主配置 |
+| session | SessionSettings | directory、extensions；主配置 |
+| prompt | PromptSettings | system_prompt、soul_file、memory_file、profile_file、append_system_prompt、memory_file_max_chars、profile_file_max_chars、provider_max_chars；prompts.json |
+| hooks | HookSettings | events、可选 file；内嵌或独立 Hook 文件 |
+
+JSON 和 Rust 的类别路径一致。execution.context 在 Rust 中为 execution.context_policy；ContextPolicy、ImagePolicy 是执行类别的嵌套策略。RequestPolicy 和 ModelLimits 从 models.providers 的 JSON 数据解析用于资源装配；不各自维护配置源。
+
+### 文件与兼容
+
+主配置 JSON 或 SQLite 保存 models/execution/security/ui/session/hooks。Prompt 单独保存在同目录 prompts.json，文件内容就是 PromptSettings 的字段，不重复包装。Hook 少时使用 hooks.events；多时主配置使用 `{"hooks":{"file":"hooks.json"}}`，独立 JSON 为 `{"hooks":{"events":{...}}}`。路径相对于主配置。非空内嵌事件与外部引用同时存在时报错，避免重复注册。旧独立 Hook 的 `{"hooks":{事件名:[...]}}` 格式仍可读取。
+
+旧平铺主配置由一个 normalize_document 函数转换成分类字段；首次普通保存迁移为分类 JSON。未知字段和同一字段的重复新旧定义都拒绝。旧内嵌 Prompt 保存时先保留到独立文件，不丢失内容。已有独立 Prompt 文件时，普通保存不改写它。
+
+SQLite 的 app_config(id=1,config_json) 保存相同分类文档。空库从邻近 yourai.json 导入一次，随后只写所选源，不双写主 JSON。没有新增存储接口类。
+
+### 读取和修改
+
+```rust,ignore
+let config = Arc::new(Mutex::new(Config::load(path)?));
+let model = config.lock().unwrap().models.selected.clone();
+let steps = config.lock().unwrap().execution.steps;
+config::update(&config, |value| {
+    value.execution.steps = Some(20);
+    value.security.yolo = true;
+    value.ui.theme = "nord".into();
+    Ok(())
+})?;
+config::update(&config, |value| {
+    value.prompt.system_prompt = Some("编程助手".into());
+    Ok(())
+})?;
+```
+
+Get 只读共享字段；Set 修改候选数据，校验并同步保存变化的来源，然后发布共享内存。保存时不重新加载配置；外部文件编辑只在下次启动读取。修改 hooks.file 可将缓存定义保存到新来源，无须重新读取文件。一次跨文件更新可能涉及多个独立文件提交，并非跨文件数据库事务；失败时共享内存不发布。
+
+模型、YOLO、主题的应用操作经 SessionClient.model/set_yolo/set_theme，内部调用同一个 config::update；模型与权限还同步更新实际资源。不能只改 models.selected 就声称已切换当前模型客户端。
+
+ExecutionOptions 同时是 execution 类别数据和 core 的每轮冻结参数。SessionManager 绑定读取共享配置的函数，下一轮取得 execution 的新值，已有轮次不被中途改写。SessionOptions 只持有一份 Config 和启动/依赖参数；ResolvedModel 是创建后的客户端和准入数据。Prompt 与 Hook 的会话资源在新建会话时装配；连接、会话目录与扩展等资源设置需要相应的重新装配操作。
+
+历史、队列、任务、用量、权限规则、临时批准与记忆内容是领域状态，不放入应用 Config；旧会话 config/model_preferences 文档不作为全局配置来源。
+
+### 验证
+
+配置测试覆盖：两文件独立保存、外部修改只在 reload 生效、旧内嵌 prompt 无损分离、JSON 保存失败不发布、SQLite 同格式与写失败回滚、模型选择全局保存及资源失败保持旧绑定、下一轮读取共享配置、旧会话设置不覆盖全局值。继续运行 workspace、Clippy、fmt/diff 及两组离线 TUI smoke。
+
+分类改造验证记录见本次工作区测试与配置集成测试；包含旧格式迁移、类别未知字段/重复字段校验、JSON/SQLite 同格式、保存失败保留内存、下一轮共享执行参数与 TUI 配置落盘检查。
+
+本次分类改造验证：workspace 648 项通过、2 项既有 ignored；配置集成测试 15 项通过；Clippy（全目标，-D warnings）、fmt/diff 检查及两组离线 TUI smoke 均通过。
+
+全局同步检查：中英文 README、架构/设计文档、TUI 启动与模型/会话测试均使用现行分类路径；明确的旧格式兼容用例保留。hooks.file 在读取或保存前拒绝与主配置、prompts.json 的路径别名（含符号链接），避免配置源互相覆盖。额外启动器 smoke 通过，现行配置文档的本仓库链接已核对。

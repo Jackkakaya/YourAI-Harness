@@ -1,5 +1,5 @@
 //! One assembly path used equally by terminal and web drivers.
-use crate::hooks::{DefaultHookManager, HooksConfig};
+use crate::hooks::DefaultHookManager;
 use crate::{
     collaboration::*, memory::LocalMemory, skills::LocalSkills, storage::LocalUsage,
     workspace::Workspace, *,
@@ -11,65 +11,43 @@ use std::{
 };
 use yourai_core::prelude::*;
 
+/// Startup selection and adapter assembly; persistent settings live in the single `config` value.
 #[derive(Clone)]
-pub struct HarnessConfig {
+pub struct SessionOptions {
     pub root: PathBuf,
     pub cwd: PathBuf,
     pub resume: Option<SessionId>,
-    pub hooks: HooksConfig,
     /// Optional replacement of the original AgentLoop scheduling interface.
     pub agent_loop: Option<Arc<dyn AgentLoop>>,
-    pub instructions: Vec<PathBuf>,
-    pub context_policy: ContextPolicy,
-    pub extensions: bool,
-    /// Explicit local trust: skip per-command shell approval. No OS isolation.
-    pub trusted_shell: bool,
-    /// Skip all tool permission approvals for this run, including subagents.
-    pub yolo: bool,
-    pub system_prompt: Option<String>,
-    pub prompt: crate::PromptConfig,
+    pub config: crate::config::Config,
     pub memory_manager: Option<Arc<dyn MemoryManager>>,
     pub skill_provider: Option<Arc<dyn SkillProvider>>,
-    pub memory_search_limit: usize,
     pub request_policy: crate::model::RequestPolicy,
     /// Stable provider key used to retain admission state across model switches.
     pub model_provider: String,
     /// Optional pinned summary model and its provider admission settings.
     /// Without this, compaction follows the currently selected main model.
-    pub compaction_model: Option<(Arc<dyn ModelProvider>, ModelSettings)>,
+    pub compaction_model: Option<crate::config::ResolvedModel>,
 }
-impl HarnessConfig {
+impl SessionOptions {
     pub fn new(root: PathBuf, cwd: PathBuf) -> Self {
         Self {
             root,
             cwd,
             resume: None,
-            hooks: HooksConfig::default(),
             agent_loop: None,
-            instructions: vec![],
-            context_policy: ContextPolicy::default(),
-            extensions: false,
-            trusted_shell: false,
-            yolo: false,
-            system_prompt: None,
-            prompt: crate::PromptConfig::default(),
+            config: crate::config::Config::default(),
             memory_manager: None,
             skill_provider: None,
-            memory_search_limit: 0,
             request_policy: Default::default(),
             model_provider: String::new(),
             compaction_model: None,
         }
     }
 }
-/// Runtime settings published with the main model at the same idle boundary.
-#[derive(Clone)]
-pub struct ModelSettings {
-    pub provider: String,
-    pub requests: crate::model::RequestPolicy,
-}
 pub struct Harness {
     normal_security: Arc<dyn SecurityProvider>,
+    yolo_security: Arc<dyn SecurityProvider>,
     provider_budgets: Mutex<HashMap<(String, crate::model::RequestPolicy), Arc<ModelBudget>>>,
     current_budget: Mutex<Arc<ModelBudget>>,
     /// Shared persistence interface for frontends reading clean session history.
@@ -87,13 +65,21 @@ pub struct Harness {
 }
 impl Harness {
     pub async fn open(
-        config: HarnessConfig,
+        config: SessionOptions,
         model: Arc<dyn ModelProvider>,
     ) -> Result<Self, YourAiError> {
-        config.context_policy.validate_for(model.token_budget())?;
-        if let Some((summary, settings)) = &config.compaction_model {
-            config.context_policy.validate_for(summary.token_budget())?;
-            settings.requests.validate()?;
+        config
+            .config
+            .execution
+            .context_policy
+            .validate_for(model.token_budget())?;
+        if let Some(summary) = &config.compaction_model {
+            config
+                .config
+                .execution
+                .context_policy
+                .validate_for(summary.model.token_budget())?;
+            summary.requests.validate()?;
         }
         let catalog = Arc::new(SessionCatalog::new(&config.root)?);
         let source = if config.resume.is_some() {
@@ -103,8 +89,7 @@ impl Harness {
         };
         let (meta, lease, prepared) = prepare_session(&catalog, &config, model.as_ref()).await?;
         let id = meta.id;
-        let prompt_notices = prepared.notices;
-        let initial_instructions = prepared.instructions;
+        let session_config = config.clone();
         let budget =
             ModelBudget::configured(config.request_policy.clone(), (*catalog.store).clone())?;
         let mut provider_budgets = HashMap::from([(
@@ -118,119 +103,90 @@ impl Harness {
         let usage = Arc::new(LocalUsage((*catalog.store).clone()));
         let hooks = Arc::new(DefaultHookManager::new().with_model(model.clone()));
         hooks
-            .register_config(&config.hooks, HookSource::Project)
+            .register_config(&config.config.hooks.events, HookSource::Project)
             .await?;
         let (agent, tools) = assemble(
-            &catalog,
             &id,
             lease.store(),
             &config.cwd,
-            config.trusted_shell,
-            model.clone(),
-            Some(hooks.clone()),
-            Some(usage.clone()),
-            None,
-            config.context_policy,
+            config.config.security.trusted_shell,
+            Agent::builder()
+                .model(model.clone())
+                .hooks(hooks.clone())
+                .usage(usage.clone()),
+            &config.config.execution_options(),
         )
         .await?;
-        if let Some((summary, settings)) = config.compaction_model {
+        if let Some(summary) = config.compaction_model {
+            let settings = summary;
             let key = (settings.provider, settings.requests.clone());
             let summary_budget = match provider_budgets.get(&key) {
                 Some(existing) => existing.clone(),
                 None => budget.for_provider(settings.requests)?,
             };
             provider_budgets.insert(key, summary_budget.clone());
-            agent.ctx().set_compaction_model(Arc::new(MeteredModel {
-                inner: summary,
+            agent.set_compaction_model(Arc::new(MeteredModel {
+                inner: settings.model,
                 budget: summary_budget,
             }));
         }
-        let normal_security = agent.ctx().security()?;
-        if config.yolo {
-            agent
-                .ctx()
-                .set_security(Arc::new(crate::security::YoloSecurity));
+        let normal_security = agent.security()?;
+        let yolo_security: Arc<dyn SecurityProvider> = Arc::new(crate::security::YoloSecurity);
+        if config.config.security.yolo {
+            agent.set_security(yolo_security.clone());
         }
-        let memory = if config.extensions {
+        let memory = if config.config.session.extensions {
             Some(Arc::new(LocalMemory::new(lease.store(), id.clone())))
         } else {
             None
         };
-        let skills = if config.extensions {
+        let skills = if config.config.session.extensions {
             Some(Arc::new(LocalSkills::new(lease.store(), id.clone())))
         } else {
             None
         };
         if let Some(provider) = config.memory_manager {
-            agent.ctx().set_memory(provider);
+            agent.set_memory(provider);
         } else if let Some(memory) = &memory {
-            agent.ctx().set_memory(memory.clone());
+            agent.set_memory(memory.clone());
         }
         crate::memory::register(hooks.as_ref(), id.clone()).await?;
-        let input = yourai_core::turn::InputOptions {
-            memory_search_limit: config.memory_search_limit,
-            ..Default::default()
-        };
+
         if let Some(agent_loop) = config.agent_loop {
-            agent.ctx().set_agent_loop(agent_loop);
+            agent.set_agent_loop(agent_loop);
         }
         if let Some(provider) = config.skill_provider {
-            agent.ctx().set_skills(provider);
+            agent.set_skills(provider);
         } else if let Some(skills) = &skills {
-            agent.ctx().set_skills(skills.clone());
+            agent.set_skills(skills.clone());
         }
-        let mut environment = SessionEnvironment::new(id, config.cwd);
-        environment.transcript_path = Some(crate::SqliteStore::path(&config.root));
-        environment.instructions = initial_instructions;
-        let host = SessionManager::open_owned(
-            lease,
-            environment,
-            agent,
-            SessionConfig {
-                input,
-                // Preserve initial instruction lifecycle hooks; reopening uses the
-                // frozen snapshot and must not require the original files.
-                instruction_paths: if source == "startup" {
-                    config.instructions
-                } else {
-                    vec![]
-                },
-                workspace_enabled: config.extensions,
-                ..Default::default()
-            },
-            source,
-        )
-        .await?;
+        let host = start_session(&session_config, id, lease, agent, prepared, source).await?;
         let ready = async {
-            for notice in prompt_notices {
-                host.post_event_async(yourai_core::runtime_event::RuntimeEvent {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    context: None,
-                    notice: Some(notice),
-                    wake: false,
-                })
-                .await?;
-            }
-            let workspace = if config.extensions {
+            let workspace = if config.config.session.extensions {
                 Some(host.workspace()?)
             } else {
                 None
             };
             // Task progress is a basic coding capability, independent of workspace/subagents.
             let tasks = Some(host.task_manager("default")?);
-            let subagents = if config.extensions {
+            let subagents = if config.config.session.extensions {
                 Some(subagent(&host, None, None))
             } else {
                 None
             };
             if let Some(tasks) = &tasks {
-                tools.register(tasks.clone());
+                tools.register(Arc::new(crate::collaboration::tools::TaskTool(
+                    tasks.clone(),
+                )));
             }
             if let Some(subagents) = &subagents {
-                tools.register(subagents.clone());
+                tools.register(Arc::new(crate::collaboration::tools::SubagentTool(
+                    subagents.clone(),
+                )));
             }
             Ok(Self {
                 normal_security,
+                yolo_security,
                 provider_budgets: Mutex::new(provider_budgets),
                 current_budget: Mutex::new(budget.clone()),
                 sessions: catalog.store.clone(),
@@ -252,12 +208,33 @@ impl Harness {
         }
         ready
     }
+    pub fn yolo(&self) -> bool {
+        self.host
+            .agent()
+            .try_security()
+            .is_some_and(|current| Arc::ptr_eq(&current, &self.yolo_security))
+    }
+    /// Change the approval mode for this run only; never save a bypass as a session default.
     /// Change permissions only between turns, preserving the original policy.
     /// In-flight tool snapshots and approval questions must finish or be cancelled first.
     pub fn set_yolo(&self, enabled: bool) -> Result<(), YourAiError> {
         let _gate = self.host.try_operation()?;
-        self.host.agent().ctx().set_security(if enabled {
-            Arc::new(crate::security::YoloSecurity)
+        self.host.agent().set_security(if enabled {
+            self.yolo_security.clone()
+        } else {
+            self.normal_security.clone()
+        });
+        Ok(())
+    }
+    pub(crate) fn set_yolo_config(
+        &self,
+        enabled: bool,
+        commit: impl FnOnce() -> Result<(), YourAiError>,
+    ) -> Result<(), YourAiError> {
+        let _gate = self.host.try_operation()?;
+        commit()?;
+        self.host.agent().set_security(if enabled {
+            self.yolo_security.clone()
         } else {
             self.normal_security.clone()
         });
@@ -272,7 +249,7 @@ impl Harness {
         model: Arc<dyn ModelProvider>,
         policy: ContextPolicy,
     ) -> Result<(), YourAiError> {
-        self.switch_model_inner(model, policy, None).await
+        self.switch_model_inner(model, policy, None, None).await
     }
     /// Shared usage counters with the current main provider's cooldown.
     pub fn model_snapshot(&self) -> crate::model::BudgetSnapshot {
@@ -283,16 +260,36 @@ impl Harness {
         &self,
         model: Arc<dyn ModelProvider>,
         policy: ContextPolicy,
-        settings: ModelSettings,
+        provider: String,
+        requests: crate::model::RequestPolicy,
     ) -> Result<(), YourAiError> {
-        settings.requests.validate()?;
-        self.switch_model_inner(model, policy, Some(settings)).await
+        requests.validate()?;
+        self.switch_model_inner(model, policy, Some((provider, requests)), None)
+            .await
+    }
+    pub(crate) async fn switch_model_config(
+        &self,
+        model: Arc<dyn ModelProvider>,
+        policy: ContextPolicy,
+        provider: String,
+        requests: crate::model::RequestPolicy,
+        commit: impl FnOnce() -> Result<(), YourAiError> + Send,
+    ) -> Result<(), YourAiError> {
+        requests.validate()?;
+        self.switch_model_inner(
+            model,
+            policy,
+            Some((provider, requests)),
+            Some(Box::new(commit)),
+        )
+        .await
     }
     async fn switch_model_inner(
         &self,
         model: Arc<dyn ModelProvider>,
         policy: ContextPolicy,
-        settings: Option<ModelSettings>,
+        settings: Option<(String, crate::model::RequestPolicy)>,
+        commit: Option<Box<dyn FnOnce() -> Result<(), YourAiError> + Send + '_>>,
     ) -> Result<(), YourAiError> {
         policy.validate_for(model.token_budget())?;
         let _gate = self.host.try_operation()?;
@@ -301,39 +298,55 @@ impl Harness {
                 .provider_budgets
                 .lock()
                 .unwrap()
-                .get(&(settings.provider.clone(), settings.requests.clone()))
+                .get(&(settings.0.clone(), settings.1.clone()))
                 .cloned()
             {
                 budget
             } else {
-                self.budget.for_provider(settings.requests.clone())?
+                self.budget.for_provider(settings.1.clone())?
             }
         } else {
             self.current_budget.lock().unwrap().clone()
         };
         let id = self.host.environment().id;
-        let history =
-            DefaultContext::new(id.clone(), String::new(), Some(self.host.store()), policy);
+        let history = DefaultContext::new(
+            id.clone(),
+            String::new(),
+            Some(self.host.store()),
+            policy.clone(),
+        );
         // Prepare everything that can fail before publishing either provider.
         history.restore().await?;
         let mut meta = self.sessions.load_session(&id).await?;
         meta.model = Some(model.model_iden().into());
-        self.host.store().save_session(&meta).await?;
+        let update_metadata_after_publish = commit.is_some();
+        if !update_metadata_after_publish {
+            self.host.store().save_session(&meta).await?;
+        }
+        if let Some(commit) = commit {
+            commit()?;
+        }
         let model = Arc::new(MeteredModel {
             inner: model,
             budget: selected_budget.clone(),
         });
         if let Some(settings) = settings {
-            self.provider_budgets.lock().unwrap().insert(
-                (settings.provider, settings.requests),
-                selected_budget.clone(),
-            );
+            self.provider_budgets
+                .lock()
+                .unwrap()
+                .insert((settings.0, settings.1), selected_budget.clone());
         }
         *self.current_budget.lock().unwrap() = selected_budget;
-        self.host.agent().ctx().update(|providers| {
+        self.host.agent().update(|providers| {
             providers.context_manager = Some(history);
             providers.model = Some(model);
         });
+        // Metadata is a display projection; file config is the authority.
+        if update_metadata_after_publish {
+            if let Err(error) = self.host.store().save_session(&meta).await {
+                self.host.close_warning(&error);
+            }
+        }
         Ok(())
     }
 
@@ -347,25 +360,21 @@ impl Harness {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Assemble the same provider set for new, resumed and child sessions.
 pub(crate) async fn assemble(
-    catalog: &Arc<SessionCatalog>,
     id: &SessionId,
     store: Arc<dyn SessionStore>,
     cwd: &std::path::Path,
     trusted_shell: bool,
-    model: Arc<dyn ModelProvider>,
-    hooks: Option<Arc<dyn HookManager>>,
-    usage: Option<Arc<dyn UsageTracker>>,
-    inherited: Option<Arc<dyn ToolRegistry>>,
-    policy: ContextPolicy,
+    mut bindings: AgentBuilder,
+    config: &ExecutionOptions,
 ) -> Result<(Arc<Agent>, Arc<ToolSet>), YourAiError> {
-    let _dir = catalog.directory(id)?;
     let output = crate::tools::ToolOutputStore::new(store.clone(), id.clone());
-    let inherited = inherited
-        .map(|registry| {
-            registry
-                .snapshot()
+    let inherited = bindings
+        .tools
+        .as_ref()
+        .map(|r| {
+            r.snapshot()
                 .into_iter()
                 .filter(|tool| !crate::tools::BUILTIN_TOOL_NAMES.contains(&tool.name()))
                 .collect()
@@ -376,43 +385,73 @@ pub(crate) async fn assemble(
         cwd,
         Some(output.clone()),
     )?);
-
-    let history = DefaultContext::new(id.clone(), String::new(), Some(store.clone()), policy);
-    let mut builder = Agent::builder()
-        .agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
-            crate::default_loop::LoopConfig {
-                execution: yourai_core::execution::ExecutionConfig {
-                    tool_output: Some(output.clone()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )))
-        .model(model)
-        .context_manager(history)
-        .session(store.clone())
-        .tools(registry.clone())
-        .security(PolicySecurity::open_for_workspace(
+    bindings
+        .agent_loop
+        .get_or_insert_with(|| Arc::new(crate::default_loop::DefaultLoop));
+    bindings.context_manager = Some(DefaultContext::new(
+        id.clone(),
+        String::new(),
+        Some(store.clone()),
+        config.context_policy.clone(),
+    ));
+    bindings.session = Some(store.clone());
+    bindings.tools = Some(registry.clone());
+    bindings.tool_output = Some(output);
+    if bindings.security.is_none() {
+        bindings.security = Some(PolicySecurity::open_for_workspace(
             store,
             id.clone(),
             vec![],
             cwd.to_owned(),
             trusted_shell,
         )?);
-    if let Some(hooks) = hooks {
-        builder = builder.hooks(hooks);
     }
-    if let Some(usage) = usage {
-        builder = builder.usage(usage);
+    Ok((bindings.build(), registry))
+}
+
+/// Publish a session only after lifecycle initialization and notices succeed.
+pub(crate) async fn start_session(
+    config: &SessionOptions,
+    id: SessionId,
+    lease: crate::runtime::SessionLease,
+    agent: Arc<Agent>,
+    prepared: crate::context::prompt::PreparedPrompt,
+    source: &str,
+) -> Result<Arc<SessionManager>, YourAiError> {
+    let mut environment = SessionEnvironment::new(id, config.cwd.clone());
+    environment.transcript_path = Some(SqliteStore::path(&config.root));
+    environment.instructions = prepared.instructions;
+    let mut settings = config.config.execution_options();
+    if source != "startup" {
+        settings.instruction_paths.clear();
     }
-    Ok((builder.build(), registry))
+    settings.workspace_enabled |= config.config.session.extensions;
+    let host = SessionManager::open_owned(lease, environment, agent, settings, source).await?;
+    let ready = async {
+        for notice in prepared.notices {
+            host.post_event_async(yourai_core::runtime_event::RuntimeEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                context: None,
+                notice: Some(notice),
+                wake: false,
+            })
+            .await?;
+        }
+        Ok::<_, YourAiError>(())
+    }
+    .await;
+    if let Err(error) = ready {
+        let _ = host.finish_close(None).await;
+        return Err(error);
+    }
+    Ok(host)
 }
 
 /// One initialization path for Harness, standalone hosts and child sessions.
 /// Resume acquires ownership before any prompt preparation or metadata write.
 pub(crate) async fn prepare_session(
     catalog: &SessionCatalog,
-    config: &HarnessConfig,
+    config: &SessionOptions,
     model: &dyn ModelProvider,
 ) -> Result<
     (
@@ -443,13 +482,15 @@ pub(crate) async fn prepare_session(
         }
     } else {
         crate::context::prompt::prepare(
-            &config.prompt,
+            &config.config,
             &config.cwd,
-            config.system_prompt.as_deref(),
-            &config.instructions,
+            config.config.prompt.system_prompt.as_deref(),
+            &config.config.execution.instruction_paths,
             config.skill_provider.as_deref(),
             config.memory_manager.as_deref(),
             config
+                .config
+                .execution
                 .context_policy
                 .maintenance_threshold(model.token_budget()),
             &tokio_util::sync::CancellationToken::new(),

@@ -1,6 +1,6 @@
-//! Providers 容器 + Agent + turn 运输机制。
+//! Agent 依赖绑定、执行入口与 turn 运输机制。
 //!
-//! - [`Providers`]：12 个 provider 插槽，`RwLock<Option<Arc<dyn>>>`，
+//! - [`Agent`]：拥有 12 个 provider 插槽与一致发布锁，
 //!   turn 级热替换（决策 5.2）；读取缺失报 `Config`（决策 5.8），
 //!   可选读取用 `try_*`（供 DefaultLoop 依赖矩阵使用）
 //! - [`Agent`]：组装产物；[`Agent::start`] 是**全局唯一 spawn 点**
@@ -23,7 +23,6 @@ use crate::error::{ErrorKind, YourAiError};
 use crate::hooks::HookManager;
 use crate::memory::MemoryManager;
 use crate::model::ModelProvider;
-use crate::observability::ObservabilityProvider;
 use crate::protocol::{In, Out};
 use crate::sandbox::SandboxProvider;
 use crate::security::SecurityProvider;
@@ -34,9 +33,9 @@ use crate::turn::{TurnInfo, TurnOptions};
 use crate::ui::OutSink;
 use crate::usage::UsageTracker;
 
-// region:    --- Providers ---
+// region:    --- Agent bindings ---
 
-/// 单一处声明全部 provider 插槽，生成 Providers / ProviderSnapshot / AgentBuilder
+/// 单一处声明全部 provider 插槽，生成 Agent / ProviderSnapshot / AgentBuilder
 /// 与三组访问器（读取/可选读取/热替换）——新增插槽只改这份清单。
 /// 第一行是必需槽（ProviderSnapshot 中非 Option），其余为可选槽。
 macro_rules! provider_slots {
@@ -45,16 +44,17 @@ macro_rules! provider_slots {
         $(, optional $field:ident : $try:ident : $setter:ident : $trait:ident)*
         $(,)?
     ) => {
-        /// 所有 provider 的容器——纯粹的 provider 容器，交互管道不在这里
-        ///（每次 turn 由 [`Agent::start`] 装配进 [`TurnContext`]，决策 5.5）。
-        pub struct Providers { bindings: RwLock<AgentBuilder> }
-        impl Providers {
+        /// Owns provider bindings and execution entry points. Each turn freezes one
+        /// coherent snapshot; channels and cancellation belong to TurnContext.
+        /// Share this owner through Arc, rather than cloning mutable bindings.
+        pub struct Agent { bindings: RwLock<AgentBuilder> }
+        impl Agent {
             /// Read one coherent configuration, including during session startup.
-            pub fn bindings(&self) -> AgentBuilder {
+            pub(crate) fn bindings(&self) -> AgentBuilder {
                 self.bindings.read().unwrap_or_else(|p| p.into_inner()).clone()
             }
             /// Publish related providers together. A panic leaves the old set intact.
-            /// The callback must not call back into this Providers container.
+            /// The callback must not call back into this Agent.
             pub fn update(&self, change: impl FnOnce(&mut AgentBuilder)) {
                 let mut current = self.bindings.write().unwrap_or_else(|p| p.into_inner());
                 let mut next = current.clone();
@@ -82,6 +82,7 @@ macro_rules! provider_slots {
                 Ok(ProviderSnapshot {
                     $req: p.$req.clone().ok_or_else(|| ErrorKind::Config(format!("provider not configured: {}", stringify!($req))))?,
                     $( $field: p.$field.clone(), )*
+                    tool_output: p.tool_output.clone(),
                 })
             }
         }
@@ -93,9 +94,10 @@ macro_rules! provider_slots {
         /// - 必需：`agent_loop`（start 已查）、`model`、`context_manager`（用点报 Config）
         /// - 工具循环需要：`tools`（无则视作空工具集）
         /// - 可选：`session` / `memory` / `skills` / `sandbox` / `security`
-        ///   （缺省 = 不拦截）/ `usage` / `observability` / `hooks`（缺省 = 不发）
+        ///   （缺省 = 不拦截）/ `usage` / `hooks`（缺省 = 不发）
         #[derive(Clone)]
         pub struct ProviderSnapshot {
+            pub tool_output: Option<Arc<crate::tool_output::ToolOutputStore>>,
             pub $req: Arc<dyn $req_trait>,
             $( pub $field: Option<Arc<dyn $trait>>, )*
         }
@@ -104,11 +106,13 @@ macro_rules! provider_slots {
         /// 缺什么在使用点报 `Config` 错。机制（builder）与策略（CLI 读配置）分离。
         #[derive(Clone, Default)]
         pub struct AgentBuilder {
+            pub tool_output: Option<Arc<crate::tool_output::ToolOutputStore>>,
             pub $req: Option<Arc<dyn $req_trait>>,
             $( pub $field: Option<Arc<dyn $trait>>, )*
         }
 
         impl AgentBuilder {
+            pub fn tool_output(mut self, store: Arc<crate::tool_output::ToolOutputStore>) -> Self { self.tool_output = Some(store); self }
             pub fn $req(mut self, v: Arc<dyn $req_trait>) -> Self {
                 self.$req = Some(v);
                 self
@@ -122,8 +126,7 @@ macro_rules! provider_slots {
 
             /// 组装 Agent（不做完整性检查，决策 5.8）
             pub fn build(self) -> Arc<Agent> {
-                let ctx = Providers { bindings: RwLock::new(self) };
-                Arc::new(Agent { ctx: Arc::new(ctx) })
+                Arc::new(Agent { bindings: RwLock::new(self) })
             }
         }
     };
@@ -142,26 +145,14 @@ provider_slots! {
     optional   sandbox:           try_sandbox:           set_sandbox:           SandboxProvider,
     optional   security:          try_security:          set_security:          SecurityProvider,
     optional   usage:             try_usage:             set_usage:             UsageTracker,
-    optional   observability:     try_observability:     set_observability:     ObservabilityProvider,
     optional   hooks:             try_hooks:             set_hooks:             HookManager,
 }
 
 // region:    --- Agent ---
 
-/// 组装产物：轻量、可 Clone（Clone 共享同一 Providers）。
-#[derive(Clone)]
-pub struct Agent {
-    ctx: Arc<Providers>,
-}
-
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
-    }
-
-    /// 读取 Providers（运行期热注册/热替换入口，见 8.4）
-    pub fn ctx(&self) -> &Providers {
-        &self.ctx
     }
 
     /// 非阻塞启动：spawn turn，立即返回句柄（全局唯一 spawn 点）。
@@ -171,7 +162,7 @@ impl Agent {
     /// 注意：丢弃 [`TurnHandle`] 请求取消该 turn，Loop/Provider 须协作清理；
     /// 要 fire-and-forget 请把句柄存进任务表，不要直接丢弃。
     pub fn start(self: &Arc<Self>, first: In) -> Result<TurnHandle, YourAiError> {
-        self.start_with(first, TurnOptions::default())
+        self.start_with(first, Default::default(), TurnOptions::default())
     }
 
     /// 带会话身份和执行限制启动。只做装配检查；限制由 Loop 执行。
@@ -179,10 +170,11 @@ impl Agent {
     pub fn start_with(
         self: &Arc<Self>,
         mut first: In,
+        config: crate::execution::ExecutionOptions,
         options: TurnOptions,
     ) -> Result<TurnHandle, YourAiError> {
         // 快照同时完成 loop 的 Config 检查，是本 turn 的恒定视图。
-        let snap = self.ctx.snapshot()?;
+        let snap = self.snapshot()?;
         validate_session_binding(&snap, &options)?;
         first.ensure_id();
         let info = TurnInfo::new(options);
@@ -199,6 +191,7 @@ impl Agent {
             let loop_ = snap.agent_loop.clone();
             let tc = TurnContext {
                 info: &task_info,
+                config,
                 snap,
                 inbox: &mut inbox_rx,
                 outbox: &sink,
@@ -225,12 +218,18 @@ impl Agent {
     /// - loop 若发出 [`Out::Ask`]，内部取消立即触发，返回 `Config` 错
     ///   （交互场景请用 [`Agent::start`]；本地代码 / 脚本场景用 run）
     pub async fn run(&self, first: In) -> TurnResult {
-        self.run_with(first, TurnOptions::default()).await
+        self.run_with(first, Default::default(), TurnOptions::default())
+            .await
     }
 
     /// 非交互执行并传递会话身份与限制。失败也保留未处理输入。
-    pub async fn run_with(&self, first: In, options: TurnOptions) -> TurnResult {
-        let snap = match self.ctx.snapshot().and_then(|snap| {
+    pub async fn run_with(
+        &self,
+        first: In,
+        config: crate::execution::ExecutionOptions,
+        options: TurnOptions,
+    ) -> TurnResult {
+        let snap = match self.snapshot().and_then(|snap| {
             validate_session_binding(&snap, &options)?;
             Ok(snap)
         }) {
@@ -253,6 +252,7 @@ impl Agent {
         let loop_ = snap.agent_loop.clone();
         let tc = TurnContext {
             info: &info,
+            config,
             snap,
             inbox: &mut inbox_rx,
             outbox: &sink,
@@ -419,6 +419,8 @@ impl Drop for TurnHandle {
 pub struct TurnContext<'a> {
     /// 本次执行身份、绑定会话和限制；不是可变全局配置。
     pub info: &'a TurnInfo,
+    /// Frozen execution settings supplied by the caller, never stored by Agent.
+    pub config: crate::execution::ExecutionOptions,
     /// start/run 时刻的 provider 快照——turn 内读 providers 一律走这里
     pub snap: ProviderSnapshot,
     /// 外界 → loop（含第一条消息）；loop 独占拉取消费
@@ -642,7 +644,7 @@ mod tests {
         let agent = Agent::builder().agent_loop(Arc::new(LoopA)).build();
         assert_eq!(agent.run(In::user_text("x")).await.unwrap().text, "A");
 
-        agent.ctx().set_agent_loop(Arc::new(LoopB)); // 热替换
+        agent.set_agent_loop(Arc::new(LoopB)); // 热替换
         assert_eq!(agent.run(In::user_text("x")).await.unwrap().text, "B");
     }
 
@@ -706,7 +708,7 @@ mod tests {
         let entered_wait = entered.notified();
         let handle = agent.start(In::user_text("x")).expect("ok");
         entered_wait.await;
-        agent.ctx().set_model(Arc::new(StubModel));
+        agent.set_model(Arc::new(StubModel));
         resume.notify_one();
         assert_eq!(
             handle.join().await.unwrap().text,

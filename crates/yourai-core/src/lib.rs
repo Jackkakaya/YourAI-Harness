@@ -64,7 +64,6 @@ pub mod interaction;
 pub mod memory;
 pub mod model;
 pub mod model_error;
-pub mod observability;
 pub mod permission;
 pub mod protocol;
 pub mod runtime;
@@ -108,12 +107,11 @@ pub mod prelude {
         CompactionRequest, CompactionResult, CompactionTrigger, ContextPolicy,
     };
     pub use crate::completion::Completion;
-    pub use crate::context::{
-        Agent, AgentBuilder, ProviderSnapshot, Providers, TurnContext, TurnHandle,
-    };
+    pub use crate::context::{Agent, AgentBuilder, ProviderSnapshot, TurnContext, TurnHandle};
     pub use crate::context_manager::{ContextManager, ContextRequest};
     pub use crate::error::{AbortReason, ErrorKind, YourAiError};
     pub use crate::execution::Turn;
+    pub use crate::execution::{ExecutionOptions, ImagePolicy};
     pub use crate::future::BoxFuture;
     pub use crate::hooks::{
         BaseInput, FailurePolicy, HookBlockingError, HookCommonOutcome, HookDispatchResult,
@@ -130,11 +128,10 @@ pub mod prelude {
         Model, ModelErrorClass, ModelEventStream, ModelLimits, ModelOptions, ModelOutput,
         ModelProvider, ModelRecovery, ModelRequest, ModelTimeouts, ModelTokenBudget,
     };
-    pub use crate::observability::{ObservabilityProvider, Span};
     pub use crate::protocol::{
         AttachmentData, FileRef, In, InputMode, Level, Out, Usage, UserAttachment,
     };
-    pub use crate::runtime::{SessionConfig, SessionManager};
+    pub use crate::runtime::SessionManager;
     pub use crate::sandbox::{SandboxPolicy, SandboxProvider, SandboxType};
     pub use crate::security::{
         ApprovalDecision, PolicyDecision, SecurityContext, SecurityProvider,
@@ -149,7 +146,7 @@ pub mod prelude {
     pub use crate::skill::{SkillContent, SkillInfo, SkillProvider};
     pub use crate::tasks::{Task, TaskManager};
     pub use crate::tool::{ExecutedTool, Tool, ToolContext, ToolProvider, ToolRegistry};
-    pub use crate::turn::{InputOptions, TurnId, TurnInfo, TurnLimits, TurnOptions};
+    pub use crate::turn::{TurnId, TurnInfo, TurnLimits, TurnOptions};
     pub use crate::ui::OutSink;
     pub use crate::usage::{UsageEvent, UsageStats, UsageTracker};
 }

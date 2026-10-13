@@ -11,7 +11,7 @@
 | `SessionStore` / `SqliteStore` | SQLite 完整历史、事务、会话恢复与 fork |
 | `ModelProvider` / `UsageTracker` | 本次选定模型与统一用量记账 |
 
-`SessionManager.environment()` 返回 `SessionEnvironment`：会话身份、工作目录、transcript 位置和已加载指令，没有聊天消息列表。对话历史通过 `SessionManager.agent().ctx().context_manager()` 获取。`environment` 用于执行环境，`context` 用于模型上下文；不保留混淆两者的旧访问器或类型别名。
+`SessionManager.environment()` 返回 `SessionEnvironment`：会话身份、工作目录、transcript 位置和已加载指令，没有聊天消息列表。对话历史通过 `SessionManager.agent().context_manager()` 获取。`environment` 用于执行环境，`context` 用于模型上下文；不保留混淆两者的旧访问器或类型别名。
 
 Compactor 只保存选定的依赖。候选消息、滚动摘要和游标是一次执行的局部变量。ContextManager 不保存第二份模型、Hook 或计量绑定。
 
@@ -63,7 +63,7 @@ exec
 
 摘要使用独立的输出预算：目标长度的四倍作为包含推理和格式的余量，且不超过本次模型的普通输出预算。通过同一个 ModelTokenBudget 解析器重算摘要输入容量，不重复预留普通回答的巨大输出空间。
 
-自动触发默认随模型窗口变化：留下窗口的 10%；窗口至少 32,000 token 时至少留下 16,000 token。触发阈值同时不能超过正常请求的硬输入预算，输出预留与安全余量始终有效。独立 input/context 限制取较小值。设置 `context.advance_tokens` 可改回在硬输入预算下预留指定距离；不设置或设为 null 使用动态余量。
+自动触发默认随模型窗口变化：留下窗口的 10%；窗口至少 32,000 token 时至少留下 16,000 token。触发阈值同时不能超过正常请求的硬输入预算，输出预留与安全余量始终有效。独立 input/context 限制取较小值。设置 `execution.context.advance_tokens` 可改回在硬输入预算下预留指定距离；不设置或设为 null 使用动态余量。
 
 超长历史使用有界滚动分块。摘要材料中的工具正文额外保留约 1,250 字符的头尾，媒体只给占位。provider 报告摘要请求溢出时依次尝试首次拒绝请求大小的 70%、50%、35%。不能容纳的旧完整消息/工具组可省略，但最新候选组、当前用户请求、当前有效指令和未结束批次不能丢弃；组内不截掉半个调用。省略会进入 `CompactionResult.notices`，并在最终摘要中保留历史缺失标记。若仍不能容纳最新候选组或上一份摘要，则失败，不提交任何历史修改。原记录始终留在 SQLite。请求的共享计数器记录所有尝试，默认最多八次；主循环对这些调用计数，但压缩不消耗业务 step。
 
@@ -71,12 +71,14 @@ exec
 
 ```json
 {
-  "model": "gateway/main-model",
-  "compaction_model": "gateway/summary-model"
+  "models": {
+    "selected": "gateway/main-model",
+    "compaction": "gateway/summary-model"
+  }
 }
 ```
 
-两项使用同一套 `provider` 模型定义，各自的容量、输出上限和连接设置独立解析。库调用方设置 `HarnessConfig.compaction_model`（模型与已有 `ModelSettings`），core 调用方设置 `Agent::builder().compaction_model(...)`。`Compactor` 用主模型判断触发和最终请求是否装得下，用摘要模型的容量组装摘要请求。限流、请求日志和用量走现有 `MeteredModel`，子任务继承独立摘要模型。切换主模型时，未配置摘要模型则跟随切换，已配置则保持固定。
+两项使用同一套 `models.providers` 模型定义，各自的容量、输出上限和连接设置独立解析。库调用方设置 `SessionOptions.compaction_model`（解析后的 `ResolvedModel`），core 调用方设置 `Agent::builder().compaction_model(...)`。`Compactor` 用主模型判断触发和最终请求是否装得下，用摘要模型的容量组装摘要请求。限流、请求日志和用量走现有 `MeteredModel`，子任务继承独立摘要模型。切换主模型时，未配置摘要模型则跟随切换，已配置则保持固定。
 
 每次已付费响应先进入共享用量记录和 UsageTracker，然后才检查摘要或提交；空摘要、截断、事务失败也计量。记账重试复用 UsageEvent 身份，不重新调用模型。用量转换统一使用 core `model::usage`。
 

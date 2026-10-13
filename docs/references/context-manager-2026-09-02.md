@@ -1,5 +1,6 @@
 # ContextManager 设计文档
 
+> 此文为 2026-09-02 的历史设计记录；其中平铺配置和旧接口不代表现行实现。当前使用统一分类 Config，见 [配置契约](../core-contracts.md#配置读写与持久化契约2026-10-13)。
 > 历史参考快照，来源：`/Users/jiangsumin/codejk/agents/yourai/docs/context-manager.md`。保留旧讨论原文，不代表当前全部采纳；最新分工与待修正问题见 [收敛设计](../session-storage-design.md)。
 
 > 状态：**v1.0 五问收口**（2026-09-02，D-CM1~16 全部决策完毕）。

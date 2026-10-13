@@ -140,19 +140,47 @@ def write_yourai_config(tmp, port):
     """Point a scratch yourai config at the mock server."""
     config = Path(tmp) / 'config.json'
     config.write_text(json.dumps({
-        'model': 'mock/scroll', 'extensions': False,
-        'provider': {'mock': {'npm': '@ai-sdk/openai-compatible', 'options': {
-            'baseURL': f'http://127.0.0.1:{port}/v1', 'apiKey': 'x'}, 'models': {}}}
+        'models': {
+            'selected': 'mock/scroll',
+            'providers': {
+                'mock': {
+                    'npm': '@ai-sdk/openai-compatible',
+                    'options': {
+                        'baseURL': f'http://127.0.0.1:{port}/v1',
+                        'apiKey': 'x'
+                    },
+                    'models': {}
+                }
+            }
+        },
+        'session': {
+            'extensions': False
+        }
     }))
     return config
 
 
 def write_opencode_config(tmp, port):
     cfg = Path(tmp) / 'oc.json'
-    cfg.write_text(json.dumps({'model': 'mock/scroll', 'provider': {'mock': {
-        'npm': '@ai-sdk/openai-compatible',
-        'options': {'baseURL': f'http://127.0.0.1:{port}/v1', 'apiKey': 'x'},
-        'models': {'scroll': {'name': 'Scroll'}}}}}))
+    cfg.write_text(json.dumps({
+        'models': {
+            'selected': 'mock/scroll',
+            'providers': {
+                'mock': {
+                    'npm': '@ai-sdk/openai-compatible',
+                    'options': {
+                        'baseURL': f'http://127.0.0.1:{port}/v1',
+                        'apiKey': 'x'
+                    },
+                    'models': {
+                        'scroll': {
+                            'name': 'Scroll'
+                        }
+                    }
+                }
+            }
+        }
+    }))
     return cfg
 
 

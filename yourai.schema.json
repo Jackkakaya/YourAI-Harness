@@ -1,0 +1,282 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "YourAI configuration",
+  "type": "object",
+  "properties": {
+    "$schema": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    "models": {"$ref": "#/$defs/models"},
+    "execution": {"$ref": "#/$defs/execution"},
+    "security": {
+      "type": "object",
+      "properties": {"trusted_shell": {"type": "boolean"}, "yolo": {"type": "boolean"}},
+      "additionalProperties": false
+    },
+    "ui": {"type": "object", "properties": {"theme": {"type": "string"}}, "additionalProperties": false},
+    "session": {
+      "type": "object",
+      "properties": {"directory": {"type": "string"}, "extensions": {"type": "boolean"}},
+      "additionalProperties": false
+    },
+    "prompt": {"$ref": "#/$defs/prompt"},
+    "hooks": {"$ref": "#/$defs/hooks"}
+  },
+  "additionalProperties": false,
+  "required": ["models"],
+  "$defs": {
+    "duration": {
+      "type": "object",
+      "properties": {
+        "secs": {"type": "integer", "minimum": 0},
+        "nanos": {"type": "integer", "minimum": 0, "maximum": 999999999}
+      },
+      "additionalProperties": false,
+      "required": ["secs", "nanos"]
+    },
+    "context": {
+      "type": "object",
+      "properties": {
+        "safety_margin": {"type": "integer", "minimum": 0},
+        "advance_tokens": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+        "keep_recent_tokens": {"type": "integer", "minimum": 0},
+        "summary_tokens": {"type": "integer", "minimum": 1},
+        "summary_min_savings": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "images": {
+      "type": "object",
+      "properties": {
+        "auto_resize": {"type": "boolean"},
+        "max_width": {"type": "integer", "minimum": 0},
+        "max_height": {"type": "integer", "minimum": 0},
+        "max_base64_bytes": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "execution": {
+      "type": "object",
+      "properties": {
+        "memory_search_limit": {"type": "integer", "minimum": 0},
+        "max_followups": {"type": "integer", "minimum": 0},
+        "memory_max_chars": {"type": "integer", "minimum": 0},
+        "attachment_text_max_chars": {"type": "integer", "minimum": 0},
+        "max_model_retries": {"type": "integer", "minimum": 0},
+        "max_overflow_compactions": {"type": "integer", "minimum": 0},
+        "max_stop_continuations": {"type": "integer", "minimum": 0},
+        "max_permission_rechecks": {"type": "integer", "minimum": 0},
+        "allow_background_wake": {"type": "boolean"},
+        "workspace_enabled": {"type": "boolean"},
+        "skill_ids": {"type": "array", "items": {"type": "string"}},
+        "instruction_paths": {"type": "array", "items": {"type": "string"}},
+        "model_timeout": {"anyOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}]},
+        "operation_timeout": {"anyOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}]},
+        "tool_timeout": {"anyOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}]},
+        "approval_timeout": {"anyOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}]},
+        "hook_timeout": {"anyOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}]},
+        "cleanup_timeout": {"anyOf": [{"$ref": "#/$defs/duration"}, {"type": "null"}]},
+        "retry_delay": {"$ref": "#/$defs/duration"},
+        "retry_max_delay": {"$ref": "#/$defs/duration"},
+        "tool_cleanup_timeout": {"$ref": "#/$defs/duration"},
+        "steps": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "context": {"$ref": "#/$defs/context"},
+        "attachment_image": {"$ref": "#/$defs/images"}
+      },
+      "additionalProperties": false
+    },
+    "requests": {
+      "type": "object",
+      "properties": {
+        "rpm": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 60000}, {"type": "null"}]},
+        "cooldown_seconds": {"type": "integer", "minimum": 0, "maximum": 3600}
+      },
+      "additionalProperties": false
+    },
+    "connection": {
+      "type": "object",
+      "properties": {
+        "baseURL": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "apiKey": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "timeout": {"anyOf": [{"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}, {"const": false}]},
+        "headerTimeout": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "chunkTimeout": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "requests": {"$ref": "#/$defs/requests"},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "context": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "input": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "output": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 4294967295}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "pricing": {
+      "type": "object",
+      "properties": {
+        "input": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+        "output": {"anyOf": [{"type": "number"}, {"type": "null"}]}
+      },
+      "additionalProperties": false
+    },
+    "generation": {
+      "type": "object",
+      "properties": {
+        "maxOutputTokens": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 4294967295}, {"type": "null"}]},
+        "temperature": {"anyOf": [{"type": "number", "minimum": 0}, {"type": "null"}]},
+        "topP": {"anyOf": [{"type": "number", "minimum": 0, "maximum": 1}, {"type": "null"}]},
+        "reasoningEffort": {"anyOf": [{"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]}, {"type": "null"}]}
+      },
+      "additionalProperties": true
+    },
+    "variant": {
+      "allOf": [{"$ref": "#/$defs/generation"}, {"type": "object", "properties": {"disabled": {"type": "boolean"}}}]
+    },
+    "model": {
+      "type": "object",
+      "properties": {
+        "id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "limit": {"$ref": "#/$defs/limits"},
+        "options": {"$ref": "#/$defs/generation"},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "variants": {"type": "object", "additionalProperties": {"$ref": "#/$defs/variant"}},
+        "pricing": {"$ref": "#/$defs/pricing"}
+      },
+      "additionalProperties": false
+    },
+    "provider": {
+      "type": "object",
+      "properties": {
+        "api": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "npm": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "options": {"$ref": "#/$defs/connection"},
+        "models": {"type": "object", "additionalProperties": {"$ref": "#/$defs/model"}}
+      },
+      "additionalProperties": false,
+      "not": {"required": ["api", "npm"]}
+    },
+    "models": {
+      "type": "object",
+      "properties": {
+        "selected": {"type": "string", "pattern": "^[^/]+/.+$"},
+        "compaction": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "variant": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "effort_overrides": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]}
+          }
+        },
+        "providers": {"type": "object", "additionalProperties": {"$ref": "#/$defs/provider"}}
+      },
+      "additionalProperties": false,
+      "required": ["selected", "providers"]
+    },
+    "prompt": {
+      "type": "object",
+      "properties": {
+        "system_prompt": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "soul_file": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "memory_file": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "profile_file": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "append_system_prompt": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "memory_file_max_chars": {"type": "integer", "minimum": 0},
+        "profile_file_max_chars": {"type": "integer", "minimum": 0},
+        "provider_max_chars": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "handler": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {"const": "command"},
+            "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+            "if": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]},
+            "command": {"type": "string"},
+            "shell": {"anyOf": [{"enum": ["bash", "powershell"]}, {"type": "null"}]},
+            "async": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "asyncRewake": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}
+          },
+          "additionalProperties": true,
+          "required": ["type", "command"]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {"const": "http"},
+            "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+            "if": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]},
+            "url": {"type": "string"},
+            "headers": {"anyOf": [{"type": "object", "additionalProperties": {"type": "string"}}, {"type": "null"}]},
+            "allowedEnvVars": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]}
+          },
+          "additionalProperties": true,
+          "required": ["type", "url"]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {"const": "prompt"},
+            "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+            "if": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]},
+            "prompt": {"type": "string"},
+            "model": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+          },
+          "additionalProperties": true,
+          "required": ["type", "prompt"]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {"const": "agent"},
+            "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+            "if": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]},
+            "prompt": {"type": "string"},
+            "model": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+          },
+          "additionalProperties": true,
+          "required": ["type", "prompt"]
+        }
+      ]
+    },
+    "hookEvents": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "matcher": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "hooks": {"type": "array", "items": {"$ref": "#/$defs/handler"}}
+          },
+          "additionalProperties": true,
+          "required": ["hooks"]
+        }
+      }
+    },
+    "hooks": {
+      "type": "object",
+      "properties": {"events": {"$ref": "#/$defs/hookEvents"}, "file": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+      "additionalProperties": false
+    }
+  }
+}

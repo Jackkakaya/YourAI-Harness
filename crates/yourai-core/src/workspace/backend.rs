@@ -15,7 +15,7 @@ impl Workspace {
             let _gate = gate;
             let _activity = activity;
             host.ensure_open()?;
-            let history = host.agent().ctx().context_manager()?;
+            let history = host.agent().context_manager()?;
             let prefix = format!("[Instructions: {}]\n", path.display());
             let note = format!("{prefix}{content}");
             let indexed = host.environment().instructions.get(&path) == Some(&content);
@@ -52,38 +52,6 @@ impl Workspace {
         })
         .await
         .map_err(|e| error("instructions", e))?
-    }
-    pub(super) async fn run_notify(
-        &self,
-        host: &Arc<SessionManager>,
-        message: &str,
-    ) -> Result<(), YourAiError> {
-        host.post_event_async(RuntimeEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            context: None,
-            notice: Some(message.into()),
-            wake: false,
-        })
-        .await?;
-        Ok(())
-    }
-    pub(super) async fn run_config(
-        &self,
-        host: &Arc<SessionManager>,
-        config: RuntimeConfig,
-        value: Value,
-        gate: tokio::sync::OwnedMutexGuard<()>,
-        activity: Activity,
-    ) -> Result<(), YourAiError> {
-        host.blocking(move |host| {
-            let _gate = gate;
-            let _activity = activity;
-            let _write = host.resource_lock()?;
-            host.save_state("config", value)?;
-            config.apply(&host);
-            Ok(())
-        })
-        .await?
     }
     pub(super) async fn run_create_worktree(
         &self,
