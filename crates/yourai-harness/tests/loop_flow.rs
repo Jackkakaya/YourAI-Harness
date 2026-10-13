@@ -11,18 +11,28 @@ use std::{
     time::{Duration, Instant},
 };
 use support::{Model, *};
+use yourai_core::execution::ExecutionOptions;
 use yourai_core::{hooks::*, model::ModelRecovery, prelude::*};
-use yourai_harness::default_loop::LoopConfig;
 
 #[tokio::test]
 async fn streamed_answer_commits_once_and_usage_is_delta() {
     let history = Arc::new(History::default());
     let model = Arc::new(Model::new(vec![answer("hello")]));
     let hooks = Arc::new(Hooks::new(|_, _| {}));
-    let agent = builder(model.clone(), history.clone(), LoopConfig::default())
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model.clone(), history.clone())
         .hooks(hooks.clone())
         .build();
-    let (events, result) = collect(agent.start(In::user_text("hi")).unwrap()).await;
+    let (events, result) = collect(
+        agent
+            .start_with(
+                In::user_text("hi"),
+                turn_config.clone(),
+                TurnOptions::default(),
+            )
+            .unwrap(),
+    )
+    .await;
     let result = result.unwrap();
     assert_eq!(result.text, "hello");
     assert_eq!(result.usage.unwrap().total_tokens, 3);
@@ -47,20 +57,25 @@ async fn streamed_answer_commits_once_and_usage_is_delta() {
 async fn image_attachment_is_committed_as_binary_and_reaches_the_model() {
     let history = Arc::new(History::default());
     let model = Arc::new(Model::new(vec![answer("ok")]));
-    let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model.clone(), history.clone()).build();
     // attachment resolution decodes and normalizes image attachments, so the
     // payload must be a real image.
     let data = tiny_png_base64();
     let (_events, result) = collect(
         agent
-            .start(In::user_text_with_attachments(
-                "describe this",
-                vec![UserAttachment::base64(
-                    "image/png",
-                    data,
-                    Some("clip.png".into()),
-                )],
-            ))
+            .start_with(
+                In::user_text_with_attachments(
+                    "describe this",
+                    vec![UserAttachment::base64(
+                        "image/png",
+                        data,
+                        Some("clip.png".into()),
+                    )],
+                ),
+                turn_config.clone(),
+                TurnOptions::default(),
+            )
             .unwrap(),
     )
     .await;
@@ -92,7 +107,8 @@ async fn image_attachment_is_committed_as_binary_and_reaches_the_model() {
 async fn file_reference_attachment_becomes_bounded_text_in_history() {
     let history = Arc::new(History::default());
     let model = Arc::new(Model::new(vec![answer("reviewed")]));
-    let agent = builder(model, history.clone(), LoopConfig::default()).build();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model, history.clone()).build();
 
     // A real file on disk, referenced (not inlined) by the frontend.
     let dir = std::env::temp_dir().join("yourai_loop_file_ref");
@@ -103,13 +119,17 @@ async fn file_reference_attachment_becomes_bounded_text_in_history() {
 
     let (_events, result) = collect(
         agent
-            .start(In::user_text_with_attachments(
-                "review this",
-                vec![UserAttachment::file(
-                    file.to_string_lossy().into_owned(),
-                    Some((2, 3)),
-                )],
-            ))
+            .start_with(
+                In::user_text_with_attachments(
+                    "review this",
+                    vec![UserAttachment::file(
+                        file.to_string_lossy().into_owned(),
+                        Some((2, 3)),
+                    )],
+                ),
+                turn_config.clone(),
+                TurnOptions::default(),
+            )
             .unwrap(),
     )
     .await;
@@ -149,11 +169,21 @@ async fn tools_record_success_and_failure_then_model_continues() {
     registry.register(Arc::new(Handler::new("ok", Mode::Return)));
     registry.register(Arc::new(Handler::new("bad", Mode::Fail)));
     let hooks = Arc::new(Hooks::new(|_, _| {}));
-    let agent = builder(model, history.clone(), LoopConfig::default())
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model, history.clone())
         .tools(registry)
         .hooks(hooks.clone())
         .build();
-    let (events, result) = collect(agent.start(In::user_text("go")).unwrap()).await;
+    let (events, result) = collect(
+        agent
+            .start_with(
+                In::user_text("go"),
+                turn_config.clone(),
+                TurnOptions::default(),
+            )
+            .unwrap(),
+    )
+    .await;
     assert_eq!(result.unwrap().text, "done");
     let roles: Vec<_> = history.messages().into_iter().map(|m| m.role).collect();
     assert_eq!(
@@ -190,16 +220,23 @@ async fn hook_changed_arguments_are_validated_and_cannot_bypass_hard_deny() {
             o.retry = true;
         }
     }));
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool"]), answer("denied")])),
         Arc::new(History::default()),
-        LoopConfig::default(),
     )
     .tools(registry)
     .security(security.clone())
     .hooks(hooks.clone())
     .build();
-    let result = agent.run(In::user_text("go")).await.unwrap();
+    let result = agent
+        .run_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .await
+        .unwrap();
     assert_eq!(result.text, "denied");
     assert!(h.inputs.lock().unwrap().is_empty());
     assert_eq!(
@@ -224,11 +261,18 @@ async fn approval_routes_replies_steer_and_follow_up_without_losing_input() {
     let registry = Arc::new(Registry::default());
     let h = Arc::new(Handler::new("tool", Mode::Return));
     registry.register(h.clone());
-    let agent = builder(model, history.clone(), LoopConfig::default())
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model, history.clone())
         .tools(registry)
         .security(Arc::new(Security::new(ApprovalDecision::Ask)))
         .build();
-    let mut handle = agent.start(In::user_text("go")).unwrap();
+    let mut handle = agent
+        .start_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .unwrap();
     while let Some(event) = handle.outbox.recv().await {
         if let Out::Ask { id, .. } = event {
             handle.inbox.send(In::follow_up("later")).unwrap();
@@ -278,16 +322,22 @@ async fn session_approval_is_owned_by_security_and_does_not_bypass_hook_asks() {
                 }
             }
         }));
+        let turn_config = ExecutionOptions::default();
         let agent = builder(
             Arc::new(Model::new(vec![calls(&["tool", "tool"]), answer("done")])),
             Arc::new(History::default()),
-            LoopConfig::default(),
         )
         .tools(registry)
         .security(policy.clone())
         .hooks(hooks)
         .build();
-        let mut handle = agent.start(In::user_text("go")).unwrap();
+        let mut handle = agent
+            .start_with(
+                In::user_text("go"),
+                turn_config.clone(),
+                TurnOptions::default(),
+            )
+            .unwrap();
         let mut asks = 0;
         while let Some(event) = handle.outbox.recv().await {
             if let Out::Ask { id, payload } = event {
@@ -322,14 +372,20 @@ async fn session_approval_is_owned_by_security_and_does_not_bypass_hook_asks() {
 async fn repeated_tool_questions_have_distinct_ids_and_no_deadlock() {
     let registry = Arc::new(Registry::default());
     registry.register(Arc::new(Handler::new("tool", Mode::Ask)));
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool"]), answer("done")])),
         Arc::new(History::default()),
-        LoopConfig::default(),
     )
     .tools(registry)
     .build();
-    let mut handle = agent.start(In::user_text("go")).unwrap();
+    let mut handle = agent
+        .start_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .unwrap();
     let mut ids = vec![];
     while let Some(e) = handle.outbox.recv().await {
         if let Out::Ask { id, payload } = e {
@@ -363,15 +419,22 @@ async fn mcp_hook_answers_without_ui_and_can_replace_tool_output() {
         }
         _ => {}
     }));
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["mcp__test__ask"]), answer("done")])),
         history.clone(),
-        LoopConfig::default(),
     )
     .tools(registry)
     .hooks(hooks.clone())
     .build();
-    assert!(agent.run(In::user_text("go")).await.is_ok());
+    assert!(agent
+        .run_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default()
+        )
+        .await
+        .is_ok());
     assert!(hooks
         .seen
         .lock()
@@ -393,13 +456,21 @@ async fn compaction_and_retry_are_bounded_and_do_not_repeat_user_history() {
     model.recovery = ModelRecovery::Compact;
     let model = Arc::new(model);
     let hooks = Arc::new(Hooks::new(|_, _| {}));
-    let config = LoopConfig {
+    let config = ExecutionOptions {
         ..Default::default()
     };
-    let agent = builder(model.clone(), history.clone(), config)
+    let turn_config = config;
+    let agent = builder(model.clone(), history.clone())
         .hooks(hooks.clone())
         .build();
-    let result = agent.run(In::user_text("go")).await.unwrap();
+    let result = agent
+        .run_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .await
+        .unwrap();
     assert_eq!(result.usage.unwrap().total_tokens, 7);
     assert_eq!(history.compactions.lock().unwrap().len(), 1);
     assert_eq!(
@@ -432,33 +503,40 @@ async fn stop_can_continue_but_not_forever() {
         }
     }));
     let model = Arc::new(Model::new(vec![answer("first"), answer("second")]));
-    let agent = builder(
-        model.clone(),
-        Arc::new(History::default()),
-        LoopConfig {
-            execution: yourai_core::execution::ExecutionConfig {
-                max_stop_continuations: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .hooks(hooks)
-    .build();
-    let error = agent.run(In::user_text("go")).await.unwrap_err();
+    let turn_config = ExecutionOptions {
+        max_stop_continuations: 1,
+        ..Default::default()
+    };
+    let agent = builder(model.clone(), Arc::new(History::default()))
+        .hooks(hooks)
+        .build();
+    let error = agent
+        .run_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .await
+        .unwrap_err();
     assert_eq!(error.output.text, "second");
     assert_eq!(count.load(Ordering::SeqCst), 2);
 }
 #[tokio::test]
 async fn cancel_preserves_partial_answer_and_pending_inputs() {
     let history = Arc::new(History::default());
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![hangs_after("partial")])),
         history.clone(),
-        LoopConfig::default(),
     )
     .build();
-    let mut handle = agent.start(In::user_text("go")).unwrap();
+    let mut handle = agent
+        .start_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .unwrap();
     while let Some(e) = handle.outbox.recv().await {
         if matches!(e, Out::Chunk { .. }) {
             handle.inbox.send(In::follow_up("later")).unwrap();
@@ -485,14 +563,20 @@ async fn tool_cancel_completes_unresolved_batch_without_running_remaining_tools(
     registry.register(first);
     registry.register(second.clone());
     let history = Arc::new(History::default());
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["slow", "later"])])),
         history.clone(),
-        LoopConfig::default(),
     )
     .tools(registry)
     .build();
-    let mut handle = agent.start(In::user_text("go")).unwrap();
+    let mut handle = agent
+        .start_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .unwrap();
     let mut done = 0;
     while let Some(e) = handle.outbox.recv().await {
         match e {
@@ -515,13 +599,19 @@ async fn tool_cancel_completes_unresolved_batch_without_running_remaining_tools(
 }
 #[tokio::test]
 async fn disconnected_output_interrupts_a_silent_model_wait() {
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![Box::pin(futures_util::stream::pending())])),
         Arc::new(History::default()),
-        LoopConfig::default(),
     )
     .build();
-    let mut handle = agent.start(In::user_text("go")).unwrap();
+    let mut handle = agent
+        .start_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .unwrap();
     handle.outbox.close();
     let error = tokio::time::timeout(Duration::from_secs(1), handle.join())
         .await
@@ -542,16 +632,17 @@ async fn slow_but_progressing_stream_completes_beyond_total_budget() {
             Ok(event)
         },
     );
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![Box::pin(stream)])),
         Arc::new(History::default()),
-        LoopConfig::default(),
     )
     .build();
     assert_eq!(
         agent
             .run_with(
                 In::user_text("go"),
+                turn_config.clone(),
                 model_timeout(Duration::from_millis(200))
             )
             .await
@@ -566,16 +657,16 @@ async fn model_call_limit_forces_final_text_only_summary() {
     let registry = Arc::new(Registry::default());
     registry.register(h.clone());
     let model = Arc::new(Model::new(vec![calls(&["tool"]), answer("final summary")]));
-    let agent = builder(
-        model.clone(),
-        Arc::new(History::default()),
-        LoopConfig::default(),
-    )
-    .tools(registry)
-    .build();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model.clone(), Arc::new(History::default()))
+        .tools(registry)
+        .build();
     let mut options = TurnOptions::default();
     options.limits.steps = Some(2);
-    let result = agent.run_with(In::user_text("go"), options).await.unwrap();
+    let result = agent
+        .run_with(In::user_text("go"), turn_config.clone(), options)
+        .await
+        .unwrap();
     assert_eq!(result.text, "final summary");
     let requests = model.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
@@ -613,12 +704,16 @@ async fn model_call_limit_never_executes_calls_from_the_final_step() {
     // the required text-only summary on the next iteration.
     let model = Arc::new(Model::new(vec![calls(&["tool"]), answer("wrapped up")]));
     let history = Arc::new(History::default());
-    let agent = builder(model.clone(), history.clone(), LoopConfig::default())
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model.clone(), history.clone())
         .tools(registry)
         .build();
     let mut options = TurnOptions::default();
     options.limits.steps = Some(1);
-    let result = agent.run_with(In::user_text("go"), options).await.unwrap();
+    let result = agent
+        .run_with(In::user_text("go"), turn_config.clone(), options)
+        .await
+        .unwrap();
     assert!(h.inputs.lock().unwrap().is_empty());
     assert_eq!(result.text, "wrapped up");
     let requests = model.requests.lock().unwrap();
@@ -651,19 +746,18 @@ async fn model_call_limit_never_executes_calls_from_the_final_step() {
 async fn invisible_failure_announces_structured_retry_status() {
     let mut m = Model::new(vec![error_stream(), answer("resumed")]);
     m.recovery = ModelRecovery::Retry;
-    let agent = builder(
-        Arc::new(m),
-        Arc::new(History::default()),
-        LoopConfig {
-            execution: yourai_core::execution::ExecutionConfig {
-                retry_delay: Duration::ZERO,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .build();
-    let mut handle = agent.start(In::user_text("go")).unwrap();
+    let turn_config = ExecutionOptions {
+        retry_delay: Duration::ZERO,
+        ..Default::default()
+    };
+    let agent = builder(Arc::new(m), Arc::new(History::default())).build();
+    let mut handle = agent
+        .start_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .unwrap();
     let mut seen = vec![];
     while let Some(e) = handle.outbox.recv().await {
         if let Out::Retry {
@@ -681,15 +775,16 @@ async fn invisible_failure_announces_structured_retry_status() {
 }
 #[tokio::test]
 async fn silent_stream_still_fails_on_per_event_timeout() {
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![Box::pin(futures_util::stream::pending())])),
         Arc::new(History::default()),
-        LoopConfig::default(),
     )
     .build();
     let error = agent
         .run_with(
             In::user_text("go"),
+            turn_config.clone(),
             model_timeout(Duration::from_millis(50)),
         )
         .await
@@ -708,16 +803,17 @@ async fn visible_model_failure_is_not_retried_and_fires_stop_failure() {
     m.recovery = ModelRecovery::Retry;
     let model = Arc::new(m);
     let hooks = Arc::new(Hooks::new(|_, _| {}));
-    let agent = builder(
-        model.clone(),
-        Arc::new(History::default()),
-        LoopConfig::default(),
-    )
-    .hooks(hooks.clone())
-    .build();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model.clone(), Arc::new(History::default()))
+        .hooks(hooks.clone())
+        .build();
     assert_eq!(
         agent
-            .run(In::user_text("go"))
+            .run_with(
+                In::user_text("go"),
+                turn_config.clone(),
+                TurnOptions::default()
+            )
             .await
             .unwrap_err()
             .output
@@ -734,16 +830,12 @@ async fn visible_model_failure_is_not_retried_and_fires_stop_failure() {
 #[tokio::test]
 async fn deadlines_and_zero_steps_stop_before_side_effects() {
     let model = Arc::new(Model::new(vec![answer("never")]));
-    let agent = builder(
-        model.clone(),
-        Arc::new(History::default()),
-        LoopConfig::default(),
-    )
-    .build();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model.clone(), Arc::new(History::default())).build();
     let mut options = TurnOptions::default();
     options.limits.deadline = Some(Instant::now());
     let error = agent
-        .run_with(In::user_text("go"), options)
+        .run_with(In::user_text("go"), turn_config.clone(), options)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -753,16 +845,12 @@ async fn deadlines_and_zero_steps_stop_before_side_effects() {
     assert!(model.requests.lock().unwrap().is_empty());
 
     let model = Arc::new(Model::new(vec![answer("never")]));
-    let agent = builder(
-        model.clone(),
-        Arc::new(History::default()),
-        LoopConfig::default(),
-    )
-    .build();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model.clone(), Arc::new(History::default())).build();
     let mut options = TurnOptions::default();
     options.limits.steps = Some(0);
     let error = agent
-        .run_with(In::user_text("go"), options)
+        .run_with(In::user_text("go"), turn_config.clone(), options)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -781,10 +869,16 @@ async fn rejected_prompt_never_enters_history_or_model() {
             block(r);
         }
     }));
-    let agent = builder(model.clone(), history.clone(), LoopConfig::default())
-        .hooks(hooks)
-        .build();
-    let output = agent.run(In::user_text("blocked")).await.unwrap();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model.clone(), history.clone()).hooks(hooks).build();
+    let output = agent
+        .run_with(
+            In::user_text("blocked"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .await
+        .unwrap();
     assert!(output.pending.is_empty());
     assert_eq!(output.rejected.len(), 1);
     assert!(history.messages().is_empty());
@@ -795,16 +889,21 @@ async fn invisible_failure_retries_only_up_to_policy_limit() {
     let mut m = Model::new(vec![error_stream(), error_stream(), answer("never")]);
     m.recovery = ModelRecovery::Retry;
     let model = Arc::new(m);
-    let config = LoopConfig {
-        execution: yourai_core::execution::ExecutionConfig {
-            max_model_retries: 1,
-            retry_delay: Duration::ZERO,
-            ..Default::default()
-        },
+    let config = ExecutionOptions {
+        max_model_retries: 1,
+        retry_delay: Duration::ZERO,
         ..Default::default()
     };
-    let agent = builder(model.clone(), Arc::new(History::default()), config).build();
-    assert!(agent.run(In::user_text("go")).await.is_err());
+    let turn_config = config;
+    let agent = builder(model.clone(), Arc::new(History::default())).build();
+    assert!(agent
+        .run_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default()
+        )
+        .await
+        .is_err());
     assert_eq!(model.requests.lock().unwrap().len(), 2);
 }
 #[tokio::test]
@@ -829,11 +928,18 @@ async fn invalid_hook_arguments_and_truncated_calls_never_execute() {
                 o.updated_input = Some(json!({"value":"invalid"}));
             }
         }));
-        let agent = builder(model, history.clone(), LoopConfig::default())
+        let turn_config = ExecutionOptions::default();
+        let agent = builder(model, history.clone())
             .tools(registry)
             .hooks(hooks)
             .build();
-        let result = agent.run(In::user_text("go")).await;
+        let result = agent
+            .run_with(
+                In::user_text("go"),
+                turn_config.clone(),
+                TurnOptions::default(),
+            )
+            .await;
         assert_eq!(result.is_err(), truncated);
         assert!(h.inputs.lock().unwrap().is_empty());
         if truncated {
@@ -850,16 +956,21 @@ async fn tool_timeout_becomes_tool_result_and_continues() {
     let h = Arc::new(Handler::new("tool", Mode::Hang));
     let registry = Arc::new(Registry::default());
     registry.register(h);
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool"]), answer("timed out")])),
         Arc::new(History::default()),
-        LoopConfig::default(),
     )
     .tools(registry)
     .build();
     let mut options = TurnOptions::default();
     options.limits.tool_timeout = Some(Duration::from_millis(5));
-    let (events, result) = collect(agent.start_with(In::user_text("go"), options).unwrap()).await;
+    let (events, result) = collect(
+        agent
+            .start_with(In::user_text("go"), turn_config.clone(), options)
+            .unwrap(),
+    )
+    .await;
     assert_eq!(result.unwrap().text, "timed out");
     assert!(events
         .iter()
@@ -871,10 +982,10 @@ async fn approval_timeout_is_denial_not_permission() {
     let registry = Arc::new(Registry::default());
     registry.register(h.clone());
     let hooks = Arc::new(Hooks::new(|_, _| {}));
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool"]), answer("denied")])),
         Arc::new(History::default()),
-        LoopConfig::default(),
     )
     .tools(registry)
     .hooks(hooks.clone())
@@ -882,7 +993,12 @@ async fn approval_timeout_is_denial_not_permission() {
     .build();
     let mut options = TurnOptions::default();
     options.limits.approval_timeout = Some(Duration::from_millis(5));
-    let (_, result) = collect(agent.start_with(In::user_text("go"), options).unwrap()).await;
+    let (_, result) = collect(
+        agent
+            .start_with(In::user_text("go"), turn_config.clone(), options)
+            .unwrap(),
+    )
+    .await;
     assert!(result.is_ok());
     assert!(h.inputs.lock().unwrap().is_empty());
     assert!(hooks
@@ -897,14 +1013,21 @@ async fn noninteractive_tool_question_returns_config_without_hanging() {
     let registry = Arc::new(Registry::default());
     registry.register(h);
     let history = Arc::new(History::default());
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool"])])),
         history.clone(),
-        LoopConfig::default(),
     )
     .tools(registry)
     .build();
-    let failure = agent.run(In::user_text("go")).await.unwrap_err();
+    let failure = agent
+        .run_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .await
+        .unwrap_err();
     assert!(matches!(
         *failure.error,
         YourAiError::Error(ErrorKind::Config(_))
@@ -948,14 +1071,18 @@ async fn real_hook_runtime_registration_effect_is_consumed_by_loop() {
         .await
         .unwrap();
     let model = Arc::new(Model::new(vec![answer("done")]));
-    let agent = builder(
-        model.clone(),
-        Arc::new(History::default()),
-        LoopConfig::default(),
-    )
-    .hooks(runtime)
-    .build();
-    agent.run(In::user_text("go")).await.unwrap();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model.clone(), Arc::new(History::default()))
+        .hooks(runtime)
+        .build();
+    agent
+        .run_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .await
+        .unwrap();
     assert!(model.requests.lock().unwrap()[0]
         .request
         .messages
@@ -976,15 +1103,24 @@ async fn post_hook_stop_retains_actual_side_effect_result() {
             r.common.prevent_continuation = true;
         }
     }));
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool", "tool"])])),
         history.clone(),
-        LoopConfig::default(),
     )
     .tools(registry)
     .hooks(hooks)
     .build();
-    let (events, result) = collect(agent.start(In::user_text("go")).unwrap()).await;
+    let (events, result) = collect(
+        agent
+            .start_with(
+                In::user_text("go"),
+                turn_config.clone(),
+                TurnOptions::default(),
+            )
+            .unwrap(),
+    )
+    .await;
     assert!(result.is_err());
     assert_eq!(h.inputs.lock().unwrap().len(), 1);
     assert!(events.iter().any(|e|matches!(e,Out::ToolDone{id,output,is_error:false,..} if id=="c0" && *output==json!({"value":1}))));
@@ -1003,14 +1139,21 @@ async fn repeated_call_identity_never_replays_a_completed_tool() {
     let h = Arc::new(Handler::new("tool", Mode::Return));
     let registry = Arc::new(Registry::default());
     registry.register(h.clone());
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool"]), calls(&["tool"])])),
         Arc::new(History::default()),
-        LoopConfig::default(),
     )
     .tools(registry)
     .build();
-    assert!(agent.run(In::user_text("go")).await.is_err());
+    assert!(agent
+        .run_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default()
+        )
+        .await
+        .is_err());
     assert_eq!(h.inputs.lock().unwrap().len(), 1);
 }
 #[tokio::test]
@@ -1060,16 +1203,23 @@ async fn permission_hook_modified_scope_is_rechecked_against_hard_policy() {
             assert_eq!(*tool_input, json!({"value":2}));
         }
     }));
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool"]), answer("denied")])),
         Arc::new(History::default()),
-        LoopConfig::default(),
     )
     .tools(registry)
     .hooks(hooks)
     .security(Arc::new(Policy))
     .build();
-    assert!(agent.run(In::user_text("go")).await.is_ok());
+    assert!(agent
+        .run_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default()
+        )
+        .await
+        .is_ok());
     assert!(h.inputs.lock().unwrap().is_empty());
 }
 
@@ -1078,20 +1228,20 @@ async fn retry_respects_max_retries_limit() {
     let mut model = Model::new(vec![error_stream(), answer("must not run")]);
     model.recovery = ModelRecovery::Retry;
     let model = Arc::new(model);
-    let agent = builder(
-        model.clone(),
-        Arc::new(History::default()),
-        LoopConfig {
-            execution: yourai_core::execution::ExecutionConfig {
-                retry_delay: Duration::ZERO,
-                max_model_retries: 0,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .build();
-    let err = agent.run(In::user_text("go")).await.unwrap_err();
+    let turn_config = ExecutionOptions {
+        retry_delay: Duration::ZERO,
+        max_model_retries: 0,
+        ..Default::default()
+    };
+    let agent = builder(model.clone(), Arc::new(History::default())).build();
+    let err = agent
+        .run_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .await
+        .unwrap_err();
     assert!(matches!(
         *err.error,
         YourAiError::Error(ErrorKind::Provider { name: "model", .. })
@@ -1108,10 +1258,14 @@ async fn compaction_does_not_consume_step() {
         .await
         .unwrap();
     let model = Arc::new(Model::new(vec![answer("ok")]).with_budget(12_000, 500));
-    let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model.clone(), history.clone()).build();
     let mut options = TurnOptions::default();
     options.limits.steps = Some(1);
-    let result = agent.run_with(In::user_text("go"), options).await.unwrap();
+    let result = agent
+        .run_with(In::user_text("go"), turn_config.clone(), options)
+        .await
+        .unwrap();
     assert_eq!(result.text, "ok");
     assert_eq!(history.compactions.lock().unwrap().len(), 1);
     assert_eq!(model.requests.lock().unwrap().len(), 2);
@@ -1133,10 +1287,16 @@ async fn invalid_attachments_are_returned_without_history_or_retry() {
     ] {
         let history = Arc::new(History::default());
         let model = Arc::new(Model::new(vec![]));
-        let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
+        let turn_config = ExecutionOptions::default();
+        let agent = builder(model.clone(), history.clone()).build();
         let input = In::user_text_with_attachments("repair me", vec![bad]);
         let original = serde_json::to_value(&input).unwrap();
-        let (events, result) = collect(agent.start(input).unwrap()).await;
+        let (events, result) = collect(
+            agent
+                .start_with(input, turn_config.clone(), TurnOptions::default())
+                .unwrap(),
+        )
+        .await;
         let output = result.unwrap();
         assert!(output.pending.is_empty());
         assert_eq!(output.rejected.len(), 1);
@@ -1165,12 +1325,17 @@ async fn invalid_attachments_are_returned_without_history_or_retry() {
 #[tokio::test]
 async fn non_streaming_callers_receive_rejected_input_too() {
     let history = Arc::new(History::default());
-    let agent = builder(Arc::new(Model::new(vec![])), history, LoopConfig::default()).build();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(Arc::new(Model::new(vec![])), history).build();
     let output = agent
-        .run(In::user_text_with_attachments(
-            "bad",
-            vec![UserAttachment::base64("image/png", "bad", None)],
-        ))
+        .run_with(
+            In::user_text_with_attachments(
+                "bad",
+                vec![UserAttachment::base64("image/png", "bad", None)],
+            ),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
         .await
         .unwrap();
     assert_eq!(output.rejected.len(), 1);
@@ -1182,12 +1347,18 @@ async fn temporary_history_failure_preserves_input_for_retry() {
     let history = Arc::new(History::default());
     history.append_failures.store(1, Ordering::SeqCst);
     let model = Arc::new(Model::new(vec![answer("done")]));
-    let agent = builder(model.clone(), history.clone(), LoopConfig::default()).build();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(model.clone(), history.clone()).build();
     let input = In::user_text_with_attachments(
         "valid",
         vec![UserAttachment::base64("image/png", tiny_png_base64(), None)],
     );
-    let (events, result) = collect(agent.start(input).unwrap()).await;
+    let (events, result) = collect(
+        agent
+            .start_with(input, turn_config.clone(), TurnOptions::default())
+            .unwrap(),
+    )
+    .await;
     let mut failed = result.unwrap_err();
     assert_eq!(failed.output.pending.len(), 1);
     assert!(failed.output.rejected.is_empty());
@@ -1196,7 +1367,16 @@ async fn temporary_history_failure_preserves_input_for_retry() {
         .any(|e| matches!(e, Out::InputRejected { .. })));
     assert!(history.messages().is_empty());
     assert!(model.requests.lock().unwrap().is_empty());
-    let (_, result) = collect(agent.start(failed.output.pending.remove(0)).unwrap()).await;
+    let (_, result) = collect(
+        agent
+            .start_with(
+                failed.output.pending.remove(0),
+                turn_config.clone(),
+                TurnOptions::default(),
+            )
+            .unwrap(),
+    )
+    .await;
     let output = result.unwrap();
     assert_eq!(output.text, "done");
     assert!(output.pending.is_empty());
@@ -1209,12 +1389,8 @@ async fn relative_file_references_resolve_against_the_session_directory() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("session-only.rs"), "session-local content").unwrap();
     let history = Arc::new(History::default());
-    let agent = builder(
-        Arc::new(Model::new(vec![answer("done")])),
-        history.clone(),
-        LoopConfig::default(),
-    )
-    .build();
+    let turn_config = ExecutionOptions::default();
+    let agent = builder(Arc::new(Model::new(vec![answer("done")])), history.clone()).build();
     let mut options = TurnOptions::default();
     options.session = Some(Arc::new(SessionEnvironment::new(
         history.id.clone(),
@@ -1227,6 +1403,7 @@ async fn relative_file_references_resolve_against_the_session_directory() {
                     "read",
                     vec![UserAttachment::file("session-only.rs", None)],
                 ),
+                turn_config.clone(),
                 options,
             )
             .unwrap(),
@@ -1245,15 +1422,21 @@ async fn invalid_steer_does_not_block_valid_steer_or_follow_up() {
     let history = Arc::new(History::default());
     let registry = Arc::new(Registry::default());
     registry.register(Arc::new(Handler::new("tool", Mode::Return)));
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool"]), answer("done")])),
         history.clone(),
-        LoopConfig::default(),
     )
     .tools(registry)
     .security(Arc::new(Security::new(ApprovalDecision::Ask)))
     .build();
-    let mut handle = agent.start(In::user_text("go")).unwrap();
+    let mut handle = agent
+        .start_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .unwrap();
     let mut rejected = 0;
     while let Some(event) = handle.outbox.recv().await {
         match event {
@@ -1304,10 +1487,10 @@ async fn default_approval_and_tool_questions_survive_long_user_waits() {
         ));
         let registry = Arc::new(Registry::default());
         registry.register(handler.clone());
+        let turn_config = ExecutionOptions::default();
         let mut b = builder(
             Arc::new(Model::new(vec![calls(&["tool"]), answer("done")])),
             Arc::new(History::default()),
-            LoopConfig::default(),
         )
         .tools(registry);
         if permission {
@@ -1317,6 +1500,7 @@ async fn default_approval_and_tool_questions_survive_long_user_waits() {
         let mut handle = agent
             .start_with(
                 In::user_text("go"),
+                turn_config.clone(),
                 model_timeout(Duration::from_secs(86_400)),
             )
             .unwrap();
@@ -1382,15 +1566,21 @@ async fn cancelled_tool_bounds_failure_hook_then_records_interruption() {
     let registry = Arc::new(Registry::default());
     registry.register(Arc::new(Handler::new("tool", Mode::Hang)));
     let history = Arc::new(History::default());
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool"])])),
         history.clone(),
-        LoopConfig::default(),
     )
     .tools(registry)
     .hooks(Arc::new(StuckFailureHook))
     .build();
-    let mut handle = agent.start(In::user_text("go")).unwrap();
+    let mut handle = agent
+        .start_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .unwrap();
     while let Some(event) = handle.outbox.recv().await {
         if matches!(event, Out::ToolProgress { .. }) {
             break;
@@ -1423,16 +1613,18 @@ async fn cancelled_tool_bounds_failure_hook_then_records_interruption() {
 async fn explicit_deadline_still_cancels_an_unlimited_question() {
     let registry = Arc::new(Registry::default());
     registry.register(Arc::new(Handler::new("tool", Mode::Ask)));
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool"])])),
         Arc::new(History::default()),
-        LoopConfig::default(),
     )
     .tools(registry)
     .build();
     let mut options = TurnOptions::default();
     options.limits.deadline = Some(Instant::now() + Duration::from_millis(50));
-    let mut handle = agent.start_with(In::user_text("go"), options).unwrap();
+    let mut handle = agent
+        .start_with(In::user_text("go"), turn_config.clone(), options)
+        .unwrap();
     while let Some(event) = handle.outbox.recv().await {
         if matches!(event, Out::Ask { .. }) {
             break;
@@ -1482,14 +1674,20 @@ async fn cancelled_tool_can_finish_within_grace_and_preserves_actual_result() {
     let registry = Arc::new(Registry::default());
     registry.register(Arc::new(SettlingTool));
     let history = Arc::new(History::default());
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["tool"])])),
         history.clone(),
-        LoopConfig::default(),
     )
     .tools(registry)
     .build();
-    let mut handle = agent.start(In::user_text("go")).unwrap();
+    let mut handle = agent
+        .start_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .unwrap();
     while let Some(event) = handle.outbox.recv().await {
         if matches!(event, Out::ToolProgress { .. }) {
             break;
@@ -1525,14 +1723,17 @@ async fn repeated_calls_use_existing_permission_ui_and_honor_denial() {
             .map(|i| events(vec![end("", vec![call(&format!("repeat-{i}"), "tool")])]))
             .collect();
         streams.push(answer("done"));
-        let agent = builder(
-            Arc::new(Model::new(streams)),
-            Arc::new(History::default()),
-            LoopConfig::default(),
-        )
-        .tools(registry)
-        .build();
-        let mut handle = agent.start(In::user_text("go")).unwrap();
+        let turn_config = ExecutionOptions::default();
+        let agent = builder(Arc::new(Model::new(streams)), Arc::new(History::default()))
+            .tools(registry)
+            .build();
+        let mut handle = agent
+            .start_with(
+                In::user_text("go"),
+                turn_config.clone(),
+                TurnOptions::default(),
+            )
+            .unwrap();
         let mut asks = 0;
         while let Some(event) = handle.outbox.recv().await {
             if let Out::Ask { id, payload } = event {
@@ -1576,20 +1777,26 @@ async fn repeated_calls_allow_hook_rewrites_and_yolo_without_extra_gate() {
             .map(|i| events(vec![end("", vec![call(&format!("repeat-{i}"), "tool")])]))
             .collect();
         streams.push(answer("done"));
-        let agent = builder(
-            Arc::new(Model::new(streams)),
-            Arc::new(History::default()),
-            LoopConfig::default(),
-        )
-        .tools(registry)
-        .hooks(hooks.clone())
-        .build();
+        let turn_config = ExecutionOptions::default();
+        let agent = builder(Arc::new(Model::new(streams)), Arc::new(History::default()))
+            .tools(registry)
+            .hooks(hooks.clone())
+            .build();
         if yolo {
-            agent
-                .ctx()
-                .set_security(Arc::new(yourai_harness::security::YoloSecurity));
+            agent.set_security(Arc::new(yourai_harness::security::YoloSecurity));
         }
-        assert_eq!(agent.run(In::user_text("go")).await.unwrap().text, "done");
+        assert_eq!(
+            agent
+                .run_with(
+                    In::user_text("go"),
+                    turn_config.clone(),
+                    TurnOptions::default()
+                )
+                .await
+                .unwrap()
+                .text,
+            "done"
+        );
         assert_eq!(
             h.inputs.lock().unwrap()[2],
             json!({"value":if yolo {1} else {2}})
@@ -1620,21 +1827,23 @@ async fn after_hook_mcp_output_is_final_and_is_not_truncated_again() {
         }
     }));
     let history = Arc::new(History::default());
+    let turn_config = ExecutionOptions::default();
     let agent = builder(
         Arc::new(Model::new(vec![calls(&["mcp__large"]), answer("done")])),
         history.clone(),
-        LoopConfig {
-            execution: yourai_core::execution::ExecutionConfig {
-                tool_output: Some(store.clone()),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
     )
     .tools(registry)
     .hooks(hooks)
+    .tool_output(store.clone())
     .build();
-    agent.run(In::user_text("go")).await.unwrap();
+    agent
+        .run_with(
+            In::user_text("go"),
+            turn_config.clone(),
+            TurnOptions::default(),
+        )
+        .await
+        .unwrap();
     let messages = history.messages();
     let response = messages
         .iter()

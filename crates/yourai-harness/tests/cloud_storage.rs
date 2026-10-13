@@ -13,7 +13,7 @@ use yourai_harness::{
     memory::LocalMemory,
     skills::LocalSkills,
     tools::{Read, ToolOutputStore},
-    Harness, HarnessConfig, SqliteStore,
+    Harness, SessionOptions, SqliteStore,
 };
 
 #[tokio::test]
@@ -199,7 +199,7 @@ async fn memory_and_skills_survive_reopening_and_observe_other_connections() {
 async fn runtime_state_import_is_once_and_resume_no_longer_needs_json() {
     let root = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
-    let config = HarnessConfig::new(root.path().to_owned(), cwd.path().to_owned());
+    let config = SessionOptions::new(root.path().to_owned(), cwd.path().to_owned());
     let first = Harness::open(config.clone(), Arc::new(support::Model::new(vec![])))
         .await
         .unwrap();
@@ -238,7 +238,7 @@ async fn config_hook_receives_proposal_without_a_temporary_file() {
     let root = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let h = Harness::open(
-        HarnessConfig::new(root.path().to_owned(), cwd.path().to_owned()),
+        SessionOptions::new(root.path().to_owned(), cwd.path().to_owned()),
         Arc::new(support::Model::new(vec![])),
     )
     .await
@@ -270,9 +270,7 @@ async fn config_hook_receives_proposal_without_a_temporary_file() {
         .await
         .unwrap();
     h.host
-        .workspace()
-        .unwrap()
-        .change_config("session", json!({"memory_search_limit":7}))
+        .check_config_change("session", json!({"memory_search_limit":7}))
         .await
         .unwrap();
     assert_eq!(
@@ -288,7 +286,7 @@ async fn config_hook_receives_proposal_without_a_temporary_file() {
 async fn legacy_tool_outputs_move_to_database_without_rewriting_history() {
     let root = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
-    let config = HarnessConfig::new(root.path().to_owned(), cwd.path().to_owned());
+    let config = SessionOptions::new(root.path().to_owned(), cwd.path().to_owned());
     let first = Harness::open(config.clone(), Arc::new(support::Model::new(vec![])))
         .await
         .unwrap();
@@ -328,7 +326,7 @@ async fn legacy_tool_outputs_move_to_database_without_rewriting_history() {
         .unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), content);
     std::fs::remove_file(&path).unwrap();
-    let snapshot = h.host.agent().ctx().snapshot().unwrap();
+    let snapshot = h.host.agent().snapshot().unwrap();
     let request = snapshot
         .context_manager
         .unwrap()

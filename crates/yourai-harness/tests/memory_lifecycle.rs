@@ -121,9 +121,9 @@ async fn run(h: &Harness, text: &str) -> SessionTurn {
 async fn callbacks_are_auto_registered_scoped_and_sync_once_after_stop_settles() {
     let d = TempDir::new().unwrap();
     let provider = Arc::new(Provider::default());
-    let mut config = HarnessConfig::new(d.path().join("sessions"), d.path().into());
+    let mut config = SessionOptions::new(d.path().join("sessions"), d.path().into());
     config.memory_manager = Some(provider.clone());
-    config.memory_search_limit = 2;
+    config.config.execution.memory_search_limit = 2;
     let h = Harness::open(
         config,
         Arc::new(Model::new(vec![
@@ -205,7 +205,7 @@ async fn callback_errors_do_not_undo_a_completed_turn_and_failed_turns_do_not_sy
         fail_sync: true,
         ..Default::default()
     });
-    let mut config = HarnessConfig::new(d.path().join("sessions"), d.path().into());
+    let mut config = SessionOptions::new(d.path().join("sessions"), d.path().into());
     config.memory_manager = Some(provider.clone());
     let h = Harness::open(config, Arc::new(Model::new(vec![answer("success")])))
         .await
@@ -221,9 +221,9 @@ async fn compact_callback_uses_clean_active_history_without_rebuilding_system() 
     let d = TempDir::new().unwrap();
     let root = d.path().join("sessions");
     let provider = Arc::new(Provider::default());
-    let mut config = HarnessConfig::new(root.clone(), d.path().into());
+    let mut config = SessionOptions::new(root.clone(), d.path().into());
     config.memory_manager = Some(provider.clone());
-    config.context_policy.keep_recent_tokens = 0;
+    config.config.execution.context_policy.keep_recent_tokens = 0;
     let model = model_fixture::TestModel::new(
         Arc::new(Model::new(vec![])),
         ModelTokenBudget::resolve(
@@ -308,7 +308,7 @@ impl MemoryManager for WaitingProvider {
 async fn cancelling_hook_dispatch_cancels_provider_callback_token() {
     let d = TempDir::new().unwrap();
     let provider = Arc::new(WaitingProvider::default());
-    let mut config = HarnessConfig::new(d.path().join("sessions"), d.path().into());
+    let mut config = SessionOptions::new(d.path().join("sessions"), d.path().into());
     config.memory_manager = Some(provider.clone());
     let h = Harness::open(config, Arc::new(Model::new(vec![])))
         .await
@@ -320,7 +320,7 @@ async fn cancelling_hook_dispatch_cancels_provider_callback_token() {
             model: None,
         },
     )
-    .with_providers(&h.host.agent().ctx().snapshot().unwrap());
+    .with_providers(&h.host.agent().snapshot().unwrap());
     assert!(tokio::time::timeout(
         std::time::Duration::from_millis(40),
         h.hooks.dispatch(&event)
@@ -353,7 +353,7 @@ async fn completion_notification_cannot_veto_result_and_resume_gets_start_callba
     let d = TempDir::new().unwrap();
     let root = d.path().join("sessions");
     let provider = Arc::new(Provider::default());
-    let mut config = HarnessConfig::new(root.clone(), d.path().into());
+    let mut config = SessionOptions::new(root.clone(), d.path().into());
     config.memory_manager = Some(provider.clone());
     let h = Harness::open(config, Arc::new(Model::new(vec![answer("complete")])))
         .await
@@ -377,7 +377,7 @@ async fn completion_notification_cannot_veto_result_and_resume_gets_start_callba
     let id = h.host.environment().id;
     h.close().await.unwrap();
     drop(h);
-    let mut config = HarnessConfig::new(root, d.path().into());
+    let mut config = SessionOptions::new(root, d.path().into());
     config.memory_manager = Some(provider.clone());
     config.resume = Some(id);
     let h = Harness::open(config, Arc::new(Model::new(vec![])))

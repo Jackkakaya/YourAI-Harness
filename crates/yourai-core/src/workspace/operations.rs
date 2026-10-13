@@ -38,39 +38,6 @@ impl Workspace {
         self.run_load_instructions(host, path, content, gate, activity)
             .await
     }
-    pub async fn notify(&self, message: &str, kind: &str) -> Result<(), YourAiError> {
-        let host = self.host()?;
-        let activity = host.activity()?;
-        let result = host
-            .dispatch_active(HookEvent::Notification {
-                message: message.into(),
-                title: None,
-                notification_type: kind.into(),
-            })
-            .await?;
-        host.apply_hook(&result).await?;
-        let _activity = activity;
-        self.run_notify(&host, message).await
-    }
-    pub async fn change_config(&self, source: &str, value: Value) -> Result<(), YourAiError> {
-        let host = self.host()?;
-        let activity = host.activity()?;
-        let gate = host.try_operation()?;
-        let config: RuntimeConfig =
-            serde_json::from_value(value.clone()).map_err(|e| error("config", e))?;
-
-        let result = host
-            .dispatch_active(HookEvent::ConfigChange {
-                source: source.into(),
-                file_path: None,
-                config: Some(value.clone()),
-            })
-            .await;
-        let result = result?;
-        result.ensure_allowed()?;
-        host.apply_hook(&result).await?;
-        self.run_config(&host, config, value, gate, activity).await
-    }
     pub async fn change_cwd(&self, path: &Path) -> Result<(), YourAiError> {
         let host = self.host()?;
         let activity = host.activity()?;

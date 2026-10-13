@@ -133,7 +133,6 @@ async fn append_history(host: &SessionManager) {
     let mut row = StoredMessage::new(ChatMessage::assistant("done"));
     row.seq = 9;
     host.agent()
-        .ctx()
         .context_manager()
         .unwrap()
         .append(vec![row])

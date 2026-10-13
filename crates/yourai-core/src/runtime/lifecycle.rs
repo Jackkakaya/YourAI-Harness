@@ -6,7 +6,7 @@ impl SessionManager {
         lease: SessionLease,
         environment: SessionEnvironment,
         agent: Arc<Agent>,
-        config: SessionConfig,
+        config: ExecutionOptions,
         source: &str,
     ) -> Result<Arc<Self>, YourAiError> {
         let (host, interrupted) = Self::run_open(lease, environment, agent, config)?;
@@ -42,21 +42,20 @@ impl SessionManager {
         interrupted: bool,
     ) -> Result<(), YourAiError> {
         self.reconcile_history().await?;
-        self.persist().await?;
-        self.attach_background();
-        if let Some(state) = self.read_state("config")? {
-            let mut value = state.value;
-            if value
-                .as_object_mut()
-                .is_some_and(|v| v.remove("system_prompt").is_some())
-            {
-                self.save_state("config", value.clone())?;
-                self.post_event_async(RuntimeEvent {id:uuid::Uuid::new_v4().to_string(),context:None,notice:Some("Removed unsupported system_prompt from legacy runtime settings; the session prompt remains frozen.".into()),wake:false}).await?;
-            }
-            serde_json::from_value::<crate::workspace::RuntimeConfig>(value)
-                .map_err(|e| error("config", e))?
-                .apply(self);
+
+        if let Err(cause) = self.ensure_title().await {
+            self.post_event_async(RuntimeEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                context: None,
+                notice: Some(format!("Session title unavailable: {cause}")),
+                wake: false,
+            })
+            .await?;
         }
+
+        self.persist().await?;
+
+        self.attach_background();
         // Heartbeat renews database ownership; a lost lease cancels execution.
         let weak = Arc::downgrade(self);
         self.background
@@ -79,7 +78,8 @@ impl SessionManager {
                     }
                 }
             }));
-        if self.config.workspace_enabled || !self.config.instruction_paths.is_empty() {
+
+        if self.config().workspace_enabled || !self.config().instruction_paths.is_empty() {
             let workspace = self.workspace()?;
             workspace
                 .setup(if source == "startup" {
@@ -88,7 +88,7 @@ impl SessionManager {
                     "maintenance"
                 })
                 .await?;
-            for path in &self.config.instruction_paths {
+            for path in &self.config().instruction_paths {
                 workspace.load_instructions(path, source).await?;
             }
         }
@@ -102,7 +102,7 @@ impl SessionManager {
         let result = self
             .dispatch(HookEvent::SessionStart {
                 source: source.into(),
-                model: self.agent.ctx().try_model().map(|m| m.model_iden().into()),
+                model: self.agent.try_model().map(|m| m.model_iden().into()),
             })
             .await?;
         self.apply_hook(&result).await?;
@@ -125,7 +125,7 @@ impl SessionManager {
         self.closing.cancel();
         self.interrupt();
         self.wait_active().await;
-        if let Ok(history) = self.history().await {
+        if let Ok(history) = self.agent.context_manager() {
             if let Err(cause) = history.restore().await {
                 self.close_warning(&cause);
             }
@@ -133,7 +133,7 @@ impl SessionManager {
         if let Err(cause) = self.run_shutdown(None).await {
             self.close_warning(&cause);
         }
-        if let Some(hooks) = self.agent.ctx().try_hooks() {
+        if let Some(hooks) = self.agent.try_hooks() {
             if let Err(cause) = hooks.shutdown_session(self.environment().id.as_str()).await {
                 self.close_warning(&cause);
             }
@@ -156,7 +156,7 @@ impl SessionManager {
         event: HookEvent,
     ) -> Result<HookDispatchResult, YourAiError> {
         // Lifecycle hooks can run before an AgentLoop is installed.
-        let snapshot = self.agent.ctx().bindings();
+        let snapshot = self.agent.bindings();
         let Some(hooks) = &snapshot.hooks else {
             return Ok(HookDispatchResult::empty(event.kind()));
         };
@@ -171,7 +171,7 @@ impl SessionManager {
         invocation.memory = snapshot.memory;
         invocation.sessions = snapshot.session;
         invocation.usage = snapshot.usage;
-        let result = crate::time::timeout(self.config.hook_timeout, hooks.dispatch(&invocation))
+        let result = crate::time::timeout(self.config().hook_timeout, hooks.dispatch(&invocation))
             .await
             .map_err(|_| error("hook", "host hook timed out"))??;
         result.validate_for(invocation.event.kind())?;
@@ -180,7 +180,6 @@ impl SessionManager {
     pub(super) fn attach_background(self: &Arc<Self>) {
         let Some(mut rx) = self
             .agent
-            .ctx()
             .try_hooks()
             .and_then(|h| h.subscribe_background())
         else {
@@ -254,7 +253,6 @@ impl SessionManager {
     ) {
         let through_seq = self
             .agent
-            .ctx()
             .try_context_manager()
             .map(|h| h.last_sequence())
             .unwrap_or(after_seq);
@@ -321,7 +319,7 @@ impl SessionManager {
             self.live.lock().unwrap().session_end = CloseNotification::Finished(warning.clone());
             warning
         };
-        if let Some(hooks) = self.agent.ctx().try_hooks() {
+        if let Some(hooks) = self.agent.try_hooks() {
             if let Err(cause) = hooks.shutdown_session(self.environment().id.as_str()).await {
                 warning = Some(
                     [warning.unwrap_or_default(), cause.to_string()]
@@ -357,7 +355,10 @@ impl SessionManager {
             // Restore is also the storage barrier for writes whose waiter was
             // cancelled after an owned SQLite commit started. Never release the
             // session lease while those writes can still modify its history.
-            self.history().await?.restore().await?;
+            self.agent.context_manager()?.restore().await?;
+            if let Err(cause) = self.ensure_title().await {
+                self.close_warning(&cause);
+            }
             self.run_shutdown(timeout).await?;
             // Closing hooks may report errors, but cannot prevent resource release.
             let hook_error = self.end_session(timeout).await;
@@ -371,4 +372,115 @@ impl SessionManager {
             )
         })?
     }
+}
+
+impl SessionManager {
+    pub async fn notify(self: &Arc<Self>, message: &str, kind: &str) -> Result<(), YourAiError> {
+        let host = self.clone();
+        let activity = host.activity()?;
+        let result = host
+            .dispatch_active(HookEvent::Notification {
+                message: message.into(),
+                title: None,
+                notification_type: kind.into(),
+            })
+            .await?;
+        host.apply_hook(&result).await?;
+        let _activity = activity;
+        host.post_event_async(RuntimeEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            context: None,
+            notice: Some(message.into()),
+            wake: false,
+        })
+        .await?;
+        Ok(())
+    }
+    /// Allow the existing ConfigChange Hook to veto an application config edit.
+    /// The application owns validation and saving; no session config is persisted here.
+    pub async fn check_config_change(
+        self: &Arc<Self>,
+        source: &str,
+        value: serde_json::Value,
+    ) -> Result<(), YourAiError> {
+        let _activity = self.activity()?;
+        let result = self
+            .dispatch_active(HookEvent::ConfigChange {
+                source: source.into(),
+                file_path: None,
+                config: Some(value),
+            })
+            .await?;
+        result.ensure_allowed()?;
+        self.apply_hook(&result).await
+    }
+}
+
+impl SessionManager {
+    /// Reading metadata does not generate or persist a title.
+    pub async fn title(&self) -> Result<Option<String>, YourAiError> {
+        Ok(self
+            .store()
+            .load_session(&self.environment().id)
+            .await?
+            .title)
+    }
+    pub(super) async fn ensure_title(&self) -> Result<(), YourAiError> {
+        let id = self.environment().id;
+        let store = self.store();
+        let mut meta = store.load_session(&id).await?;
+        if let Some(_title) = meta
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            return Ok(());
+        }
+        let mut after = 0;
+        loop {
+            let page = store
+                .read_messages(
+                    &id,
+                    MessageQuery {
+                        after,
+                        active_only: false,
+                        limit: 256,
+                    },
+                )
+                .await?;
+            for row in page.messages {
+                if row.summary || row.runtime_context || row.message.role != ChatRole::User {
+                    continue;
+                }
+                if let Some(title) = derive_title(&row.message.content.texts().join("\n")) {
+                    meta.title = Some(title.clone());
+                    store.save_session(&meta).await?;
+                    return Ok(());
+                }
+            }
+            match page.next {
+                Some(next) if next > after => after = next,
+                _ => return Ok(()),
+            }
+        }
+    }
+}
+/// Title from the first line of a prompt: whitespace-collapsed, truncated.
+fn derive_title(text: &str) -> Option<String> {
+    let mut title = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        return None;
+    }
+    if title.chars().count() > 48 {
+        title = title.chars().take(47).collect();
+        title.push('…');
+    }
+    Some(title)
 }

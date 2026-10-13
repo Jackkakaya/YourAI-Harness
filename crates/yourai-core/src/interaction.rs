@@ -111,13 +111,7 @@ pub async fn elicit(
     request: InteractionRequest,
 ) -> Result<Value, YourAiError> {
     turn.ensure_active()?;
-    let timeout = [
-        turn.tc.info.options.limits.approval_timeout,
-        turn.config.approval_timeout,
-    ]
-    .into_iter()
-    .flatten()
-    .min();
+    let timeout = turn.config.approval_timeout;
     let total_deadline = turn.tc.info.options.limits.deadline;
     let deadline = [request.deadline, turn.deadline(timeout)]
         .into_iter()

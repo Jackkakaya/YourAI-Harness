@@ -365,7 +365,7 @@ impl Model {
                 options = options.with_tool_choice(ToolChoice::None);
             }
             let model = self.backend.clone();
-            let model_timeout = turn.tc.info.options.limits.model_timeout;
+            let model_timeout = turn.config.model_timeout;
             let header_timeout = model_timeout
                 .or(options.stream_header_timeout)
                 .unwrap_or(model.timeouts().headers);

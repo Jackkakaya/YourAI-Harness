@@ -35,7 +35,7 @@
 //! let runtime = DefaultHookManager::new();
 //!
 //! // 从 Claude 兼容的 settings.json 注册
-//! let config: HooksConfig = serde_json::from_str(r#"{
+//! let config: serde_json::Value = serde_json::from_str(r#"{
 //!   "hooks": {
 //!     "PreToolUse": [
 //!       { "matcher": "Bash", "hooks": [
@@ -85,9 +85,7 @@ pub(crate) const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 // ── Re-exports：实现层类型 ──────────────────────────────────────────
 
 pub use command::{BackgroundHookEvent, CommandHandler};
-pub use config::{
-    build_registrations, HandlerConfig, HookMatcherGroup, HookRegistration, HookShell, HooksConfig,
-};
+pub use config::{build_registrations, HandlerConfig, HookRegistration, HookShell};
 pub use handler::NativeHandler;
 pub use http::{HttpHandler, HttpHookPolicy};
 pub use matcher::CompiledMatcher;

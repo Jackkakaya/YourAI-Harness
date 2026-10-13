@@ -1,7 +1,9 @@
 //! Concrete implementations and assembly of the YourAI core contracts.
 pub mod assembly;
 pub mod collaboration;
+pub mod config;
 pub mod context;
+pub mod controller;
 pub mod default_loop;
 pub mod execution;
 pub mod hooks;
@@ -14,13 +16,14 @@ pub mod storage;
 pub mod tools;
 pub mod workspace;
 
-pub use assembly::{Harness, HarnessConfig};
-pub use context::{prompt::PromptConfig, DefaultContext};
+pub use assembly::{Harness, SessionOptions};
+pub use context::DefaultContext;
 pub use model::{GenaiModel, MeteredModel, ModelBudget};
-pub use runtime::{SessionConfig, SessionManager};
+pub use runtime::SessionManager;
 pub use security::PolicySecurity;
 pub use storage::{SessionCatalog, SqliteStore};
 pub use tools::ToolSet;
+pub use yourai_core::execution::ExecutionOptions;
 
 pub(crate) fn error(name: &'static str, e: impl std::fmt::Display) -> yourai_core::YourAiError {
     yourai_core::ErrorKind::Provider {

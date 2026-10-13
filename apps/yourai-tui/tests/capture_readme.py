@@ -128,8 +128,20 @@ def main():
         provider = {'api': 'openai-compatible', 'options': {
             'baseURL': f'http://127.0.0.1:{server.server_port}/v1', 'apiKey': 'demo-only'},
             'models': {'code': model}}
-        config.write_text(json.dumps({'model': 'demo/code', 'theme': 'dark',
-            'session_dir': str(tmp / 'sessions'), 'provider': {'demo': provider}}))
+        config.write_text(json.dumps({
+        'models': {
+            'selected': 'demo/code',
+            'providers': {
+                'demo': provider
+            }
+        },
+        'ui': {
+            'theme': 'dark'
+        },
+        'session': {
+            'directory': str(tmp / 'sessions')
+        }
+    }))
         env = {k: v for k, v in os.environ.items() if k not in ('TMUX', 'TMUX_PANE', 'TERM_PROGRAM')}
         env['TERM'] = 'xterm-256color'
         child, master = run_pty([str(DEFAULT_BIN), '--config', str(config)], env=env, cwd=workspace, cols=120, rows=38)

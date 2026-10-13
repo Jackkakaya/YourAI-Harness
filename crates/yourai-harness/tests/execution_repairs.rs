@@ -14,9 +14,8 @@ mod tests {
     };
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
-    use yourai_core::execution::ExecutionConfig;
     use yourai_core::prelude::*;
-    use yourai_core::runtime::{SessionConfig, SessionManager};
+    use yourai_core::runtime::SessionManager;
     use yourai_harness::DefaultContext;
 
     struct LostAppendReply {
@@ -111,7 +110,7 @@ mod tests {
     impl AgentLoop for RejectThenExec {
         fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
             Box::pin(async move {
-                let mut t = Turn::open(tc, ExecutionConfig::default()).await?;
+                let mut t = Turn::open(tc).await?;
                 let c = t.enqueue("tool", json!({"value":1})).await?;
                 self.0.fail_result.store(true, Ordering::SeqCst);
                 assert!(t.reject_pending_tools("disabled").await.is_err());
@@ -154,7 +153,7 @@ mod tests {
     impl AgentLoop for RecoverModel {
         fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
             Box::pin(async move {
-                let mut t = Turn::open(tc, ExecutionConfig::default()).await?;
+                let mut t = Turn::open(tc).await?;
                 self.0.fail_assistant.store(true, Ordering::SeqCst);
                 assert!(t
                     .model()?
@@ -218,9 +217,7 @@ mod tests {
             .unwrap();
         let a = Agent::builder()
             .session(store)
-            .agent_loop(Arc::new(
-                yourai_harness::default_loop::DefaultLoop::default(),
-            ))
+            .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
             .context_manager(history.clone())
             .model(Arc::new(Model::new(vec![answer("done")])))
             .build();
@@ -228,7 +225,7 @@ mod tests {
             dir.path(),
             SessionEnvironment::new(history.session_id().clone(), dir.path()),
             a,
-            SessionConfig::default(),
+            Default::default(),
             "startup",
         )
         .await
@@ -322,9 +319,7 @@ mod tests {
     async fn usage_failure_preserves_terminal_calls_and_known_usage() {
         let history = Arc::new(History::default());
         let a = Agent::builder()
-            .agent_loop(Arc::new(
-                yourai_harness::default_loop::DefaultLoop::default(),
-            ))
+            .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
             .context_manager(history.clone())
             .model(Arc::new(Model::new(vec![calls(&["tool"])])))
             .usage(BrokenUsage::new(false))
@@ -353,9 +348,7 @@ mod tests {
         let history = Arc::new(History::default());
         let usage = BrokenUsage::new(true);
         let a = Agent::builder()
-            .agent_loop(Arc::new(
-                yourai_harness::default_loop::DefaultLoop::default(),
-            ))
+            .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
             .context_manager(history)
             .model(Arc::new(Model::new(vec![answer("done")])))
             .usage(usage.clone())
@@ -448,9 +441,7 @@ mod tests {
             }
         }));
         let a = Agent::builder()
-            .agent_loop(Arc::new(
-                yourai_harness::default_loop::DefaultLoop::default(),
-            ))
+            .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
             .context_manager(history.clone())
             .model(Arc::new(Model::new(vec![answer("unused")])))
             .hooks(hooks)
@@ -508,9 +499,7 @@ mod tests {
         );
         let model = Arc::new(Model::new(vec![answer("done")]));
         let agent = Agent::builder()
-            .agent_loop(Arc::new(
-                yourai_harness::default_loop::DefaultLoop::default(),
-            ))
+            .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
             .context_manager(history)
             .model(model.clone())
             .hooks(hooks.clone())
@@ -521,9 +510,7 @@ mod tests {
         let restored =
             DefaultContext::new(id, String::new(), Some(store), ContextPolicy::default());
         let agent = Agent::builder()
-            .agent_loop(Arc::new(
-                yourai_harness::default_loop::DefaultLoop::default(),
-            ))
+            .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
             .context_manager(restored.clone())
             .model(model.clone())
             .hooks(hooks.clone())
@@ -567,7 +554,7 @@ mod tests {
     impl AgentLoop for RecoverEnqueue {
         fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
             Box::pin(async move {
-                let mut turn = Turn::open(tc, ExecutionConfig::default()).await?;
+                let mut turn = Turn::open(tc).await?;
                 self.0.fail_assistant.store(true, Ordering::SeqCst);
                 assert!(turn.enqueue("tool", json!({"value":1})).await.is_err());
                 let calls = turn.pending_tools();
@@ -623,9 +610,7 @@ mod tests {
             end.captured_stop_reason = Some(StopReason::MaxTokens("length".into()));
         }
         let agent = Agent::builder()
-            .agent_loop(Arc::new(
-                yourai_harness::default_loop::DefaultLoop::default(),
-            ))
+            .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
             .context_manager(history.clone())
             .model(Arc::new(Model::new(vec![events(vec![terminal])])))
             .build();

@@ -1,0 +1,10 @@
+{
+  "system_prompt": null,
+  "soul_file": null,
+  "memory_file": null,
+  "profile_file": null,
+  "append_system_prompt": null,
+  "memory_file_max_chars": 12000,
+  "profile_file_max_chars": 6000,
+  "provider_max_chars": 8000
+}

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
-use yourai_harness::{GenaiModel, Harness, HarnessConfig};
+use yourai_harness::{GenaiModel, Harness, SessionOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let cwd = std::env::current_dir()?;
     let harness = Harness::open(
-        HarnessConfig::new(cwd.join(".yourai/sessions"), cwd),
+        SessionOptions::new(cwd.join(".yourai/sessions"), cwd),
         Arc::new(GenaiModel::new(
             genai::Client::builder().build().unwrap(),
             model,

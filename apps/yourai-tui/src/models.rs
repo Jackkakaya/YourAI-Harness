@@ -1,20 +1,12 @@
-//! Model selection: builds the candidate list from config and resolves switches.
+//! Model picker display entries. Resolution and switching belong to the backend.
 use crate::config::Config;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Selectable reasoning-effort levels in the `/models` effort sub-picker.
 /// `None` means "no explicit effort" (remove any runtime override; the
 /// merged config options decide).
-pub const EFFORT_CHOICES: [Option<&str>; 8] = [
-    None,
-    Some("none"),
-    Some("minimal"),
-    Some("low"),
-    Some("medium"),
-    Some("high"),
-    Some("xhigh"),
-    Some("max"),
-];
+pub use yourai_harness::config::{EffortChoice, EFFORT_CHOICES};
 
 /// A selectable model entry in the `/models` picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,22 +22,18 @@ pub struct ModelChoice {
     pub effort: Option<String>,
 }
 
-/// Runtime thinking-effort selection for one `/models` entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EffortChoice {
-    /// Keep what the (merged) config options specify; removes any runtime
-    /// override previously applied through the picker.
-    Config,
-    /// Set the effort keyword for this entry.
-    Set(String),
-}
-
 /// Enumerate all selectable model entries from the config.
 /// Each model always gets one default (no-variant) entry plus one per non-disabled variant.
 pub fn model_choices(config: &Config) -> Vec<ModelChoice> {
     let mut choices = Vec::new();
-    for (provider_id, provider) in &config.provider {
-        for (model_key, model) in &provider.models {
+    for (provider_id, provider) in &config.models.providers {
+        for (model_key, model) in provider
+            .get("models")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .collect::<BTreeMap<_, _>>()
+        {
             let id = format!("{provider_id}/{model_key}");
             // Default entry (no variant).
             choices.push(ModelChoice {
@@ -55,7 +43,13 @@ pub fn model_choices(config: &Config) -> Vec<ModelChoice> {
                 effort: config.effective_effort(&id, None),
             });
             // Variant entries.
-            for (variant_name, variant_cfg) in &model.variants {
+            for (variant_name, variant_cfg) in model
+                .get("variants")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .collect::<BTreeMap<_, _>>()
+            {
                 if variant_cfg.get("disabled") == Some(&Value::Bool(true)) {
                     continue;
                 }
@@ -70,15 +64,15 @@ pub fn model_choices(config: &Config) -> Vec<ModelChoice> {
     }
     if !choices
         .iter()
-        .any(|choice| choice.id == config.model && choice.variant.is_none())
+        .any(|choice| choice.id == config.models.selected && choice.variant.is_none())
     {
         choices.insert(
             0,
             ModelChoice {
-                id: config.model.clone(),
+                id: config.models.selected.clone(),
                 variant: None,
-                label: config.model.clone(),
-                effort: None,
+                label: config.models.selected.clone(),
+                effort: config.effective_effort(&config.models.selected, None),
             },
         );
     }
@@ -90,6 +84,25 @@ mod tests {
     #[allow(clippy::wildcard_imports)]
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn model_and_variant_order_is_stable_across_json_object_order() {
+        let config = parse_config(
+            r#"{
+            "model":"mock/z", "provider":{"mock":{"models":{
+                "z":{}, "a":{"variants":{"z":{},"a":{}}}, "m":{}
+            }}}
+        }"#,
+        );
+        let labels: Vec<_> = model_choices(&config)
+            .into_iter()
+            .map(|choice| choice.label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["mock/a", "mock/a · a", "mock/a · z", "mock/m", "mock/z"]
+        );
+    }
 
     fn parse_config(json_str: &str) -> Config {
         let dir = tempfile::tempdir().unwrap();

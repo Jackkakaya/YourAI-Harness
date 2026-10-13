@@ -1,5 +1,5 @@
 //! Core owns the session lifecycle; Harness assembles providers.
-pub use yourai_core::runtime::*;
+pub use yourai_core::runtime::{ContextUsage, SessionLease, SessionManager};
 mod factory;
 pub use factory::{create, restore};
 

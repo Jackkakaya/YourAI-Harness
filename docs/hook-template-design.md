@@ -1,3 +1,5 @@
+> 配置与启动接口已收敛，当前迁移说明见 [配置与运行职责收敛](orthogonal-runtime.md)。
+
 # Hook 最终实现
 
 > 当前存储已改为 SQLite schema v6：队列、扩展状态和工具原文使用 SessionStore；SessionLease 使用数据库租约。旧章节中的状态 JSON、输出文件和文件锁描述已被 [云端存储实现](cloud-storage.md) 替代。
@@ -30,12 +32,12 @@ SessionManager / Workspace / TaskManager / Subagent：各自公共操作拥有�
 | Compactor | 压缩准备、摘要前后 Hook、执行和提交状态报告 | 请求投影不再依赖整个执行对象 |
 | SessionManager | 会话运行、资源所有权与关闭 | 唯一 TaskManager、Workspace 和 children 登记 |
 | Workspace | 配置、指令、cwd、Git worktree 与变化检测 | 不允许为同一 host 公开构造第二份状态 |
-| TaskManager | 任务规则、查询、工具参数和 SQLite 保存 | 没有 TaskTool、TaskStore、JsonTasks 或第二份序号 |
-| Subagent | 子会话创建、运行、继续与清理 | 没有 SubagentTool 或另一份 children map |
+| TaskManager | 任务规则、Hook、查询和 SQLite 保存 | 工具 JSON 参数由 harness TaskTool 适配，不另存领域状态 |
+| Subagent | 子会话创建、运行、继续与清理 | 工具 JSON 参数由 harness SubagentTool 适配，不另存 children map |
 | permission::authorize | 校验参数和审批 | 普通函数，没有 PermissionExecutor |
 | interaction::elicit | 普通 / MCP 提问、Hook 答案、schema 校验 | 普通函数，复用 Turn 的唯一输入路由 |
 
-ContextManager 管理上下文；SessionManager 管理会话运行，SessionStore 管理持久化。Providers 是注册槽容器，ProviderSnapshot 是本次选择的依赖快照，Agent 是装配后的启动入口；它们不再兼任 Hook 执行器。
+ContextManager 管理上下文；SessionManager 管理会话运行，SessionStore 管理持久化。Agent 同时拥有依赖绑定与启动入口，ProviderSnapshot 是本次选择的依赖快照；它们不再兼任 Hook 执行器。
 
 HookManager 统一注册、注销与分发，HookHandler 表示具体处理。默认实现 DefaultHookManager 在注册时把配置编译成实际 handler；dispatch 不再按注册来源临时造 handler。once 在注册写锁内先认领；失败、超时或取消也不自动恢复。
 
@@ -79,7 +81,7 @@ enqueue 只登记调用，exec 只执行已登记调用。模型生成的调用�
 
 - 工具调用只有一条记录：call、固定 Tool、Pending / Running / Observed、稳定结果 ID。开始后禁止重放；多个调用各自保存结果，post 或保存失败不能互相覆盖。
 - 部分模型响应和延迟 Hook 上下文带稳定消息身份。保存成功后才删除；失败时 finish 继续保存。Completed 是终态，finish 同时检查未结调用和未提交消息。
-- LoopConfig 只有 steps 和 ExecutionConfig；默认值只定义一次。DefaultLoop 自己持有调度步数，Turn 持有执行额度。
+- ExecutionOptions 统一设置；默认值只定义一次。DefaultLoop 无配置和状态，调度步数是 run_turn 的局部状态，Turn 持有解析后的执行设置。
 - SessionManager 每个会话只初始化一个 TaskManager 和 Workspace。children 的唯一强引用集合也在 host；确认 child 关闭后才取消登记。
 
 ## Task 就是一个具体工具
@@ -151,6 +153,15 @@ Setup、idle 等本身就是操作边界，不制造空的 run。多个真实工
 
 ## 删除与合并
 
-已删除空 Operation / Executor 包装、ExecutionState、HookHost、SessionStartSink、SessionRuntime 转发协议和多余阶段数据。ToolBinding → Tool，ToolHandler → ToolProvider，TurnExecution → Turn，ContextExecution → Compactor，MemoryContext → DefaultContext，Context 注册容器 → Providers；这些名字不保留兼容别名。
+已删除空 Operation / Executor 包装、ExecutionState、HookHost、SessionStartSink、SessionRuntime 转发协议和多余阶段数据。ToolBinding → Tool，ToolHandler → ToolProvider，TurnExecution → Turn，ContextExecution → Compactor，MemoryContext → DefaultContext，Context 注册容器曾改名为 Providers，现已合入 Agent；这些名字不保留兼容别名。
 
 TaskBoard / TaskTool 合为 TaskManager，TaskStore / JsonTasks 删除；SubagentTool 并入 Subagent，SubagentBackend 改为只创建的 SubagentFactory。RegisteredHandler 分支、UnsupportedHandler、重复 handler factory、重复取消 guard 与重复时间 / JSON 基础函数也已删除或共用。
+
+
+## Hook 事件与超时收敛（2026-10-13）
+
+DefaultHookManager 内部从 dispatch 到输出事件校验、聚合都使用 HookEventKind，不再先转字符串再按名称选择内部 outcome。HookSpecificOutput.event_kind() 在协议适配处把外部变体映射到 core 判别器；外部 JSON 的 hookEventName 仍保持原字段和命名。字符串只用于外部编码和可读错误。
+
+HandlerConfig.validate() 返回 Result<Option<Duration>, String>：一次完成有效性校验与超时解析，build_registrations 直接保存结果。原独立 timeout() getter 已删除，避免校验与转换分离。无超时仍返回 None；正数但超出 Duration 范围、或舍入为零的值返回配置错误，不能在转换中 panic。四种 handler 使用同一入口。
+
+Parsed HookOutput 直接调用 wire_output::parse_hook_value；删除单调用点的 parse_json_value 私有转发。Command 对普通文本的兼容、HTTP 的 JSON 要求、Parsed 输出的严格校验仍分别保留，这些属于真实协议差异。外部 FailurePolicyConfig、wire 输出与 core outcome 保留为不同协议/行为类型，本轮没有合并它们。

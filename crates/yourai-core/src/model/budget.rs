@@ -1,7 +1,7 @@
 //! Model capacity and generation settings have one owner: the selected model.
 use crate::{chat::*, model::ModelProvider, ErrorKind, YourAiError};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelLimits {
     pub context: Option<u64>,

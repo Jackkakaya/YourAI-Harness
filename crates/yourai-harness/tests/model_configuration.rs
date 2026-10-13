@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 use yourai_core::{context::DiscardSink, prelude::*};
-use yourai_harness::{Harness, HarnessConfig};
+use yourai_harness::{Harness, SessionOptions};
 
 struct Capture {
     name: &'static str,
@@ -107,11 +107,11 @@ async fn switching_models_updates_hooks_and_inherited_children_with_one_budget()
             vec![support::end("parent done", vec![])],
         ],
     );
-    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
-    config.system_prompt = Some("test".into());
-    config.extensions = true;
-    config.yolo = true;
-    config.hooks = serde_json::from_value(serde_json::json!({"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"prompt","prompt":"check"},{"type":"agent","prompt":"check"}]}]}})).unwrap();
+    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    config.config.prompt.system_prompt = Some("test".into());
+    config.config.session.extensions = true;
+    config.config.security.yolo = true;
+    config.config.hooks.events = serde_json::from_value(serde_json::json!({"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"prompt","prompt":"check"},{"type":"agent","prompt":"check"}]}]}})).unwrap();
     let h = Harness::open(config, configured(old.clone(), 16_384))
         .await
         .unwrap();
@@ -158,17 +158,21 @@ async fn an_explicitly_pinned_child_keeps_its_model_after_parent_switch() {
         "parent",
         vec![vec![spawn()], vec![support::end("done", vec![])]],
     );
-    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
-    config.system_prompt = Some("test".into());
-    config.extensions = true;
-    config.yolo = true;
+    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    config.config.prompt.system_prompt = Some("test".into());
+    config.config.session.extensions = true;
+    config.config.security.yolo = true;
     let h = Harness::open(config, configured(old.clone(), 16_384))
         .await
         .unwrap();
-    h.tools.register(yourai_harness::collaboration::subagent(
-        &h.host,
-        Some(configured(old.clone(), 16_384)),
-        None,
+    h.tools.register(Arc::new(
+        yourai_harness::collaboration::tools::SubagentTool(
+            yourai_harness::collaboration::subagent(
+                &h.host,
+                Some(configured(old.clone(), 16_384)),
+                None,
+            ),
+        ),
     ));
     h.switch_model(configured(new.clone(), 65_536), ContextPolicy::default())
         .await
@@ -238,9 +242,7 @@ async fn accounting_failure_reuses_one_identity_and_never_repeats_the_model_call
             .model(model.clone())
             .usage(tracker.clone())
             .context_manager(Arc::new(support::History::default()))
-            .agent_loop(Arc::new(
-                yourai_harness::default_loop::DefaultLoop::default(),
-            ))
+            .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
             .build();
         let (events, report) = support::collect(agent.start(In::follow_up("go")).unwrap()).await;
         assert_eq!(report.unwrap().text, "paid answer");

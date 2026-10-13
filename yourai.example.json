@@ -1,23 +1,46 @@
 {
-  "model": "gateway/YOUR_MODEL_NAME",
-  "provider": {
-    "gateway": {
-      "options": {
-        "baseURL": "https://api.openai.com/v1",
-        "apiKey": "{env:OPENAI_API_KEY}",
-        "headerTimeout": 300000,
-        "chunkTimeout": 300000
-      },
-      "models": {
-        "YOUR_MODEL_NAME": {
-          "id": "YOUR_MODEL_NAME",
-          "limit": {
-            "context": 128000,
-            "output": 4096
+  "models": {
+    "selected": "gateway/YOUR_MODEL_NAME",
+    "providers": {
+      "gateway": {
+        "options": {
+          "baseURL": "https://api.openai.com/v1",
+          "apiKey": "{env:OPENAI_API_KEY}",
+          "headerTimeout": 300000,
+          "chunkTimeout": 300000
+        },
+        "models": {
+          "YOUR_MODEL_NAME": {
+            "id": "YOUR_MODEL_NAME",
+            "limit": {
+              "context": 128000,
+              "output": 4096
+            }
           }
-        }
-      },
-      "api": "openai-compatible"
+        },
+        "api": "openai-compatible"
+      }
     }
+  },
+  "execution": {
+    "steps": null,
+    "context": {
+      "safety_margin": 1024,
+      "keep_recent_tokens": 20000,
+      "summary_tokens": 2000
+    }
+  },
+  "security": {
+    "yolo": false,
+    "trusted_shell": false
+  },
+  "ui": {
+    "theme": "system"
+  },
+  "session": {
+    "extensions": false
+  },
+  "hooks": {
+    "events": {}
   }
 }

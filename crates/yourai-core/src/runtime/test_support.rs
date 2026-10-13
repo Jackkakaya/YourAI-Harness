@@ -102,7 +102,7 @@ pub(crate) async fn fixture_with_hooks(
         dir.path().join("session"),
         context,
         agent,
-        SessionConfig {
+        ExecutionOptions {
             workspace_enabled: true,
             ..Default::default()
         },
@@ -234,6 +234,31 @@ impl SessionStore for Store {
         states.insert(key.into(), SessionState { revision, value });
         Ok(revision)
     }
+    fn append_output<'a>(
+        &'a self,
+        _: &'a SessionId,
+        _: &'a str,
+        _: u64,
+        _: Vec<u8>,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        panic!("unused outputs in journal fixture")
+    }
+    fn read_output<'a>(
+        &'a self,
+        _: &'a SessionId,
+        _: &'a str,
+        _: u64,
+        _: usize,
+    ) -> BoxFuture<'a, Result<Vec<u8>, YourAiError>> {
+        panic!("unused outputs in journal fixture")
+    }
+    fn cleanup_outputs<'a>(
+        &'a self,
+        _: &'a SessionId,
+        _: i64,
+    ) -> BoxFuture<'a, Result<(), YourAiError>> {
+        panic!("unused outputs in journal fixture")
+    }
     fn read_tasks(&self, _id: &SessionId) -> Result<Vec<crate::tasks::Task>, YourAiError> {
         panic!("unused persistence in runtime fixture")
     }
@@ -256,7 +281,12 @@ impl SessionStore for Store {
         _id: &'a SessionId,
         _query: MessageQuery,
     ) -> BoxFuture<'a, Result<MessagePage, YourAiError>> {
-        panic!("unused persistence in runtime fixture")
+        Box::pin(async {
+            Ok(MessagePage {
+                messages: vec![],
+                next: None,
+            })
+        })
     }
     fn append_messages<'a>(
         &'a self,
@@ -283,9 +313,20 @@ impl SessionStore for Store {
     }
     fn load_session<'a>(
         &'a self,
-        _id: &'a SessionId,
+        id: &'a SessionId,
     ) -> BoxFuture<'a, Result<SessionMeta, YourAiError>> {
-        panic!("unused persistence in runtime fixture")
+        Box::pin(async move {
+            Ok(SessionMeta {
+                id: id.clone(),
+                system_prompt: Some(String::new()),
+                title: None,
+                parent_session_id: None,
+                provider: None,
+                created_at: 0,
+                updated_at: 0,
+                model: None,
+            })
+        })
     }
     fn save_session<'a>(
         &'a self,
