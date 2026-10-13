@@ -51,36 +51,13 @@ with tempfile.TemporaryDirectory() as tmp:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     config = Path(tmp) / 'config.json'
     config.write_text(json.dumps({
-        'models': {
-            'selected': 'mock/m',
-            'providers': {
-                'mock': {
-                    'npm': '@ai-sdk/openai-compatible',
-                    'options': {
-                        'baseURL': f'http://127.0.0.1:{server.server_port}/v1',
-                        'apiKey': 'x'
-                    },
-                    'models': {
-                        'm': {
-                            'id': 'm',
-                            'limit': {
-                                'context': 16000,
-                                'output': 4096
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        'session': {
-            'extensions': False
-        },
-        'execution': {
-            'context': {
-                'keep_recent_tokens': 0,
-                'summary_min_savings': 1
-            }
-        }
+        "model": "mock/m", "extensions": False,
+        "provider": {"mock": {
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {"baseURL": f"http://127.0.0.1:{server.server_port}/v1", "apiKey": "x"},
+            "models": {"m": {"id": "m", "limit": {"context": 16000, "output": 4096}}}
+        }},
+        "context": {"keep_recent_tokens": 0, "summary_min_savings": 1}
     }))
     # Seed an existing session by running the TUI once briefly.
     bin_path = DEFAULT_BIN

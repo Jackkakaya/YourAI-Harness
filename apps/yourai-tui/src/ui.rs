@@ -1,4 +1,3 @@
-use yourai_harness::config::Config;
 mod app;
 mod clipboard;
 mod commands;
@@ -16,7 +15,7 @@ mod session;
 mod state;
 pub(crate) mod syntax;
 pub(crate) mod theme;
-use crate::config::Error;
+use crate::config::{Config, Error};
 use app::{App, Flow};
 use crossterm::event::{self, Event};
 use ratatui::Terminal;
@@ -32,7 +31,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use yourai_core::prelude::*;
-use yourai_harness::{Harness, SessionOptions};
+use yourai_harness::{Harness, HarnessConfig};
 
 use crate::terminal::SyncWriter;
 
@@ -103,7 +102,7 @@ pub async fn run(
     limits: TurnLimits,
     config: Arc<std::sync::Mutex<Config>>,
     choices: Vec<crate::models::ModelChoice>,
-    config_template: SessionOptions,
+    config_template: HarnessConfig,
 ) -> Result<(String, Vec<In>), Error> {
     // Load clean persistent records before opening the alternate screen.
     let mut view = View::default();
@@ -112,11 +111,11 @@ pub async fn run(
     let (pricing, effort) = {
         let cfg = config.lock().map_err(|e| Error::from(e.to_string()))?;
         let p = cfg.pricing();
-        let pricing = match p {
+        let pricing = match (p.input, p.output) {
             (Some(i), Some(o)) => Some((i, o)),
             _ => None,
         };
-        let effort = cfg.effective_effort(&cfg.models.selected, cfg.models.variant.as_deref());
+        let effort = cfg.effective_effort(&cfg.model, cfg.selected_variant.as_deref());
         (pricing, effort)
     };
     view.model = state::ModelInfo {
@@ -134,7 +133,7 @@ pub async fn run(
         trusted_shell,
         yolo,
     };
-    let controller = Controller::new(harness, config, config_template, limits);
+    let controller = Controller::new(harness, config, config_template, limits, yolo);
     let mut app = App::new(controller, view, meta);
     // Input is delivered by a dedicated reader thread; the UI loop wakes on
     // the channel instead of polling on a timer, so wheel and key events
@@ -199,7 +198,7 @@ pub async fn run(
             // the tick (animations, stats, timeouts). Whichever fires, the same
             // body below runs; bursts are coalesced into one frame.
             let mut input_queue: Vec<Event> = Vec::new();
-            let mut pending_out: Option<yourai_harness::controller::SessionEvent> = None;
+            let mut pending_out: Option<Out> = None;
             tokio::select! {
                 maybe = input_rx.recv() => {
                     match maybe {

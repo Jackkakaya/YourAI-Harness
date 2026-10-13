@@ -1,5 +1,3 @@
-> 配置与启动接口已收敛，当前迁移说明见 [配置与运行职责收敛](orthogonal-runtime.md)。
-
 # DefaultLoop 实现
 
 > 会话存储与统一提交路径已经落地，当前行为以 [会话存储设计](./session-storage-design.md) 和源码为准。
@@ -26,7 +24,7 @@ Agent.start / run
 | 文件 | 职责 |
 |---|---|
 | Harness `default_loop/mod.rs` | 调度 Model / Tool，提交候选完成 |
-| Core `config.rs` | ExecutionOptions 默认值与单轮限制解析 |
+| Harness `default_loop/config.rs` | steps 和一个 ExecutionConfig |
 | core `execution/mod.rs` | Turn、唯一输入路由、调用账本、完成与收尾 |
 | core `execution/config.rs` | 业务执行配置及唯一默认值 |
 | core `execution/control.rs` | 可取消等待、输入路由和延迟上下文 |
@@ -43,23 +41,22 @@ Turn 持有共享控制和账本。DefaultLoop 用 turn.model()?.exec、turn.too
 ```rust
 use std::sync::Arc;
 use yourai_core::prelude::*;
-use yourai_harness::default_loop::DefaultLoop;
+use yourai_harness::default_loop::{DefaultLoop, LoopConfig};
 
 fn assemble(model: Arc<dyn ModelProvider>, history: Arc<dyn ContextManager>) -> Arc<Agent> {
-    let config = ExecutionOptions {
+    let config = LoopConfig {
         steps: Some(20),
         ..Default::default()
     };
     Agent::builder()
-        .config(config)
-        .agent_loop(Arc::new(DefaultLoop))
+        .agent_loop(Arc::new(DefaultLoop::new(config)))
         .model(model)
         .context_manager(history)
         .build()
 }
 ```
 
-必需 ModelProvider、ContextManager。工具、安全、Hook、记忆、技能及用量均按需装配。默认不检索记忆、不自动激活所有技能；配置 `ExecutionOptions.input.memory_search_limit` 和 `ExecutionOptions.input.skill_ids` 后才使用相应能力。
+必需 ModelProvider、ContextManager。工具、安全、Hook、记忆、技能、用量及可观测性均按需装配。默认不检索记忆、不自动激活所有技能；配置 `LoopConfig.execution.memory_search_limit` 和 `LoopConfig.execution.skill_ids` 后才使用相应能力。
 
 模型通过 `ModelProvider::stream_events` 获取事件流。测试和其他适配器可以直接构造事件流。`ModelProvider::recovery` 默认映射 provider 的 `classify_error`；未分类错误默认不可恢复。GenaiModel 自行分类结构化 HTTP 错误，其他适配器可独立实现分类和恢复策略，不能靠字符串猜测后无限重试。
 

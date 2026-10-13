@@ -1,5 +1,3 @@
-> 配置与启动接口已收敛，当前迁移说明见 [配置与运行职责收敛](orthogonal-runtime.md)。
-
 # 公共执行入口与自定义 Loop
 
 当前 core 的公共对象直接拥有 Hook 流程：Tool.exec、Model.exec、Compactor.exec，以及 Turn、SessionManager、Workspace、TaskManager、Subagent 的语义操作。DefaultLoop 只决定调用顺序。完整对象划分见 [最终实现](hook-template-design.md)。
@@ -10,13 +8,13 @@ AgentLoop 协议不变。Turn::open 恢复历史并接纳初始输入；Turn 持
 
 ```rust
 use yourai_core::prelude::*;
-use yourai_core::execution::{Completion, Turn};
+use yourai_core::execution::{Completion, ExecutionConfig, Turn};
 
 struct MyLoop;
 impl AgentLoop for MyLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
-            let mut turn = Turn::open(tc).await?;
+            let mut turn = Turn::open(tc, ExecutionConfig::default()).await?;
             let result = async {
                 if !turn.input_accepted() { return Ok(()); }
                 let call = turn.enqueue("my_tool", serde_json::json!({})).await?;
@@ -38,13 +36,13 @@ impl AgentLoop for MyLoop {
 }
 ```
 
-手动装配使用 Agent::builder().agent_loop(...)；完整装配使用 SessionOptions.agent_loop。Loop 的局部调度状态在 Stop 要求继续时保留。配置更新只改变后续 turn 的输入设置，不替换 Loop。
+手动装配使用 Agent::builder().agent_loop(...)；完整装配使用 HarnessConfig.agent_loop。Loop 的局部调度状态在 Stop 要求继续时保留。配置更新只改变后续 turn 的输入设置，不替换 Loop。
 
 ## 接口
 
 | 调用 | 含义 |
 |---|---|
-| `Turn::open(tc)` | 恢复并接纳首条输入；恢复也响应控制信号 |
+| `Turn::open(tc, config)` | 恢复并接纳首条输入；恢复也响应控制信号 |
 | `turn.accept_input(input)` | 接纳新输入；明确拒绝返回 false 并交还输入 |
 | `turn.enqueue(name, input)` | 保存程序发起的调用，返回 ToolCall；不执行 |
 | `turn.model()?.exec(&mut turn, options)` | 构造请求、流、恢复和提交，返回 ModelOutput |

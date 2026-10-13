@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
-use yourai_core::prelude::*;
+use yourai_core::{execution::ExecutionConfig, prelude::*};
 
 struct TimedHooks {
     slow: HookEventKind,
@@ -55,7 +55,7 @@ struct DirectElicitation {
 impl AgentLoop for DirectElicitation {
     fn run_turn<'a>(&'a self, context: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
-            let mut turn = Turn::open(context).await?;
+            let mut turn = Turn::open(context, ExecutionConfig::default()).await?;
             let kind = if self.question {
                 InteractionKind::Question
             } else {

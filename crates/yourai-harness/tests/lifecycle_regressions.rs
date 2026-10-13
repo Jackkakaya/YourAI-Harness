@@ -22,7 +22,7 @@ use yourai_core::{
 use yourai_harness::{collaboration::subagent, runtime, SessionManager};
 
 async fn open(root: &Path, cwd: &Path, model: Arc<Model>) -> Arc<SessionManager> {
-    runtime::create(root, cwd.to_owned(), Agent::builder().model(model))
+    runtime::create(root, cwd.to_owned(), model, None, None)
         .await
         .unwrap()
 }
@@ -112,8 +112,8 @@ async fn child_inherits_normal_security_and_sandbox() {
         ..Default::default()
     });
     let sandbox = Arc::new(RejectSandbox(AtomicUsize::new(0)));
-    parent.agent().set_security(security.clone());
-    parent.agent().set_sandbox(sandbox.clone());
+    parent.agent().ctx().set_security(security.clone());
+    parent.agent().ctx().set_sandbox(sandbox.clone());
     let replacement_security = Arc::new(Security::default());
     let replacement_sandbox = Arc::new(RejectSandbox(AtomicUsize::new(0)));
     let startup_parent = Arc::downgrade(&parent);
@@ -124,8 +124,8 @@ async fn child_inherits_normal_security_and_sandbox() {
             // Startup can change the parent, but this child must retain the
             // providers captured by the tool invocation that created it.
             let parent = startup_parent.upgrade().unwrap();
-            parent.agent().set_security(startup_security.clone());
-            parent.agent().set_sandbox(startup_sandbox.clone());
+            parent.agent().ctx().set_security(startup_security.clone());
+            parent.agent().ctx().set_sandbox(startup_sandbox.clone());
         }
         if let HookPointOutcome::PermissionRequest(outcome) = &mut result.outcome {
             outcome.decision = Some(PermissionRequestDecision {
@@ -137,7 +137,7 @@ async fn child_inherits_normal_security_and_sandbox() {
             });
         }
     }));
-    parent.agent().set_hooks(hooks.clone());
+    parent.agent().ctx().set_hooks(hooks.clone());
     let model = Arc::new(Model::new(vec![
         events(vec![end(
             "",
@@ -241,6 +241,7 @@ async fn changed_cwd_is_shared_by_execution_and_approval_paths() {
     let description = read.security_context(&json!({"path":"marker"}), Some(&cwd));
     assert_eq!(
         host.agent()
+            .ctx()
             .security()
             .unwrap()
             .check_tool_call(&description)
@@ -249,7 +250,7 @@ async fn changed_cwd_is_shared_by_execution_and_approval_paths() {
         ApprovalDecision::Ask
     );
     let security = Arc::new(Security::default());
-    host.agent().set_security(security.clone());
+    host.agent().ctx().set_security(security.clone());
     turn(&host).await;
     let text = model.requests.lock().unwrap()[1]
         .request
@@ -321,7 +322,7 @@ async fn instructions_reverting_to_old_content_publish_the_latest_value() {
         .collect();
     assert_eq!(texts.len(), 1);
     assert!(texts[0].ends_with("A-CONTENT"));
-    let archive = host.agent().context_manager().unwrap().records();
+    let archive = host.agent().ctx().context_manager().unwrap().records();
     let updates: Vec<_> = archive.iter().filter(|m| m.context_key.is_some()).collect();
     assert_eq!(updates.len(), 3);
     assert!(updates[1]
@@ -486,11 +487,12 @@ async fn imported_task_backup_is_retired_even_when_it_changes_or_breaks() {
             root.path(),
             id.clone(),
             cwd.path().into(),
-            Agent::builder().model(Arc::new(Model::new(vec![]))),
-            ExecutionOptions {
-                context_policy: ContextPolicy::default(),
-                ..Default::default()
-            },
+            Arc::new(Model::new(vec![])),
+            None,
+            None,
+            None,
+            None,
+            ContextPolicy::default(),
             "resume",
         )
         .await
@@ -515,6 +517,7 @@ async fn task_import_can_retry_after_completion_marker_write_fails() {
     assert!(host.task_manager("team").is_err());
     assert_eq!(
         host.agent()
+            .ctx()
             .session()
             .unwrap()
             .read_tasks(&host.environment().id)

@@ -13,7 +13,7 @@ DefaultContext / SQLite 的分工。整理的单位是职责和不变量，不�
 - 主循环优先级：TurnLimits.model_timeout > 请求 ChatOptions > 模型默认值。
   complete、compact、模型 Hook 和子 Agent 共享所持模型的默认值。
   Hook evaluation 自身的总时限仍独立存在。
-- 模型与上下文管理器通过同一次 Agent.update 发布。Hook 和新建子任务使用调用时冻结的依赖快照，默认继承模型；显式固定模型的子任务保持原身份。
+- 模型与上下文管理器通过同一次 Providers.update 发布。Hook 和新建子任务使用调用时冻结的依赖快照，默认继承模型；显式固定模型的子任务保持原身份。
 - TUI 的 `Config::resolve` 一次返回 ResolvedModel，包含已配置的模型和运行设置；容量不再存入上下文策略；
   启动、切换、创建会话共用，不在不同入口重新解析超时和请求策略。
 

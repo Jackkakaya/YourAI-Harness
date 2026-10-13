@@ -100,14 +100,14 @@ async fn turn_metadata_reaches_loop_and_deadline_failure_retains_input() {
     options.limits.steps = Some(4);
     let agent = Agent::builder().agent_loop(Arc::new(MetadataLoop)).build();
     let handle = agent
-        .start_with(In::user_text("hello"), Default::default(), options.clone())
+        .start_with(In::user_text("hello"), options.clone())
         .unwrap();
     let expected = format!("{}:{}", session.id, handle.info.id);
     assert_eq!(handle.join().await.unwrap().text, expected);
 
     options.limits.deadline = Some(Instant::now());
     let failure = agent
-        .run_with(In::user_text("not processed"), Default::default(), options)
+        .run_with(In::user_text("not processed"), options)
         .await
         .unwrap_err();
     assert!(matches!(

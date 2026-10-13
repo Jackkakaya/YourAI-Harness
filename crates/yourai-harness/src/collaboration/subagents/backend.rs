@@ -34,7 +34,7 @@ impl SubagentFactory for ChildFactory {
             };
             let snapshot = match tc.providers {
                 Some(providers) => providers.clone(),
-                None => parent.agent().snapshot()?,
+                None => parent.agent().ctx().snapshot()?,
             };
             let history = snapshot
                 .context_manager
@@ -52,31 +52,25 @@ impl SubagentFactory for ChildFactory {
                 .await?;
             meta.parent_session_id = Some(parent.environment().id);
             catalog.store.save_session(&meta).await?;
-
-            let mut settings = parent.config().clone();
-            settings.context_policy = history.policy();
-            // Child input activation is independent of the parent's selected skills/memory.
-            settings.skill_ids.clear();
-            settings.memory_search_limit = 0;
-            settings.instruction_paths.clear();
-            settings.workspace_enabled = false;
-            let mut bindings = Agent::builder().model(model);
-            bindings.hooks = snapshot.hooks;
-            bindings.tools = self.tools.clone();
-            bindings.security = tc.security.clone();
-            bindings.sandbox = tc.sandbox.clone();
-            bindings.compaction_model = snapshot.compaction_model;
-            crate::runtime::restore(
+            let child = crate::runtime::restore(
                 &root,
                 id,
                 tc.cwd
                     .map(Path::to_owned)
                     .unwrap_or_else(|| parent.environment().cwd),
-                bindings,
-                settings,
+                model,
+                snapshot.hooks.clone(),
+                self.tools.clone(),
+                tc.security.clone(),
+                tc.sandbox.clone(),
+                history.policy(),
                 "startup",
             )
-            .await
+            .await?;
+            if let Some(summary) = snapshot.compaction_model {
+                child.agent().ctx().set_compaction_model(summary);
+            }
+            Ok(child)
         })
     }
 }

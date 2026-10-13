@@ -1,22 +1,17 @@
 //! Hook wire interpretation and aggregation; no scheduling or I/O.
 use super::*;
-use yourai_core::hooks::HookEventKind;
 
 // ── Output parsing ──────────────────────────────────────────────────
 
 pub(super) fn parse_handler_output(
     output: &HookOutput,
-    expected_event: HookEventKind,
+    expected_event: &str,
 ) -> Result<Contribution, YourAiError> {
     let mut contrib = Contribution::default();
 
     match output {
         HookOutput::Parsed(json_value) => {
-            let json_output = crate::hooks::wire_output::parse_hook_value(json_value.clone())
-                .map_err(|error| ErrorKind::Provider {
-                    name: "hook",
-                    message: format!("parsed hook output validation failed: {error}"),
-                })?;
+            let json_output: HookJsonOutput = parse_json_value(json_value)?;
             apply_json_output(&json_output, expected_event, &mut contrib)?;
         }
         HookOutput::Command {
@@ -104,9 +99,19 @@ pub(super) fn parse_handler_output(
     Ok(contrib)
 }
 
+fn parse_json_value(value: &Value) -> Result<HookJsonOutput, YourAiError> {
+    crate::hooks::wire_output::parse_hook_json(&value.to_string()).map_err(|error| {
+        ErrorKind::Provider {
+            name: "hook",
+            message: format!("parsed hook output validation failed: {error}"),
+        }
+        .into()
+    })
+}
+
 fn apply_json_output(
     json_output: &HookJsonOutput,
-    expected_event: HookEventKind,
+    expected_event: &str,
     contrib: &mut Contribution,
 ) -> Result<(), YourAiError> {
     match json_output {
@@ -120,7 +125,7 @@ fn apply_json_output(
 
 fn apply_sync_output(
     s: &SyncOutput,
-    expected_event: HookEventKind,
+    expected_event: &str,
     contrib: &mut Contribution,
 ) -> Result<(), YourAiError> {
     contrib.suppress_output = s.suppress_output.unwrap_or(false);
@@ -155,14 +160,12 @@ fn apply_sync_output(
     }
 
     if let Some(hso) = &s.hook_specific_output {
-        let hso_event = hso.event_kind();
+        let hso_event = hso.event_name();
         if hso_event != expected_event {
             return Err(ErrorKind::Provider {
                 name: "hook",
                 message: format!(
-                    "hookEventName mismatch: expected {}, got {}",
-                    expected_event.as_str(),
-                    hso_event.as_str()
+                    "hookEventName mismatch: expected {expected_event}, got {hso_event}"
                 ),
             }
             .into());
@@ -312,42 +315,31 @@ fn apply_hook_specific_output(hso: &HookSpecificOutput, contrib: &mut Contributi
 
 // ── Aggregation ─────────────────────────────────────────────────────
 
-pub(super) fn aggregate(
-    event: HookEventKind,
-    contributions: Vec<Contribution>,
-) -> HookPointOutcome {
-    match event {
-        HookEventKind::PreToolUse => {
-            HookPointOutcome::PreToolUse(aggregate_pre_tool_use(contributions))
-        }
-        HookEventKind::PostToolUse => {
-            HookPointOutcome::PostToolUse(aggregate_post_tool_use(contributions))
-        }
-        HookEventKind::UserPromptSubmit => HookPointOutcome::UserPromptSubmit,
-        HookEventKind::SessionStart => {
-            HookPointOutcome::SessionStart(aggregate_session_start(contributions))
-        }
-        HookEventKind::PermissionDenied => {
+pub(super) fn aggregate(event_name: &str, contributions: Vec<Contribution>) -> HookPointOutcome {
+    match event_name {
+        "PreToolUse" => HookPointOutcome::PreToolUse(aggregate_pre_tool_use(contributions)),
+        "PostToolUse" => HookPointOutcome::PostToolUse(aggregate_post_tool_use(contributions)),
+        "UserPromptSubmit" => HookPointOutcome::UserPromptSubmit,
+        "SessionStart" => HookPointOutcome::SessionStart(aggregate_session_start(contributions)),
+        "PermissionDenied" => {
             HookPointOutcome::PermissionDenied(aggregate_permission_denied(contributions))
         }
-        HookEventKind::PermissionRequest => {
+        "PermissionRequest" => {
             HookPointOutcome::PermissionRequest(aggregate_permission_request(contributions))
         }
-        HookEventKind::CwdChanged | HookEventKind::FileChanged => {
+        "CwdChanged" | "FileChanged" => {
             let wp = aggregate_watch_paths(contributions);
-            if event == HookEventKind::CwdChanged {
+            if event_name == "CwdChanged" {
                 HookPointOutcome::CwdChanged(wp)
             } else {
                 HookPointOutcome::FileChanged(wp)
             }
         }
-        HookEventKind::Elicitation => {
-            HookPointOutcome::Elicitation(aggregate_elicitation(contributions))
-        }
-        HookEventKind::ElicitationResult => {
+        "Elicitation" => HookPointOutcome::Elicitation(aggregate_elicitation(contributions)),
+        "ElicitationResult" => {
             HookPointOutcome::ElicitationResult(aggregate_elicitation(contributions))
         }
-        HookEventKind::WorktreeCreate => {
+        "WorktreeCreate" => {
             HookPointOutcome::WorktreeCreate(aggregate_worktree_create(contributions))
         }
         _ => HookPointOutcome::Generic,

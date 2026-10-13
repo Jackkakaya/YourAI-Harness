@@ -165,8 +165,15 @@ async fn output_is_bounded_before_after_hook_and_hook_changes_reach_the_model_un
             .context_manager(c.clone())
             .tools(tools)
             .hooks(hooks)
-            .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
-            .tool_output(outputs.clone())
+            .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop::new(
+                yourai_harness::default_loop::LoopConfig {
+                    execution: yourai_harness::execution::ExecutionConfig {
+                        tool_output: Some(outputs.clone()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )))
             .build();
         assert_eq!(
             agent.run(In::user_text("run tool")).await.unwrap().text,
@@ -243,7 +250,9 @@ async fn old_outputs_over_budget_trigger_summary_instead_of_age_pruning() {
     let agent = Agent::builder()
         .model(model.clone())
         .context_manager(c.clone())
-        .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
+        .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop::new(
+            Default::default(),
+        )))
         .build();
     assert_eq!(
         agent.run(In::user_text("continue")).await.unwrap().text,

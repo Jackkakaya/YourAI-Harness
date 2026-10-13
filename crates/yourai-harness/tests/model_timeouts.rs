@@ -9,7 +9,10 @@ use tokio::{
 };
 use yourai_core::prelude::*;
 use yourai_harness::GenaiModel;
-use yourai_harness::{default_loop::DefaultLoop, MeteredModel, ModelBudget};
+use yourai_harness::{
+    default_loop::{DefaultLoop, LoopConfig},
+    MeteredModel, ModelBudget,
+};
 
 async fn server(mode: &'static str) -> (GenaiModel, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -263,23 +266,19 @@ async fn raw_byte_progress_keeps_compaction_and_metered_main_loop_alive() {
                 let agent = Agent::builder()
                     .model(model)
                     .context_manager(Arc::new(support::History::default()))
-                    .agent_loop(Arc::new(DefaultLoop))
-                    .build();
-                tokio::time::timeout(
-                    Duration::from_secs(3),
-                    agent.run_with(
-                        In::user_text("hello"),
-                        ExecutionOptions {
+                    .agent_loop(Arc::new(DefaultLoop::new(LoopConfig {
+                        execution: yourai_core::execution::ExecutionConfig {
                             max_model_retries: 0,
                             ..Default::default()
                         },
-                        TurnOptions::default(),
-                    ),
-                )
-                .await
-                .unwrap()
-                .unwrap()
-                .text
+                        ..Default::default()
+                    })))
+                    .build();
+                tokio::time::timeout(Duration::from_secs(3), agent.run(In::user_text("hello")))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .text
             } else {
                 tokio::time::timeout(Duration::from_secs(3), model.complete(request()))
                     .await
@@ -302,24 +301,13 @@ async fn explicit_turn_deadline_still_stops_a_healthy_heartbeat_stream() {
     let agent = Agent::builder()
         .model(Arc::new(model))
         .context_manager(Arc::new(support::History::default()))
-        .agent_loop(Arc::new(DefaultLoop))
+        .agent_loop(Arc::new(DefaultLoop::default()))
         .build();
     let mut options = TurnOptions::default();
     options.limits.deadline = Some(std::time::Instant::now() + Duration::from_millis(200));
     let (_, result) = tokio::time::timeout(
         Duration::from_secs(2),
-        support::collect(
-            agent
-                .start_with(
-                    In::user_text("hello"),
-                    ExecutionOptions {
-                        max_model_retries: 0,
-                        ..Default::default()
-                    },
-                    options,
-                )
-                .unwrap(),
-        ),
+        support::collect(agent.start_with(In::user_text("hello"), options).unwrap()),
     )
     .await
     .unwrap();
@@ -342,24 +330,19 @@ async fn per_turn_model_limit_is_forwarded_to_transport() {
             budget: ModelBudget::new(),
         }))
         .context_manager(Arc::new(support::History::default()))
-        .agent_loop(Arc::new(DefaultLoop))
+        .agent_loop(Arc::new(DefaultLoop::new(LoopConfig {
+            execution: yourai_core::execution::ExecutionConfig {
+                max_model_retries: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        })))
         .build();
     let mut options = TurnOptions::default();
     options.limits.model_timeout = Some(Duration::from_millis(50));
     let (_, result) = tokio::time::timeout(
         Duration::from_secs(2),
-        support::collect(
-            agent
-                .start_with(
-                    In::user_text("hello"),
-                    ExecutionOptions {
-                        max_model_retries: 0,
-                        ..Default::default()
-                    },
-                    options,
-                )
-                .unwrap(),
-        ),
+        support::collect(agent.start_with(In::user_text("hello"), options).unwrap()),
     )
     .await
     .unwrap();
@@ -437,7 +420,7 @@ async fn configured_model_defaults_reach_collected_and_default_loop_requests() {
                 let agent = Agent::builder()
                     .model(model)
                     .context_manager(Arc::new(support::History::default()))
-                    .agent_loop(Arc::new(DefaultLoop))
+                    .agent_loop(Arc::new(DefaultLoop::default()))
                     .build();
                 *agent.run(In::user_text("test")).await.unwrap_err().error
             }

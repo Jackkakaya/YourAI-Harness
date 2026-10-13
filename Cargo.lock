@@ -3599,7 +3599,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
- "tracing",
  "uuid",
 ]
 
@@ -3626,7 +3625,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "tracing",
  "uuid",
  "yourai-core",
 ]
@@ -3636,6 +3634,7 @@ name = "yourai-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "genai",
  "libc",
  "pulldown-cmark",
  "ratatui",

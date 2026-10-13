@@ -102,7 +102,7 @@ pub(crate) async fn fixture_with_hooks(
         dir.path().join("session"),
         context,
         agent,
-        ExecutionOptions {
+        SessionConfig {
             workspace_enabled: true,
             ..Default::default()
         },
@@ -234,31 +234,6 @@ impl SessionStore for Store {
         states.insert(key.into(), SessionState { revision, value });
         Ok(revision)
     }
-    fn append_output<'a>(
-        &'a self,
-        _: &'a SessionId,
-        _: &'a str,
-        _: u64,
-        _: Vec<u8>,
-    ) -> BoxFuture<'a, Result<(), YourAiError>> {
-        panic!("unused outputs in journal fixture")
-    }
-    fn read_output<'a>(
-        &'a self,
-        _: &'a SessionId,
-        _: &'a str,
-        _: u64,
-        _: usize,
-    ) -> BoxFuture<'a, Result<Vec<u8>, YourAiError>> {
-        panic!("unused outputs in journal fixture")
-    }
-    fn cleanup_outputs<'a>(
-        &'a self,
-        _: &'a SessionId,
-        _: i64,
-    ) -> BoxFuture<'a, Result<(), YourAiError>> {
-        panic!("unused outputs in journal fixture")
-    }
     fn read_tasks(&self, _id: &SessionId) -> Result<Vec<crate::tasks::Task>, YourAiError> {
         panic!("unused persistence in runtime fixture")
     }
@@ -281,12 +256,7 @@ impl SessionStore for Store {
         _id: &'a SessionId,
         _query: MessageQuery,
     ) -> BoxFuture<'a, Result<MessagePage, YourAiError>> {
-        Box::pin(async {
-            Ok(MessagePage {
-                messages: vec![],
-                next: None,
-            })
-        })
+        panic!("unused persistence in runtime fixture")
     }
     fn append_messages<'a>(
         &'a self,
@@ -313,20 +283,9 @@ impl SessionStore for Store {
     }
     fn load_session<'a>(
         &'a self,
-        id: &'a SessionId,
+        _id: &'a SessionId,
     ) -> BoxFuture<'a, Result<SessionMeta, YourAiError>> {
-        Box::pin(async move {
-            Ok(SessionMeta {
-                id: id.clone(),
-                system_prompt: Some(String::new()),
-                title: None,
-                parent_session_id: None,
-                provider: None,
-                created_at: 0,
-                updated_at: 0,
-                model: None,
-            })
-        })
+        panic!("unused persistence in runtime fixture")
     }
     fn save_session<'a>(
         &'a self,

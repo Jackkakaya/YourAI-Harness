@@ -144,27 +144,6 @@ impl SqliteStore {
         root.join("sessions.sqlite3")
     }
 }
-fn save_state_row(
-    c: &Connection,
-    id: &SessionId,
-    key: &str,
-    expected: Option<i64>,
-    value: &serde_json::Value,
-) -> Result<i64, YourAiError> {
-    let revision = expected
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| sql("state revision overflow"))?;
-    let raw = serde_json::to_string(value).map_err(sql)?;
-    let n = match expected {
-        Some(old) => c.execute("UPDATE session_state SET revision=?3,value_json=?4 WHERE session_id=?1 AND state_key=?2 AND revision=?5",params![id.as_str(),key,revision,raw,old]),
-        None => c.execute("INSERT INTO session_state(session_id,state_key,revision,value_json) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id,state_key) DO NOTHING",params![id.as_str(),key,revision,raw]),
-    }.map_err(sql)?;
-    if n != 1 {
-        return Err(sql("session state changed; retry from current revision"));
-    }
-    Ok(revision)
-}
 const SCHEMA: &str = "
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS sessions (
@@ -453,7 +432,19 @@ impl SessionStore for SqliteStore {
         if key.is_empty() || key.len() > 128 {
             return Err(sql("invalid state key"));
         }
-        self.with(|c| save_state_row(c, id, key, expected, &value))
+        let revision = expected
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| sql("state revision overflow"))?;
+        let raw = serde_json::to_string(&value).map_err(sql)?;
+        self.with(|c| {
+            let n=match expected {
+                Some(old)=>c.execute("UPDATE session_state SET revision=?3,value_json=?4 WHERE session_id=?1 AND state_key=?2 AND revision=?5",params![id.as_str(),key,revision,raw,old]),
+                None=>c.execute("INSERT INTO session_state(session_id,state_key,revision,value_json) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id,state_key) DO NOTHING",params![id.as_str(),key,revision,raw]),
+            }.map_err(sql)?;
+            if n!=1 { return Err(sql("session state changed; retry from current revision")); }
+            Ok(revision)
+        })
     }
     fn append_output<'a>(
         &'a self,

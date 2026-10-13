@@ -7,7 +7,7 @@
 - Tool、Model、Compactor 直接拥有完整公共 exec 和私有业务步骤；删除 Turn 中旧工具 / 模型执行入口。
 - Turn 的调用阶段、固定工具、真实结果和稳定结果身份合为一条记录；部分响应和延迟上下文成功保存后才移除。
 - 授权、MCP 交互是实际普通函数，没有额外 Executor。
-- 当时的 LoopConfig / ExecutionConfig 已进一步合并到 Config.execution；DefaultLoop 无状态，默认值定义一次。当前分类契约见 [配置说明](core-contracts.md#配置读写与持久化契约2026-10-13)。
+- LoopConfig 只包含 steps 与 ExecutionConfig，默认值定义一次。
 - TaskManager 直接实现 ToolProvider，复用 SQLite；删除独立 TaskTool / TaskStore / JsonTasks。
 - Subagent 直接实现 ToolProvider；SessionManager 唯一 children 集合；SubagentFactory 只装配 child。
 - Workspace / TaskManager 每个 host 唯一；初始化、关闭和 owned 写入维持资源所有权。

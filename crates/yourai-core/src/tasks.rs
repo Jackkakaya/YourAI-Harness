@@ -1,8 +1,10 @@
-//! One task manager owns transitions and the session's persisted task view.
+//! One task manager owns transitions, tool input and the session's persisted task view.
 use crate::{error, file_store::read_json, prelude::*, runtime::SessionManager};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, Weak,
@@ -31,7 +33,7 @@ pub struct TaskManager {
 impl TaskManager {
     /// The host owns initialization and publishes only one manager per session.
     pub(crate) fn open(host: &Arc<SessionManager>, team: String) -> Result<Arc<Self>, YourAiError> {
-        let sessions = host.agent().session()?;
+        let sessions = host.agent().ctx().session()?;
         let id = host.environment().id;
         let mut tasks: HashMap<_, _> = sessions
             .read_tasks(&id)?
@@ -77,16 +79,6 @@ impl TaskManager {
     }
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
-    }
-    pub fn snapshot_since(&self, previous: Option<u64>) -> Option<(u64, Vec<Task>)> {
-        let current = self.tasks.lock().unwrap();
-        let version = self.version.load(Ordering::Acquire);
-        if previous == Some(version) {
-            return None;
-        }
-        let mut tasks: Vec<_> = current.values().cloned().collect();
-        tasks.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.id.cmp(&b.id)));
-        Some((version, tasks))
     }
     pub fn list(&self) -> Vec<Task> {
         let mut tasks: Vec<_> = self.tasks.lock().unwrap().values().cloned().collect();
@@ -208,11 +200,83 @@ impl TaskManager {
                 .save_tasks(&host.environment().id, vec![task])?
                 .pop()
                 .ok_or_else(|| error("tasks", "session manager returned no saved task"))?;
-            let mut tasks = manager.tasks.lock().unwrap();
-            tasks.insert(saved.id.clone(), saved.clone());
+            manager
+                .tasks
+                .lock()
+                .unwrap()
+                .insert(saved.id.clone(), saved.clone());
             manager.version.fetch_add(1, Ordering::Release);
             Ok(saved)
         })
         .await?
+    }
+}
+
+impl ToolProvider for TaskManager {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new("tasks")
+            .with_description("Track coding TODOs. Create a task with a subject, list tasks, and mark a task complete by its id only when the work is done.")
+            .with_schema(json!({
+                "type":"object",
+                "properties":{
+                    "action":{"enum":["list","create","complete","idle"]},
+                    "subject":{"type":"string"},
+                    "id":{"type":"string"},
+                    "owner":{"type":"string"}
+                },
+                "required":["action"]
+            }))
+    }
+    fn security_context(&self, input: &Value, _cwd: Option<&Path>) -> SecurityContext {
+        SecurityContext {
+            action: "tasks".into(),
+            input: input.clone(),
+            is_destructive: false,
+            is_network: false,
+        }
+    }
+    fn run<'a>(
+        &'a self,
+        tc: ToolContext<'a>,
+        input: Value,
+    ) -> BoxFuture<'a, Result<Value, YourAiError>> {
+        Box::pin(async move {
+            if tc.cancel.is_cancelled() {
+                return Err(AbortReason::Cancelled.into());
+            }
+            match input["action"].as_str() {
+                Some("list") => Ok(json!(self.list())),
+                Some("create") => Ok(json!(
+                    self.create(
+                        input["subject"]
+                            .as_str()
+                            .ok_or_else(|| error("tasks", "subject required"))?
+                            .into(),
+                        None,
+                        input["owner"].as_str().map(str::to_owned),
+                    )
+                    .await?
+                )),
+                Some("complete") => {
+                    self.complete(
+                        input["id"]
+                            .as_str()
+                            .ok_or_else(|| error("tasks", "id required"))?,
+                    )
+                    .await?;
+                    Ok(json!({"completed":true}))
+                }
+                Some("idle") => {
+                    self.idle(
+                        input["owner"]
+                            .as_str()
+                            .ok_or_else(|| error("tasks", "owner required"))?,
+                    )
+                    .await?;
+                    Ok(json!({"idle":true}))
+                }
+                _ => Err(error("tasks", "unknown action")),
+            }
+        })
     }
 }

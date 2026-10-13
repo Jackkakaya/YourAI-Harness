@@ -4,14 +4,14 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use yourai_core::execution::{Completion, Turn};
+use yourai_core::execution::{Completion, ExecutionConfig, Turn};
 use yourai_core::prelude::*;
 
 pub struct ReverseLoop;
 impl AgentLoop for ReverseLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
-            let mut cx = Turn::open(tc).await?;
+            let mut cx = Turn::open(tc, ExecutionConfig::default()).await?;
             let result = async {
                 if !cx.input_accepted() {
                     return Ok(());
@@ -52,7 +52,7 @@ impl AgentLoop for DirectLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
             self.starts.fetch_add(1, Ordering::SeqCst);
-            let mut cx = Turn::open(tc).await?;
+            let mut cx = Turn::open(tc, ExecutionConfig::default()).await?;
             let result = async {
                 if !cx.input_accepted() {
                     return Ok(());
@@ -81,7 +81,7 @@ pub struct WaitingLoop(pub Arc<AtomicUsize>);
 impl AgentLoop for WaitingLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
-            let mut cx = Turn::open(tc).await?;
+            let mut cx = Turn::open(tc, ExecutionConfig::default()).await?;
             self.0.fetch_add(1, Ordering::SeqCst);
             let result = cx.wait(std::future::pending()).await;
             cx.finish(result).await
@@ -92,7 +92,7 @@ pub struct CompactLoop;
 impl AgentLoop for CompactLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
-            let mut cx = Turn::open(tc).await?;
+            let mut cx = Turn::open(tc, ExecutionConfig::default()).await?;
             let result = async {
                 if !cx.input_accepted() {
                     return Ok(());
@@ -116,7 +116,7 @@ impl AgentLoop for OperationsLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
             let registry = tc.snap.tools.clone().unwrap();
-            let mut cx = Turn::open(tc).await?;
+            let mut cx = Turn::open(tc, ExecutionConfig::default()).await?;
             let result = async {
                 if !cx.input_accepted() {
                     return Ok(());
@@ -169,7 +169,7 @@ pub struct GuardLoop;
 impl AgentLoop for GuardLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
-            let mut cx = Turn::open(tc).await?;
+            let mut cx = Turn::open(tc, ExecutionConfig::default()).await?;
             let result = async {
                 if !cx.input_accepted() {
                     return Ok(());
@@ -221,7 +221,7 @@ pub struct BoundLoop;
 impl AgentLoop for BoundLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
-            let mut cx = Turn::open(tc).await?;
+            let mut cx = Turn::open(tc, ExecutionConfig::default()).await?;
             let result = async {
                 if !cx.input_accepted() {
                     return Ok(());

@@ -47,11 +47,11 @@
 
 ### 模型配置与流转（/models 相关）
 
-- 当前配置已迁入 harness：共享 `Config` 按 models/execution/security/ui/session/prompt/hooks 分类，JSON 使用相同路径；`config.models.providers` 保存 Provider/模型 JSON 数据。
-- `Config.models.selected` 形如 `"provider/model"`。`Config::resolve(&self, variant)` 返回 `ResolvedModel`，不改写模型容量或共享配置。
-- 模型/effort 切换通过 `SessionClient.model`，后端在操作锁内解析、准备资源并保存配置，随后发布绑定；TUI 显示结果。
-- 每轮读取 Config.execution 的冻结副本；已开始轮次保持原参数。上下文策略位于 `execution.context`，容量来自选定模型的 ModelTokenBudget。
-- 以下界面重设计计划保留原讨论背景；当前实现与配置用法以 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13) 和 [TUI 文档](tui.md) 为准。
+- `config.rs`：`Config.provider: BTreeMap<String, ProviderConfig>`；`ProviderConfig.models: BTreeMap<String, ModelConfig>`；`ModelConfig { id: Option<String>, limit: Limits, options: Map<String,Value>, headers, variants: BTreeMap<String, Map<String,Value>> }`（约 48-86 行）。variant 含 `"disabled": true` 的需过滤。
+- `Config.model` 形如 `"provider/model"`；`Config::resolve(&mut self, variant: Option<&str>) -> Result<Arc<GenaiModel>, Error>`（约 157 行起）：校验并构建模型，副作用是写回 `self.context.context_window / input_limit`（约 207-208 行）。
+- `main.rs`：`let model = config.resolve(...)` → `Harness::open(hc, model)`；此后 `ui::run(&harness, &config.model, ...)`。**运行时没有换模型的通道。**
+- `DefaultLoop`（crates/yourai-harness/src/default_loop/mod.rs:136）：`model: Arc<dyn ModelProvider>`，启动后固定。
+- 每个请求的 context 预算来自构建期 `hc.context_policy`（换模型后其窗口/输入限额不同，需要一并更新）。
 
 ### 会话存储与 title（/sessions 相关）
 
@@ -391,7 +391,7 @@ pub struct ModelChoice {
     pub label: String,           // 显示用："provider/model" 或 "provider/model · variant"
 }
 pub fn model_choices(config: &Config) -> Vec<ModelChoice>;
-// 遍历 config.models.providers × models × variants；variants 中值含 "disabled": true 的跳过；
+// 遍历 config.provider × models × variants；variants 中值含 "disabled": true 的跳过；
 // 每个 model 始终生成一个无 variant 的默认条目，另有 N 个 variant 条目。
 ```
 
@@ -440,7 +440,7 @@ pub fn model_choices(config: &Config) -> Vec<ModelChoice>;
 ### 6.2 启动选择器（`--resume` 不带 ID）
 
 - CLI 解析：`--resume` 后**无值或下一个参数以 `--` 开头** → 进入选择器；`--resume <ID>` 保留现状直接恢复。`--help` 与 usage 文案改为 `[--resume [SESSION_ID]]`。
-- 实现位置：`Harness::open` **之前**的独立轻量 alternate-screen 循环，新文件 `apps/yourai-tui/src/launcher.rs`（约 150-200 行），只需 `SessionCatalog::new(config.session_dir())` + `store.list_sessions()`，不依赖 harness。
+- 实现位置：`Harness::open` **之前**的独立轻量 alternate-screen 循环，新文件 `apps/yourai-tui/src/launcher.rs`（约 150-200 行），只需 `SessionCatalog::new(&config.session_dir)` + `store.list_sessions()`，不依赖 harness。
   - 流程：`Config::load`（及 `--check-config` 等早退分支）之后、`Harness::open` 之前：picker 模式 → `launcher::pick(&config) -> Result<Option<SessionId>, Error>`：`Some(id)` → `hc.resume = Some(id)` 正常启动；`None`（Esc）→ 全新会话继续。
   - 键位：字符输入 = 过滤、Backspace 删除、`↑↓`/`Ctrl-P/N` 移动、`Enter` 选择、`Esc` = 新建会话、`Ctrl-Q` = 直接退出进程。
   - 空数据提示：`No sessions yet — Esc to start fresh`。
@@ -450,7 +450,7 @@ pub fn model_choices(config: &Config) -> Vec<ModelChoice>;
 
 `ui::run` 的结构性改动，按此拆分：
 
-1. 启动时保留一份 `SessionOptions` 装配模板（`resume` 字段可换）；把「`Harness::open` → `restore_history` → spawn driver」抽成事件循环内可重建的单元。
+1. 启动时保留一份 `HarnessConfig` 模板（`resume` 字段可换）；把「`Harness::open` → `restore_history` → spawn driver」抽成事件循环内可重建的单元。
 2. 切换序列（在事件循环内顺序执行）：
    a. 守卫：`view.active || !view.asks_empty()` → 拒绝并 notice；
    b. `cancel` 旧 driver、`h.host.interrupt()`、`harness.close().await`（若返回 pending 输入非空 → notice 说明丢弃数量）；

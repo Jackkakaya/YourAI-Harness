@@ -27,30 +27,24 @@ Cargo 将 `yourai` 安装到 bin 目录，通常是 `~/.cargo/bin`。也可以�
 ```sh
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/yourai"
 cp yourai.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/yourai/yourai.json"
-cp prompts.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/yourai/prompts.json"
 ```
 
 编辑这个文件，将 **三处** `YOUR_MODEL_NAME` 都替换成服务提供的模型 ID，设置 `baseURL`，并按照模型实际容量填写上下文和输出上限：
 
 ```json
 {
-  "models": {
-    "selected": "gateway/YOUR_MODEL_NAME",
-    "providers": {
-      "gateway": {
-        "api": "openai-compatible",
-        "options": {
-          "baseURL": "https://api.openai.com/v1",
-          "apiKey": "{env:OPENAI_API_KEY}"
-        },
-        "models": {
-          "YOUR_MODEL_NAME": {
-            "id": "YOUR_MODEL_NAME",
-            "limit": {
-              "context": 128000,
-              "output": 4096
-            }
-          }
+  "model": "gateway/YOUR_MODEL_NAME",
+  "provider": {
+    "gateway": {
+      "api": "openai-compatible",
+      "options": {
+        "baseURL": "https://api.openai.com/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": {
+        "YOUR_MODEL_NAME": {
+          "id": "YOUR_MODEL_NAME",
+          "limit": { "context": 128000, "output": 4096 }
         }
       }
     }
@@ -67,12 +61,6 @@ yourai --check-config
 
 `--check-config` 只验证配置，不请求模型。默认配置位置是 `$XDG_CONFIG_HOME/yourai/yourai.json`，未设置时使用 `~/.config/yourai/yourai.json`；可通过 `--config PATH` 指定其他文件。
 
-配置按 `models`、`execution`、`security`、`ui`、`session`、`prompt`、`hooks` 分类，Rust 和 JSON 使用相同路径。主配置保存在 `yourai.json`，Prompt 单独保存在同目录 `prompts.json`。Hook 少时放在 `hooks.events`，多时使用 `"hooks": {"file":"hooks.json"}`；独立文件格式为 `{"hooks":{"events":{...}}}`，路径相对于主配置。
-
-所有文件只在启动时加载到一份共享 `Config`。应用内修改通过 `config::update` 同步保存并更新内存，不重新加载文件；外部修改下次启动生效。模型、YOLO 和主题通过现有应用操作更新资源，执行参数下一轮使用；Prompt 与 Hook 用于新建会话。
-
-旧平铺配置仍兼容，首次普通保存迁移为分类格式。同一字段同时使用新旧位置会报错。主配置也支持 SQLite：`yourai --config /path/to/yourai.sqlite3`；空库从相邻 `yourai.json` 导入一次，后续只写所选源，Prompt 与可选 Hook 文件仍独立。
-
 还支持 `openai-responses`、`anthropic`、`gemini` 和 `ollama` API。多模型、思考强度和 variant 的配置见[模型配置说明](./docs/tui.md#模型配置)。
 
 ## 在项目中使用
@@ -84,7 +72,7 @@ cd /path/to/your/project
 yourai
 ```
 
-例如输入：“找到失败的测试，修复问题，然后运行相关测试。”Agent 可以读写和编辑文件、执行 Shell、搜索和读取网页、跟踪任务。在配置里设置 `"session": {"extensions": true}`，可以启用子 Agent、工作区管理、记忆和技能扩展。
+例如输入：“找到失败的测试，修复问题，然后运行相关测试。”Agent 可以读写和编辑文件、执行 Shell、搜索和读取网页、跟踪任务。在配置里设置 `"extensions": true`，可以启用子 Agent、工作区管理、记忆和技能扩展。
 
 | 操作 | 用法 |
 |---|---|
@@ -120,7 +108,7 @@ yourai --resume SESSION_ID   # 直接恢复指定会话
 
 也可以在应用内使用 **/sessions** 切换；退出时会打印会话 ID。
 
-Agent 数据统一保存到 SQLite：消息、摘要、排队输入、运行状态、任务、用量、扩展数据和完整工具输出。全新安装默认保存到 `${XDG_DATA_HOME:-$HOME/.local/share}/yourai/sessions/sessions.sqlite3`，可通过 `session.directory` 指定目录。自定义相对路径以配置文件目录为基准；检测到已有旧存储位置时会继续沿用。
+Agent 数据统一保存到 SQLite：消息、摘要、排队输入、运行状态、任务、用量、扩展数据和完整工具输出。全新安装默认保存到 `${XDG_DATA_HOME:-$HOME/.local/share}/yourai/sessions/sessions.sqlite3`，可通过 `session_dir` 指定目录。自定义相对路径以配置文件目录为基准；检测到已有旧存储位置时会继续沿用。
 
 工具执行后，超过 50 KiB / 2000 行的最终结果生成一次头尾预览，完整内容保存在 SQLite。正常模型请求直接使用已保存的结果，不再二次截断或按年龄清空旧正文。请求接近容量上限时，`Compactor` 调用模型生成滚动历史摘要。原始消息仍在 SQLite，Agent 可以通过 `read` 找回工具输出。详见[上下文与压缩](./docs/context-manager-design.md)。
 

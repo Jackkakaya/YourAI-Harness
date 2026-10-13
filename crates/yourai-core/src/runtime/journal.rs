@@ -129,7 +129,7 @@ mod tests {
             old.dir.clone(),
             old.environment(),
             old.agent.clone(),
-            Default::default(),
+            SessionConfig::default(),
             "resume",
         )
         .await
@@ -283,7 +283,7 @@ mod tests {
             entered: Notify::new(),
             finish: Notify::new(),
         });
-        host.agent.set_agent_loop(agent_loop.clone());
+        host.agent.ctx().set_agent_loop(agent_loop.clone());
         host.submit_async(In::user_text("retry me")).await.unwrap();
         let running = host.clone();
         let task = tokio::spawn(async move {

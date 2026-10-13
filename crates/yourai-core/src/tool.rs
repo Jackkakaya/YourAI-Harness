@@ -244,7 +244,7 @@ impl Tool {
         };
         turn.observe_tool_result(&call, output.clone(), is_error);
         if !aborted {
-            if let Some(store) = turn.tc.snap.tool_output.clone() {
+            if let Some(store) = turn.config.tool_output.clone() {
                 match turn
                     .wait_operation(store.bound(&output), turn.op_timeout(), "tool-output")
                     .await
@@ -380,7 +380,14 @@ impl Tool {
         };
         let future = self.backend.run(tool_context, call.fn_arguments.clone());
         tokio::pin!(future);
-        let deadline = turn.deadline(turn.config.tool_timeout);
+        let deadline = turn.deadline(
+            turn.tc
+                .info
+                .options
+                .limits
+                .tool_timeout
+                .or(turn.config.tool_timeout),
+        );
         let mut request_ids = HashSet::new();
         loop {
             tokio::select! {

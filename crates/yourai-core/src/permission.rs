@@ -96,7 +96,13 @@ pub async fn authorize(
                             "tool_name": call.fn_name,
                             "input": call.fn_arguments,
                         });
-                        let timeout = turn.config.approval_timeout;
+                        let timeout = turn
+                            .tc
+                            .info
+                            .options
+                            .limits
+                            .approval_timeout
+                            .or(turn.config.approval_timeout);
                         let reply = turn
                             .ask(uuid::Uuid::new_v4().to_string(), payload, timeout)
                             .await;

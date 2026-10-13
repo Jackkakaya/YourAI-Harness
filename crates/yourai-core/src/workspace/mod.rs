@@ -7,8 +7,20 @@ mod backend;
 mod operations;
 use crate::{error, runtime::SessionManager};
 
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeConfig {
+    pub skill_ids: Vec<String>,
+    pub memory_search_limit: usize,
+}
+impl RuntimeConfig {
+    pub(crate) fn apply(self, host: &SessionManager) {
+        host.configure_input(self.skill_ids, self.memory_search_limit);
+    }
+}
 use crate::{prelude::*, runtime_event::RuntimeEvent};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -65,6 +77,13 @@ impl Workspace {
         self.host
             .upgrade()
             .ok_or_else(|| error("workspace", "session gone"))
+    }
+    pub fn config(&self) -> Result<Value, YourAiError> {
+        Ok(self
+            .host()?
+            .read_state("config")?
+            .map(|s| s.value)
+            .unwrap_or_else(|| json!({})))
     }
     /// Polling watcher avoids OS-specific dependencies; only explicitly registered paths.
     pub fn start_watching(self: &Arc<Self>, interval: Duration) -> Result<(), YourAiError> {

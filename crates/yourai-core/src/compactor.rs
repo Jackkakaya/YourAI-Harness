@@ -18,7 +18,7 @@ pub enum CompactionTrigger {
     Manual,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ContextPolicy {
     pub safety_margin: u64,

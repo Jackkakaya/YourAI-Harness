@@ -685,7 +685,9 @@ async fn automatic_summary_failure_is_not_repeated_during_model_retries() {
     let agent = Agent::builder()
         .model(context_fixture::configured(model.clone(), Some(4000), 500))
         .context_manager(c.inner.clone())
-        .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
+        .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop::new(
+            Default::default(),
+        )))
         .build();
     let output = agent.run(In::user_text("continue")).await.unwrap();
     assert_eq!(output.text, "done");
@@ -701,57 +703,6 @@ struct UncertainStore {
     reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl SessionStore for UncertainStore {
-    fn claim_session(
-        &self,
-        id: &SessionId,
-        owner: &str,
-        ttl: u64,
-    ) -> Result<Arc<dyn SessionStore>, YourAiError> {
-        self.inner.claim_session(id, owner, ttl)
-    }
-    fn renew_session(&self, ttl: u64) -> Result<(), YourAiError> {
-        self.inner.renew_session(ttl)
-    }
-    fn release_session(&self) -> Result<(), YourAiError> {
-        self.inner.release_session()
-    }
-    fn read_state(&self, id: &SessionId, key: &str) -> Result<Option<SessionState>, YourAiError> {
-        self.inner.read_state(id, key)
-    }
-    fn save_state(
-        &self,
-        id: &SessionId,
-        key: &str,
-        revision: Option<i64>,
-        value: serde_json::Value,
-    ) -> Result<i64, YourAiError> {
-        self.inner.save_state(id, key, revision, value)
-    }
-    fn append_output<'a>(
-        &'a self,
-        id: &'a SessionId,
-        output: &'a str,
-        offset: u64,
-        bytes: Vec<u8>,
-    ) -> BoxFuture<'a, Result<(), YourAiError>> {
-        self.inner.append_output(id, output, offset, bytes)
-    }
-    fn read_output<'a>(
-        &'a self,
-        id: &'a SessionId,
-        output: &'a str,
-        offset: u64,
-        limit: usize,
-    ) -> BoxFuture<'a, Result<Vec<u8>, YourAiError>> {
-        self.inner.read_output(id, output, offset, limit)
-    }
-    fn cleanup_outputs<'a>(
-        &'a self,
-        id: &'a SessionId,
-        before: i64,
-    ) -> BoxFuture<'a, Result<(), YourAiError>> {
-        self.inner.cleanup_outputs(id, before)
-    }
     fn read_tasks(&self, id: &SessionId) -> Result<Vec<Task>, YourAiError> {
         self.inner.read_tasks(id)
     }
@@ -1439,7 +1390,9 @@ async fn pinned_summary_model_uses_its_capacity_but_admits_against_the_main_mode
     )
     .await;
     let agent = Agent::builder()
-        .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop))
+        .agent_loop(Arc::new(yourai_harness::default_loop::DefaultLoop::new(
+            Default::default(),
+        )))
         .model(context_fixture::configured(main.clone(), Some(4000), 500))
         .compaction_model(context_fixture::configured(
             summary.clone(),
@@ -1448,7 +1401,7 @@ async fn pinned_summary_model_uses_its_capacity_but_admits_against_the_main_mode
         ))
         .context_manager(c.inner.clone())
         .build();
-    let execution = Compactor::from_snapshot(&agent.snapshot().unwrap(), None).unwrap();
+    let execution = Compactor::from_snapshot(&agent.ctx().snapshot().unwrap(), None).unwrap();
     let result = execution
         .exec(manual(), &CancellationToken::new(), None)
         .await

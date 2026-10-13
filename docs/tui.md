@@ -15,78 +15,39 @@ yourai
 
 `yourai.json` 含密钥，请勿提交；仓库根的 `yourai.json` 与 `.yourai/` 已加入 gitignore。配置中的 `apiKey` 可用 `{env:VAR}` 引用环境变量，避免明文。不会将密钥打印到界面或写入会话历史。
 
-## 配置文件与生效
-
-应用共享一个 `Config`，Rust 字段和 JSON 同样按类别组织：
-
-| 类别 | 内容 |
-|---|---|
-| models | selected、compaction、variant、effort_overrides、providers |
-| execution | steps、上下文/附件策略、超时、重试、技能/记忆执行参数 |
-| security | yolo、trusted_shell |
-| ui | theme |
-| session | directory、extensions |
-| prompt | system_prompt、提示词文件引用、追加内容及长度上限 |
-| hooks | events、可选 file |
-
-主配置 `yourai.json` 保存 models/execution/security/ui/session/hooks；同目录 `prompts.json` 是 prompt 类别的独立数据文件（示例见 [prompts.example.json](../prompts.example.json)）。Hook 少时写 `hooks.events`，多时使用 `"hooks": {"file":"hooks.json"}`；独立文件内容为 `{ "hooks": { "events": { ... } } }`。引用路径相对于主配置文件，不合并两份 Hook。独立 Hook 文件的旧事件 map 格式也可读。
-
-启动只加载一次，所有类别统一通过 `config::update` 修改缓存，并同步保存发生变化的来源；运行中不重新读取配置文件。保存成功后发布共享内存，失败保留旧值。外部编辑文件下次启动加载。已运行的轮次保留冻结参数，下一轮读取新的执行参数；Prompt/Hook 的会话资源仍在新建会话时装配。
-
-旧的平铺配置、内嵌 prompt 均可继续读取，首次普通保存转成分类格式，并先保留 prompt 到独立文件。同一字段同时出现在平铺和分类位置时报错，不静默覆盖。
-
-`--config PATH` 支持 JSON 和 `.db`/`.sqlite`/`.sqlite3`。SQLite 在 app_config 表保存相同的分类 JSON 文档；空库从邻近 yourai.json 导入一次。更新只写所选主配置源，Prompt 和可选 Hook 文件仍独立。
-
 ## 模型配置
 
 ```json
 {
-  "models": {
-    "selected": "gateway/YOUR_MODEL_NAME",
-    "providers": {
-      "gateway": {
-        "api": "openai-compatible",
-        "options": {
-          "baseURL": "https://api.openai.com/v1",
-          "apiKey": "{env:OPENAI_API_KEY}",
-          "headerTimeout": 300000,
-          "chunkTimeout": 300000
-        },
-        "models": {
-          "YOUR_MODEL_NAME": {
-            "id": "YOUR_MODEL_NAME",
-            "limit": {
-              "context": 128000,
-              "output": 4096
-            },
-            "options": {
-              "maxOutputTokens": 4096
-            },
-            "pricing": {
-              "input": 5.0,
-              "output": 15.0
-            },
-            "variants": {
-              "fast": {
-                "temperature": 0.2
-              },
-              "disabled-example": {
-                "disabled": true
-              }
-            }
+  "model": "gateway/YOUR_MODEL_NAME",
+  "session_dir": ".yourai/sessions",
+  "system_prompt": "你是一个编程助手。",
+  "provider": {
+    "gateway": {
+      "api": "openai-compatible",
+      "options": {
+        "baseURL": "https://api.openai.com/v1",
+        "apiKey": "{env:OPENAI_API_KEY}",
+        "headerTimeout": 300000,
+        "chunkTimeout": 300000
+      },
+      "models": {
+        "YOUR_MODEL_NAME": {
+          "id": "YOUR_MODEL_NAME",
+          "limit": { "context": 128000, "output": 4096 },
+          "options": { "maxOutputTokens": 4096 },
+          "pricing": { "input": 5.0, "output": 15.0 },
+          "variants": {
+            "fast": { "temperature": 0.2 },
+            "disabled-example": { "disabled": true }
           }
         }
       }
     }
   },
-  "session": {
-    "directory": ".yourai/sessions"
-  },
-  "execution": {
-    "context": {
-      "keep_recent_tokens": 20000,
-      "summary_tokens": 2000
-    }
+  "context": {
+    "keep_recent_tokens": 20000,
+    "summary_tokens": 2000
   }
 }
 ```
@@ -94,8 +55,8 @@ yourai
 - `api` 可取 `openai-compatible`、`openai-responses`、`anthropic`、`gemini` 或 `ollama`；省略时会根据 provider ID 推断，未知 ID 默认按 OpenAI Compatible 处理。
 - `options.baseURL` 填基础地址（例如 `/v1`），不要填 `/chat/completions`；省略时使用 genai 的默认服务地址。
 - `options.apiKey` 支持 `{env:VAR}`；无需认证的本地服务可填任意非空占位值，或按 provider 默认认证方式省略。
-- `session.directory` 和提示词文件路径相对配置文件解析；工作目录仍是启动 TUI 时所在目录。
-- 模型窗口与输出上限放在 `models.providers.*.models.*.limit`；输出预算按 `options.maxOutputTokens`、`limit.output`、32000 的顺序取值，不得超过模型输出容量。输入预算取 `limit.input` 与 `limit.context - 输出预算` 中的较小值，再扣安全余量。思考强度独立于输出预算。旧的 `execution.context.context_window/input_limit/output_reserve` 配置会被拒绝。
+- `session_dir` 和提示词文件路径相对配置文件解析；工作目录仍是启动 TUI 时所在目录。
+- 模型窗口与输出上限放在 `provider.*.models.*.limit`；输出预算按 `options.maxOutputTokens`、`limit.output`、32000 的顺序取值，不得超过模型输出容量。输入预算取 `limit.input` 与 `limit.context - 输出预算` 中的较小值，再扣安全余量。思考强度独立于输出预算。旧的 `context.context_window/input_limit/output_reserve` 配置会被拒绝。
 - `variants` 会合并到模型 `options`；含 `"disabled": true` 的 variant 不会出现在 `/models` 选择器中。
 - `options.reasoningEffort`（或 variant 内同名键）设置思考强度：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`。OpenAI 系以 `reasoning_effort` 发送；Anthropic/Gemini/Bedrock 会换算成 thinking budget。variant 内的设置优先于模型级。
 - 可选 `pricing` 使用每百万 token 的美元价格：`{"input": 5.0, "output": 15.0}`。状态栏和仪表盘会显示估算成本；未配置时不显示。
@@ -108,7 +69,7 @@ yourai
 - 二级选择器中 `Enter` 应用所选强度并切换到该模型；`Esc`/`←` 返回模型列表。
 - 确认当前预选强度保留其来源：继承模型设定的 variant 继续继承，已有显式覆盖继续独立。改变强度才建立覆盖；`config default` 恢复原配置或继承。
 - 有效的未声明模型同样可以确认、调整强度并恢复默认；只有显式覆盖需要创建内存条目。
-- 覆盖写入内存中的配置，随 `/models` 更新主对话与压缩模型；Hook 和新建子任务默认继承当前模型，显式指定模型的子任务保留自己的选择。保存到当前配置源（JSON 或 SQLite），同时更新共享内存；重启后保留。
+- 覆盖写入内存中的配置，随 `/models` 更新主对话与压缩模型；Hook 和新建子任务默认继承当前模型，显式指定模型的子任务保留自己的选择。不回写 `yourai.json`，重启后回到文件配置。
 - 当前 effort 显示在三处：`/models` 行内（如 `gateway/kimi-k3 · high`）、输入框左侧模型标签、`Ctrl-B` 仪表盘首行；切换成功也会提示 `Model switched to … · thinking high`。
 
 未配置窗口时会提示预算未知，自动摘要关闭，手动摘要报配置错误。Tool.exec 在 after hook 前，结果超过 50 KiB / 2000 行时生成头尾预览，完整大输出保存到 SQLite，原文通过 `read` 回看。模型请求不再二次截断或按年龄清空工具正文；历史达到容量整理阈值时由 Compactor 摘要。旧配置请移除 `context.tool_output_chars`、`context.tool_prune_keep_tokens` 和 `context.tool_prune_min_savings`。
@@ -154,7 +115,7 @@ yourai --config /path/to/yourai.json --check-config
 
 底栏始终一行，横跨窗口，是 composer 下方唯一的状态行。空闲时显示标题、目录、累计 token、ctx、最近一次回复速度及权限；ctx 在宽度足够（≥60）时附带 11 格压力进度条（▓/░，70% 起黄、85% 起红），窄屏退化为纯百分比；忙碌时左侧替换为当前动作（spinner + 动作 + 耗时 + esc stop），标题与目录让位。未知指标直接省略（不再显示 — 占位）；窄屏缩略标题和路径，优先保留 ctx 与权限，放不下的次要指标用 … 示意，Ctrl-B 查看模型及完整统计。右侧仅在有 Todo 且宽度 ≥100 时出现任务面板，Ctrl-T 收起；没有任务时对话全宽。`/theme dark` 是纯黑背景配冰蓝强调（语义色：绿=成功、红=失败、琥珀=高权限），`/theme light` 是暖白配墨绿强调。
 
-`/new` 开启全新会话；`/clear` 重置上下文（等同于新会话，旧记录仍在 `/sessions`）。运行或排队中的输入需先结束。`/yolo` 或 Ctrl-G 切换 YOLO，`/yolo on|off` 显式设置；仅在两轮之间切换，运行中先 Esc 停止。关闭后恢复原审批策略；选择保存到主配置并在新建/切换会话及重启后保留，不修改持久权限规则。
+`/new` 开启全新会话；`/clear` 重置上下文（等同于新会话，旧记录仍在 `/sessions`）。运行或排队中的输入需先结束。`/yolo` 或 Ctrl-G 切换 YOLO，`/yolo on|off` 显式设置；仅在两轮之间切换，运行中先 Esc 停止。关闭后恢复原审批策略；本次进程中的选择在新建/切换会话时保留，不修改持久权限规则。
 
 所有弹层独占输入：Esc 关闭弹层，Ctrl-Q 退出。弹层里的文本、粘贴和鼠标不会操作背后的任务；仅会话搜索接受粘贴。删除会话显示标题和 ID，必须按 Y 确认，Enter 不会删除。帮助支持滚动。最小主界面为 30×10，所有弹层限制在实际终端内。
 
@@ -185,7 +146,7 @@ python3 apps/yourai-tui/tests/smoke_ui.py
 
 ## SQLite 会话存储
 
-默认使用 `<session.directory>/sessions.sqlite3`，schema v6。消息、摘要、任务、用量和请求诊断、运行队列与恢复状态、扩展配置、会话租约和工具输出都保存在 SQLite。全新安装的默认目录是 `${XDG_DATA_HOME:-$HOME/.local/share}/yourai/sessions`；检测到已有旧位置时继续使用它。`--resume` 从数据库恢复。详细表结构与迁移规则见 [Agent 数据库存储](./cloud-storage.md)。
+默认使用 `<session_dir>/sessions.sqlite3`，schema v6。消息、摘要、任务、用量和请求诊断、运行队列与恢复状态、扩展配置、会话租约和工具输出都保存在 SQLite。全新安装的默认目录是 `${XDG_DATA_HOME:-$HOME/.local/share}/yourai/sessions`；检测到已有旧位置时继续使用它。`--resume` 从数据库恢复。详细表结构与迁移规则见 [Agent 数据库存储](./cloud-storage.md)。
 
 旧 JSON 会话先关闭再显式导入；命令不调用模型，保留原文件：
 
@@ -195,7 +156,7 @@ yourai --config /path/to/yourai.json --import-json-sessions
 
 导入范围和边界见 [会话存储](./session-storage-design.md)。
 
-模型切换保留当前 Harness 的共享调用预算、限流与计量策略；不会重置已用额度。既有 hook/subagent 执行器继续使用原模型。运行时选择的 variant 在 `/sessions` 切换中保留，选择也保存到主配置，重启仍可使用；CLI 可覆盖本次启动值。
+模型切换保留当前 Harness 的共享调用预算、限流与计量策略；不会重置已用额度。既有 hook/subagent 执行器继续使用原模型。运行时选择的 variant 在 `/sessions` 切换中保留，重启仍以配置和 CLI 为准。
 
 交互优化：Ctrl-Home 回到最新问题，回看时输入区显示简短的 `↓ Latest` 返回最新输出。连续成功的读取/搜索操作以 `Read & search` 摘要收起，点击或选中后 Ctrl-O 展开；失败和代码修改保持单独可见。
 

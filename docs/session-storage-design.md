@@ -108,7 +108,7 @@ v4→v5新增tasks表及会话顺序索引，不改既有会话和历史。任�
 
 ## 5. 运行与迁移
 
-新会话直接使用 SQLite；TUI 使用 Config.session.directory 指定存储目录（旧 session_dir 输入仍兼容）。
+新会话直接使用 SQLite；TUI 的 session_dir 配置保持不变。
 
 旧任务文件`<session_dir>/<session_id>/tasks.json`在TaskManager初始化时导入同一数据库：只导入数据库尚未存在的任务，整批事务提交；原文件保留为备份，之后任务转换只写SQLite。格式或任务身份不合法时明确报错，不留下部分导入。
 
@@ -121,7 +121,7 @@ cargo run -p yourai-tui -- --config /path/to/yourai.json --resume SESSION_ID
 
 导入在单个事务中完成，保留原始 JSON 文件；重复导入或 ID 冲突报错，不覆盖数据库。旧 boundary 转换为消息 status，旧 summary 转为摘要消息，usage 取 history.json 中的流水，不再次导入重复的 usage.json 聚合。旧时间戳转换为毫秒。
 
-导入范围是配置 session.directory 的直属会话；旧 children 目录保留原样，如需导入其中会话，需以该目录作为 session.directory 单独执行。新建子 Agent 与父会话共用数据库并记录 parent_session_id。
+导入范围是配置 session_dir 的直属会话；旧 children 目录保留原样，如需导入其中会话，需以该目录作为 session_dir 单独执行。新建子 Agent 与父会话共用数据库并记录 parent_session_id。
 
 host.json、配置、权限、任务、记忆、技能仍由各自模块保存。这些不是会话消息表，当前没有为了本次迁移新增业务表。
 

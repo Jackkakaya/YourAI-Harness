@@ -41,7 +41,7 @@ async fn equal_messages_get_distinct_ids_and_keep_attachments_after_reopen() {
         host.dir.clone(),
         host.environment(),
         host.agent.clone(),
-        Default::default(),
+        SessionConfig::default(),
         "resume",
     )
     .await
@@ -153,7 +153,7 @@ async fn legacy_queue_ids_are_migrated_once_and_persisted() {
         host.dir.clone(),
         host.environment(),
         host.agent.clone(),
-        Default::default(),
+        SessionConfig::default(),
         "resume",
     )
     .await

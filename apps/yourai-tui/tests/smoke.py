@@ -18,19 +18,6 @@ import termios
 import threading
 import time
 
-SUMMARY = """## Goal
-Review parser
-## Constraints and decisions
-None
-## Completed and verified
-Prior task list is complete.
-## Current work
-None
-## Next steps
-None
-## Files and commands
-None"""
-
 requests = []
 request_times = []
 rate_limit = "--rate-limit" in sys.argv
@@ -61,7 +48,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
         if not body.get('stream'):
-            payload = json.dumps({'id':'compact-smoke','object':'chat.completion','model':'smoke-model','choices':[{'index':0,'message':{'role':'assistant','content':SUMMARY},'finish_reason':'stop'}],'usage':{'prompt_tokens':1000,'completion_tokens':20,'total_tokens':1020}}).encode()
+            payload = json.dumps({'id':'compact-smoke','object':'chat.completion','model':'smoke-model','choices':[{'index':0,'message':{'role':'assistant','content':'Prior task list is complete.'},'finish_reason':'stop'}],'usage':{'prompt_tokens':1000,'completion_tokens':20,'total_tokens':1020}}).encode()
             self.send_response(200)
             self.send_header('Content-Type','application/json')
             self.send_header('Content-Length',str(len(payload)))
@@ -72,7 +59,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             m.get('role') == 'user' and '<previous-summary>' in str(m.get('content'))
             and '<conversation>' in str(m.get('content')) for m in body.get('messages', []))
         if compact:
-            delta = {'content': SUMMARY}
+            delta = {'content': 'Prior task list is complete.'}
             reason = 'stop'
         elif len(requests) == 1 and not single_request:
             delta = {'tool_calls': [{'index': 0, 'id': 'call-smoke', 'type': 'function',
@@ -99,58 +86,17 @@ with tempfile.TemporaryDirectory() as tmp:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     config = Path(tmp) / 'config.json'
     config.write_text(json.dumps({
-        'models': {
-            'selected': 'mock/smoke',
-            'providers': {
-                'mock': {
-                    'npm': '@ai-sdk/openai-compatible',
-                    'options': {
-                        'baseURL': f'http://127.0.0.1:{server.server_port}/v1',
-                        'apiKey': 'smoke-only',
-                        'headers': {
-                            'x-config-test': 'provider'
-                        },
-                        'requests': {
-                            'cooldown_seconds': 7
-                        }
-                    },
-                    'models': {
-                        'smoke': {
-                            'id': 'smoke-model',
-                            'limit': {
-                                'context': 16000,
-                                'output': 4096
-                            },
-                            'headers': {
-                                'x-config-test': 'model'
-                            },
-                            'options': {
-                                'maxOutputTokens': 4096,
-                                'temperature': 0.8,
-                                'topP': 0.9,
-                                'reasoningEffort': 'low',
-                                'user': 'config-smoke'
-                            },
-                            'variants': {
-                                'test': {
-                                    'temperature': 0.2,
-                                    'reasoningEffort': 'high'
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        'session': {
-            'extensions': False
-        },
-        'execution': {
-            'context': {
-                'keep_recent_tokens': 0,
-                'summary_min_savings': 1
-            }
-        }
+        "model": "mock/smoke", "extensions": False,
+        "provider": {"mock": {
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {"baseURL": f"http://127.0.0.1:{server.server_port}/v1", "apiKey": "smoke-only",
+                        "headers": {"x-config-test": "provider"}, "requests": {"cooldown_seconds": 7}},
+            "models": {"smoke": {"id": "smoke-model", "limit": {"context": 16000, "output": 4096},
+                        "headers": {"x-config-test": "model"},
+                        "options": {"maxOutputTokens": 4096, "temperature": 0.8, "topP": 0.9, "reasoningEffort": "low", "user": "config-smoke"},
+                        "variants": {"test": {"temperature": 0.2, "reasoningEffort": "high"}}}}
+        }},
+        "context": {"keep_recent_tokens": 0, "summary_min_savings": 1}
     }))
     # Mock clipboard commands: exercise mouse-release copying without changing the user's clipboard.
     clipboard_file = Path(tmp) / 'clipboard.txt'

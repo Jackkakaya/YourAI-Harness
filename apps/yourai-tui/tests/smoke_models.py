@@ -56,57 +56,18 @@ with tempfile.TemporaryDirectory() as tmp:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     config = Path(tmp) / 'config.json'
     config.write_text(json.dumps({
-        'models': {
-            'selected': 'mock/smoke',
-            'providers': {
-                'mock': {
-                    'npm': '@ai-sdk/openai-compatible',
-                    'options': {
-                        'baseURL': f'http://127.0.0.1:{server.server_port}/v1',
-                        'apiKey': 'x'
-                    },
-                    'models': {
-                        'smoke': {
-                            'id': 'smoke-model',
-                            'limit': {
-                                'context': 16000,
-                                'output': 4096
-                            }
-                        },
-                        'third': {
-                            'id': 'third-model',
-                            'limit': {
-                                'context': 16000,
-                                'output': 4096
-                            }
-                        },
-                        'alt': {
-                            'id': 'alt-model',
-                            'limit': {
-                                'context': 262144,
-                                'output': 65536
-                            },
-                            'options': {
-                                'reasoningEffort': 'low',
-                                'maxOutputTokens': 49152
-                            },
-                            'variants': {
-                                'inherit': {}
-                            }
-                        }
-                    }
-                }
+        "model": "mock/smoke", "extensions": False,
+        "provider": {"mock": {
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {"baseURL": f"http://127.0.0.1:{server.server_port}/v1", "apiKey": "x"},
+            "models": {
+                "smoke": {"id": "smoke-model", "limit": {"context": 16000, "output": 4096}},
+                "third": {"id": "third-model", "limit": {"context": 16000, "output": 4096}},
+                "alt": {"id": "alt-model", "limit": {"context": 262144, "output": 65536},
+                        "options": {"reasoningEffort": "low", "maxOutputTokens": 49152}, "variants": {"inherit": {}}}
             }
-        },
-        'session': {
-            'extensions': False
-        },
-        'execution': {
-            'context': {
-                'keep_recent_tokens': 0,
-                'summary_min_savings': 1
-            }
-        }
+        }},
+        "context": {"keep_recent_tokens": 0, "summary_min_savings": 1}
     }))
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
@@ -320,12 +281,7 @@ with tempfile.TemporaryDirectory() as tmp:
         wait_exit(child, master)
         assert child.returncode == 0
         assert termios.tcgetattr(slave) == original, 'terminal mode was not restored'
-        saved = json.loads(config.read_text())
-        assert saved['models']['selected'] == 'mock/alt', saved['models']['selected']
-        assert saved['models'].get('variant') is None
-        assert saved['models']['effort_overrides']['mock/alt'][''] == 'medium'
-        assert (Path(tmp) / 'prompts.json').is_file()
-        print('PASS: /models two-step confirmation -> cancelled selection -> inherited/explicit effort -> configured defaults + complete F2 cycle + persisted config on HTTP requests')
+        print('PASS: /models two-step confirmation -> cancelled selection -> inherited/explicit effort -> configured defaults + complete F2 cycle on HTTP requests')
     finally:
         if child.poll() is None:
             child.kill()

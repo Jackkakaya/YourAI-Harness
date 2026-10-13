@@ -24,6 +24,31 @@ use std::{
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Clone)]
+pub struct SessionConfig {
+    pub input: crate::turn::InputOptions,
+    pub hook_timeout: Option<Duration>,
+    /// Optional supervisor quarantine bound after cancellation.
+    pub cleanup_timeout: Option<Duration>,
+    pub allow_background_wake: bool,
+    pub max_followups: usize,
+    pub instruction_paths: Vec<PathBuf>,
+    pub workspace_enabled: bool,
+}
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            input: crate::turn::InputOptions::default(),
+            hook_timeout: None,
+            cleanup_timeout: None,
+            allow_background_wake: true,
+            max_followups: 64,
+            instruction_paths: vec![],
+            workspace_enabled: false,
+        }
+    }
+}
+
 /// Workspace file-watcher poll interval.
 const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 /// Follow-up injected to make an idle host consume a pending runtime event.
@@ -95,9 +120,9 @@ pub struct SessionManager {
     self_ref: std::sync::OnceLock<std::sync::Weak<SessionManager>>,
     pub(crate) environment: Mutex<SessionEnvironment>,
     agent: Arc<Agent>,
-    config: ExecutionOptions,
-    config_source: std::sync::OnceLock<Arc<dyn Fn() -> ExecutionOptions + Send + Sync>>,
     pub(crate) dir: PathBuf,
+    config: SessionConfig,
+    input_options: Mutex<crate::turn::InputOptions>,
     live: Mutex<Live>,
     journal_gate: Mutex<()>,
     events: Arc<RuntimeEvents>,
@@ -140,30 +165,20 @@ pub struct ContextUsage {
 }
 
 impl SessionManager {
-    /// Read the application's current configuration, or standalone startup defaults.
-    pub fn config(&self) -> ExecutionOptions {
-        self.config_source
-            .get()
-            .map_or_else(|| self.config.clone(), |source| source())
-    }
-    /// Read fresh execution defaults from the application's one shared config.
-    /// Standalone callers without a source use their explicit startup defaults.
-    pub fn bind_config_source(
-        &self,
-        source: Arc<dyn Fn() -> ExecutionOptions + Send + Sync>,
-    ) -> Result<(), YourAiError> {
-        self.config_source
-            .set(source)
-            .map_err(|_| error("config", "configuration source already bound"))
-    }
     pub fn agent(&self) -> &Arc<Agent> {
         &self.agent
     }
     pub fn directory(&self) -> &Path {
         &self.dir
     }
+    pub(crate) fn configure_input(&self, skill_ids: Vec<String>, memory_search_limit: usize) {
+        *self.input_options.lock().unwrap() = crate::turn::InputOptions {
+            skill_ids,
+            memory_search_limit,
+        };
+    }
     pub fn context_usage(&self) -> Result<ContextUsage, YourAiError> {
-        let snapshot = self.agent.snapshot()?;
+        let snapshot = self.agent.ctx().snapshot()?;
         let history = snapshot
             .context_manager
             .as_ref()
@@ -220,11 +235,11 @@ impl SessionManager {
         dir: impl Into<PathBuf>,
         environment: SessionEnvironment,
         agent: Arc<Agent>,
-        config: ExecutionOptions,
+        config: SessionConfig,
         source: &str,
     ) -> Result<Arc<Self>, YourAiError> {
-        let lease = SessionLease::acquire(dir.into(), &environment.id, agent.session()?)?;
-        agent.set_session(lease.store());
+        let lease = SessionLease::acquire(dir.into(), &environment.id, agent.ctx().session()?)?;
+        agent.ctx().set_session(lease.store());
         Self::open_owned(lease, environment, agent, config, source).await
     }
 
@@ -232,10 +247,10 @@ impl SessionManager {
         lease: SessionLease,
         environment: SessionEnvironment,
         agent: Arc<Agent>,
-        config: ExecutionOptions,
+        config: SessionConfig,
     ) -> Result<(Arc<Self>, bool), YourAiError> {
         let dir = lease.dir.clone();
-        let history = agent.context_manager()?;
+        let history = agent.ctx().context_manager()?;
         if history.session_id() != &environment.id || lease.id != environment.id {
             return Err(error("host", "history/session identity mismatch"));
         }
@@ -264,9 +279,12 @@ impl SessionManager {
             self_ref: std::sync::OnceLock::new(),
             environment: Mutex::new(environment),
             agent,
-            config_source: std::sync::OnceLock::new(),
-            config,
             dir,
+            input_options: Mutex::new(crate::turn::InputOptions {
+                skill_ids: config.input.skill_ids.clone(),
+                memory_search_limit: config.input.memory_search_limit,
+            }),
+            config,
             journal_gate: Mutex::new(()),
             live: Mutex::new(Live {
                 journal,
@@ -365,9 +383,6 @@ impl SessionManager {
             children.remove(id);
         }
     }
-    pub fn tasks_since(&self, previous: Option<u64>) -> Option<(u64, Vec<Task>)> {
-        self.tasks.get()?.snapshot_since(previous)
-    }
     pub fn child_ids(&self) -> Vec<SessionId> {
         self.children.lock().unwrap().keys().cloned().collect()
     }
@@ -447,7 +462,7 @@ impl SessionManager {
     pub fn last_error(&self) -> Option<String> {
         self.live.lock().unwrap().journal.last_error.clone()
     }
-    pub(crate) fn watch_paths(&self) -> Vec<PathBuf> {
+    pub fn watch_paths(&self) -> Vec<PathBuf> {
         self.live.lock().unwrap().journal.watch.clone()
     }
     pub fn watch_path(&self, path: PathBuf) -> Result<(), YourAiError> {
@@ -477,7 +492,7 @@ impl SessionManager {
         journal.seen.insert(event.id.clone());
         journal.events.push(event.clone());
         if event.wake
-            && self.config().allow_background_wake
+            && self.config.allow_background_wake
             && self.status() == SessionStatus::Idle
             && journal.queue.is_empty()
         {
@@ -488,8 +503,12 @@ impl SessionManager {
         self.notify.notify_one();
         Ok(true)
     }
+    pub(crate) async fn history(&self) -> Result<Arc<dyn ContextManager>, YourAiError> {
+        self.agent.ctx().context_manager()
+    }
+
     async fn reconcile_history(&self) -> Result<(), YourAiError> {
-        let history = self.agent.context_manager()?;
+        let history = self.history().await?;
         history.restore().await?;
         let messages = history.messages();
         let done: HashSet<_> = messages
@@ -521,7 +540,7 @@ impl SessionManager {
         cancel: &CancellationToken,
     ) -> Result<Vec<SessionTurn>, YourAiError> {
         let mut reports = vec![];
-        for _ in 0..self.config().max_followups {
+        for _ in 0..self.config.max_followups {
             match self.run_next(limits.clone(), out, cancel).await? {
                 Some(report) => {
                     let failed = report.result.is_err();
@@ -693,7 +712,7 @@ impl SessionManager {
         // A previous failed/cancelled append may have committed in SQLite
         // without updating the memory view. Establish the committed boundary
         // first, so those older records never enter this turn's sync payload.
-        let after_seq = if let Some(history) = self.agent.try_context_manager() {
+        let after_seq = if let Some(history) = self.agent.ctx().try_context_manager() {
             tokio::select! { biased;
                 _ = cancel.cancelled() => return Err(AbortReason::Cancelled.into()),
                 _ = self.closing.cancelled() => return Err(AbortReason::Cancelled.into()),
@@ -738,9 +757,9 @@ impl SessionManager {
                         session: Some(Arc::new(host.environment())),
                         limits,
                         events: Some(host.events.clone()),
+                        input: Some(host.input_options.lock().unwrap().clone()),
                     };
-                    let handle = match host.agent.start_with(first.clone(), host.config(), options)
-                    {
+                    let handle = match host.agent.start_with(first.clone(), options) {
                         Ok(handle) => handle,
                         Err(e) => {
                             journal.restore_unstarted(first)?;
@@ -793,7 +812,7 @@ impl SessionManager {
                 tokio::select! {biased;
                                        _=timeout=>{timed_out=true;break},
                                        _=request_cancel.cancelled(),if !request_cancelled=>{request_cancelled=true;task_cancel.cancel();},
-                                       _=task_cancel.cancelled(),if !cancel_consumed=>{cancel_consumed=true;cancelled_at=host.config().cleanup_timeout.map(|t|tokio::time::Instant::now()+t);},
+                                       _=task_cancel.cancelled(),if !cancel_consumed=>{cancel_consumed=true;cancelled_at=host.config.cleanup_timeout.map(|t|tokio::time::Instant::now()+t);},
                                        event=handle.outbox.recv()=>match event{Some(event)=>{if let Out::Ask{id,..}=&event{host.live.lock().unwrap().asks.insert(id.clone());}
                 if tx.send(event).is_err(){task_cancel.cancel();}},None=>break}
                                    }
@@ -838,7 +857,7 @@ impl SessionManager {
                     }
                     if host.events.pending().iter().any(|e| e.wake)
                         && journal.queue.is_empty()
-                        && host.config().allow_background_wake
+                        && host.config.allow_background_wake
                     {
                         journal.queue.push_back(In::follow_up(RUNTIME_EVENT_PROMPT));
                     }
@@ -863,12 +882,6 @@ impl SessionManager {
                 })
                 .await;
             let result = settled.unwrap_or_else(|e| Err(TurnFailure::from(e)));
-            if let Err(error) = host.ensure_title().await {
-                let _ = tx.send(Out::Notice {
-                    level: Level::Warning,
-                    message: format!("Session title unavailable: {error}"),
-                });
-            }
             // Stop hooks have settled and history + host journal are committed.
             // This notification cannot change the turn outcome or request continuation.
             if result.is_ok() {
@@ -924,7 +937,7 @@ impl SessionManager {
             let _status = StatusGuard(host.clone());
             let task = async {
                 request.trigger = CompactionTrigger::Manual;
-                let snapshot = host.agent.snapshot()?;
+                let snapshot = host.agent.ctx().snapshot()?;
                 let environment = host.environment();
                 let history = snapshot
                     .context_manager
@@ -947,7 +960,7 @@ impl SessionManager {
                     })
                     .unwrap_or_default();
                 Compactor::from_snapshot(&snapshot, Some(&environment))?
-                    .exec(request, &token, host.config().hook_timeout)
+                    .exec(request, &token, host.config.hook_timeout)
                     .await
             };
             tokio::pin!(task);
@@ -982,8 +995,7 @@ impl SessionManager {
         let mut failures = vec![];
         for child in children {
             let id = child.environment().id;
-            if let Err(cause) =
-                Box::pin(child.close(self.config().cleanup_timeout.or(timeout))).await
+            if let Err(cause) = Box::pin(child.close(self.config.cleanup_timeout.or(timeout))).await
             {
                 failures.push(cause.to_string());
             }

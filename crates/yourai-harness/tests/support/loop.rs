@@ -12,7 +12,7 @@ use yourai_core::{
     model::{ModelEventStream, ModelRecovery},
     prelude::*,
 };
-use yourai_harness::default_loop::DefaultLoop;
+use yourai_harness::default_loop::{DefaultLoop, LoopConfig};
 
 #[derive(Default)]
 pub struct History {
@@ -411,9 +411,9 @@ impl HookManager for Hooks {
         })
     }
 }
-pub fn builder(model: Arc<Model>, history: Arc<History>) -> AgentBuilder {
+pub fn builder(model: Arc<Model>, history: Arc<History>, config: LoopConfig) -> AgentBuilder {
     Agent::builder()
-        .agent_loop(Arc::new(DefaultLoop))
+        .agent_loop(Arc::new(DefaultLoop::new(config)))
         .model(model)
         .context_manager(history)
 }

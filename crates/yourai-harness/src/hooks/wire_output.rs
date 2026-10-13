@@ -164,25 +164,24 @@ pub enum HookSpecificOutput {
 }
 
 impl HookSpecificOutput {
-    /// Map the external output variant to the core event discriminator.
-    pub fn event_kind(&self) -> yourai_core::hooks::HookEventKind {
-        use yourai_core::hooks::HookEventKind;
+    /// 返回该输出的 `hookEventName` 值。
+    pub fn event_name(&self) -> &'static str {
         match self {
-            HookSpecificOutput::PreToolUse { .. } => HookEventKind::PreToolUse,
-            HookSpecificOutput::UserPromptSubmit { .. } => HookEventKind::UserPromptSubmit,
-            HookSpecificOutput::SessionStart { .. } => HookEventKind::SessionStart,
-            HookSpecificOutput::Setup { .. } => HookEventKind::Setup,
-            HookSpecificOutput::SubagentStart { .. } => HookEventKind::SubagentStart,
-            HookSpecificOutput::PostToolUse { .. } => HookEventKind::PostToolUse,
-            HookSpecificOutput::PostToolUseFailure { .. } => HookEventKind::PostToolUseFailure,
-            HookSpecificOutput::PermissionDenied { .. } => HookEventKind::PermissionDenied,
-            HookSpecificOutput::Notification { .. } => HookEventKind::Notification,
-            HookSpecificOutput::PermissionRequest { .. } => HookEventKind::PermissionRequest,
-            HookSpecificOutput::CwdChanged { .. } => HookEventKind::CwdChanged,
-            HookSpecificOutput::FileChanged { .. } => HookEventKind::FileChanged,
-            HookSpecificOutput::Elicitation { .. } => HookEventKind::Elicitation,
-            HookSpecificOutput::ElicitationResult { .. } => HookEventKind::ElicitationResult,
-            HookSpecificOutput::WorktreeCreate { .. } => HookEventKind::WorktreeCreate,
+            HookSpecificOutput::PreToolUse { .. } => "PreToolUse",
+            HookSpecificOutput::UserPromptSubmit { .. } => "UserPromptSubmit",
+            HookSpecificOutput::SessionStart { .. } => "SessionStart",
+            HookSpecificOutput::Setup { .. } => "Setup",
+            HookSpecificOutput::SubagentStart { .. } => "SubagentStart",
+            HookSpecificOutput::PostToolUse { .. } => "PostToolUse",
+            HookSpecificOutput::PostToolUseFailure { .. } => "PostToolUseFailure",
+            HookSpecificOutput::PermissionDenied { .. } => "PermissionDenied",
+            HookSpecificOutput::Notification { .. } => "Notification",
+            HookSpecificOutput::PermissionRequest { .. } => "PermissionRequest",
+            HookSpecificOutput::CwdChanged { .. } => "CwdChanged",
+            HookSpecificOutput::FileChanged { .. } => "FileChanged",
+            HookSpecificOutput::Elicitation { .. } => "Elicitation",
+            HookSpecificOutput::ElicitationResult { .. } => "ElicitationResult",
+            HookSpecificOutput::WorktreeCreate { .. } => "WorktreeCreate",
         }
     }
 }
@@ -299,10 +298,7 @@ pub fn parse_hook_json(raw: &str) -> Result<HookJsonOutput, serde_json::Error> {
     if trimmed.is_empty() {
         return Ok(HookJsonOutput::Sync(SyncOutput::default()));
     }
-    parse_hook_value(serde_json::from_str(trimmed)?)
-}
-
-pub fn parse_hook_value(value: Value) -> Result<HookJsonOutput, serde_json::Error> {
+    let value: Value = serde_json::from_str(trimmed)?;
     if value.get("async") == Some(&Value::Bool(true)) {
         let async_output: AsyncOutput = serde_json::from_value(value)?;
         Ok(HookJsonOutput::Async(async_output))
@@ -455,10 +451,7 @@ mod tests {
             let HookJsonOutput::Sync(output) = parse_hook_json(&raw).unwrap() else {
                 panic!("expected sync output");
             };
-            assert_eq!(
-                output.hook_specific_output.unwrap().event_kind().as_str(),
-                expected
-            );
+            assert_eq!(output.hook_specific_output.unwrap().event_name(), expected);
         }
     }
 }

@@ -1,6 +1,4 @@
-> 当前配置与装配接口见 [配置与运行职责收敛](orthogonal-runtime.md)；下文历史示例保留为设计背景。
-
-> 2026-10-09 更新：当前业务执行采用 [Hook 最终实现](hook-template-design.md)：Tool / Model / Compactor 的公共 exec 直接拥有流程，Turn 只管理本轮状态。依赖绑定已合入 Agent，Providers 和 Agent::ctx() 已删除；ProviderSnapshot 保留单轮冻结语义。ContextManager / SessionStore 保留原领域名。本文保留早期调研与运输示例；正常业务调用使用 [execution.md](execution.md)，完整协议以当前源码为准。
+> 2026-10-09 更新：当前业务执行采用 [Hook 最终实现](hook-template-design.md)：Tool / Model / Compactor 的公共 exec 直接拥有流程，Turn 只管理本轮状态。Providers 是注册容器，ContextManager / SessionStore 保留原领域名。本文保留早期调研与运输示例；正常业务调用使用 [execution.md](execution.md)，完整协议以当前源码为准。
 
 > 当前存储已改为 SQLite schema v6：队列、扩展状态和工具原文使用 SessionStore；SessionLease 使用数据库租约。旧章节中的状态 JSON、输出文件和文件锁描述已被 [云端存储实现](cloud-storage.md) 替代。
 
@@ -44,7 +42,7 @@ YourAI 是一个"乐高积木"式的 agent 框架。`yourai-core` 定义接口�
 
 1. **Core 定义业务接口并实现固定执行模板** —— Hook、权限、取消和生命周期规则由 core 保证；具体模型、工具和存储 Provider 在 Harness 或外部插件中
 2. **机制与词汇分离** —— 词汇（In/Out 消息）定义在独立叶子 crate `yourai-protocol`（零依赖），core 依赖它并以**具体类型**签名；改词汇不碰 core 源码，`#[non_exhaustive]` 保证加变体不炸下游插件
-3. **Agent 绑定模式** —— Agent 直接持有依赖绑定，明确字段，类型安全
+3. **Providers 容器模式** —— 全局 `Providers` 持有所有 provider，明确字段，类型安全
 4. **AgentLoop 最小签名** —— 只给 `TurnContext`（providers 引用 + inbox/outbox/cancel）；loop 是 inbox 的**独占拉取消费者**，用户完全自由编排
 5. **全部可热替换** —— 所有 provider 是 `Arc<dyn Trait>`，运行时可替换
 6. **复用 genai** —— 模型层直接使用 [rust-genai](https://github.com/jeremychone/rust-genai) 的类型（ChatRequest/ChatResponse/ChatMessage/Tool/Usage 等），不重新造轮子
@@ -236,7 +234,7 @@ yourai/                              # workspace root
 ├── yourai-core/                     # 接口 + 运输机制（零业务 Provider 实现）
 │   └── src/
 │       ├── lib.rs                   # 入口 + prelude
-│       ├── context.rs               # Agent 依赖绑定 + AgentBuilder
+│       ├── context.rs               # Providers 容器 + Agent + AgentBuilder
 │       ├── agent_loop.rs            # AgentLoop trait
 │       ├── model.rs                 # ModelProvider trait
 │       ├── context_manager.rs       # ContextManager trait
@@ -280,20 +278,29 @@ yourai/                              # workspace root
 每个实现 crate 只依赖 `yourai-core` + 自己需要的第三方库，互不依赖。
 用户按需选择 crate 组装，不要的就不引入。
 
-### 3.5 Agent 依赖绑定
+### 3.5 Providers 容器
 
-`Agent` 直接拥有依赖绑定与执行入口；原来的 `Providers` 包装已删除。Builder 提供装配参数，ProviderSnapshot 提供一次执行冻结的依赖选择。
+`Providers` 是所有 provider 的容器。AgentLoop 从 Providers 取所需 provider 来编排。
 
 ```
-Agent（绑定与启动）                 TurnContext（单轮借用）
-├── bindings: RwLock<AgentBuilder>  ├── info: &TurnInfo
-├── update / set_*                ├── snap: ProviderSnapshot
-├── snapshot                      ├── inbox: &mut Receiver<In>
-└── start / run                   ├── outbox: &dyn OutSink
-                                 └── cancel: &CancellationToken
+Providers (容器)                          TurnContext (每次 turn 的交互参数)
+├── agent_loop:      AgentLoop          ├── ctx:    &Providers
+├── model:           ModelProvider      ├── outbox: &dyn OutSink       ← send(Out)
+├── context_manager: ContextManager     ├── inbox:  &mut Receiver<In>  ← 外界 → loop
+├── session:         SessionStore     └── cancel: &CancellationToken ← 控制面
+├── memory:          MemoryManager
+├── tools:           ToolRegistry
+├── skills:          SkillProvider
+├── sandbox:         SandboxProvider
+├── security:        SecurityProvider
+├── usage:           UsageTracker
+├── observability:   ObservabilityProvider
+└── hooks:           HookManager
 ```
 
-一个 `Agent::update` 原子发布相关绑定，已经启动的轮次继续使用旧快照。模型、工具、上下文、存储、安全、沙箱、用量与 Hook 保留各自的领域 Interface；取消和交互管道属于单轮参数。`Agent` 通过 Arc 共享同一绑定所有者，无额外共享容器。
+**命名澄清：** `Providers`（容器）和 `ContextManager`（对话历史管理）是两个不同的东西。
+
+**Providers 是纯粹的 provider 容器**——交互管道（inbox/outbox/cancel）不在 Providers 里，而是每次 turn 由 `Agent::start()` 装配进 `TurnContext` 传入（见第 6 章，借鉴 pi 的"交互管道是 run 的参数"）。消息类型是 `yourai-protocol` 的具体 `In`/`Out`（4.13）——core 依赖协议 crate 但不拥有词汇。
 
 ### 3.6 数据流
 
@@ -310,7 +317,7 @@ AgentLoop::run_turn(tc)             ← 用户自定义的编排逻辑
   ├── tc.snap.security              → check_tool_call()（第一层审批）
   ├── tc.snap.tools                 → execute(tc, ...)（ToolContext 可发进度/可取消）
   ├── tc.snap.memory / usage        → store / record
-  ├── tc.snap.hooks                 → dispatch（诊断通过 tracing）
+  ├── tc.snap.observability / hooks → span/metric / dispatch
   └── tc.outbox.send(Out::*)        → outbox → 调用方渲染（false = 消费端关闭）
                                         （sandbox/二层的 check_* 经 ToolContext 由工具自调）
   ↓
@@ -325,7 +332,7 @@ TurnOutput { text, usage, pending }  → join() 交付；pending 非空由调用
 
 **职责：** 编排 turn 流程（模型调用 → 工具执行 → 重复直到完成）
 
-**设计决策：最小签名，最大自由。** 只给 TurnContext（providers 快照 + inbox/outbox/cancel），用户完全自己编排。启动输入不是特殊参数——**它是 inbox 的第一条消息**，loop 只有一条读路径。可变 Agent 绑定不进入 TurnContext，避免自定义 loop 绕过 turn 级快照。
+**设计决策：最小签名，最大自由。** 只给 TurnContext（providers 快照 + inbox/outbox/cancel），用户完全自己编排。启动输入不是特殊参数——**它是 inbox 的第一条消息**，loop 只有一条读路径。live Providers 不进入 TurnContext，避免自定义 loop 绕过 turn 级快照。
 
 ```rust
 pub trait AgentLoop: Send + Sync {
@@ -708,7 +715,7 @@ pub enum Out {
 **语义约定：**
 
 - **Ask/Reply 是唯一的一问一答机制**：审批、提问、多选、表单、计划确认、MCP elicitation 全是 payload 约定，机制只有一对。审批 = `Ask{payload: 审批描述}` + `Reply{payload: approve/deny}`
-- **取消不走 In**（cancel token，控制面）；SetModel/Compact/Shutdown 不是 turn 消息，是 Agent 方法（热替换走 Agent 的 RwLock，见 5.2 / 8.4）
+- **取消不走 In**（cancel token，控制面）；SetModel/Compact/Shutdown 不是 turn 消息，是 Agent 方法（热替换走 Providers 的 RwLock，见 5.2 / 8.4）
 - **协议不携带任何工具的专属变体**：工具三段式（Started/Progress/Done）是骨架，input/output/payload 是结构化 Value；browser 截图、subagent 事件树、shell stdout 都走 ToolProgress 载荷
 - **渲染知识在前端**：前端按 tool name 注册 renderer，新工具出现协议零改动
 
@@ -736,7 +743,7 @@ YourAI 是开箱即用的 agent，用户可以零定制直接跑，也可以替�
 
 **决策：** `RwLock<Option<Arc<dyn Trait>>>` 够用，不引入 `arc-swap`。
 
-**语义（收敛修订：由"读取时取最新"收紧为 **turn 开始时快照**）：** `start()/run()` 在启动时把 12 个插槽快照成 `ProviderSnapshot` 装进 `TurnContext`——一个 turn 内所有 provider 读取都走快照，**热替换必然只影响下一 turn**。可变 Agent 绑定不进入 TurnContext；管理方直接经 `Agent` 调 `set_*`/registry API。替换后旧 Arc 由快照持有，进行中的调用安全完成。agent 瓶颈在 IO，锁竞争可忽略；未来如需优化，换 `arc-swap` 是实现细节，不影响 trait 定义。
+**语义（收敛修订：由"读取时取最新"收紧为 **turn 开始时快照**）：** `start()/run()` 在启动时把 12 个插槽快照成 `ProviderSnapshot` 装进 `TurnContext`——一个 turn 内所有 provider 读取都走快照，**热替换必然只影响下一 turn**。live Providers 不进入 TurnContext；管理方经 `Agent::ctx()` 调 `set_*`/registry API。替换后旧 Arc 由快照持有，进行中的调用安全完成。agent 瓶颈在 IO，锁竞争可忽略；未来如需优化，换 `arc-swap` 是实现细节，不影响 trait 定义。
 
 ### 5.3 MCP 集成 ✅ 已决策
 
@@ -763,7 +770,7 @@ YourAI 是开箱即用的 agent，用户可以零定制直接跑，也可以替�
 
 - **词汇在 `yourai-protocol`**（独立叶子 crate，零依赖，core 依赖它）：In 2 变体（UserText/Reply）+ Out 9 变体；Ask/Reply 是唯一的一问一答机制（审批/提问/表单/计划确认全是 payload 约定）
 - **不用类型擦除**（`dyn Any` 曾被考虑后否决）：生态需要一门共同语言而不是 N 门；具体类型带来编译期安全 + 无装箱噪音；加变体改 protocol crate，core 源码不动；`#[non_exhaustive]` 保证演化不炸下游。这正是 codex 的真实结构（`codex-protocol` 叶子 crate，`codex-core` 依赖它）
-- **交互管道是 run 的参数**（借鉴 pi）：由 `Agent::start()` 每次 turn 装配进 TurnContext，不放 Agent 绑定
+- **交互管道是 run 的参数**（借鉴 pi）：由 `Agent::start()` 每次 turn 装配进 TurnContext，不放 Providers
 - **`start()` 是唯一 spawn 点**（对应 pi 低层 fire-and-forget）→ 返回 TurnHandle；`run()` 是丢弃 outbox 的阻塞变体（不建 channel，避免无人消费堆积）
 - **双路径**：取消走 CancellationToken 快路径（绕过 inbox 立即生效，能打断"正在等消息的 loop"本身）；其余一切消息走 inbox 慢路径（loop 独占拉取，消费时机是 loop 的自由）
 - **工具可发消息、可被取消**：`ToolProvider::run(tc: ToolContext, input)`——subagent/browser/长任务可显示的先决条件
@@ -832,12 +839,12 @@ pub enum ErrorKind {
 // 装配期
 Agent::builder().agent_loop(...).model(...)...build();   // 全字段 Option，不猜完整性
 // 运行期（同一 API，MCP 重连/TUI 斜杠命令装工具免费获得）
-agent.tools()?.register(handler);   // 单个
-agent.tools()?.extend(handlers);    // 批量（MCP connect → Vec 一批进）
+agent.ctx().tools()?.register(handler);   // 单个
+agent.ctx().tools()?.extend(handlers);    // 批量（MCP connect → Vec 一批进）
 ```
 
 - **build() 不做必需性检查**——缺什么在使用点报 `Config` 错。原则：只有 loop 知道自己需要什么，装配点猜"必需/可选"必然猜错（trivial loop 不要 tools，headless loop 可没有 model）。typestate builder（编译期强制完整性）因此否决
-- **Agent 绑定双读法**：`model()/tools()/...` 缺失报 `Config` 错；`try_model()/try_tools()/...` 缺失返回 `None`——loop 按下面的依赖矩阵自选读法
+- **Providers 双读法**：`model()/tools()/...` 缺失报 `Config` 错；`try_model()/try_tools()/...` 缺失返回 `None`——loop 按下面的依赖矩阵自选读法
 - **turn 开始时快照**（见 5.2）：`ProviderSnapshot` 里必需项直接是字段，可选项是 `Option<Arc<dyn>>`
 
 **DefaultLoop 依赖矩阵：**
@@ -850,7 +857,7 @@ agent.tools()?.extend(handlers);    // 批量（MCP connect → Vec 一批进）
 | security | 可选 | 缺省 = 不拦截，直接执行 |
 | sandbox | 可选 | 缺省 = 不施加沙箱 |
 | session / memory / skills / usage / observability / hooks | 可选 | 缺省 = 跳过对应职责 |
-- **安装期零依赖**：插件 install 时不给任何依赖，所有协作推迟到运行期经 Agent 绑定解决——消掉注册顺序问题
+- **安装期零依赖**：插件 install 时不给任何依赖，所有协作推迟到运行期经 Providers 解决——消掉注册顺序问题
 
 **策略层（CLI）：类型化直调，不做通用 from_config**
 
@@ -1168,20 +1175,23 @@ async fn wait_reply(tc: &mut TurnContext<'_>, stash: &mut Vec<In>, id: &str) -> 
 
 **工具结果注入（genai 格式）：** 用 `ChatRequest::append_tool_use_from_stream_end` 或手动构造 assistant 消息 + tool response 消息，保持 genai 的消息格式。
 
-### 7.3 统一分类配置
+### 7.3 DefaultLoop 的可选配置
 
-DefaultLoop 是无状态调度策略，没有独立 DefaultLoopConfig。应用共享一份 Config，JSON 与 Rust 都按 models/execution/security/ui/session/prompt/hooks 分类；执行前复制 Config.execution，并用 TurnLimits 收紧本轮限制。
+```rust
+pub struct DefaultLoopConfig {
+    pub system_prompt: Option<String>,
+    pub max_steps: u32,                    // 防无限循环，默认 32
+    pub parallel_tool_calls: bool,         // 默认 false（串行）
+    pub steer_mode: SteerMode,             // InjectNow / NextTurn
+}
 
-```rust,ignore
-let shared = Arc::new(Mutex::new(Config::load(config_path)?));
-config::update(&shared, |value| {
-    value.execution.steps = Some(32);
-    value.prompt.system_prompt = Some("编程助手".into());
-    Ok(())
-})?;
+pub enum SteerMode {
+    /// turn 中到达的消息立即注入下一轮（pi 的 steer）
+    InjectNow,
+    /// turn 中到达的消息排队，turn 结束后作为新 turn
+    NextTurn,
+}
 ```
-
-config::update 只修改缓存并保存变化来源，不重新读取文件。外部文件修改下次启动加载。Prompt 与可选 Hook 独立文件仍归同一 Config；模型/权限等资源切换通过现有 SessionClient 操作。详见 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13)。
 
 ### 7.4 用户自定义 loop 的最小示例
 
@@ -1221,11 +1231,11 @@ impl AgentLoop for MyLoop {
 ```rust
 use std::sync::Arc;
 use yourai_core::prelude::*;
-use yourai_harness::{GenaiModel, Harness, SessionOptions};
+use yourai_harness::{GenaiModel, Harness, HarnessConfig};
 
 let cwd = std::env::current_dir()?;
 let harness = Harness::open(
-    SessionOptions::new(cwd.join(".yourai/sessions"), cwd),
+    HarnessConfig::new(cwd.join(".yourai/sessions"), cwd),
     Arc::new(GenaiModel::new(genai::Client::default(), "deepseek-chat")),
 ).await?;
 harness.host.submit(In::user_text("hello"))?;   // 输入走 inbox，fire-and-forget
@@ -1297,7 +1307,7 @@ impl ToolProvider for WeatherTool {
 }
 
 // 注册到已有的 registry
-let registry = agent.tools()?;
+let registry = agent.ctx().tools()?;
 registry.register(Arc::new(WeatherTool));
 ```
 
@@ -1305,11 +1315,11 @@ registry.register(Arc::new(WeatherTool));
 
 ```rust
 // 运行中切换模型
-agent.set_model(Arc::new(GenaiModel::new("gpt-4o")));
+agent.ctx().set_model(Arc::new(GenaiModel::new("gpt-4o")));
 
 // 运行中加载新工具
-agent.tools()?.register(Arc::new(WeatherTool));
+agent.ctx().tools()?.register(Arc::new(WeatherTool));
 
 // 运行中切换 agent loop
-agent.set_agent_loop(Arc::new(DifferentLoop));
+agent.ctx().set_agent_loop(Arc::new(DifferentLoop));
 ```

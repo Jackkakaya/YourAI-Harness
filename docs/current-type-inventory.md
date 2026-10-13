@@ -1,15 +1,14 @@
 # 当前源码类型清单
 
-范围：三个 crate 的 src 生产 Rust 源码声明；排除测试文件、内联测试项、examples 与第三方 re-export。包括条件编译及宏中固定名称的声明。声明数不代表抽象层数。
+范围：core、harness、TUI 的生产 Rust 源码声明。排除测试文件与内联测试模块；包含条件编译及宏中固定名称的声明。统计的是声明数，不是运行时实例数或抽象层数。
 
-应用共享一份 Config；SessionManager 读取当前配置并将执行数据冻结给 Agent。prompt 文件独立，配置不再按会话持久化。会话执行与操作控制已移到 harness 后端，TUI 只消费结果和显示快照。设计见 [重构计划](architecture-refactoring-plan.md) 与 [后端与 UI 分工](backend-ui-separation.md)。
+压缩现在只有一个 `Compactor`，public exec 包住 Hook，private run 完成算法。ContextManager 负责投影和原子应用，SessionStore 负责持久化。压缩不再引入计划或摘要任务对象。
 
 | 包 | struct | trait | enum | 合计 |
 |---|---:|---:|---:|---:|
-| yourai-core | 95 | 16 | 35 | 146 |
-| yourai-harness | 77 | 0 | 22 | 99 |
-| yourai-tui | 54 | 0 | 17 | 71 |
-| **合计** | **226** | **16** | **74** | **316** |
+| yourai-core | 98 | 18 | 35 | 151 |
+| yourai-harness | 64 | 0 | 16 | 80 |
+| yourai-tui | 62 | 0 | 21 | 83 |
 
 ## yourai-core
 
@@ -20,20 +19,19 @@
 | `AgentLoop` | trait | `pub` | [crates/yourai-core/src/agent_loop.rs:90](../crates/yourai-core/src/agent_loop.rs#L90) |
 | `CompactionTrigger` | enum | `pub` | [crates/yourai-core/src/compactor.rs:15](../crates/yourai-core/src/compactor.rs#L15) |
 | `ContextPolicy` | struct | `pub` | [crates/yourai-core/src/compactor.rs:23](../crates/yourai-core/src/compactor.rs#L23) |
-| `CompactionRequest` | struct | `pub` | [crates/yourai-core/src/compactor.rs:84](../crates/yourai-core/src/compactor.rs#L84) |
-| `CompactionResult` | struct | `pub` | [crates/yourai-core/src/compactor.rs:116](../crates/yourai-core/src/compactor.rs#L116) |
-| `Compactor` | struct | `pub` | [crates/yourai-core/src/compactor.rs:145](../crates/yourai-core/src/compactor.rs#L145) |
+| `CompactionRequest` | struct | `pub` | [crates/yourai-core/src/compactor.rs:82](../crates/yourai-core/src/compactor.rs#L82) |
+| `CompactionResult` | struct | `pub` | [crates/yourai-core/src/compactor.rs:114](../crates/yourai-core/src/compactor.rs#L114) |
+| `Compactor` | struct | `pub` | [crates/yourai-core/src/compactor.rs:143](../crates/yourai-core/src/compactor.rs#L143) |
 | `Completion` | enum | `pub` | [crates/yourai-core/src/completion.rs:5](../crates/yourai-core/src/completion.rs#L5) |
-| `ImagePolicy` | struct | `pub` | [crates/yourai-core/src/execution/options.rs:10](../crates/yourai-core/src/execution/options.rs#L10) |
-| `ExecutionOptions` | struct | `pub` | [crates/yourai-core/src/execution/options.rs:34](../crates/yourai-core/src/execution/options.rs#L34) |
-| `Agent` | struct | `pub` | [crates/yourai-core/src/context.rs:50](../crates/yourai-core/src/context.rs#L50) |
-| `ProviderSnapshot` | struct | `pub` | [crates/yourai-core/src/context.rs:99](../crates/yourai-core/src/context.rs#L99) |
-| `AgentBuilder` | struct | `pub` | [crates/yourai-core/src/context.rs:108](../crates/yourai-core/src/context.rs#L108) |
-| `TurnHandle` | struct | `pub` | [crates/yourai-core/src/context.rs:372](../crates/yourai-core/src/context.rs#L372) |
-| `TurnContext` | struct | `pub` | [crates/yourai-core/src/context.rs:419](../crates/yourai-core/src/context.rs#L419) |
-| `ChannelSink` | struct | `private` | [crates/yourai-core/src/context.rs:459](../crates/yourai-core/src/context.rs#L459) |
-| `DiscardSink` | struct | `pub` | [crates/yourai-core/src/context.rs:479](../crates/yourai-core/src/context.rs#L479) |
-| `NonInteractiveSink` | struct | `private` | [crates/yourai-core/src/context.rs:489](../crates/yourai-core/src/context.rs#L489) |
+| `Providers` | struct | `pub` | [crates/yourai-core/src/context.rs:50](../crates/yourai-core/src/context.rs#L50) |
+| `ProviderSnapshot` | struct | `pub` | [crates/yourai-core/src/context.rs:98](../crates/yourai-core/src/context.rs#L98) |
+| `AgentBuilder` | struct | `pub` | [crates/yourai-core/src/context.rs:106](../crates/yourai-core/src/context.rs#L106) |
+| `Agent` | struct | `pub` | [crates/yourai-core/src/context.rs:152](../crates/yourai-core/src/context.rs#L152) |
+| `TurnHandle` | struct | `pub` | [crates/yourai-core/src/context.rs:371](../crates/yourai-core/src/context.rs#L371) |
+| `TurnContext` | struct | `pub` | [crates/yourai-core/src/context.rs:418](../crates/yourai-core/src/context.rs#L418) |
+| `ChannelSink` | struct | `private` | [crates/yourai-core/src/context.rs:456](../crates/yourai-core/src/context.rs#L456) |
+| `DiscardSink` | struct | `pub` | [crates/yourai-core/src/context.rs:476](../crates/yourai-core/src/context.rs#L476) |
+| `NonInteractiveSink` | struct | `private` | [crates/yourai-core/src/context.rs:486](../crates/yourai-core/src/context.rs#L486) |
 | `ContextRequest` | struct | `pub` | [crates/yourai-core/src/context_manager.rs:9](../crates/yourai-core/src/context_manager.rs#L9) |
 | `ContextManager` | trait | `pub` | [crates/yourai-core/src/context_manager.rs:20](../crates/yourai-core/src/context_manager.rs#L20) |
 | `YourAiError` | enum | `pub` | [crates/yourai-core/src/error.rs:10](../crates/yourai-core/src/error.rs#L10) |
@@ -41,7 +39,9 @@
 | `ErrorKind` | enum | `pub` | [crates/yourai-core/src/error.rs:42](../crates/yourai-core/src/error.rs#L42) |
 | `ResolveError` | enum | `pub(crate)` | [crates/yourai-core/src/execution/attachment.rs:37](../crates/yourai-core/src/execution/attachment.rs#L37) |
 | `FileKind` | enum | `private` | [crates/yourai-core/src/execution/attachment.rs:233](../crates/yourai-core/src/execution/attachment.rs#L233) |
-| `Turn` | struct | `pub` | [crates/yourai-core/src/execution/mod.rs:21](../crates/yourai-core/src/execution/mod.rs#L21) |
+| `AttachmentImageConfig` | struct | `pub` | [crates/yourai-core/src/execution/config.rs:8](../crates/yourai-core/src/execution/config.rs#L8) |
+| `ExecutionConfig` | struct | `pub` | [crates/yourai-core/src/execution/config.rs:29](../crates/yourai-core/src/execution/config.rs#L29) |
+| `Turn` | struct | `pub` | [crates/yourai-core/src/execution/mod.rs:20](../crates/yourai-core/src/execution/mod.rs#L20) |
 | `CallState` | enum | `pub(crate)` | [crates/yourai-core/src/execution/mod.rs:41](../crates/yourai-core/src/execution/mod.rs#L41) |
 | `CallRecord` | struct | `pub(crate)` | [crates/yourai-core/src/execution/mod.rs:50](../crates/yourai-core/src/execution/mod.rs#L50) |
 | `BaseInput` | struct | `pub` | [crates/yourai-core/src/hooks.rs:30](../crates/yourai-core/src/hooks.rs#L30) |
@@ -96,6 +96,8 @@
 | `ModelOutput` | struct | `pub` | [crates/yourai-core/src/model.rs:171](../crates/yourai-core/src/model.rs#L171) |
 | `Model` | struct | `pub` | [crates/yourai-core/src/model.rs:181](../crates/yourai-core/src/model.rs#L181) |
 | `Backoff` | struct | `pub` | [crates/yourai-core/src/model_error.rs:87](../crates/yourai-core/src/model_error.rs#L87) |
+| `Span` | trait | `pub` | [crates/yourai-core/src/observability.rs:6](../crates/yourai-core/src/observability.rs#L6) |
+| `ObservabilityProvider` | trait | `pub` | [crates/yourai-core/src/observability.rs:11](../crates/yourai-core/src/observability.rs#L11) |
 | `UserAttachment` | struct | `pub` | [crates/yourai-core/src/protocol.rs:22](../crates/yourai-core/src/protocol.rs#L22) |
 | `AttachmentData` | enum | `pub` | [crates/yourai-core/src/protocol.rs:37](../crates/yourai-core/src/protocol.rs#L37) |
 | `FileRef` | struct | `pub` | [crates/yourai-core/src/protocol.rs:47](../crates/yourai-core/src/protocol.rs#L47) |
@@ -106,14 +108,15 @@
 | `Level` | enum | `pub` | [crates/yourai-core/src/protocol.rs:242](../crates/yourai-core/src/protocol.rs#L242) |
 | `Usage` | struct | `pub` | [crates/yourai-core/src/protocol.rs:250](../crates/yourai-core/src/protocol.rs#L250) |
 | `Transaction` | struct | `pub(super)` | [crates/yourai-core/src/runtime/journal.rs:5](../crates/yourai-core/src/runtime/journal.rs#L5) |
-| `SessionLease` | struct | `pub` | [crates/yourai-core/src/runtime/mod.rs:33](../crates/yourai-core/src/runtime/mod.rs#L33) |
-| `Journal` | struct | `private` | [crates/yourai-core/src/runtime/mod.rs:65](../crates/yourai-core/src/runtime/mod.rs#L65) |
-| `Live` | struct | `private` | [crates/yourai-core/src/runtime/mod.rs:76](../crates/yourai-core/src/runtime/mod.rs#L76) |
-| `CloseNotification` | enum | `private` | [crates/yourai-core/src/runtime/mod.rs:87](../crates/yourai-core/src/runtime/mod.rs#L87) |
-| `SessionManager` | struct | `pub` | [crates/yourai-core/src/runtime/mod.rs:94](../crates/yourai-core/src/runtime/mod.rs#L94) |
-| `Activity` | struct | `pub(crate)` | [crates/yourai-core/src/runtime/mod.rs:115](../crates/yourai-core/src/runtime/mod.rs#L115) |
-| `StatusGuard` | struct | `private` | [crates/yourai-core/src/runtime/mod.rs:124](../crates/yourai-core/src/runtime/mod.rs#L124) |
-| `ContextUsage` | struct | `pub` | [crates/yourai-core/src/runtime/mod.rs:135](../crates/yourai-core/src/runtime/mod.rs#L135) |
+| `SessionConfig` | struct | `pub` | [crates/yourai-core/src/runtime/mod.rs:28](../crates/yourai-core/src/runtime/mod.rs#L28) |
+| `SessionLease` | struct | `pub` | [crates/yourai-core/src/runtime/mod.rs:58](../crates/yourai-core/src/runtime/mod.rs#L58) |
+| `Journal` | struct | `private` | [crates/yourai-core/src/runtime/mod.rs:90](../crates/yourai-core/src/runtime/mod.rs#L90) |
+| `Live` | struct | `private` | [crates/yourai-core/src/runtime/mod.rs:101](../crates/yourai-core/src/runtime/mod.rs#L101) |
+| `CloseNotification` | enum | `private` | [crates/yourai-core/src/runtime/mod.rs:112](../crates/yourai-core/src/runtime/mod.rs#L112) |
+| `SessionManager` | struct | `pub` | [crates/yourai-core/src/runtime/mod.rs:119](../crates/yourai-core/src/runtime/mod.rs#L119) |
+| `Activity` | struct | `pub(crate)` | [crates/yourai-core/src/runtime/mod.rs:140](../crates/yourai-core/src/runtime/mod.rs#L140) |
+| `StatusGuard` | struct | `private` | [crates/yourai-core/src/runtime/mod.rs:149](../crates/yourai-core/src/runtime/mod.rs#L149) |
+| `ContextUsage` | struct | `pub` | [crates/yourai-core/src/runtime/mod.rs:160](../crates/yourai-core/src/runtime/mod.rs#L160) |
 | `RuntimeEvent` | struct | `pub` | [crates/yourai-core/src/runtime_event.rs:9](../crates/yourai-core/src/runtime_event.rs#L9) |
 | `RuntimeEvents` | struct | `pub` | [crates/yourai-core/src/runtime_event.rs:16](../crates/yourai-core/src/runtime_event.rs#L16) |
 | `SandboxPolicy` | enum | `pub` | [crates/yourai-core/src/sandbox.rs:9](../crates/yourai-core/src/sandbox.rs#L9) |
@@ -126,14 +129,13 @@
 | `SessionId` | struct | `pub` | [crates/yourai-core/src/session.rs:10](../crates/yourai-core/src/session.rs#L10) |
 | `SessionMeta` | struct | `pub` | [crates/yourai-core/src/session.rs:49](../crates/yourai-core/src/session.rs#L49) |
 | `SessionStore` | trait | `pub` | [crates/yourai-core/src/session.rs:61](../crates/yourai-core/src/session.rs#L61) |
-| `StoredMessage` | struct | `pub` | [crates/yourai-core/src/session.rs:218](../crates/yourai-core/src/session.rs#L218) |
-| `MessageStatus` | enum | `pub` | [crates/yourai-core/src/session.rs:249](../crates/yourai-core/src/session.rs#L249) |
-| `HistoryIndex` | struct | `pub` | [crates/yourai-core/src/session.rs:301](../crates/yourai-core/src/session.rs#L301) |
-| `MessageQuery` | struct | `pub` | [crates/yourai-core/src/session.rs:310](../crates/yourai-core/src/session.rs#L310) |
-| `MessagePage` | struct | `pub` | [crates/yourai-core/src/session.rs:325](../crates/yourai-core/src/session.rs#L325) |
-| `RequestObservation` | struct | `pub` | [crates/yourai-core/src/session.rs:331](../crates/yourai-core/src/session.rs#L331) |
-| `CommitStatus` | enum | `pub` | [crates/yourai-core/src/session.rs:340](../crates/yourai-core/src/session.rs#L340) |
-| `SessionState` | struct | `pub` | [crates/yourai-core/src/session.rs:348](../crates/yourai-core/src/session.rs#L348) |
+| `StoredMessage` | struct | `pub` | [crates/yourai-core/src/session.rs:181](../crates/yourai-core/src/session.rs#L181) |
+| `MessageStatus` | enum | `pub` | [crates/yourai-core/src/session.rs:211](../crates/yourai-core/src/session.rs#L211) |
+| `MessageQuery` | struct | `pub` | [crates/yourai-core/src/session.rs:263](../crates/yourai-core/src/session.rs#L263) |
+| `MessagePage` | struct | `pub` | [crates/yourai-core/src/session.rs:278](../crates/yourai-core/src/session.rs#L278) |
+| `RequestObservation` | struct | `pub` | [crates/yourai-core/src/session.rs:284](../crates/yourai-core/src/session.rs#L284) |
+| `CommitStatus` | enum | `pub` | [crates/yourai-core/src/session.rs:293](../crates/yourai-core/src/session.rs#L293) |
+| `SessionState` | struct | `pub` | [crates/yourai-core/src/session.rs:301](../crates/yourai-core/src/session.rs#L301) |
 | `SessionEnvironment` | struct | `pub` | [crates/yourai-core/src/session_runtime.rs:22](../crates/yourai-core/src/session_runtime.rs#L22) |
 | `SessionStatus` | enum | `pub` | [crates/yourai-core/src/session_runtime.rs:44](../crates/yourai-core/src/session_runtime.rs#L44) |
 | `SessionTurn` | struct | `pub` | [crates/yourai-core/src/session_runtime.rs:56](../crates/yourai-core/src/session_runtime.rs#L56) |
@@ -142,78 +144,61 @@
 | `SkillProvider` | trait | `pub` | [crates/yourai-core/src/skill.rs:23](../crates/yourai-core/src/skill.rs#L23) |
 | `SubagentFactory` | trait | `pub` | [crates/yourai-core/src/subagent.rs:7](../crates/yourai-core/src/subagent.rs#L7) |
 | `Subagent` | struct | `pub` | [crates/yourai-core/src/subagent.rs:16](../crates/yourai-core/src/subagent.rs#L16) |
-| `ChildCleanup` | struct | `private` | [crates/yourai-core/src/subagent.rs:171](../crates/yourai-core/src/subagent.rs#L171) |
-| `Task` | struct | `pub` | [crates/yourai-core/src/tasks.rs:13](../crates/yourai-core/src/tasks.rs#L13) |
-| `TaskManager` | struct | `pub` | [crates/yourai-core/src/tasks.rs:23](../crates/yourai-core/src/tasks.rs#L23) |
+| `ChildCleanup` | struct | `private` | [crates/yourai-core/src/subagent.rs:198](../crates/yourai-core/src/subagent.rs#L198) |
+| `Task` | struct | `pub` | [crates/yourai-core/src/tasks.rs:15](../crates/yourai-core/src/tasks.rs#L15) |
+| `TaskManager` | struct | `pub` | [crates/yourai-core/src/tasks.rs:25](../crates/yourai-core/src/tasks.rs#L25) |
 | `ToolContext` | struct | `pub` | [crates/yourai-core/src/tool.rs:30](../crates/yourai-core/src/tool.rs#L30) |
 | `ToolProvider` | trait | `pub` | [crates/yourai-core/src/tool.rs:84](../crates/yourai-core/src/tool.rs#L84) |
 | `Tool` | struct | `pub` | [crates/yourai-core/src/tool.rs:108](../crates/yourai-core/src/tool.rs#L108) |
-| `ExecutedTool` | struct | `pub` | [crates/yourai-core/src/tool.rs:444](../crates/yourai-core/src/tool.rs#L444) |
-| `ToolRegistry` | trait | `pub` | [crates/yourai-core/src/tool.rs:450](../crates/yourai-core/src/tool.rs#L450) |
+| `ExecutedTool` | struct | `pub` | [crates/yourai-core/src/tool.rs:438](../crates/yourai-core/src/tool.rs#L438) |
+| `ToolRegistry` | trait | `pub` | [crates/yourai-core/src/tool.rs:444](../crates/yourai-core/src/tool.rs#L444) |
 | `ToolOutputStore` | struct | `pub` | [crates/yourai-core/src/tool_output.rs:21](../crates/yourai-core/src/tool_output.rs#L21) |
 | `TurnId` | struct | `pub` | [crates/yourai-core/src/turn.rs:10](../crates/yourai-core/src/turn.rs#L10) |
 | `TurnLimits` | struct | `pub` | [crates/yourai-core/src/turn.rs:40](../crates/yourai-core/src/turn.rs#L40) |
-| `TurnOptions` | struct | `pub` | [crates/yourai-core/src/turn.rs:53](../crates/yourai-core/src/turn.rs#L53) |
-| `TurnInfo` | struct | `pub` | [crates/yourai-core/src/turn.rs:65](../crates/yourai-core/src/turn.rs#L65) |
+| `InputOptions` | struct | `pub` | [crates/yourai-core/src/turn.rs:52](../crates/yourai-core/src/turn.rs#L52) |
+| `TurnOptions` | struct | `pub` | [crates/yourai-core/src/turn.rs:60](../crates/yourai-core/src/turn.rs#L60) |
+| `TurnInfo` | struct | `pub` | [crates/yourai-core/src/turn.rs:73](../crates/yourai-core/src/turn.rs#L73) |
 | `OutSink` | trait | `pub` | [crates/yourai-core/src/ui.rs:15](../crates/yourai-core/src/ui.rs#L15) |
 | `UsageStats` | struct | `pub` | [crates/yourai-core/src/usage.rs:8](../crates/yourai-core/src/usage.rs#L8) |
 | `UsageEvent` | struct | `pub` | [crates/yourai-core/src/usage.rs:17](../crates/yourai-core/src/usage.rs#L17) |
 | `UsageTracker` | trait | `pub` | [crates/yourai-core/src/usage.rs:37](../crates/yourai-core/src/usage.rs#L37) |
-| `WorktreeRegistration` | enum | `private` | [crates/yourai-core/src/workspace/mod.rs:24](../crates/yourai-core/src/workspace/mod.rs#L24) |
-| `Workspace` | struct | `pub` | [crates/yourai-core/src/workspace/mod.rs:42](../crates/yourai-core/src/workspace/mod.rs#L42) |
+| `RuntimeConfig` | struct | `pub` | [crates/yourai-core/src/workspace/mod.rs:12](../crates/yourai-core/src/workspace/mod.rs#L12) |
+| `WorktreeRegistration` | enum | `private` | [crates/yourai-core/src/workspace/mod.rs:36](../crates/yourai-core/src/workspace/mod.rs#L36) |
+| `Workspace` | struct | `pub` | [crates/yourai-core/src/workspace/mod.rs:54](../crates/yourai-core/src/workspace/mod.rs#L54) |
 
 ## yourai-harness
 
 | 名称 | 声明 | 可见性 | 源码 |
 |---|---|---|---|
-| `SessionOptions` | struct | `pub` | [crates/yourai-harness/src/assembly.rs:16](../crates/yourai-harness/src/assembly.rs#L16) |
-| `Harness` | struct | `pub` | [crates/yourai-harness/src/assembly.rs:48](../crates/yourai-harness/src/assembly.rs#L48) |
+| `HarnessConfig` | struct | `pub` | [crates/yourai-harness/src/assembly.rs:15](../crates/yourai-harness/src/assembly.rs#L15) |
+| `ModelSettings` | struct | `pub` | [crates/yourai-harness/src/assembly.rs:63](../crates/yourai-harness/src/assembly.rs#L63) |
+| `Harness` | struct | `pub` | [crates/yourai-harness/src/assembly.rs:67](../crates/yourai-harness/src/assembly.rs#L67) |
 | `ChildFactory` | struct | `pub(super)` | [crates/yourai-harness/src/collaboration/subagents/backend.rs:4](../crates/yourai-harness/src/collaboration/subagents/backend.rs#L4) |
-| `TaskTool` | struct | `pub` | [crates/yourai-harness/src/collaboration/tools.rs:6](../crates/yourai-harness/src/collaboration/tools.rs#L6) |
-| `SubagentTool` | struct | `pub` | [crates/yourai-harness/src/collaboration/tools.rs:7](../crates/yourai-harness/src/collaboration/tools.rs#L7) |
-| `Config` | struct | `pub` | [crates/yourai-harness/src/config.rs:23](../crates/yourai-harness/src/config.rs#L23) |
-| `ModelSettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:38](../crates/yourai-harness/src/config.rs#L38) |
-| `SecuritySettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:50](../crates/yourai-harness/src/config.rs#L50) |
-| `UiSettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:56](../crates/yourai-harness/src/config.rs#L56) |
-| `SessionSettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:68](../crates/yourai-harness/src/config.rs#L68) |
-| `PromptSettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:82](../crates/yourai-harness/src/config.rs#L82) |
-| `HookSettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:108](../crates/yourai-harness/src/config.rs#L108) |
-| `ResolvedModel` | struct | `pub` | [crates/yourai-harness/src/config.rs:418](../crates/yourai-harness/src/config.rs#L418) |
-| `EffortChoice` | enum | `pub` | [crates/yourai-harness/src/config.rs:1374](../crates/yourai-harness/src/config.rs#L1374) |
 | `View` | struct | `private` | [crates/yourai-harness/src/context/mod.rs:16](../crates/yourai-harness/src/context/mod.rs#L16) |
-| `DefaultContext` | struct | `pub` | [crates/yourai-harness/src/context/mod.rs:27](../crates/yourai-harness/src/context/mod.rs#L27) |
-| `PreparedPrompt` | struct | `pub` | [crates/yourai-harness/src/context/prompt.rs:11](../crates/yourai-harness/src/context/prompt.rs#L11) |
-| `ModelSelection` | struct | `pub` | [crates/yourai-harness/src/controller.rs:21](../crates/yourai-harness/src/controller.rs#L21) |
-| `SessionHistory` | struct | `pub` | [crates/yourai-harness/src/controller.rs:43](../crates/yourai-harness/src/controller.rs#L43) |
-| `SessionSnapshot` | struct | `pub` | [crates/yourai-harness/src/controller.rs:50](../crates/yourai-harness/src/controller.rs#L50) |
-| `SessionEvent` | enum | `pub` | [crates/yourai-harness/src/controller.rs:64](../crates/yourai-harness/src/controller.rs#L64) |
-| `Reply` | enum | `pub` | [crates/yourai-harness/src/controller.rs:78](../crates/yourai-harness/src/controller.rs#L78) |
-| `InputAction` | enum | `private` | [crates/yourai-harness/src/controller.rs:83](../crates/yourai-harness/src/controller.rs#L83) |
-| `Command` | enum | `private` | [crates/yourai-harness/src/controller.rs:87](../crates/yourai-harness/src/controller.rs#L87) |
-| `Effect` | enum | `private` | [crates/yourai-harness/src/controller.rs:95](../crates/yourai-harness/src/controller.rs#L95) |
-| `Shared` | struct | `private` | [crates/yourai-harness/src/controller.rs:101](../crates/yourai-harness/src/controller.rs#L101) |
-| `SessionController` | struct | `pub` | [crates/yourai-harness/src/controller.rs:119](../crates/yourai-harness/src/controller.rs#L119) |
-| `SessionClient` | struct | `pub` | [crates/yourai-harness/src/controller.rs:128](../crates/yourai-harness/src/controller.rs#L128) |
-| `SessionSubscription` | struct | `pub` | [crates/yourai-harness/src/controller.rs:143](../crates/yourai-harness/src/controller.rs#L143) |
-| `Runner` | struct | `private` | [crates/yourai-harness/src/controller.rs:534](../crates/yourai-harness/src/controller.rs#L534) |
-| `DefaultLoop` | struct | `pub` | [crates/yourai-harness/src/default_loop/mod.rs:27](../crates/yourai-harness/src/default_loop/mod.rs#L27) |
+| `DefaultContext` | struct | `pub` | [crates/yourai-harness/src/context/mod.rs:26](../crates/yourai-harness/src/context/mod.rs#L26) |
+| `PromptConfig` | struct | `pub` | [crates/yourai-harness/src/context/prompt.rs:14](../crates/yourai-harness/src/context/prompt.rs#L14) |
+| `PreparedPrompt` | struct | `pub` | [crates/yourai-harness/src/context/prompt.rs:36](../crates/yourai-harness/src/context/prompt.rs#L36) |
+| `LoopConfig` | struct | `pub` | [crates/yourai-harness/src/default_loop/config.rs:3](../crates/yourai-harness/src/default_loop/config.rs#L3) |
+| `DefaultLoop` | struct | `pub` | [crates/yourai-harness/src/default_loop/mod.rs:28](../crates/yourai-harness/src/default_loop/mod.rs#L28) |
 | `BackgroundCommandContext` | struct | `pub(crate)` | [crates/yourai-harness/src/hooks/command.rs:22](../crates/yourai-harness/src/hooks/command.rs#L22) |
 | `OwnedChild` | struct | `private` | [crates/yourai-harness/src/hooks/command.rs:32](../crates/yourai-harness/src/hooks/command.rs#L32) |
 | `CommandHandler` | struct | `pub` | [crates/yourai-harness/src/hooks/command.rs:146](../crates/yourai-harness/src/hooks/command.rs#L146) |
-| `HandlerConfig` | enum | `pub` | [crates/yourai-harness/src/hooks/config.rs:22](../crates/yourai-harness/src/hooks/config.rs#L22) |
-| `FailurePolicyConfig` | enum | `pub` | [crates/yourai-harness/src/hooks/config.rs:137](../crates/yourai-harness/src/hooks/config.rs#L137) |
-| `HookShell` | enum | `pub` | [crates/yourai-harness/src/hooks/config.rs:144](../crates/yourai-harness/src/hooks/config.rs#L144) |
-| `HookRegistration` | struct | `pub` | [crates/yourai-harness/src/hooks/config.rs:252](../crates/yourai-harness/src/hooks/config.rs#L252) |
+| `HooksConfig` | struct | `pub` | [crates/yourai-harness/src/hooks/config.rs:22](../crates/yourai-harness/src/hooks/config.rs#L22) |
+| `HookMatcherGroup` | struct | `pub` | [crates/yourai-harness/src/hooks/config.rs:29](../crates/yourai-harness/src/hooks/config.rs#L29) |
+| `HandlerConfig` | enum | `pub` | [crates/yourai-harness/src/hooks/config.rs:38](../crates/yourai-harness/src/hooks/config.rs#L38) |
+| `FailurePolicyConfig` | enum | `pub` | [crates/yourai-harness/src/hooks/config.rs:153](../crates/yourai-harness/src/hooks/config.rs#L153) |
+| `HookShell` | enum | `pub` | [crates/yourai-harness/src/hooks/config.rs:160](../crates/yourai-harness/src/hooks/config.rs#L160) |
+| `HookRegistration` | struct | `pub` | [crates/yourai-harness/src/hooks/config.rs:269](../crates/yourai-harness/src/hooks/config.rs#L269) |
 | `ModelHookHandler` | struct | `private` | [crates/yourai-harness/src/hooks/handler.rs:12](../crates/yourai-harness/src/hooks/handler.rs#L12) |
-| `NativeHandler` | struct | `pub` | [crates/yourai-harness/src/hooks/handler.rs:123](../crates/yourai-harness/src/hooks/handler.rs#L123) |
+| `NativeHandler` | struct | `pub` | [crates/yourai-harness/src/hooks/handler.rs:124](../crates/yourai-harness/src/hooks/handler.rs#L124) |
 | `HttpHookPolicy` | struct | `pub` | [crates/yourai-harness/src/hooks/http.rs:11](../crates/yourai-harness/src/hooks/http.rs#L11) |
 | `HttpHandler` | struct | `pub` | [crates/yourai-harness/src/hooks/http.rs:17](../crates/yourai-harness/src/hooks/http.rs#L17) |
 | `CompiledMatcher` | enum | `pub` | [crates/yourai-harness/src/hooks/matcher.rs:10](../crates/yourai-harness/src/hooks/matcher.rs#L10) |
 | `Contribution` | struct | `private` | [crates/yourai-harness/src/hooks/runtime.rs:39](../crates/yourai-harness/src/hooks/runtime.rs#L39) |
 | `RegisteredHook` | struct | `private` | [crates/yourai-harness/src/hooks/runtime.rs:61](../crates/yourai-harness/src/hooks/runtime.rs#L61) |
 | `DefaultHookManager` | struct | `pub` | [crates/yourai-harness/src/hooks/runtime.rs:78](../crates/yourai-harness/src/hooks/runtime.rs#L78) |
-| `HandlerExecResult` | enum | `private` | [crates/yourai-harness/src/hooks/runtime.rs:515](../crates/yourai-harness/src/hooks/runtime.rs#L515) |
-| `ExecutedHook` | struct | `private` | [crates/yourai-harness/src/hooks/runtime.rs:530](../crates/yourai-harness/src/hooks/runtime.rs#L530) |
+| `HandlerExecResult` | enum | `private` | [crates/yourai-harness/src/hooks/runtime.rs:516](../crates/yourai-harness/src/hooks/runtime.rs#L516) |
+| `ExecutedHook` | struct | `private` | [crates/yourai-harness/src/hooks/runtime.rs:531](../crates/yourai-harness/src/hooks/runtime.rs#L531) |
 | `HookJsonOutput` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:14](../crates/yourai-harness/src/hooks/wire_output.rs#L14) |
 | `AsyncOutput` | struct | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:21](../crates/yourai-harness/src/hooks/wire_output.rs#L21) |
 | `SyncOutput` | struct | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:30](../crates/yourai-harness/src/hooks/wire_output.rs#L30) |
@@ -221,11 +206,11 @@
 | `PermissionBehavior` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:56](../crates/yourai-harness/src/hooks/wire_output.rs#L56) |
 | `ElicitationAction` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:64](../crates/yourai-harness/src/hooks/wire_output.rs#L64) |
 | `HookSpecificOutput` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:75](../crates/yourai-harness/src/hooks/wire_output.rs#L75) |
-| `PermissionRequestDecision` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:195](../crates/yourai-harness/src/hooks/wire_output.rs#L195) |
-| `PermissionUpdate` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:216](../crates/yourai-harness/src/hooks/wire_output.rs#L216) |
-| `PermissionUpdateDestination` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:253](../crates/yourai-harness/src/hooks/wire_output.rs#L253) |
-| `PermissionMode` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:267](../crates/yourai-harness/src/hooks/wire_output.rs#L267) |
-| `PermissionRuleValue` | struct | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:281](../crates/yourai-harness/src/hooks/wire_output.rs#L281) |
+| `PermissionRequestDecision` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:194](../crates/yourai-harness/src/hooks/wire_output.rs#L194) |
+| `PermissionUpdate` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:215](../crates/yourai-harness/src/hooks/wire_output.rs#L215) |
+| `PermissionUpdateDestination` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:252](../crates/yourai-harness/src/hooks/wire_output.rs#L252) |
+| `PermissionMode` | enum | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:266](../crates/yourai-harness/src/hooks/wire_output.rs#L266) |
+| `PermissionRuleValue` | struct | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:280](../crates/yourai-harness/src/hooks/wire_output.rs#L280) |
 | `MemoryHookAdapter` | struct | `private` | [crates/yourai-harness/src/memory/hooks.rs:33](../crates/yourai-harness/src/memory/hooks.rs#L33) |
 | `LocalMemory` | struct | `pub` | [crates/yourai-harness/src/memory/mod.rs:9](../crates/yourai-harness/src/memory/mod.rs#L9) |
 | `RequestPolicy` | struct | `pub` | [crates/yourai-harness/src/model/control.rs:13](../crates/yourai-harness/src/model/control.rs#L13) |
@@ -244,8 +229,8 @@
 | `Job` | enum | `private` | [crates/yourai-harness/src/storage/request_log.rs:10](../crates/yourai-harness/src/storage/request_log.rs#L10) |
 | `RequestLog` | struct | `pub(crate)` | [crates/yourai-harness/src/storage/request_log.rs:14](../crates/yourai-harness/src/storage/request_log.rs#L14) |
 | `SqliteStore` | struct | `pub` | [crates/yourai-harness/src/storage/sqlite.rs:21](../crates/yourai-harness/src/storage/sqlite.rs#L21) |
-| `Meta` | struct | `private` | [crates/yourai-harness/src/storage/sqlite.rs:777](../crates/yourai-harness/src/storage/sqlite.rs#L777) |
-| `History` | struct | `private` | [crates/yourai-harness/src/storage/sqlite.rs:786](../crates/yourai-harness/src/storage/sqlite.rs#L786) |
+| `Meta` | struct | `private` | [crates/yourai-harness/src/storage/sqlite.rs:746](../crates/yourai-harness/src/storage/sqlite.rs#L746) |
+| `History` | struct | `private` | [crates/yourai-harness/src/storage/sqlite.rs:755](../crates/yourai-harness/src/storage/sqlite.rs#L755) |
 | `Table` | struct | `pub(crate)` | [crates/yourai-harness/src/storage/table.rs:5](../crates/yourai-harness/src/storage/table.rs#L5) |
 | `LocalUsage` | struct | `pub` | [crates/yourai-harness/src/storage/usage.rs:5](../crates/yourai-harness/src/storage/usage.rs#L5) |
 | `ReadInput` | struct | `private` | [crates/yourai-harness/src/tools/files.rs:147](../crates/yourai-harness/src/tools/files.rs#L147) |
@@ -270,9 +255,16 @@
 
 | 名称 | 声明 | 可见性 | 源码 |
 |---|---|---|---|
+| `Config` | struct | `pub` | [apps/yourai-tui/src/config.rs:23](../apps/yourai-tui/src/config.rs#L23) |
+| `ProviderConfig` | struct | `pub` | [apps/yourai-tui/src/config.rs:75](../apps/yourai-tui/src/config.rs#L75) |
+| `ConnectionOptions` | struct | `pub` | [apps/yourai-tui/src/config.rs:87](../apps/yourai-tui/src/config.rs#L87) |
+| `ModelConfig` | struct | `pub` | [apps/yourai-tui/src/config.rs:102](../apps/yourai-tui/src/config.rs#L102) |
+| `Pricing` | struct | `pub` | [apps/yourai-tui/src/config.rs:121](../apps/yourai-tui/src/config.rs#L121) |
+| `ResolvedModel` | struct | `pub` | [apps/yourai-tui/src/config.rs:126](../apps/yourai-tui/src/config.rs#L126) |
 | `GitContext` | struct | `pub` | [apps/yourai-tui/src/git.rs:11](../apps/yourai-tui/src/git.rs#L11) |
 | `Choice` | enum | `pub` | [apps/yourai-tui/src/launcher.rs:25](../apps/yourai-tui/src/launcher.rs#L25) |
-| `ModelChoice` | struct | `pub` | [apps/yourai-tui/src/models.rs:13](../apps/yourai-tui/src/models.rs#L13) |
+| `ModelChoice` | struct | `pub` | [apps/yourai-tui/src/models.rs:21](../apps/yourai-tui/src/models.rs#L21) |
+| `EffortChoice` | enum | `pub` | [apps/yourai-tui/src/models.rs:35](../apps/yourai-tui/src/models.rs#L35) |
 | `SessionRow` | struct | `pub` | [apps/yourai-tui/src/sessions.rs:11](../apps/yourai-tui/src/sessions.rs#L11) |
 | `Screen` | struct | `pub(crate)` | [apps/yourai-tui/src/terminal.rs:60](../apps/yourai-tui/src/terminal.rs#L60) |
 | `SizedBackend` | struct | `pub(crate)` | [apps/yourai-tui/src/terminal.rs:117](../apps/yourai-tui/src/terminal.rs#L117) |
@@ -320,8 +312,12 @@
 | `Hit` | enum | `pub(crate)` | [apps/yourai-tui/src/ui/render.rs:90](../apps/yourai-tui/src/ui/render.rs#L90) |
 | `ComposerMeta` | struct | `private` | [apps/yourai-tui/src/ui/render.rs:1129](../apps/yourai-tui/src/ui/render.rs#L1129) |
 | `Selection` | struct | `pub` | [apps/yourai-tui/src/ui/selection.rs:10](../apps/yourai-tui/src/ui/selection.rs#L10) |
-| `Target` | enum | `pub(super)` | [apps/yourai-tui/src/ui/session.rs:22](../apps/yourai-tui/src/ui/session.rs#L22) |
-| `Controller` | struct | `pub(super)` | [apps/yourai-tui/src/ui/session.rs:26](../apps/yourai-tui/src/ui/session.rs#L26) |
+| `InputAction` | enum | `private` | [apps/yourai-tui/src/ui/session/runtime.rs:43](../apps/yourai-tui/src/ui/session/runtime.rs#L43) |
+| `Runtime` | struct | `pub(super)` | [apps/yourai-tui/src/ui/session/runtime.rs:53](../apps/yourai-tui/src/ui/session/runtime.rs#L53) |
+| `Target` | enum | `pub(super)` | [apps/yourai-tui/src/ui/session.rs:19](../apps/yourai-tui/src/ui/session.rs#L19) |
+| `Reply` | enum | `pub(super)` | [apps/yourai-tui/src/ui/session.rs:26](../apps/yourai-tui/src/ui/session.rs#L26) |
+| `Effect` | enum | `private` | [apps/yourai-tui/src/ui/session.rs:31](../apps/yourai-tui/src/ui/session.rs#L31) |
+| `Controller` | struct | `pub(super)` | [apps/yourai-tui/src/ui/session.rs:37](../apps/yourai-tui/src/ui/session.rs#L37) |
 | `ToolResult` | struct | `pub(super)` | [apps/yourai-tui/src/ui/state/tool_output.rs:373](../apps/yourai-tui/src/ui/state/tool_output.rs#L373) |
 | `Role` | enum | `pub` | [apps/yourai-tui/src/ui/state.rs:15](../apps/yourai-tui/src/ui/state.rs#L15) |
 | `ToolStatus` | enum | `pub` | [apps/yourai-tui/src/ui/state.rs:22](../apps/yourai-tui/src/ui/state.rs#L22) |
@@ -337,11 +333,8 @@
 | `View` | struct | `pub` | [apps/yourai-tui/src/ui/state.rs:244](../apps/yourai-tui/src/ui/state.rs#L244) |
 | `SessionView` | struct | `pub` | [apps/yourai-tui/src/ui/state.rs:260](../apps/yourai-tui/src/ui/state.rs#L260) |
 | `Todos` | struct | `pub` | [apps/yourai-tui/src/ui/state.rs:287](../apps/yourai-tui/src/ui/state.rs#L287) |
+| `ModelInfo` | struct | `pub` | [apps/yourai-tui/src/ui/state.rs:337](../apps/yourai-tui/src/ui/state.rs#L337) |
 | `Palette` | struct | `pub` | [apps/yourai-tui/src/ui/theme.rs:109](../apps/yourai-tui/src/ui/theme.rs#L109) |
 | `Theme` | enum | `pub` | [apps/yourai-tui/src/ui/theme.rs:242](../apps/yourai-tui/src/ui/theme.rs#L242) |
-| `ReaderGate` | struct | `private` | [apps/yourai-tui/src/ui.rs:45](../apps/yourai-tui/src/ui.rs#L45) |
-| `Screen` | struct | `private` | [apps/yourai-tui/src/ui.rs:75](../apps/yourai-tui/src/ui.rs#L75) |
-
-## 配置接口调整补充（2026-10-13）
-
-按用户最新确定的分类方案，只有一个共享配置入口 Config；内部七类数据分别为 models(ModelSettings)、execution(ExecutionOptions)、security(SecuritySettings)、ui(UiSettings)、session(SessionSettings)、prompt(PromptSettings)、hooks(HookSettings)。新增六个分组 struct，ExecutionOptions 复用 core 执行数据；各分组没有独立加载、保存或全局实例，全部由 config::update 管理。ContextPolicy/ImagePolicy 是 execution 的嵌套策略，RequestPolicy/ModelLimits 为资源装配数据。旧平铺 JSON 可读，保存时迁移为与 Rust 类别对应的 JSON；Prompt 和可选 Hook 独立文件不改变单一共享入口。详见 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13)。
+| `ReaderGate` | struct | `private` | [apps/yourai-tui/src/ui.rs:44](../apps/yourai-tui/src/ui.rs#L44) |
+| `Screen` | struct | `private` | [apps/yourai-tui/src/ui.rs:74](../apps/yourai-tui/src/ui.rs#L74) |

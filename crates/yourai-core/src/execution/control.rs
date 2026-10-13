@@ -243,7 +243,9 @@ impl Turn<'_> {
                     "History cleanup incomplete; do not replay tools automatically: {message}"
                 ),
             });
-            tracing::warn!(turn_id = %self.tc.info.id, %message, "turn cleanup failed");
+            if let Some(observability) = &self.tc.snap.observability {
+                observability.increment("loop.cleanup_failed", &[]);
+            }
         }
     }
 }

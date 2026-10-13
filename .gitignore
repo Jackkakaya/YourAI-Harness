@@ -18,8 +18,3 @@ __pycache__/
 /.yourai/
 
 /yourai.json
-
-/prompts.json
-/yourai.sqlite
-/yourai.sqlite3
-/yourai.db

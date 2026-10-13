@@ -1,66 +1,75 @@
 //! Session factories assemble providers, then enter the core lifecycle template.
+use super::*;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
 use yourai_core::prelude::*;
-
-/// Assemble a new session from dependency bindings. Runtime configuration stays
-/// with SessionManager; context, storage and built-in tools are session-owned.
 pub async fn create(
     root: &Path,
     cwd: PathBuf,
-    bindings: AgentBuilder,
+    model: Arc<dyn ModelProvider>,
+    hooks: Option<Arc<dyn HookManager>>,
+    tools: Option<Arc<dyn ToolRegistry>>,
 ) -> Result<Arc<SessionManager>, YourAiError> {
-    let config = crate::SessionOptions::new(root.to_owned(), cwd);
-    open(config, bindings, "startup").await
+    let config = crate::HarnessConfig::new(root.to_owned(), cwd);
+    open(config, model, hooks, tools, None, None, "startup").await
 }
-
-/// Restore with explicit dependency bindings and independent runtime settings.
+#[allow(clippy::too_many_arguments)]
 pub async fn restore(
     root: &Path,
     id: SessionId,
     cwd: PathBuf,
-    bindings: AgentBuilder,
-    settings: ExecutionOptions,
+    model: Arc<dyn ModelProvider>,
+    hooks: Option<Arc<dyn HookManager>>,
+    tools: Option<Arc<dyn ToolRegistry>>,
+    security: Option<Arc<dyn SecurityProvider>>,
+    sandbox: Option<Arc<dyn SandboxProvider>>,
+    policy: ContextPolicy,
     source: &str,
 ) -> Result<Arc<SessionManager>, YourAiError> {
-    let mut config = crate::SessionOptions::new(root.to_owned(), cwd);
+    let mut config = crate::HarnessConfig::new(root.to_owned(), cwd);
     config.resume = Some(id);
-    config.config.apply_execution_options(settings);
-    open(config, bindings, source).await
+    config.context_policy = policy;
+    open(config, model, hooks, tools, security, sandbox, source).await
 }
-
+#[allow(clippy::too_many_arguments)]
 async fn open(
-    config: crate::SessionOptions,
-    mut bindings: AgentBuilder,
+    config: crate::HarnessConfig,
+    model: Arc<dyn ModelProvider>,
+    hooks: Option<Arc<dyn HookManager>>,
+    tools: Option<Arc<dyn ToolRegistry>>,
+    security: Option<Arc<dyn SecurityProvider>>,
+    sandbox: Option<Arc<dyn SandboxProvider>>,
     source: &str,
 ) -> Result<Arc<SessionManager>, YourAiError> {
-    let model = bindings
-        .model
-        .as_ref()
-        .ok_or_else(|| ErrorKind::Config("provider not configured: model".into()))?;
-    config
-        .config
-        .execution
-        .context_policy
-        .validate_for(model.token_budget())?;
+    config.context_policy.validate_for(model.token_budget())?;
     let catalog = Arc::new(crate::SessionCatalog::new(&config.root)?);
     let (meta, lease, prepared) =
         crate::assembly::prepare_session(&catalog, &config, model.as_ref()).await?;
     let id = meta.id;
-    // Explicit usage implementations are dependencies, just like hooks/security.
-    bindings
-        .usage
-        .get_or_insert_with(|| Arc::new(crate::storage::LocalUsage((*catalog.store).clone())));
+    let usage = Arc::new(crate::storage::LocalUsage((*catalog.store).clone()));
     let (agent, _) = crate::assembly::assemble(
+        &catalog,
         &id,
         lease.store(),
         &config.cwd,
-        config.config.security.trusted_shell,
-        bindings,
-        &config.config.execution_options(),
+        false,
+        model,
+        hooks,
+        Some(usage),
+        tools,
+        config.context_policy,
     )
     .await?;
-    crate::assembly::start_session(&config, id, lease, agent, prepared, source).await
+    if let Some(security) = security {
+        agent.ctx().set_security(security);
+    }
+    if let Some(sandbox) = sandbox {
+        agent.ctx().set_sandbox(sandbox);
+    }
+    let mut environment = SessionEnvironment::new(id, config.cwd);
+    environment.instructions = prepared.instructions;
+    environment.transcript_path = Some(crate::SqliteStore::path(&config.root));
+    SessionManager::open_owned(lease, environment, agent, SessionConfig::default(), source).await
 }

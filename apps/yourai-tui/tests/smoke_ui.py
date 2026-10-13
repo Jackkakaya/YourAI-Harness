@@ -59,28 +59,13 @@ with tempfile.TemporaryDirectory() as tmp:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     config = Path(tmp) / 'config.json'
     config.write_text(json.dumps({
-        'models': {
-            'selected': 'mock/smoke',
-            'providers': {
-                'mock': {
-                    'npm': '@ai-sdk/openai-compatible',
-                    'options': {
-                        'baseURL': f'http://127.0.0.1:{server.server_port}/v1',
-                        'apiKey': 'x'
-                    },
-                    'models': {}
-                }
-            }
-        },
-        'session': {
-            'extensions': False
-        },
-        'execution': {
-            'context': {
-                'keep_recent_tokens': 0,
-                'summary_min_savings': 1
-            }
-        }
+        "model": "mock/smoke", "extensions": False,
+        "provider": {"mock": {
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {"baseURL": f"http://127.0.0.1:{server.server_port}/v1", "apiKey": "x"},
+            "models": {}
+        }},
+        "context": {"keep_recent_tokens": 0, "summary_min_savings": 1}
     }))
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))

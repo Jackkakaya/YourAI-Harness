@@ -48,19 +48,20 @@ impl ModelHookHandler {
             let mut builder = Agent::builder()
                 .model(model.clone())
                 .context_manager(history)
-                .agent_loop(Arc::new(crate::default_loop::DefaultLoop));
+                .agent_loop(Arc::new(crate::default_loop::DefaultLoop::new(
+                    crate::default_loop::LoopConfig {
+                        steps: Some(8),
+                        ..Default::default()
+                    },
+                )));
             if let Some(usage) = &invocation.usage {
                 builder = builder.usage(usage.clone());
             }
             let mut options = TurnOptions::default();
             options.source = Some("hook");
-            let config = yourai_core::execution::ExecutionOptions {
-                steps: Some(8),
-                ..Default::default()
-            };
             builder
                 .build()
-                .run_with(In::user_text(prompt), config, options)
+                .run_with(In::user_text(prompt), options)
                 .await
                 .map_err(|failure| *failure.error)?
                 .text

@@ -51,8 +51,8 @@ async fn coding_loop_modifies_tests_and_persists_results() {
         ),
         answer("fixed and tested"),
     ]));
-    let mut cfg = SessionOptions::new(root.clone(), d.path().into());
-    cfg.config.security.trusted_shell = true;
+    let mut cfg = HarnessConfig::new(root.clone(), d.path().into());
+    cfg.trusted_shell = true;
     let h = Harness::open(cfg, model.clone()).await.unwrap();
     let capture = Capture(Mutex::new(vec![]));
     h.host
@@ -111,7 +111,7 @@ async fn coding_loop_modifies_tests_and_persists_results() {
         invoke("re-read", "read", json!({"path":"answer.txt"})),
         answer("restored"),
     ]));
-    let mut cfg = SessionOptions::new(root, d.path().into());
+    let mut cfg = HarnessConfig::new(root, d.path().into());
     cfg.resume = Some(id);
     let h = Harness::open(cfg, model.clone()).await.unwrap();
     // Approve any permission request so the resumed turn cannot stall.
@@ -210,7 +210,7 @@ async fn denied_shell_does_not_run_and_next_model_request_gets_failure() {
         answer("denied"),
     ]));
     let h = Harness::open(
-        SessionOptions::new(d.path().join("sessions"), d.path().into()),
+        HarnessConfig::new(d.path().join("sessions"), d.path().into()),
         model.clone(),
     )
     .await
@@ -247,7 +247,7 @@ async fn child_restore_rebinds_builtin_working_directory() {
     let child = TempDir::new().unwrap();
     let root = d.path().join("sessions");
     let h = Harness::open(
-        SessionOptions::new(root.clone(), d.path().into()),
+        HarnessConfig::new(root.clone(), d.path().into()),
         Arc::new(Model::new(vec![])),
     )
     .await
@@ -271,11 +271,12 @@ async fn child_restore_rebinds_builtin_working_directory() {
         &root,
         id,
         child.path().into(),
-        Agent::builder().model(model).tools(h.tools.clone()),
-        ExecutionOptions {
-            context_policy: ContextPolicy::default(),
-            ..Default::default()
-        },
+        model,
+        None,
+        Some(h.tools.clone()),
+        None,
+        None,
+        ContextPolicy::default(),
         "startup",
     )
     .await
@@ -329,9 +330,9 @@ async fn yolo_skips_all_permissions_including_children_but_preserves_questions()
         invoke("question", "ask_user", json!({"value":1})),
         answer("all done"),
     ]));
-    let mut cfg = SessionOptions::new(d.path().join("sessions"), d.path().into());
-    cfg.config.security.yolo = true;
-    cfg.config.session.extensions = true;
+    let mut cfg = HarnessConfig::new(d.path().join("sessions"), d.path().into());
+    cfg.yolo = true;
+    cfg.extensions = true;
     let h = Harness::open(cfg, model).await.unwrap();
     h.tools
         .register(Arc::new(Handler::new("ask_user", Mode::Ask)));
@@ -384,7 +385,7 @@ async fn yolo_skips_all_permissions_including_children_but_preserves_questions()
     let id = h.host.environment().id;
     h.close().await.unwrap();
     drop(h);
-    let mut cfg = SessionOptions::new(d.path().join("sessions"), d.path().into());
+    let mut cfg = HarnessConfig::new(d.path().join("sessions"), d.path().into());
     cfg.resume = Some(id);
     let h = Harness::open(
         cfg,
@@ -429,8 +430,8 @@ async fn runtime_yolo_can_be_disabled_and_rejects_changes_during_approval() {
         invoke("second", "shell", json!({"command":"printf second"})),
         answer("second done"),
     ]));
-    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    config.config.security.yolo = true;
+    let mut config = HarnessConfig::new(dir.path().join("sessions"), dir.path().into());
+    config.yolo = true;
     let h = Harness::open(config, model).await.unwrap();
     // Even CLI-selected YOLO can restore the original permission provider.
     h.set_yolo(false).unwrap();
