@@ -1,5 +1,6 @@
 pub(crate) mod configured;
 mod control;
+pub(crate) use control::validate as validate_requests;
 pub mod failure;
 mod metrics;
 #[cfg(test)]
@@ -8,11 +9,11 @@ pub(crate) mod retry;
 #[cfg(test)]
 #[path = "../../tests/support/model.rs"]
 mod settings_fixture;
-pub use crate::config::{
-    ConnectionSettings, ConnectionTimeout, Error, ModelDefinition, ModelPricing, ModelSettings,
-    ProviderSettings, RequestPolicy, VariantSettings,
+pub use crate::config::{ConnectionTimeout, Error, ModelConfig, ProviderConfig};
+pub use configured::{
+    choices, effective_effort, pricing, resolve, resolve_compaction, select, EffortChoice,
+    ModelChoice, ResolvedModel, EFFORT_CHOICES,
 };
-pub use configured::{EffortChoice, ModelChoice, ResolvedModel, EFFORT_CHOICES};
 use futures_util::StreamExt;
 use metrics::Attempt;
 pub use metrics::RequestMetrics;
@@ -266,10 +267,10 @@ impl ModelBudget {
         })
     }
     pub fn configured(
-        policy: RequestPolicy,
+        policy: (Option<u32>, u64),
         store: crate::SqliteStore,
     ) -> Result<Arc<Self>, YourAiError> {
-        policy.validate()?;
+        control::validate(policy)?;
         Ok(Arc::new(Self {
             state: Arc::new(Mutex::new(BudgetSnapshot::default())),
             starts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
@@ -280,8 +281,11 @@ impl ModelBudget {
         }))
     }
     /// Provider-specific admission, retaining shared accounting and hard limits.
-    pub(crate) fn for_provider(&self, policy: RequestPolicy) -> Result<Arc<Self>, YourAiError> {
-        policy.validate()?;
+    pub(crate) fn for_provider(
+        &self,
+        policy: (Option<u32>, u64),
+    ) -> Result<Arc<Self>, YourAiError> {
+        control::validate(policy)?;
         Ok(Arc::new(Self {
             state: self.state.clone(),
             starts: self.starts.clone(),

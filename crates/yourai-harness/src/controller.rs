@@ -25,17 +25,22 @@ pub struct ModelSelection {
 }
 impl ModelSelection {
     pub fn from_config(preferences: &Config) -> Self {
-        Self::from_models(preferences.values().models())
+        Self::from_data(&preferences.values())
     }
-    fn from_models(models: &crate::config::ModelSettings) -> Self {
-        let pricing = models.pricing();
+    fn from_data(data: &serde_json::Value) -> Self {
+        let model: String = crate::config::read(data, "model");
+        let variant: Option<String> = crate::config::read(data, "variant");
+        let pricing = crate::model::configured::pricing_data(data);
         Self {
-            label: models.variant().as_ref().map_or_else(
-                || models.model().clone(),
-                |v| format!("{} · {v}", models.model()),
-            ),
+            label: variant
+                .as_ref()
+                .map_or_else(|| model.clone(), |v| format!("{model} · {v}")),
             pricing: pricing.0.zip(pricing.1),
-            effort: models.effective_effort(models.model(), models.variant().as_deref()),
+            effort: crate::model::configured::effective_effort_data(
+                data,
+                &model,
+                variant.as_deref(),
+            ),
         }
     }
 }
@@ -406,10 +411,10 @@ impl SessionClient {
             .map_err(|e| YourAiError::from(ErrorKind::Config(e.message().into())))?;
         s.harness().apply_yolo_with_commit(enabled, || {
             let mut data = self.config.write();
-            let previous = data.security().clone();
-            data.security_mut().set_yolo(enabled);
+            let previous: bool = crate::config::read(&data, "yolo");
+            crate::config::put(&mut data, "yolo", enabled);
             if let Err(error) = self.config.save_data(&data) {
-                data.set_security(previous);
+                crate::config::put(&mut data, "yolo", previous);
                 return Err(crate::error("config", error));
             }
             Ok(())
@@ -814,7 +819,7 @@ pub async fn history(h: &Harness) -> Result<SessionHistory, YourAiError> {
 fn bind_config(h: &Harness, config: &Arc<Config>) -> Result<(), YourAiError> {
     let config = config.clone();
     h.host.bind_config_source(Arc::new(move || {
-        config.execution().resolve(&TurnLimits::default())
+        config.execution_options().resolve(&TurnLimits::default())
     }))
 }
 async fn switch_model(
@@ -825,18 +830,19 @@ async fn switch_model(
     effort: Option<EffortChoice>,
 ) -> Result<ModelSelection, String> {
     let values = config.values();
-    let dependencies = serde_json::to_value((values.models(), values.execution().context_policy()))
-        .map_err(|e| e.to_string())?;
-    let candidate = values
-        .models()
-        .select_model(id, variant.clone(), effort.as_ref())
-        .map_err(|e| e.to_string())?;
+    let dependencies = crate::model::configured::dependencies(&values);
+    let candidate =
+        crate::model::configured::select_data(&values, id, variant.clone(), effort.as_ref())
+            .map_err(|e| e.to_string())?;
     let crate::model::ResolvedModel {
         model,
         provider,
         requests,
-    } = candidate.resolve().map_err(|e| e.to_string())?;
-    let policy = values.execution().context_policy().clone();
+    } = crate::model::configured::resolve_data(&candidate).map_err(|e| e.to_string())?;
+    let policy =
+        crate::config::read::<yourai_core::execution::ExecutionOptions>(&values, "execution")
+            .context_policy()
+            .clone();
     h.host
         .check_config_change(
             "model",
@@ -844,22 +850,19 @@ async fn switch_model(
         )
         .await
         .map_err(|e| e.to_string())?;
-    let selection = ModelSelection::from_models(&candidate);
+    let selection = ModelSelection::from_data(&candidate);
     h.apply_model_with_commit(model, policy, provider, requests, || {
         let mut data = config.write();
-        if serde_json::to_value((data.models(), data.execution().context_policy()))
-            .map_err(|e| crate::error("config", e))?
-            != dependencies
-        {
+        if crate::model::configured::dependencies(&data) != dependencies {
             return Err(crate::error(
                 "config",
                 "Model settings changed while preparing the switch; retry",
             ));
         }
-        let previous = data.models().clone();
-        data.set_models(candidate);
+        let previous = data.clone();
+        crate::model::configured::apply_selection(&mut data, &candidate);
         if let Err(error) = config.save_data(&data) {
-            data.set_models(previous);
+            crate::model::configured::apply_selection(&mut data, &previous);
             return Err(crate::error("config", error));
         }
         Ok(())
@@ -996,12 +999,11 @@ mod switch_tests {
         let path = dir.path().join("yourai.json");
         std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
         let cfg = Config::init(&path).unwrap();
-        let crate::model::ResolvedModel { model, .. } =
-            cfg.values().models().clone().resolve().unwrap();
+        let crate::model::ResolvedModel { model, .. } = crate::model::resolve(&cfg).unwrap();
         let hc = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
         hc.config.set_system_prompt(Some("test".into()));
         hc.config
-            .set_context_policy(cfg.values().execution().clone().context_policy().clone());
+            .set_context_policy(cfg.execution_options().context_policy().clone());
         let h = Harness::open(hc.clone(), model).await.unwrap();
         let config = Arc::new(cfg);
         for (id, variant) in [
@@ -1019,12 +1021,9 @@ mod switch_tests {
             .await
             .is_err());
             let cfg = &config;
-            assert_eq!(cfg.values().models().clone().model(), "mock/large");
+            assert_eq!(cfg.model(), "mock/large");
             assert_eq!(
-                cfg.values()
-                    .models()
-                    .clone()
-                    .resolve()
+                crate::model::resolve(cfg)
                     .unwrap()
                     .model
                     .token_budget()
@@ -1032,7 +1031,7 @@ mod switch_tests {
                     .context(),
                 Some(64000)
             );
-            assert!(cfg.values().models().clone().variant().is_none());
+            assert!(cfg.variant().is_none());
             assert_eq!(h.host.context_usage().unwrap().context_window, Some(64000));
         }
         let selected =
@@ -1045,10 +1044,7 @@ mod switch_tests {
         assert_eq!(resume_model.token_budget().limits().context(), Some(32000));
         // This differs from the default model's 4096, proving variant resolution.
         assert_eq!(resume_model.token_budget().max_output_tokens(), 2048);
-        assert_eq!(
-            config.values().models().clone().variant().as_deref(),
-            Some("short")
-        );
+        assert_eq!(config.variant().as_deref(), Some("short"));
         assert_eq!(selected.label, "mock/small · short");
         h.close().await.unwrap();
     }
@@ -1096,12 +1092,11 @@ mod switch_tests {
         let path = dir.path().join("yourai.json");
         std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
         let cfg = Config::init(&path).unwrap();
-        let crate::model::ResolvedModel { model, .. } =
-            cfg.values().models().clone().resolve().unwrap();
+        let crate::model::ResolvedModel { model, .. } = crate::model::resolve(&cfg).unwrap();
         let hc = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
         hc.config.set_system_prompt(Some("test".into()));
         hc.config
-            .set_context_policy(cfg.values().execution().clone().context_policy().clone());
+            .set_context_policy(cfg.execution_options().context_policy().clone());
         let h = Harness::open(hc, model).await.unwrap();
         let config = Arc::new(cfg);
 
@@ -1117,22 +1112,12 @@ mod switch_tests {
         .unwrap();
         assert_eq!(selected.effort.as_deref(), Some("high"));
         assert_eq!(
-            config
-                .values()
-                .models()
-                .clone()
-                .effective_effort("mock/small", Some("short"))
-                .as_deref(),
+            crate::model::effective_effort(&config, "mock/small", Some("short")).as_deref(),
             Some("high")
         );
         // The file-configured model-level effort still applies to its entry.
         assert_eq!(
-            config
-                .values()
-                .models()
-                .clone()
-                .effective_effort("mock/large", None)
-                .as_deref(),
+            crate::model::effective_effort(&config, "mock/large", None).as_deref(),
             Some("low")
         );
 
@@ -1147,12 +1132,10 @@ mod switch_tests {
         .await
         .unwrap();
         assert_eq!(selected.effort, None);
-        assert!(
-            !config.values().models().clone().providers()["mock"].models()["small"].variants()
-                ["short"]
-                .options()
-                .contains_key("reasoningEffort")
-        );
+        assert!(!config
+            .variant_options("mock/small", "short")
+            .unwrap()
+            .contains_key("reasoningEffort"));
 
         // Invalid keywords never reach the resolve or the shared config.
         assert!(crate::controller::switch_model(
@@ -1164,12 +1147,11 @@ mod switch_tests {
         )
         .await
         .is_err());
-        assert!(
-            config.values().models().clone().providers()["mock"].models()["small"]
-                .options()
-                .get("reasoningEffort")
-                .is_none()
-        );
+        assert!(config
+            .model_options("mock/small")
+            .unwrap()
+            .get("reasoningEffort")
+            .is_none());
         h.close().await.unwrap();
     }
 }

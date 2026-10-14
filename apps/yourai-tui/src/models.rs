@@ -1,17 +1,10 @@
 //! Model picker display entries. Resolution and switching belong to the backend.
-use crate::config::Config;
-
 /// Selectable reasoning-effort levels in the `/models` effort sub-picker.
 /// `None` means "no explicit effort" (remove any runtime override; the
 /// merged config options decide).
 pub use yourai_harness::model::{EffortChoice, EFFORT_CHOICES};
 
-pub use yourai_harness::model::ModelChoice;
-
-/// Enumerate the model menu from one coherent configuration read.
-pub fn model_choices(config: &Config) -> Vec<ModelChoice> {
-    config.models().choices()
-}
+pub use yourai_harness::model::{choices as model_choices, ModelChoice};
 
 #[cfg(test)]
 mod tests {

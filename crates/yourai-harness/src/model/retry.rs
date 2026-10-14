@@ -172,12 +172,7 @@ mod tests {
             ("1e100", MAX_DELAY),
         ] {
             let budget = super::super::ModelBudget::configured(
-                {
-                    let mut settings = super::super::RequestPolicy::default();
-                    settings.set_rpm(None);
-                    settings.set_cooldown_seconds(7);
-                    settings
-                },
+                (None, 7),
                 crate::SqliteStore::open(std::path::Path::new(":memory:")).unwrap(),
             )
             .unwrap();

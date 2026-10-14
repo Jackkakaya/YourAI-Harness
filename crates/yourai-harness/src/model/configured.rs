@@ -1,7 +1,5 @@
 //! Build model clients from typed configuration; no configuration storage lives here.
-use crate::config::{
-    ConnectionSettings, ConnectionTimeout, Error, ModelDefinition, ModelSettings, ProviderSettings,
-};
+use crate::config::{ConnectionTimeout, Error, ModelConfig, ProviderConfig};
 use crate::GenaiModel;
 use genai::{
     adapter::AdapterKind,
@@ -11,21 +9,19 @@ use genai::{
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use yourai_core::prelude::{ModelProvider, ModelTimeouts, ModelTokenBudget};
 
 pub(crate) fn build_model(
-    models: &ModelSettings,
+    data: &Value,
     id: &str,
     variant: Option<&str>,
     effort: Option<&str>,
 ) -> Result<ResolvedModel, Error> {
-    let (provider_id, provider, model_key) = models.provider_entry(id)?;
-    let requests = provider.options().requests().clone();
-    requests.validate()?;
-    let defaults = ModelDefinition::default();
-    let model = provider.models().get(model_key).unwrap_or(&defaults);
-    let name = model.id().as_deref().unwrap_or(model_key);
+    let (provider_id, provider, model_key, model) = provider_entry(data, id)?;
+    let requests = (provider.rpm(), provider.cooldown_seconds());
+    super::control::validate(requests)?;
+    let name = model.id().as_deref().unwrap_or(&model_key);
     if name.trim().is_empty() {
         return Err("Model id is empty".into());
     }
@@ -35,10 +31,16 @@ pub(crate) fn build_model(
             .variants()
             .get(variant)
             .ok_or("Unknown model variant")?;
-        if selected.disabled() {
+        if selected
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             return Err("Model variant is disabled".into());
         }
-        merge(&mut options, Value::Object(selected.options().clone()));
+        let mut selected = selected.clone();
+        selected.remove("disabled");
+        merge(&mut options, Value::Object(selected));
     }
     if let Some(effort) = effort {
         options["reasoningEffort"] = Value::String(effort.into());
@@ -108,14 +110,14 @@ pub(crate) fn build_model(
     if !options.is_empty() {
         chat.extra_body = Some(Value::Object(options));
     }
-    let mut headers = provider.options().headers().clone();
+    let mut headers = provider.headers().clone();
     headers.extend(model.headers().clone());
     let headers: Vec<(String, String)> = headers
         .into_iter()
         .map(|(k, v)| Ok((k, expand(&v)?)))
         .collect::<Result<_, Error>>()?;
-    let client = provider_client(provider, provider_id, chat)?;
-    let (header_timeout, chunk_timeout) = model_timeouts(provider.options())?;
+    let client = provider_client(&provider, &provider_id, chat)?;
+    let (header_timeout, chunk_timeout) = model_timeouts(&provider)?;
     let defaults = ModelTimeouts::default();
     let model = Arc::new(
         GenaiModel::new(client, name)
@@ -129,7 +131,7 @@ pub(crate) fn build_model(
     );
     Ok(ResolvedModel {
         model,
-        provider: provider_id.into(),
+        provider: provider_id,
         requests,
     })
 }
@@ -155,7 +157,7 @@ fn expand(value: &str) -> Result<String, Error> {
     Ok(value.into())
 }
 pub(crate) fn model_timeouts(
-    options: &ConnectionSettings,
+    options: &ProviderConfig,
 ) -> Result<(Option<Duration>, Option<Duration>), Error> {
     let timeout = |key: &str, value: Option<u64>| -> Result<Option<Duration>, Error> {
         value
@@ -174,7 +176,7 @@ pub(crate) fn model_timeouts(
     ))
 }
 pub(crate) fn provider_client(
-    provider: &ProviderSettings,
+    provider: &ProviderConfig,
     provider_id: &str,
     chat: ChatOptions,
 ) -> Result<Client, Error> {
@@ -200,7 +202,7 @@ pub(crate) fn provider_client(
     let mut builder = Client::builder()
         .with_adapter_kind(adapter)
         .with_chat_options(chat);
-    if let Some(key) = provider.options().api_key().as_deref() {
+    if let Some(key) = provider.api_key().as_deref() {
         let key = expand(key)?;
         if key.trim().is_empty() {
             return Err("API key is empty".into());
@@ -208,7 +210,7 @@ pub(crate) fn provider_client(
         builder =
             builder.with_auth_resolver_fn(move |_| Ok(Some(AuthData::from_single(key.clone()))));
     }
-    if let Some(base) = provider.options().base_url().as_deref() {
+    if let Some(base) = provider.base_url().as_deref() {
         let mut url = reqwest::Url::parse(&expand(base)?).map_err(|_| "Invalid baseURL")?;
         if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
@@ -229,7 +231,7 @@ pub(crate) fn provider_client(
                 Ok(target)
             });
     }
-    if let Some(timeout) = provider.options().timeout().as_ref() {
+    if let Some(timeout) = provider.timeout().as_ref() {
         let duration = match timeout {
             ConnectionTimeout::Disabled(false) => None,
             ConnectionTimeout::Milliseconds(n) if *n > 0 => Some(Duration::from_millis(*n)),
@@ -247,7 +249,7 @@ pub(crate) fn provider_client(
 pub struct ResolvedModel {
     pub model: Arc<dyn ModelProvider>,
     pub provider: String,
-    pub requests: crate::model::RequestPolicy,
+    pub requests: (Option<u32>, u64),
 }
 
 pub const EFFORT_CHOICES: [Option<&str>; 8] = [
@@ -271,20 +273,6 @@ pub enum EffortChoice {
     Set(String),
 }
 
-impl ModelSettings {
-    pub(crate) fn provider_entry<'a>(
-        &'a self,
-        id: &'a str,
-    ) -> Result<(&'a str, &'a ProviderSettings, &'a str), Error> {
-        let (provider_id, key) = model_parts(id)?;
-        let provider = self
-            .providers()
-            .get(provider_id)
-            .ok_or("Unknown provider")?;
-        Ok((provider_id, provider, key))
-    }
-}
-
 pub(crate) fn model_parts(id: &str) -> Result<(&str, &str), Error> {
     let (provider, model) = id.split_once('/').ok_or("model must be provider/model")?;
     if provider.trim().is_empty() || model.trim().is_empty() {
@@ -292,177 +280,210 @@ pub(crate) fn model_parts(id: &str) -> Result<(&str, &str), Error> {
     }
     Ok((provider, model))
 }
-
-impl ModelSettings {
-    /// Build the recorded selection without overriding or changing its values.
-    pub fn resolve(&self) -> Result<ResolvedModel, Error> {
-        let variant = self.variant().as_deref();
+fn provider_entry(
+    data: &Value,
+    id: &str,
+) -> Result<(String, ProviderConfig, String, ModelConfig), Error> {
+    let (fallback, key) = model_parts(id)?;
+    let model: ModelConfig = match data["models"].get(id) {
+        Some(value) => crate::config::decode(value.clone(), "model")?,
+        None => ModelConfig::default(),
+    };
+    let provider_id = if model.provider().is_empty() {
+        fallback
+    } else {
+        model.provider()
+    };
+    let provider = data["providers"]
+        .get(provider_id)
+        .ok_or("Unknown provider")?;
+    Ok((
+        provider_id.into(),
+        crate::config::decode(provider.clone(), "provider")?,
+        key.into(),
+        model,
+    ))
+}
+pub(crate) fn resolve_data(data: &Value) -> Result<ResolvedModel, Error> {
+    let id: String = crate::config::read(data, "model");
+    let variant: Option<String> = crate::config::read(data, "variant");
+    build_model(
+        data,
+        &id,
+        variant.as_deref(),
+        effective_effort_data(data, &id, variant.as_deref()).as_deref(),
+    )
+}
+pub(crate) fn resolve_compaction_data(data: &Value) -> Result<Option<ResolvedModel>, Error> {
+    let id: Option<String> = crate::config::read(data, "compaction_model");
+    id.map(|id| {
         build_model(
-            self,
-            self.model(),
-            variant,
-            self.effective_effort(self.model(), variant).as_deref(),
+            data,
+            &id,
+            None,
+            effective_effort_data(data, &id, None).as_deref(),
         )
-    }
-    pub fn resolve_compaction(&self) -> Result<Option<ResolvedModel>, Error> {
-        self.compaction()
-            .as_ref()
-            .map(|id| build_model(self, id, None, self.effective_effort(id, None).as_deref()))
-            .transpose()
-    }
-    /// Apply the coupled model choice to a detached candidate as one operation.
-    pub fn select_model(
-        &self,
-        id: &str,
-        variant: Option<String>,
-        effort: Option<&EffortChoice>,
-    ) -> Result<Self, Error> {
-        self.validate_selection(id, variant.as_deref())?;
-        let mut next = self.clone();
-        if let Some(effort) = effort {
-            next.set_entry_effort(id, variant.as_deref(), effort)?;
+    })
+    .transpose()
+}
+fn validate_entry(
+    data: &Value,
+    id: &str,
+    variant: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(), Error> {
+    let (_, _, _, model) = provider_entry(data, id)?;
+    if let Some(variant) = variant {
+        if !model.variants().contains_key(variant) {
+            return Err("Unknown model variant".into());
         }
-        next.set_model(id.into());
-        next.set_variant(variant);
-        Ok(next)
     }
-    pub fn with_effort(
-        &self,
-        id: &str,
-        variant: Option<&str>,
-        choice: &EffortChoice,
-    ) -> Result<Self, Error> {
-        let mut next = self.clone();
-        next.set_entry_effort(id, variant, choice)?;
-        Ok(next)
+    if effort.is_some_and(|v| !EFFORT_CHOICES.iter().flatten().any(|allowed| *allowed == v)) {
+        return Err("Invalid reasoningEffort".into());
     }
-    fn set_entry_effort(
-        &mut self,
-        id: &str,
-        variant: Option<&str>,
-        choice: &EffortChoice,
-    ) -> Result<(), Error> {
-        self.validate_entry(
-            id,
-            variant,
-            match choice {
-                EffortChoice::Set(value) => Some(value),
-                EffortChoice::Config => None,
-            },
-        )?;
-        let mut overrides = self.effort_overrides().clone();
-        match choice {
-            EffortChoice::Config => {
-                if let Some(entries) = overrides.get_mut(id) {
-                    entries.remove(variant.unwrap_or(""));
-                }
-                if overrides.get(id).is_some_and(BTreeMap::is_empty) {
+    Ok(())
+}
+pub(crate) fn select_data(
+    data: &Value,
+    id: &str,
+    variant: Option<String>,
+    effort: Option<&EffortChoice>,
+) -> Result<Value, Error> {
+    validate_entry(
+        data,
+        id,
+        variant.as_deref(),
+        match effort {
+            Some(EffortChoice::Set(value)) => Some(value),
+            _ => None,
+        },
+    )?;
+    if let Some(variant) = &variant {
+        if data["models"][id]["variants"][variant]["disabled"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            return Err("Model variant is disabled".into());
+        }
+    }
+    let mut next = data.clone();
+    if let Some(effort) = effort {
+        set_effort(&mut next, id, variant.as_deref(), effort)?;
+    }
+    crate::config::put(&mut next, "model", id);
+    crate::config::put(&mut next, "variant", variant);
+    Ok(next)
+}
+fn set_effort(
+    data: &mut Value,
+    id: &str,
+    variant: Option<&str>,
+    effort: &EffortChoice,
+) -> Result<(), Error> {
+    validate_entry(
+        data,
+        id,
+        variant,
+        match effort {
+            EffortChoice::Set(v) => Some(v),
+            EffortChoice::Config => None,
+        },
+    )?;
+    let overrides = data["effort_overrides"].as_object_mut().unwrap();
+    match effort {
+        EffortChoice::Set(value) => {
+            overrides
+                .entry(id.to_owned())
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .unwrap()
+                .insert(variant.unwrap_or("").into(), Value::String(value.clone()));
+        }
+        EffortChoice::Config => {
+            if let Some(entries) = overrides.get_mut(id).and_then(Value::as_object_mut) {
+                entries.remove(variant.unwrap_or(""));
+                if entries.is_empty() {
                     overrides.remove(id);
                 }
             }
-            EffortChoice::Set(value) => {
-                overrides
-                    .entry(id.into())
-                    .or_default()
-                    .insert(variant.unwrap_or("").into(), value.clone());
-            }
         }
-        self.set_effort_overrides(overrides);
-        Ok(())
     }
-    fn validate_selection(&self, id: &str, variant: Option<&str>) -> Result<(), Error> {
-        self.validate_entry(id, variant, None)?;
-        if let Some(variant) = variant {
-            let (_, provider, key) = self.provider_entry(id)?;
-            if provider.models()[key].variants()[variant].disabled() {
-                return Err("Model variant is disabled".into());
-            }
-        }
-        Ok(())
+    Ok(())
+}
+pub(crate) fn apply_selection(data: &mut Value, next: &Value) {
+    for key in ["model", "variant", "effort_overrides"] {
+        crate::config::put(data, key, &next[key]);
     }
-    fn validate_entry(
-        &self,
-        id: &str,
-        variant: Option<&str>,
-        effort: Option<&str>,
-    ) -> Result<(), Error> {
-        let (_, provider, key) = self.provider_entry(id)?;
-        if let Some(variant) = variant {
-            let model = provider.models().get(key).ok_or("Unknown model")?;
-            if !model.variants().contains_key(variant) {
-                return Err("Unknown model variant".into());
-            }
-        }
-        if let Some(value) = effort {
-            if !EFFORT_CHOICES
-                .iter()
-                .flatten()
-                .any(|allowed| *allowed == value)
-            {
-                return Err(format!("Invalid reasoningEffort: {value}").into());
-            }
-        }
-        Ok(())
-    }
-    /// Returns the pricing for the currently selected model, if configured.
-    pub fn pricing(&self) -> (Option<f64>, Option<f64>) {
-        let model = self
-            .provider_entry(self.model())
-            .ok()
-            .and_then(|(_, provider, key)| provider.models().get(key));
-        model.map_or((None, None), |model| {
-            (model.pricing().input(), model.pricing().output())
+}
+pub(crate) fn dependencies(data: &Value) -> Value {
+    serde_json::json!([
+        data["model"],
+        data["variant"],
+        data["compaction_model"],
+        data["effort_overrides"],
+        data["providers"],
+        data["models"],
+        data["execution"]["context"]
+    ])
+}
+pub(crate) fn pricing_data(data: &Value) -> (Option<f64>, Option<f64>) {
+    let id: String = crate::config::read(data, "model");
+    provider_entry(data, &id).map_or((None, None), |(_, _, _, model)| {
+        (model.input_price(), model.output_price())
+    })
+}
+pub(crate) fn effective_effort_data(
+    data: &Value,
+    id: &str,
+    variant: Option<&str>,
+) -> Option<String> {
+    let overrides = &data["effort_overrides"][id];
+    variant
+        .and_then(|name| overrides[name].as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            variant
+                .and_then(|name| data["models"][id]["variants"][name]["reasoningEffort"].as_str())
+                .map(str::to_owned)
         })
+        .or_else(|| overrides[""].as_str().map(str::to_owned))
+        .or_else(|| {
+            data["models"][id]["options"]["reasoningEffort"]
+                .as_str()
+                .map(str::to_owned)
+        })
+}
+pub(crate) fn validate_data(data: &Value, loaded: bool) -> Result<(), Error> {
+    let id: String = crate::config::read(data, "model");
+    let variant: Option<String> = crate::config::read(data, "variant");
+    if loaded || !id.is_empty() {
+        model_parts(&id)?;
     }
-    /// Variant overrides/defaults precede model overrides/defaults.
-    pub fn effective_effort(&self, id: &str, variant: Option<&str>) -> Option<String> {
-        let overrides = self.effort_overrides().get(id);
-        if let Some(value) = variant.and_then(|name| overrides?.get(name)) {
-            return Some(value.clone());
+    if !data["providers"].as_object().unwrap().is_empty() {
+        validate_entry(data, &id, variant.as_deref(), None)?;
+        if variant.as_ref().is_some_and(|v| {
+            data["models"][&id]["variants"][v]["disabled"]
+                .as_bool()
+                .unwrap_or(false)
+        }) {
+            return Err("Model variant is disabled".into());
         }
-        let model = self
-            .provider_entry(id)
-            .ok()
-            .and_then(|(_, provider, key)| provider.models().get(key));
-        variant
-            .and_then(|name| {
-                model?
-                    .variants()
-                    .get(name)?
-                    .options()
-                    .get("reasoningEffort")
-            })
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| overrides?.get("").cloned())
-            .or_else(|| {
-                model?
-                    .options()
-                    .get("reasoningEffort")?
-                    .as_str()
-                    .map(str::to_owned)
-            })
     }
-    pub(crate) fn validate(&self, loaded: bool) -> Result<(), Error> {
-        if loaded || !self.model().is_empty() {
-            model_parts(self.model())?;
-        }
-        // Embedders may inject a ModelProvider without declaring any clients.
-        // Only validate a configured choice when this document defines providers;
-        // actual client construction always checks the provider independently.
-        if !self.providers().is_empty() {
-            self.validate_selection(self.model(), self.variant().as_deref())?;
-        }
-        for provider in self.providers().values() {
-            provider.options().requests().validate()?;
-        }
-        for (id, variants) in self.effort_overrides() {
-            for (variant, effort) in variants {
-                self.validate_entry(id, (!variant.is_empty()).then_some(variant), Some(effort))?;
-            }
-        }
-        Ok(())
+    for provider in data["providers"].as_object().unwrap().values() {
+        let provider: ProviderConfig = crate::config::decode(provider.clone(), "provider")?;
+        super::control::validate((provider.rpm(), provider.cooldown_seconds()))?;
     }
+    for (id, entries) in data["effort_overrides"].as_object().unwrap() {
+        for (variant, effort) in entries.as_object().unwrap() {
+            validate_entry(
+                data,
+                id,
+                (!variant.is_empty()).then_some(variant),
+                effort.as_str(),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// A selectable model entry in the `/models` picker.
@@ -479,46 +500,68 @@ pub struct ModelChoice {
     pub effort: Option<String>,
 }
 
-impl ModelSettings {
-    /// Project selectable models, variants and efforts from the same data version.
-    pub fn choices(&self) -> Vec<ModelChoice> {
-        let mut choices = Vec::new();
-        for (provider_id, provider) in self.providers() {
-            for (model_key, model) in provider.models() {
-                let id = format!("{provider_id}/{model_key}");
-                choices.push(ModelChoice {
-                    id: id.clone(),
-                    variant: None,
-                    label: id.clone(),
-                    effort: self.effective_effort(&id, None),
-                });
-                for (name, variant) in model.variants() {
-                    if variant.disabled() {
-                        continue;
-                    }
-                    choices.push(ModelChoice {
-                        id: id.clone(),
-                        variant: Some(name.clone()),
-                        label: format!("{id} · {name}"),
-                        effort: self.effective_effort(&id, Some(name)),
-                    });
-                }
+fn choices_data(data: &Value) -> Vec<ModelChoice> {
+    let mut choices = Vec::new();
+    for (id, model) in data["models"].as_object().unwrap() {
+        choices.push(ModelChoice {
+            id: id.clone(),
+            variant: None,
+            label: id.clone(),
+            effort: effective_effort_data(data, id, None),
+        });
+        for (name, variant) in model["variants"].as_object().unwrap() {
+            if variant["disabled"].as_bool().unwrap_or(false) {
+                continue;
             }
+            choices.push(ModelChoice {
+                id: id.clone(),
+                variant: Some(name.clone()),
+                label: format!("{id} · {name}"),
+                effort: effective_effort_data(data, id, Some(name)),
+            });
         }
-        if !choices
-            .iter()
-            .any(|choice| choice.id == *self.model() && choice.variant.is_none())
-        {
-            choices.insert(
-                0,
-                ModelChoice {
-                    id: self.model().clone(),
-                    variant: None,
-                    label: self.model().clone(),
-                    effort: self.effective_effort(self.model(), None),
-                },
-            );
-        }
-        choices
     }
+    let id: String = crate::config::read(data, "model");
+    if !choices.iter().any(|c| c.id == id && c.variant.is_none()) {
+        choices.insert(
+            0,
+            ModelChoice {
+                id: id.clone(),
+                variant: None,
+                label: id.clone(),
+                effort: effective_effort_data(data, &id, None),
+            },
+        );
+    }
+    choices
+}
+pub fn resolve(config: &crate::config::Config) -> Result<ResolvedModel, Error> {
+    resolve_data(&config.values())
+}
+pub fn resolve_compaction(config: &crate::config::Config) -> Result<Option<ResolvedModel>, Error> {
+    resolve_compaction_data(&config.values())
+}
+pub fn choices(config: &crate::config::Config) -> Vec<ModelChoice> {
+    choices_data(&config.write())
+}
+pub fn pricing(config: &crate::config::Config) -> (Option<f64>, Option<f64>) {
+    pricing_data(&config.write())
+}
+pub fn effective_effort(
+    config: &crate::config::Config,
+    id: impl AsRef<str>,
+    variant: Option<&str>,
+) -> Option<String> {
+    effective_effort_data(&config.write(), id.as_ref(), variant)
+}
+pub fn select(
+    config: &crate::config::Config,
+    id: &str,
+    variant: Option<String>,
+    effort: Option<&EffortChoice>,
+) -> Result<(), Error> {
+    let mut data = config.write();
+    let next = select_data(&data, id, variant, effort)?;
+    apply_selection(&mut data, &next);
+    Ok(())
 }

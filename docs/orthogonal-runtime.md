@@ -51,12 +51,12 @@
 
 用户后续要求采用简单的文件与共享内存方案，替代此前分散的会话设置管理。完整清单见 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13)。
 
-- 一份共享 Config；yourai.json 保存全部七组配置。只在初始化 init 时读取，旧分拆文件仅用于迁移，不自动监听。
+- 一份共享 Config；yourai.json 保存全部配置。只在初始化 init 时读取，旧分拆文件仅用于迁移，不自动监听。
 - 嵌套 setter 直接修改同一份 Config 并内部加锁，save 原子写入完整主 JSON；普通保存失败保留内存修改，模型和安全切换失败回滚对应分组。
 - 模型/effort、YOLO、主题都保存主配置；不恢复 SQLite 中独立的会话配置。
 - 应用配置只使用主 JSON；SQLite 仅保存会话等领域数据。
 - 每轮从共享配置的 execution 类别复制 core 执行数据；已经运行的轮次冻结。Prompt 用于新会话，已存在的会话保留冻结历史。
-- 旧会话偏好与独立 InputSettings 已删除；当前 ModelSettings 仅为 Config.models 的数据分组。没有新增 ConfigManager 或配置服务。
+- 旧会话偏好与独立 InputSettings 已删除；模型数据只保留 ProviderConfig 与 ModelConfig；选择字段直接属于 Config。没有新增 ConfigManager 或配置服务。
 
 独立执行示例 [session_config.rs](../crates/yourai-harness/examples/session_config.rs) 仍演示显式执行数据与单轮限制，不是第二份应用配置。
 

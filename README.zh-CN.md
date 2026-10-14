@@ -33,25 +33,22 @@ cp yourai.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/yourai/yourai.json"
 
 ```json
 {
+  "model": "gateway/YOUR_MODEL_NAME",
+  "providers": {
+    "gateway": {
+      "api": "openai-compatible",
+      "baseURL": "https://api.openai.com/v1",
+      "apiKey": "{env:OPENAI_API_KEY}"
+    }
+  },
   "models": {
-    "model": "gateway/YOUR_MODEL_NAME",
-    "providers": {
-      "gateway": {
-        "api": "openai-compatible",
-        "options": {
-          "baseURL": "https://api.openai.com/v1",
-          "apiKey": "{env:OPENAI_API_KEY}"
-        },
-        "models": {
-          "YOUR_MODEL_NAME": {
-            "id": "YOUR_MODEL_NAME",
-            "limit": {
-              "context": 128000,
-              "output": 4096
-            }
-          }
-        }
-      }
+    "gateway/YOUR_MODEL_NAME": {
+      "id": "YOUR_MODEL_NAME",
+      "limit": {
+        "context": 128000,
+        "output": 4096
+      },
+      "provider": "gateway"
     }
   }
 }

@@ -41,8 +41,7 @@ async fn open(
         .model
         .as_ref()
         .ok_or_else(|| ErrorKind::Config("provider not configured: model".into()))?;
-    values
-        .execution()
+    crate::config::read::<ExecutionOptions>(&values, "execution")
         .context_policy()
         .validate_for(model.token_budget())?;
     let catalog = Arc::new(crate::SessionCatalog::new(&config.root)?);
@@ -57,9 +56,9 @@ async fn open(
         &id,
         lease.store(),
         &config.cwd,
-        values.security().trusted_shell(),
+        crate::config::read::<bool>(&values, "trusted_shell"),
         bindings,
-        values.execution(),
+        &crate::config::read::<ExecutionOptions>(&values, "execution"),
     )
     .await?;
     crate::assembly::start_session(&config, id, lease, agent, prepared, source, &values).await

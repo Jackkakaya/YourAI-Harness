@@ -1799,12 +1799,7 @@ async fn pinned_summary_model_keeps_its_binding_and_shared_accounting_after_main
     let dir = TempDir::new().unwrap();
     let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
     config.config.set_system_prompt(Some("test".into()));
-    config
-        .config
-        .execution()
-        .context_policy()
-        .set_keep_recent_tokens(0)
-        .unwrap();
+    config.config.set_context_keep_recent_tokens(0);
     let summary = Arc::new(Model::new(vec![]));
     config.compaction_model = Some(yourai_harness::model::ResolvedModel {
         model: context_fixture::configured(summary.clone(), Some(100_000), 8000),

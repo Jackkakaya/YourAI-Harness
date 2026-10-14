@@ -111,14 +111,13 @@ pub async fn run(
     view.model_choices = choices;
     let (pricing, effort) = {
         let cfg = &config;
-        let p = cfg.models().pricing();
+        let p = yourai_harness::model::pricing(cfg);
         let pricing = match p {
             (Some(i), Some(o)) => Some((i, o)),
             _ => None,
         };
-        let effort = cfg
-            .models()
-            .effective_effort(cfg.models().model(), cfg.models().variant().as_deref());
+        let effort =
+            yourai_harness::model::effective_effort(cfg, cfg.model(), cfg.variant().as_deref());
         (pricing, effort)
     };
     view.model = state::ModelInfo {

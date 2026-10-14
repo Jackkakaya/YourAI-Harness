@@ -29,7 +29,7 @@ yourai
 | prompt | system_prompt、提示词文件引用、追加内容及长度上限 |
 | hooks | events |
 
-一个 `yourai.json` 保存全部七组配置，包括 `prompt` 和 `hooks.events`。完整示例见 [yourai.example.json](../yourai.example.json)。`Config::init` 只读 JSON，分类 getter/setter 只访问数据，`Config::save()` 原子保存整份配置。业务校验与保存后的发布由使用方负责；运行中的模型、权限、主题操作经 controller。
+一个 `yourai.json` 保存全部配置，包括 `prompt` 和 `hooks.events`。完整示例见 [yourai.example.json](../yourai.example.json)。`Config::init` 只读 JSON，分类 getter/setter 只访问数据，`Config::save()` 原子保存整份配置。业务校验与保存后的发布由使用方负责；运行中的模型、权限、主题操作经 controller。
 
 旧平铺字段、相邻 `prompts.json` 和 `hooks.file` 可以迁移读取。主 JSON 的 `prompt` 优先；下一次保存全部内嵌到主 JSON，旧文件保留且不再参与覆盖。保存不重新读取外部文件。已有轮次使用冻结参数，下一轮取得新执行参数；Prompt/Hook 在新会话装配时生效。
 
@@ -39,64 +39,57 @@ yourai
 
 ```json
 {
-  "models": {
-    "model": "gateway/YOUR_MODEL_NAME",
-    "providers": {
-      "gateway": {
-        "api": "openai-compatible",
-        "options": {
-          "baseURL": "https://api.openai.com/v1",
-          "apiKey": "{env:OPENAI_API_KEY}",
-          "headerTimeout": 300000,
-          "chunkTimeout": 300000
-        },
-        "models": {
-          "YOUR_MODEL_NAME": {
-            "id": "YOUR_MODEL_NAME",
-            "limit": {
-              "context": 128000,
-              "output": 4096
-            },
-            "options": {
-              "maxOutputTokens": 4096
-            },
-            "pricing": {
-              "input": 5.0,
-              "output": 15.0
-            },
-            "variants": {
-              "fast": {
-                "temperature": 0.2
-              },
-              "disabled-example": {
-                "disabled": true
-              }
-            }
-          }
-        }
-      }
-    }
-  },
-  "session": {
-    "directory": ".yourai/sessions"
-  },
   "execution": {
     "context": {
       "keep_recent_tokens": 20000,
       "summary_tokens": 2000
+    }
+  },
+  "model": "gateway/YOUR_MODEL_NAME",
+  "providers": {
+    "gateway": {
+      "api": "openai-compatible",
+      "baseURL": "https://api.openai.com/v1",
+      "apiKey": "{env:OPENAI_API_KEY}",
+      "headerTimeout": 300000,
+      "chunkTimeout": 300000
+    }
+  },
+  "directory": ".yourai/sessions",
+  "models": {
+    "gateway/YOUR_MODEL_NAME": {
+      "id": "YOUR_MODEL_NAME",
+      "limit": {
+        "context": 128000,
+        "output": 4096
+      },
+      "options": {
+        "maxOutputTokens": 4096
+      },
+      "variants": {
+        "fast": {
+          "temperature": 0.2
+        },
+        "disabled-example": {
+          "disabled": true
+        }
+      },
+      "provider": "gateway",
+      "input_price": 5.0,
+      "output_price": 15.0
     }
   }
 }
 ```
 
 - `api` 可取 `openai-compatible`、`openai-responses`、`anthropic`、`gemini` 或 `ollama`；省略时会根据 provider ID 推断，未知 ID 默认按 OpenAI Compatible 处理。
-- `options.baseURL` 填基础地址（例如 `/v1`），不要填 `/chat/completions`；省略时使用 genai 的默认服务地址。
-- `options.apiKey` 支持 `{env:VAR}`；无需认证的本地服务可填任意非空占位值，或按 provider 默认认证方式省略。
-- `session.directory` 和提示词文件路径相对配置文件解析；工作目录仍是启动 TUI 时所在目录。
-- 模型窗口与输出上限放在 `models.providers.*.models.*.limit`；输出预算按 `options.maxOutputTokens`、`limit.output`、32000 的顺序取值，不得超过模型输出容量。输入预算取 `limit.input` 与 `limit.context - 输出预算` 中的较小值，再扣安全余量。思考强度独立于输出预算。旧的 `execution.context.context_window/input_limit/output_reserve` 配置会被拒绝。
+- `baseURL` 填基础地址（例如 `/v1`），不要填 `/chat/completions`；省略时使用 genai 的默认服务地址。
+- `apiKey` 支持 `{env:VAR}`；无需认证的本地服务可填任意非空占位值，或按 provider 默认认证方式省略。
+- `directory` 和提示词文件路径相对配置文件解析；工作目录仍是启动 TUI 时所在目录。
+- 模型窗口与输出上限放在 `models["provider/model"].limit`；输出预算按 `options.maxOutputTokens`、`limit.output`、32000 的顺序取值，不得超过模型输出容量。输入预算取 `limit.input` 与 `limit.context - 输出预算` 中的较小值，再扣安全余量。思考强度独立于输出预算。旧的 `execution.context.context_window/input_limit/output_reserve` 配置会被拒绝。
 - `variants` 会合并到模型 `options`；含 `"disabled": true` 的 variant 不会出现在 `/models` 选择器中。
 - `options.reasoningEffort`（或 variant 内同名键）设置思考强度：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`。OpenAI 系以 `reasoning_effort` 发送；Anthropic/Gemini/Bedrock 会换算成 thinking budget。variant 内的设置优先于模型级。
-- 可选 `pricing` 使用每百万 token 的美元价格：`{"input": 5.0, "output": 15.0}`。状态栏和仪表盘会显示估算成本；未配置时不显示。
+- 可选 `input_price`、`output_price` 使用每百万 token 的美元价格，例如 `5.0`、`15.0`。状态栏和仪表盘会显示估算成本；未配置时不显示。
 
 ### 在 `/models` 选择器中调整 thinking effort
 
@@ -106,7 +99,7 @@ yourai
 - 二级选择器中 `Enter` 应用所选强度并切换到该模型；`Esc`/`←` 返回模型列表。
 - 确认当前预选强度保留其来源：继承模型设定的 variant 继续继承，已有显式覆盖继续独立。改变强度才建立覆盖；`config default` 恢复原配置或继承。
 - 有效的未声明模型同样可以确认、调整强度并恢复默认；只有显式覆盖需要创建内存条目。
-- 覆盖写入内存中的配置，随 `/models` 更新主对话与压缩模型；Hook 和新建子任务默认继承当前模型，显式指定模型的子任务保留自己的选择。保存到当前配置源（JSON 或 SQLite），同时更新共享内存；重启后保留。
+- 覆盖写入内存中的配置，随 `/models` 更新主对话与压缩模型；Hook 和新建子任务默认继承当前模型，显式指定模型的子任务保留自己的选择。保存到当前配置 JSON，同时更新共享内存；重启后保留。
 - 当前 effort 显示在三处：`/models` 行内（如 `gateway/kimi-k3 · high`）、输入框左侧模型标签、`Ctrl-B` 仪表盘首行；切换成功也会提示 `Model switched to … · thinking high`。
 
 未配置窗口时会提示预算未知，自动摘要关闭，手动摘要报配置错误。Tool.exec 在 after hook 前，结果超过 50 KiB / 2000 行时生成头尾预览，完整大输出保存到 SQLite，原文通过 `read` 回看。模型请求不再二次截断或按年龄清空工具正文；历史达到容量整理阈值时由 Compactor 摘要。旧配置请移除 `context.tool_output_chars`、`context.tool_prune_keep_tokens` 和 `context.tool_prune_min_savings`。

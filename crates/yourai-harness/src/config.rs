@@ -109,274 +109,39 @@ pub enum HookShell {
     Powershell,
 }
 
-/// Application settings. Share with Arc; setters acquire the internal lock.
-/// ```compile_fail
-/// let config = yourai_harness::config::Config::default();
-/// let duplicate = config.clone();
-/// ```
-/// Setters change configuration data; a running model/security change goes through
-/// the session operation that prepares and applies its resources.
-/// ```compile_fail
-/// let config = yourai_harness::config::Config::default();
-/// config.snapshot();
-/// ```
-#[derive(Default, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Config {
-    data: parking_lot::Mutex<ConfigData>,
-    #[serde(skip)]
-    path: Option<PathBuf>,
-}
-
-type Selector<'a, T> =
-    std::sync::Arc<dyn for<'b> Fn(&'b mut ConfigData) -> Option<&'b mut T> + Send + Sync + 'a>;
-/// A borrowed path into the one Config. It owns no configuration data or lock.
-/// Each getter/setter locks only for that call. Missing indexed entries return errors.
-pub struct ConfigSection<'a, T: 'static> {
-    config: &'a Config,
-    select: Selector<'a, T>,
-}
-impl<'a, T: 'static> ConfigSection<'a, T> {
-    fn access<R>(&self, action: impl FnOnce(&mut T) -> R) -> Result<R, Error> {
-        let mut data = self.config.data.lock();
-        let value = (self.select)(&mut data).ok_or("configuration entry no longer exists")?;
-        Ok(action(value))
-    }
-    fn root<R>(&self, action: impl FnOnce(&mut T) -> R) -> R {
-        self.access(action)
-            .expect("root configuration group always exists")
-    }
-    fn child<U: 'static>(
-        &self,
-        select: impl for<'b> Fn(&'b mut T) -> Option<&'b mut U> + Send + Sync + 'a,
-    ) -> ConfigSection<'a, U> {
-        let parent = std::sync::Arc::clone(&self.select);
-        ConfigSection {
-            config: self.config,
-            select: std::sync::Arc::new(move |data| select(parent(data)?)),
-        }
-    }
-}
-impl<T: Serialize + 'static> Serialize for ConfigSection<'_, T> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.access(|value| value.serialize(serializer))
-            .map_err(serde::ser::Error::custom)?
-    }
-}
-macro_rules! view_fields {
-    ($mode:ident $name:ident { $($field:ident: $ty:ty => $setter:ident [$($kind:tt)*],)* }) => {
-        impl<'a> ConfigSection<'a, $name> { $(
-            view_fields!(@get $mode $field: $ty [$($kind)*]);
-            pub fn $setter(&self, value: $ty) -> Result<(), Error> {
-                self.access(|node| node.$setter(value))
-            }
-        )* }
-    };
-    (@get $mode:ident limit: $ty:ty [value]) => {
-        pub fn limit(&self) -> ConfigSection<'a, ModelLimits> { self.child(|node| Some(node.limit_mut())) }
-    };
-    (@get $mode:ident $field:ident: $ty:ty [mut $edit:ident]) => {
-        pub fn $field(&self) -> ConfigSection<'a, $ty> { self.child(|node| Some(node.$edit())) }
-    };
-    (@get root $field:ident: $ty:ty [map $edit:ident $child:ty]) => {
-        pub fn $field(&self) -> BTreeMap<String, ConfigSection<'a, $child>> {
-            self.root(|node| node.$field().keys().cloned().collect::<Vec<_>>()).into_iter().map(|id| {
-                let key = id.clone(); (id, self.child(move |node| node.$edit(&key)))
-            }).collect()
-        }
-    };
-    (@get nested $field:ident: $ty:ty [map $edit:ident $child:ty]) => {
-        pub fn $field(&self) -> Result<BTreeMap<String, ConfigSection<'a, $child>>, Error> {
-            Ok(self.access(|node| node.$field().keys().cloned().collect::<Vec<_>>())?.into_iter().map(|id| {
-                let key = id.clone(); (id, self.child(move |node| node.$edit(&key)))
-            }).collect())
-        }
-    };
-    (@get root $field:ident: $ty:ty [value]) => {
-        pub fn $field(&self) -> $ty { self.root(|node| node.$field()) }
-    };
-    (@get nested $field:ident: $ty:ty [value]) => {
-        pub fn $field(&self) -> Result<$ty, Error> { self.access(|node| node.$field()) }
-    };
-    (@get root $field:ident: $ty:ty [$kind:ident]) => {
-        pub fn $field(&self) -> $ty { self.root(|node| node.$field().clone()) }
-    };
-    (@get nested $field:ident: $ty:ty [$kind:ident]) => {
-        pub fn $field(&self) -> Result<$ty, Error> { self.access(|node| node.$field().clone()) }
-    };
-}
-// JSON structs describe data; shared access is generated from the same fields.
-macro_rules! config_fields {
-    ($( $(#[$attr:meta])* $vis:vis struct $name:ident
-        $(as $group:ident => $get:ident, $set:ident)? {
-        $( $(#[$field_attr:meta])* $field:ident: $ty:ty => $setter:ident [$($kind:tt)*], )*
-    })+) => {
-        yourai_core::settings_fields! { $( $(#[$attr])* $vis struct $name {
-            $( $(#[$field_attr])* $field: $ty => $setter [$($kind)*], )*
-        })+ }
-        $(config_fields!(@shared $name $(, $group, $get, $set)?; $($field: $ty => $setter [$($kind)*],)*);)+
-    };
-    (@shared $name:ident, $group:ident, $get:ident, $set:ident; $($field:ident: $ty:ty => $setter:ident [$($kind:tt)*],)*) => {
-        view_fields! { root $name { $($field: $ty => $setter [$($kind)*],)* } }
-        impl Config {
-            pub fn $get(&self) -> ConfigSection<'_, $name> {
-                ConfigSection { config: self, select: std::sync::Arc::new(|data| Some(&mut data.$group)) }
-            }
-            pub fn $set(&self, value: $name) { self.data.lock().$set(value); }
-            $(pub fn $setter(&self, value: $ty) {
-                self.$get().$setter(value).expect("root configuration group always exists");
-            })*
-        }
-    };
-    (@shared ConfigData; $($field:ident: $ty:ty => $setter:ident [$($kind:tt)*],)*) => {};
-    (@shared $name:ident; $($field:ident: $ty:ty => $setter:ident [$($kind:tt)*],)*) => {
-        view_fields! { nested $name { $($field: $ty => $setter [$($kind)*],)* } }
-    };
-}
-config_fields! { @shared ExecutionOptions, execution, execution, set_execution;
-    skill_ids: Vec<String> => set_skill_ids [ref],
-    memory_search_limit: usize => set_memory_search_limit [value],
-    context_policy: ContextPolicy => set_context_policy [mut context_policy_mut],
-    steps: Option<u32> => set_steps [value],
-    model_timeout: Option<Duration> => set_model_timeout [value],
-    allow_background_wake: bool => set_allow_background_wake [value],
-    max_followups: usize => set_max_followups [value],
-    instruction_paths: Vec<PathBuf> => set_instruction_paths [ref],
-    workspace_enabled: bool => set_workspace_enabled [value],
-    memory_max_chars: usize => set_memory_max_chars [value],
-    attachment_image: ImagePolicy => set_attachment_image [mut attachment_image_mut],
-    attachment_text_max_chars: usize => set_attachment_text_max_chars [value],
-    max_model_retries: u32 => set_max_model_retries [value],
-    max_overflow_compactions: u32 => set_max_overflow_compactions [value],
-    max_stop_continuations: u32 => set_max_stop_continuations [value],
-    max_permission_rechecks: u32 => set_max_permission_rechecks [value],
-    retry_delay: Duration => set_retry_delay [value],
-    retry_max_delay: Duration => set_retry_max_delay [value],
-    operation_timeout: Option<Duration> => set_operation_timeout [value],
-    tool_timeout: Option<Duration> => set_tool_timeout [value],
-    approval_timeout: Option<Duration> => set_approval_timeout [value],
-    hook_timeout: Option<Duration> => set_hook_timeout [value],
-    cleanup_timeout: Option<Duration> => set_cleanup_timeout [value],
-    tool_cleanup_timeout: Duration => set_tool_cleanup_timeout [value],
-}
-view_fields! { root ContextPolicy {
-    safety_margin: u64 => set_safety_margin [value],
-    advance_tokens: Option<u64> => set_advance_tokens [value],
-    keep_recent_tokens: u64 => set_keep_recent_tokens [value],
-    summary_tokens: u64 => set_summary_tokens [value],
-    summary_min_savings: u64 => set_summary_min_savings [value],
-} }
-view_fields! { root ImagePolicy {
-    auto_resize: bool => set_auto_resize [value],
-    max_width: u32 => set_max_width [value],
-    max_height: u32 => set_max_height [value],
-    max_base64_bytes: usize => set_max_base64_bytes [value],
-} }
-view_fields! { nested ModelLimits {
-    context: Option<u64> => set_context [value],
-    input: Option<u64> => set_input [value],
-    output: Option<u32> => set_output [value],
-} }
-config_fields! {
+yourai_core::settings_fields! {
 #[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ModelSettings as models => models, set_models {
-    #[serde(alias = "selected")]
-    model: String => set_model [ref],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    compaction: Option<String> => set_compaction [ref],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    variant: Option<String> => set_variant [ref],
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    effort_overrides: BTreeMap<String, BTreeMap<String, String>> => set_effort_overrides [ref],
-    providers: BTreeMap<String, ProviderSettings> => set_providers [map provider_mut ProviderSettings],
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ProviderSettings {
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct ProviderConfig {
     #[serde(alias = "npm")]
     api: Option<String> => set_api [ref],
     name: Option<String> => set_name [ref],
-    options: ConnectionSettings => set_options [mut options_mut],
-    models: BTreeMap<String, ModelDefinition> => set_models [map model_mut ModelDefinition],
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
-pub struct ConnectionSettings {
     #[serde(rename = "baseURL")]
     base_url: Option<String> => set_base_url [ref],
     api_key: Option<String> => set_api_key [ref],
     timeout: Option<ConnectionTimeout> => set_timeout [ref],
     header_timeout: Option<u64> => set_header_timeout [value],
     chunk_timeout: Option<u64> => set_chunk_timeout [value],
-    requests: RequestPolicy => set_requests [mut requests_mut],
+    rpm: Option<u32> => set_rpm [value],
+    cooldown_seconds: u64 => set_cooldown_seconds [value],
     headers: BTreeMap<String, String> => set_headers [ref],
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct ModelDefinition {
+pub struct ModelConfig {
+    provider: String => set_provider [ref],
     id: Option<String> => set_id [ref],
     name: Option<String> => set_name [ref],
     limit: ModelLimits => set_limit [value],
+    input_price: Option<f64> => set_input_price [value],
+    output_price: Option<f64> => set_output_price [value],
     options: Map<String, Value> => set_options [ref],
     headers: BTreeMap<String, String> => set_headers [ref],
-    variants: BTreeMap<String, VariantSettings> => set_variants [map variant_mut VariantSettings],
-    pricing: ModelPricing => set_pricing [mut pricing_mut],
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-pub struct VariantSettings {
-    #[serde(default)]
-    disabled: bool => set_disabled [value],
-    #[serde(flatten)]
-    options: Map<String, Value> => set_options [ref],
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ModelPricing {
-    input: Option<f64> => set_input [value],
-    output: Option<f64> => set_output [value],
-}
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RequestPolicy {
-    /// Optional known provider quota. Requests are paced evenly, without a burst allowance.
-    rpm: Option<u32> => set_rpm [value],
-    /// Opt-in shared fallback for HTTP 429 without a server delay; zero disables it.
-    cooldown_seconds: u64 => set_cooldown_seconds [value],
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct ConfigData {
-    #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
-    schema: Option<String> => set_schema [ref],
-    models: ModelSettings => set_models [mut models_mut],
-    execution: ExecutionOptions => set_execution [mut execution_mut],
-    security: SecuritySettings => set_security [mut security_mut],
-    ui: UiSettings => set_ui [mut ui_mut],
-    session: SessionSettings => set_session [mut session_mut],
-    prompt: PromptSettings => set_prompt [mut prompt_mut],
-    hooks: HookSettings => set_hooks [mut hooks_mut],
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SecuritySettings as security => security, set_security {
-    trusted_shell: bool => set_trusted_shell [value],
-    yolo: bool => set_yolo [value],
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct UiSettings as ui => ui, set_ui {
-    theme: String => set_theme [ref],
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SessionSettings as session => session, set_session {
-    directory: PathBuf => set_directory [ref],
-    extensions: bool => set_extensions [value],
+    variants: BTreeMap<String, Map<String, Value>> => set_variants [ref],
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct PromptSettings as prompt => prompt, set_prompt {
+pub struct PromptSettings {
     system_prompt: Option<String> => set_system_prompt [ref],
     soul_file: Option<PathBuf> => set_soul_file [ref],
     memory_file: Option<PathBuf> => set_memory_file [ref],
@@ -388,24 +153,9 @@ pub struct PromptSettings as prompt => prompt, set_prompt {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct HookSettings as hooks => hooks, set_hooks {
+pub struct HookSettings {
     events: Value => set_events [ref],
 }
-}
-impl Default for UiSettings {
-    fn default() -> Self {
-        Self {
-            theme: "system".into(),
-        }
-    }
-}
-impl Default for SessionSettings {
-    fn default() -> Self {
-        Self {
-            directory: ".yourai/sessions".into(),
-            extensions: false,
-        }
-    }
 }
 impl Default for PromptSettings {
     fn default() -> Self {
@@ -431,52 +181,315 @@ impl Default for HookSettings {
 fn empty_object() -> Value {
     Value::Object(Map::new())
 }
-/// Convert legacy flat keys once; grouped values cannot be silently overridden.
-fn normalize_document(mut value: Value) -> Result<Value, Error> {
-    let object = value.as_object_mut().ok_or("config must be an object")?;
-    // Old hooks is an event map; new hooks contains events and an optional file.
-    if let Some(hooks) = object.get_mut("hooks") {
-        let map = hooks.as_object().ok_or("hooks must be an object")?;
-        if !map.contains_key("events") && !map.contains_key("file") {
-            *hooks = serde_json::json!({"events": hooks.clone()});
+/// ```compile_fail
+/// let config = yourai_harness::config::Config::default();
+/// config.clone();
+/// ```
+/// One JSON document, shared through Arc. All mutations use internally locked setters.
+/// ```compile_fail
+/// let config = yourai_harness::config::Config::default();
+/// config.snapshot();
+/// ```
+#[derive(Serialize)]
+#[serde(transparent)]
+pub struct Config {
+    document: parking_lot::Mutex<Value>,
+    #[serde(skip)]
+    path: Option<PathBuf>,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            document: parking_lot::Mutex::new(default_document()),
+            path: None,
         }
     }
-    for (category, fields) in LEGACY_FIELDS {
-        for field in fields.split_whitespace() {
-            let (old, key) = field.split_once(':').unwrap_or((field, field));
-            if let Some(value) = object.remove(old) {
-                let group = object
-                    .entry(*category)
-                    .or_insert_with(empty_object)
-                    .as_object_mut()
-                    .ok_or_else(|| format!("{category} must be an object"))?;
-                if group.insert(key.into(), value).is_some() {
-                    return Err(format!("duplicate config: {old} and {category}.{key}").into());
+}
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::from_document(Value::deserialize(d)?, None).map_err(serde::de::Error::custom)
+    }
+}
+fn default_document() -> Value {
+    serde_json::json!({
+        "model":"", "variant":null, "compaction_model":null, "effort_overrides":{},
+        "providers":{}, "models":{}, "execution":ExecutionOptions::default(),
+        "theme":"system", "yolo":false, "trusted_shell":false,
+        "directory":".yourai/sessions", "extensions":false,
+        "prompt":PromptSettings::default(), "hooks":HookSettings::default()
+    })
+}
+// Only validated JSON is stored; callers never receive the document or a lock.
+pub(crate) fn read<T: serde::de::DeserializeOwned>(data: &Value, key: &str) -> T {
+    serde_json::from_value(data[key].clone()).expect("validated configuration field")
+}
+pub(crate) fn put(data: &mut Value, key: &str, value: impl Serialize) {
+    data[key] = serde_json::to_value(value).expect("configuration value is serializable");
+}
+macro_rules! fields {
+    ($path:expr; $($get:ident, $set:ident: $ty:ty => $key:literal;)*) => {
+        impl Config { $(
+            pub fn $get(&self) -> $ty {
+                let data = self.document.lock();
+                let mut node = &*data;
+                for key in $path { node = &node[key]; }
+                read(node, $key)
+            }
+            pub fn $set(&self, value: $ty) {
+                let mut data = self.document.lock();
+                let mut node = &mut *data;
+                for key in $path { node = &mut node[key]; }
+                put(node, $key, value);
+            }
+        )* }
+    };
+}
+fields! { [] as [&str; 0];
+    model, set_model: String => "model";
+    variant, set_variant: Option<String> => "variant";
+    compaction_model, set_compaction_model: Option<String> => "compaction_model";
+    theme, set_theme: String => "theme";
+    yolo, set_yolo: bool => "yolo";
+    trusted_shell, set_trusted_shell: bool => "trusted_shell";
+    directory, set_directory: PathBuf => "directory";
+    extensions, set_extensions: bool => "extensions";
+    schema, set_schema: Option<String> => "$schema";
+    execution_options, set_execution: ExecutionOptions => "execution";
+    prompt, set_prompt: PromptSettings => "prompt";
+    hooks, set_hooks: HookSettings => "hooks";
+}
+fields! { ["execution"];
+    skill_ids, set_skill_ids: Vec<String> => "skill_ids";
+    memory_search_limit, set_memory_search_limit: usize => "memory_search_limit";
+    context_policy, set_context_policy: ContextPolicy => "context";
+    steps, set_steps: Option<u32> => "steps";
+    model_timeout, set_model_timeout: Option<Duration> => "model_timeout";
+    allow_background_wake, set_allow_background_wake: bool => "allow_background_wake";
+    max_followups, set_max_followups: usize => "max_followups";
+    instruction_paths, set_instruction_paths: Vec<PathBuf> => "instruction_paths";
+    workspace_enabled, set_workspace_enabled: bool => "workspace_enabled";
+    memory_max_chars, set_memory_max_chars: usize => "memory_max_chars";
+    attachment_image, set_attachment_image: ImagePolicy => "attachment_image";
+    attachment_text_max_chars, set_attachment_text_max_chars: usize => "attachment_text_max_chars";
+    max_model_retries, set_max_model_retries: u32 => "max_model_retries";
+    max_overflow_compactions, set_max_overflow_compactions: u32 => "max_overflow_compactions";
+    max_stop_continuations, set_max_stop_continuations: u32 => "max_stop_continuations";
+    max_permission_rechecks, set_max_permission_rechecks: u32 => "max_permission_rechecks";
+    retry_delay, set_retry_delay: Duration => "retry_delay";
+    retry_max_delay, set_retry_max_delay: Duration => "retry_max_delay";
+    operation_timeout, set_operation_timeout: Option<Duration> => "operation_timeout";
+    tool_timeout, set_tool_timeout: Option<Duration> => "tool_timeout";
+    approval_timeout, set_approval_timeout: Option<Duration> => "approval_timeout";
+    hook_timeout, set_hook_timeout: Option<Duration> => "hook_timeout";
+    cleanup_timeout, set_cleanup_timeout: Option<Duration> => "cleanup_timeout";
+    tool_cleanup_timeout, set_tool_cleanup_timeout: Duration => "tool_cleanup_timeout";
+}
+fields! { ["prompt"];
+    system_prompt, set_system_prompt: Option<String> => "system_prompt";
+    soul_file, set_soul_file: Option<PathBuf> => "soul_file";
+    memory_file, set_memory_file: Option<PathBuf> => "memory_file";
+    profile_file, set_profile_file: Option<PathBuf> => "profile_file";
+    append_system_prompt, set_append_system_prompt: Option<String> => "append_system_prompt";
+    memory_file_max_chars, set_memory_file_max_chars: usize => "memory_file_max_chars";
+    profile_file_max_chars, set_profile_file_max_chars: usize => "profile_file_max_chars";
+    provider_max_chars, set_provider_max_chars: usize => "provider_max_chars";
+}
+fields! { ["hooks"];
+    events, set_events: Value => "events";
+}
+fn normalize_document(mut data: Value) -> Result<Value, Error> {
+    let object = data.as_object_mut().ok_or("config must be an object")?;
+    for (group, fields) in [
+        ("ui", &["theme"][..]),
+        ("security", &["yolo", "trusted_shell"][..]),
+        ("session", &["directory", "extensions"][..]),
+    ] {
+        if let Some(value) = object.remove(group) {
+            let map = value
+                .as_object()
+                .ok_or_else(|| format!("{group} must be an object"))?;
+            for (key, value) in map {
+                if !fields.contains(&key.as_str()) {
+                    return Err(format!("unknown {group} field: {key}").into());
+                }
+                if object.insert(key.clone(), value.clone()).is_some() {
+                    return Err(format!("duplicate config: {group}.{key}").into());
                 }
             }
         }
     }
-    Ok(value)
+    if object
+        .get("models")
+        .and_then(Value::as_object)
+        .is_some_and(|m| {
+            m.contains_key("providers") || m.contains_key("model") || m.contains_key("selected")
+        })
+    {
+        let mut group = object
+            .remove("models")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        if let Some(v) = group.remove("selected") {
+            if group.insert("model".into(), v).is_some() {
+                return Err("duplicate model and selected".into());
+            }
+        }
+        if let Some(v) = group.remove("compaction") {
+            group.insert("compaction_model".into(), v);
+        }
+        for (key, value) in group {
+            if ![
+                "model",
+                "variant",
+                "compaction_model",
+                "effort_overrides",
+                "providers",
+            ]
+            .contains(&key.as_str())
+            {
+                return Err(format!("unknown models field: {key}").into());
+            }
+            if object.insert(key.clone(), value).is_some() {
+                return Err(format!("duplicate config: models.{key}").into());
+            }
+        }
+    }
+    for (old, new) in [
+        ("provider", "providers"),
+        ("compaction", "compaction_model"),
+        ("session_dir", "directory"),
+    ] {
+        if let Some(v) = object.remove(old) {
+            if object.insert(new.into(), v).is_some() {
+                return Err(format!("duplicate config: {old}").into());
+            }
+        }
+    }
+    for (group, fields) in LEGACY_FIELDS {
+        for field in fields.split_whitespace() {
+            let (old, key) = field.split_once(':').unwrap_or((field, field));
+            if let Some(value) = object.remove(old) {
+                let map = object
+                    .entry(*group)
+                    .or_insert_with(empty_object)
+                    .as_object_mut()
+                    .ok_or_else(|| format!("{group} must be an object"))?;
+                if map.insert(key.into(), value).is_some() {
+                    return Err(format!("duplicate config: {old} and {group}.{key}").into());
+                }
+            }
+        }
+    }
+    let mut models = object
+        .remove("models")
+        .unwrap_or_else(empty_object)
+        .as_object()
+        .ok_or("models must be an object")?
+        .clone();
+    if let Some(providers) = object.get_mut("providers") {
+        for (provider_id, provider) in providers
+            .as_object_mut()
+            .ok_or("providers must be an object")?
+        {
+            let provider = provider
+                .as_object_mut()
+                .ok_or("provider must be an object")?;
+            if let Some(options) = provider.remove("options") {
+                for (key, value) in options
+                    .as_object()
+                    .ok_or("provider options must be an object")?
+                {
+                    if ![
+                        "baseURL",
+                        "apiKey",
+                        "timeout",
+                        "headerTimeout",
+                        "chunkTimeout",
+                        "requests",
+                        "headers",
+                    ]
+                    .contains(&key.as_str())
+                    {
+                        return Err(format!("unknown provider options field: {key}").into());
+                    }
+                    if key == "requests" {
+                        for (key, value) in value.as_object().ok_or("requests must be an object")? {
+                            if !["rpm", "cooldown_seconds"].contains(&key.as_str()) {
+                                return Err(format!("unknown requests field: {key}").into());
+                            }
+                            let key = if key == "cooldown_seconds" {
+                                "cooldownSeconds"
+                            } else {
+                                key
+                            };
+                            if provider.insert(key.into(), value.clone()).is_some() {
+                                return Err("duplicate provider request field".into());
+                            }
+                        }
+                    } else if provider.insert(key.clone(), value.clone()).is_some() {
+                        return Err(format!("duplicate provider field: {key}").into());
+                    }
+                }
+            }
+            if let Some(entries) = provider.remove("models") {
+                for (id, model) in entries
+                    .as_object()
+                    .ok_or("provider models must be an object")?
+                {
+                    let mut model = model.as_object().ok_or("model must be an object")?.clone();
+                    if model
+                        .get("provider")
+                        .is_some_and(|value| value.as_str() != Some(provider_id))
+                    {
+                        return Err("conflicting model provider".into());
+                    }
+                    model.insert("provider".into(), Value::String(provider_id.clone()));
+                    if models
+                        .insert(format!("{provider_id}/{id}"), Value::Object(model))
+                        .is_some()
+                    {
+                        return Err("duplicate model entry".into());
+                    }
+                }
+            }
+        }
+    }
+    for (id, model) in &mut models {
+        let model = model.as_object_mut().ok_or("model must be an object")?;
+        if !model.contains_key("provider") {
+            if let Some((provider, _)) = id.split_once('/') {
+                model.insert("provider".into(), Value::String(provider.into()));
+            }
+        }
+        if let Some(pricing) = model.remove("pricing") {
+            for (key, value) in pricing.as_object().ok_or("pricing must be an object")? {
+                let key = match key.as_str() {
+                    "input" => "input_price",
+                    "output" => "output_price",
+                    _ => return Err("unknown pricing field".into()),
+                };
+                if model.insert(key.into(), value.clone()).is_some() {
+                    return Err("duplicate model price".into());
+                }
+            }
+        }
+    }
+    object.insert("models".into(), Value::Object(models));
+    if let Some(hooks) = object.get_mut("hooks") {
+        let map = hooks.as_object().ok_or("hooks must be an object")?;
+        if !map.contains_key("events") && !map.contains_key("file") {
+            *hooks = serde_json::json!({"events":hooks.clone()});
+        }
+    }
+    Ok(data)
 }
-const LEGACY_FIELDS: &[(&str, &str)] = &[
-    (
-        "execution",
-        "skill_ids memory_search_limit context steps model_timeout allow_background_wake max_followups instruction_paths workspace_enabled memory_max_chars attachment_image attachment_text_max_chars max_model_retries max_overflow_compactions max_stop_continuations max_permission_rechecks retry_delay retry_max_delay operation_timeout tool_timeout approval_timeout hook_timeout cleanup_timeout tool_cleanup_timeout max_model_calls:steps",
-    ),
-    (
-        "prompt",
-        "system_prompt soul_file memory_file profile_file append_system_prompt memory_file_max_chars profile_file_max_chars provider_max_chars",
-    ),
-    (
-        "models",
-        "model compaction_model:compaction variant effort_overrides provider:providers",
-    ),
-    ("ui", "theme"),
-    ("security", "trusted_shell yolo"),
-    ("session", "session_dir:directory extensions"),
+const LEGACY_FIELDS: &[(&str,&str)] = &[
+    ("execution", "skill_ids memory_search_limit context steps model_timeout allow_background_wake max_followups instruction_paths workspace_enabled memory_max_chars attachment_image attachment_text_max_chars max_model_retries max_overflow_compactions max_stop_continuations max_permission_rechecks retry_delay retry_max_delay operation_timeout tool_timeout approval_timeout hook_timeout cleanup_timeout tool_cleanup_timeout max_model_calls:steps"),
+    ("prompt", "system_prompt soul_file memory_file profile_file append_system_prompt memory_file_max_chars profile_file_max_chars provider_max_chars"),
     ("hooks", "hooks_file:file"),
 ];
-
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(value: Value, kind: &str) -> Result<T, Error> {
     serde_json::from_value(value).map_err(|e| {
         let message = e.to_string();
@@ -488,6 +501,13 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(value: Value, kind: &str) -
     })
 }
 
+fn canonical<T: serde::de::DeserializeOwned + Serialize>(
+    data: &mut Value,
+    key: &str,
+) -> Result<(), Error> {
+    data[key] = serde_json::to_value(decode::<T>(data[key].clone(), key)?)?;
+    Ok(())
+}
 fn read_document(path: &Path) -> Result<Value, Error> {
     let bytes =
         std::fs::read(path).map_err(|_| format!("Cannot read config at {}", path.display()))?;
@@ -514,44 +534,133 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     }
     Ok(())
 }
-
 impl Config {
-    /// Write the complete configuration to its one JSON file.
-    pub fn save(&self) -> Result<(), Error> {
-        self.save_data(&self.data.lock())
+    fn from_document(document: Value, path: Option<PathBuf>) -> Result<Self, Error> {
+        let document = normalize_document(document)?;
+        let mut data = default_document();
+        for (key, value) in document.as_object().unwrap() {
+            if key != "$schema" && data.get(key).is_none() {
+                return Err(format!("unknown config field: {key}").into());
+            }
+            data[key] = value.clone();
+        }
+        canonical::<ExecutionOptions>(&mut data, "execution")?;
+        canonical::<PromptSettings>(&mut data, "prompt")?;
+        canonical::<HookSettings>(&mut data, "hooks")?;
+        canonical::<BTreeMap<String, ProviderConfig>>(&mut data, "providers")?;
+        canonical::<BTreeMap<String, ModelConfig>>(&mut data, "models")?;
+        for key in ["model", "theme"] {
+            decode::<String>(data[key].clone(), key)?;
+        }
+        for key in ["variant", "compaction_model", "$schema"] {
+            decode::<Option<String>>(data[key].clone(), key)?;
+        }
+        for key in ["yolo", "trusted_shell", "extensions"] {
+            decode::<bool>(data[key].clone(), key)?;
+        }
+        decode::<PathBuf>(data["directory"].clone(), "directory")?;
+        decode::<BTreeMap<String, BTreeMap<String, String>>>(
+            data["effort_overrides"].clone(),
+            "effort_overrides",
+        )?;
+        for model in data["models"].as_object().unwrap().values() {
+            for variant in model["variants"].as_object().unwrap().values() {
+                if let Some(value) = variant.get("disabled") {
+                    decode::<bool>(value.clone(), "variant.disabled")?;
+                }
+            }
+        }
+        Ok(Self {
+            document: parking_lot::Mutex::new(data),
+            path,
+        })
     }
-    pub(crate) fn save_data(&self, data: &ConfigData) -> Result<(), Error> {
+    pub fn save(&self) -> Result<(), Error> {
+        self.save_data(&self.document.lock())
+    }
+    pub(crate) fn save_data(&self, data: &Value) -> Result<(), Error> {
         let path = self
             .path
             .as_deref()
             .ok_or("config has no file path; initialize it before saving")?;
         write_bytes(path, &document_bytes(data)?)
     }
-    pub(crate) fn write(&self) -> parking_lot::MutexGuard<'_, ConfigData> {
-        self.data.lock()
+    pub(crate) fn write(&self) -> parking_lot::MutexGuard<'_, Value> {
+        self.document.lock()
     }
-    // Resource preparation takes coherent input data, never another writable Config.
-    pub(crate) fn values(&self) -> ConfigData {
-        self.data.lock().clone()
-    }
-    pub fn set_provider(&self, id: String, provider: ProviderSettings) {
-        self.data.lock().models.providers.insert(id, provider);
-    }
-    pub fn schema(&self) -> Option<String> {
-        self.data.lock().schema().clone()
-    }
-    pub fn set_schema(&self, value: Option<String>) {
-        self.data.lock().set_schema(value);
-    }
-    pub fn theme(&self) -> String {
-        self.ui().theme()
+    pub(crate) fn values(&self) -> Value {
+        self.document.lock().clone()
     }
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
-
-    /// Initialize from JSON. Old split files are read only for migration;
-    /// once saved, the main document contains all settings and takes precedence.
+    pub fn set_provider(&self, id: String, value: ProviderConfig) {
+        self.document.lock()["providers"][id] = serde_json::to_value(value).unwrap();
+    }
+    pub fn set_model_config(&self, id: String, value: ModelConfig) -> Result<(), Error> {
+        for options in value.variants().values() {
+            if let Some(disabled) = options.get("disabled") {
+                decode::<bool>(disabled.clone(), "variant.disabled")?;
+            }
+        }
+        self.document.lock()["models"][id] = serde_json::to_value(value)?;
+        Ok(())
+    }
+    pub fn remove_provider(&self, id: &str) -> Result<(), Error> {
+        self.document.lock()["providers"]
+            .as_object_mut()
+            .unwrap()
+            .remove(id)
+            .ok_or("Unknown provider")?;
+        Ok(())
+    }
+    pub fn remove_model(&self, id: &str) -> Result<(), Error> {
+        self.document.lock()["models"]
+            .as_object_mut()
+            .unwrap()
+            .remove(id)
+            .ok_or("Unknown model")?;
+        Ok(())
+    }
+    pub fn provider_ids(&self) -> Vec<String> {
+        self.document.lock()["providers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    }
+    pub fn model_ids(&self) -> Vec<String> {
+        self.document.lock()["models"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    }
+    fn set_entry(
+        &self,
+        group: &str,
+        id: &str,
+        path: &[&str],
+        value: impl Serialize,
+    ) -> Result<(), Error> {
+        let mut data = self.document.lock();
+        let mut node = data[group]
+            .get_mut(id)
+            .ok_or("Unknown configuration entry")?;
+        for key in &path[..path.len() - 1] {
+            node = node.get_mut(*key).ok_or("Unknown configuration field")?;
+        }
+        let object = node
+            .as_object_mut()
+            .ok_or("configuration field must be an object")?;
+        object.insert(
+            path.last().unwrap().to_string(),
+            serde_json::to_value(value)?,
+        );
+        Ok(())
+    }
     pub fn init(path: &Path) -> Result<Self, Error> {
         let mut document = normalize_document(read_document(path)?)?;
         let path = path.canonicalize()?;
@@ -593,11 +702,7 @@ impl Config {
                 );
             }
         }
-        let data: ConfigData = decode(document, "config")?;
-        Ok(Self {
-            data: parking_lot::Mutex::new(data),
-            path: Some(path),
-        })
+        Self::from_document(document, Some(path))
     }
 }
 /// Resolve the standard XDG config directory.
@@ -622,122 +727,95 @@ pub fn default_config_path() -> Result<PathBuf, Error> {
 }
 #[cfg(test)]
 mod tests;
-
-impl ModelDefinition {
-    pub fn limit_mut(&mut self) -> &mut ModelLimits {
-        &mut self.limit
-    }
+macro_rules! entry_fields {
+    ($group:literal; $( $get:ident, $set:ident: $ty:ty => [$($key:literal),+]; )*) => {
+        impl Config { $(
+            pub fn $get(&self, id: &str) -> Result<$ty,Error> {
+                let data = self.document.lock();
+                let mut node = data[$group].get(id).ok_or("Unknown configuration entry")?;
+                $(node = node.get($key).ok_or("Unknown configuration field")?;)+
+                decode(node.clone(), "configuration field")
+            }
+            pub fn $set(&self, id: &str, value: $ty) -> Result<(),Error> { self.set_entry($group,id,&[$($key),+],value) }
+        )* }
+    };
 }
-
-impl<'a> ConfigSection<'a, ModelSettings> {
-    pub fn choices(&self) -> Vec<crate::model::ModelChoice> {
-        self.root(|models| models.choices())
+entry_fields! { "providers";
+    provider_api, set_provider_api: Option<String> => ["api"];
+    provider_name, set_provider_name: Option<String> => ["name"];
+    provider_base_url, set_provider_base_url: Option<String> => ["baseURL"];
+    provider_api_key, set_provider_api_key: Option<String> => ["apiKey"];
+    provider_timeout, set_provider_timeout: Option<ConnectionTimeout> => ["timeout"];
+    provider_header_timeout, set_provider_header_timeout: Option<u64> => ["headerTimeout"];
+    provider_chunk_timeout, set_provider_chunk_timeout: Option<u64> => ["chunkTimeout"];
+    provider_rpm, set_provider_rpm: Option<u32> => ["rpm"];
+    provider_cooldown_seconds, set_provider_cooldown_seconds: u64 => ["cooldownSeconds"];
+    provider_headers, set_provider_headers: BTreeMap<String,String> => ["headers"];
+}
+entry_fields! { "models";
+    model_provider, set_model_provider: String => ["provider"];
+    model_id, set_model_id: Option<String> => ["id"];
+    model_name, set_model_name: Option<String> => ["name"];
+    model_context, set_model_context: Option<u64> => ["limit", "context"];
+    model_input, set_model_input: Option<u64> => ["limit", "input"];
+    model_output, set_model_output: Option<u32> => ["limit", "output"];
+    model_input_price, set_model_input_price: Option<f64> => ["input_price"];
+    model_output_price, set_model_output_price: Option<f64> => ["output_price"];
+    model_options, set_model_options: Map<String,Value> => ["options"];
+    model_headers, set_model_headers: BTreeMap<String,String> => ["headers"];
+}
+impl Config {
+    pub fn set_provider_header(&self, id: &str, key: String, value: String) -> Result<(), Error> {
+        self.set_entry("providers", id, &["headers", &key], value)
     }
-    pub fn provider(&self, id: &str) -> Result<ConfigSection<'a, ProviderSettings>, Error> {
-        let key = id.to_owned();
-        let node = self.child(move |models| models.provider_mut(&key));
-        node.access(|_| ())?;
-        Ok(node)
+    pub fn set_model_option(&self, id: &str, key: String, value: Value) -> Result<(), Error> {
+        self.set_entry("models", id, &["options", &key], value)
     }
-    pub fn set_provider(&self, id: String, provider: ProviderSettings) -> Result<(), Error> {
-        self.access(|models| {
-            models.providers.insert(id, provider);
-        })
+    pub fn set_model_header(&self, id: &str, key: String, value: String) -> Result<(), Error> {
+        self.set_entry("models", id, &["headers", &key], value)
     }
-    pub fn select_model(
+    pub fn variant_options(&self, id: &str, variant: &str) -> Result<Map<String, Value>, Error> {
+        let data = self.document.lock();
+        let node = data["models"]
+            .get(id)
+            .and_then(|m| m["variants"].get(variant))
+            .ok_or("Unknown variant")?;
+        decode(node.clone(), "variant")
+    }
+    pub fn set_model_variant(
         &self,
         id: &str,
-        variant: Option<String>,
-        effort: Option<&crate::model::EffortChoice>,
-    ) -> Result<ModelSettings, Error> {
-        self.root(|models| models.select_model(id, variant, effort))
+        variant: String,
+        options: Map<String, Value>,
+    ) -> Result<(), Error> {
+        if let Some(disabled) = options.get("disabled") {
+            decode::<bool>(disabled.clone(), "variant.disabled")?;
+        }
+        self.set_entry("models", id, &["variants", &variant], options)
     }
-    pub fn with_effort(
+    pub fn set_variant_option(
         &self,
         id: &str,
-        variant: Option<&str>,
-        effort: &crate::model::EffortChoice,
-    ) -> Result<ModelSettings, Error> {
-        self.root(|models| models.with_effort(id, variant, effort))
-    }
-    pub fn resolve(&self) -> Result<crate::model::ResolvedModel, Error> {
-        self.root(|models| models.clone()).resolve()
-    }
-    pub fn resolve_compaction(&self) -> Result<Option<crate::model::ResolvedModel>, Error> {
-        self.root(|models| models.clone()).resolve_compaction()
-    }
-    pub fn effective_effort(&self, id: impl AsRef<str>, variant: Option<&str>) -> Option<String> {
-        self.root(|models| models.effective_effort(id.as_ref(), variant))
-    }
-    pub fn pricing(&self) -> (Option<f64>, Option<f64>) {
-        self.root(|models| models.pricing())
+        variant: &str,
+        key: String,
+        value: Value,
+    ) -> Result<(), Error> {
+        if key == "disabled" {
+            decode::<bool>(value.clone(), "variant.disabled")?;
+        }
+        self.set_entry("models", id, &["variants", variant, &key], value)
     }
 }
-impl<'a> ConfigSection<'a, ProviderSettings> {
-    pub fn model(&self, id: &str) -> Result<ConfigSection<'a, ModelDefinition>, Error> {
-        let key = id.to_owned();
-        let node = self.child(move |provider| provider.model_mut(&key));
-        node.access(|_| ())?;
-        Ok(node)
-    }
-    pub fn set_model(&self, id: String, model: ModelDefinition) -> Result<(), Error> {
-        self.access(|provider| {
-            provider.models.insert(id, model);
-        })
-    }
+fields! { ["execution","context"];
+    context_safety_margin, set_context_safety_margin: u64 => "safety_margin";
+    context_advance_tokens, set_context_advance_tokens: Option<u64> => "advance_tokens";
+    context_keep_recent_tokens, set_context_keep_recent_tokens: u64 => "keep_recent_tokens";
+    context_summary_tokens, set_context_summary_tokens: u64 => "summary_tokens";
+    context_summary_min_savings, set_context_summary_min_savings: u64 => "summary_min_savings";
 }
-impl<'a> ConfigSection<'a, ModelDefinition> {
-    pub fn variant(&self, id: &str) -> Result<ConfigSection<'a, VariantSettings>, Error> {
-        let key = id.to_owned();
-        let node = self.child(move |model| model.variant_mut(&key));
-        node.access(|_| ())?;
-        Ok(node)
-    }
-    pub fn set_variant(&self, id: String, variant: VariantSettings) -> Result<(), Error> {
-        self.access(|model| {
-            model.variants.insert(id, variant);
-        })
-    }
-    pub fn set_option(&self, key: String, value: Value) -> Result<(), Error> {
-        self.access(|model| {
-            model.options.insert(key, value);
-        })
-    }
-}
-impl ConfigSection<'_, VariantSettings> {
-    pub fn set_option(&self, key: String, value: Value) -> Result<(), Error> {
-        self.access(|variant| {
-            variant.options.insert(key, value);
-        })
-    }
-}
-impl ConfigSection<'_, ConnectionSettings> {
-    pub fn set_header(&self, key: String, value: String) -> Result<(), Error> {
-        self.access(|connection| {
-            connection.headers.insert(key, value);
-        })
-    }
-}
-impl ConfigSection<'_, ExecutionOptions> {
-    /// Prepare per-turn execution parameters from the current shared settings.
-    pub fn resolve(&self, limits: &yourai_core::turn::TurnLimits) -> ExecutionOptions {
-        self.root(|execution| execution.resolve(limits))
-    }
-}
-impl ConfigSection<'_, ContextPolicy> {
-    pub fn input_budget(&self, budget: yourai_core::model::ModelTokenBudget) -> Option<u64> {
-        self.root(|policy| policy.input_budget(budget))
-    }
-    pub fn validate_for(
-        &self,
-        budget: yourai_core::model::ModelTokenBudget,
-    ) -> Result<(), yourai_core::YourAiError> {
-        self.root(|policy| policy.validate_for(budget))
-    }
-    pub fn maintenance_threshold(
-        &self,
-        budget: yourai_core::model::ModelTokenBudget,
-    ) -> Option<u64> {
-        self.root(|policy| policy.maintenance_threshold(budget))
-    }
+fields! { ["execution","attachment_image"];
+    image_auto_resize, set_image_auto_resize: bool => "auto_resize";
+    image_max_width, set_image_max_width: u32 => "max_width";
+    image_max_height, set_image_max_height: u32 => "max_height";
+    image_max_base64_bytes, set_image_max_base64_bytes: usize => "max_base64_bytes";
 }

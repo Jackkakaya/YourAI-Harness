@@ -1,6 +1,5 @@
 //! One admission/cooldown gate for every model sharing this Harness budget.
 use super::ModelBudget;
-use crate::config::RequestPolicy;
 use crate::storage::request_log::RequestLog;
 #[cfg(test)]
 use crate::SqliteStore;
@@ -8,30 +7,28 @@ use std::{sync::Mutex, time::Duration};
 use tokio::time::Instant;
 use yourai_core::prelude::*;
 
-impl RequestPolicy {
-    pub fn validate(&self) -> Result<(), YourAiError> {
-        if self.rpm().is_some_and(|n| n == 0 || n > 60_000) || self.cooldown_seconds() > 3600 {
-            return Err(ErrorKind::Config(
-                "requests.rpm must be 1..60000; cooldown_seconds must be 0..3600".into(),
-            )
-            .into());
-        }
-        Ok(())
+pub(crate) fn validate((rpm, cooldown_seconds): (Option<u32>, u64)) -> Result<(), YourAiError> {
+    if rpm.is_some_and(|n| n == 0 || n > 60_000) || cooldown_seconds > 3600 {
+        return Err(ErrorKind::Config(
+            "requests.rpm must be 1..60000; cooldown_seconds must be 0..3600".into(),
+        )
+        .into());
     }
+    Ok(())
 }
 pub(super) struct RequestControl {
-    policy: RequestPolicy,
+    policy: (Option<u32>, u64),
     deadlines: Mutex<(Instant, Instant)>, // next paced admission, shared cooldown
     pub(super) log: Option<std::sync::Arc<RequestLog>>,
     run_id: String,
 }
 impl Default for RequestControl {
     fn default() -> Self {
-        Self::new(RequestPolicy::default(), None)
+        Self::new(Default::default(), None)
     }
 }
 impl RequestControl {
-    pub fn new(policy: RequestPolicy, log: Option<std::sync::Arc<RequestLog>>) -> Self {
+    pub fn new(policy: (Option<u32>, u64), log: Option<std::sync::Arc<RequestLog>>) -> Self {
         Self {
             policy,
             deadlines: Mutex::new((Instant::now(), Instant::now())),
@@ -56,7 +53,7 @@ impl RequestControl {
         let mut deadlines = self.deadlines.lock().unwrap();
         let now = Instant::now();
         let delay = delay
-            .unwrap_or(Duration::from_secs(self.policy.cooldown_seconds()))
+            .unwrap_or(Duration::from_secs(self.policy.1))
             .min(super::retry::MAX_DELAY);
         let until = now + delay;
         deadlines.1 = deadlines.1.max(until);
@@ -119,7 +116,7 @@ impl ModelBudget {
                         + self
                             .control
                             .policy
-                            .rpm()
+                            .0
                             .map(|rpm| Duration::from_secs_f64(60.0 / rpm as f64))
                             .unwrap_or_default();
                     return Ok(());
@@ -135,7 +132,7 @@ impl ModelBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn budget(policy: RequestPolicy) -> std::sync::Arc<ModelBudget> {
+    fn budget(policy: (Option<u32>, u64)) -> std::sync::Arc<ModelBudget> {
         ModelBudget::configured(
             policy,
             SqliteStore::open(std::path::Path::new(":memory:")).unwrap(),
@@ -144,11 +141,7 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn concurrent_callers_get_distinct_paced_slots() {
-        let budget = budget({
-            let mut settings: RequestPolicy = Default::default();
-            settings.set_rpm(Some(2));
-            settings
-        });
+        let budget = budget((Some(2), 0));
         let start = Instant::now();
         let (a, b, c) = tokio::join!(
             async {
@@ -171,11 +164,7 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn pace_and_cancel_wait_without_counting_attempts() {
-        let budget = budget({
-            let mut settings: RequestPolicy = Default::default();
-            settings.set_rpm(Some(2));
-            settings
-        });
+        let budget = budget((Some(2), 0));
         budget.admit().await.unwrap();
         assert_eq!(budget.snapshot().calls, 1);
         assert!(
@@ -191,11 +180,7 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn cooldown_is_shared_and_can_be_extended_during_wait() {
-        let budget = budget({
-            let mut settings: RequestPolicy = Default::default();
-            settings.set_cooldown_seconds(60);
-            settings
-        });
+        let budget = budget((None, 60));
         budget.control.cool_down(None);
         let other = budget.clone();
         let waiting = tokio::spawn(async move { other.admit().await.unwrap() });
@@ -214,17 +199,8 @@ mod provider_tests {
     #[tokio::test(start_paused = true)]
     async fn provider_gates_are_independent_and_accounting_is_shared() {
         let store = SqliteStore::open(std::path::Path::new(":memory:")).unwrap();
-        let a = ModelBudget::configured(
-            {
-                let mut settings = RequestPolicy::default();
-                settings.set_rpm(Some(1));
-                settings.set_cooldown_seconds(60);
-                settings
-            },
-            store.clone(),
-        )
-        .unwrap();
-        let b = a.for_provider(RequestPolicy::default()).unwrap();
+        let a = ModelBudget::configured((Some(1), 60), store.clone()).unwrap();
+        let b = a.for_provider(Default::default()).unwrap();
         a.admit().await.unwrap();
         a.control.cool_down(None);
         tokio::time::timeout(Duration::from_millis(1), b.admit())

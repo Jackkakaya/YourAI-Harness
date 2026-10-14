@@ -33,25 +33,22 @@ Edit that file. Replace **all three** occurrences of `YOUR_MODEL_NAME` with your
 
 ```json
 {
+  "model": "gateway/YOUR_MODEL_NAME",
+  "providers": {
+    "gateway": {
+      "api": "openai-compatible",
+      "baseURL": "https://api.openai.com/v1",
+      "apiKey": "{env:OPENAI_API_KEY}"
+    }
+  },
   "models": {
-    "model": "gateway/YOUR_MODEL_NAME",
-    "providers": {
-      "gateway": {
-        "api": "openai-compatible",
-        "options": {
-          "baseURL": "https://api.openai.com/v1",
-          "apiKey": "{env:OPENAI_API_KEY}"
-        },
-        "models": {
-          "YOUR_MODEL_NAME": {
-            "id": "YOUR_MODEL_NAME",
-            "limit": {
-              "context": 128000,
-              "output": 4096
-            }
-          }
-        }
-      }
+    "gateway/YOUR_MODEL_NAME": {
+      "id": "YOUR_MODEL_NAME",
+      "limit": {
+        "context": 128000,
+        "output": 4096
+      },
+      "provider": "gateway"
     }
   }
 }

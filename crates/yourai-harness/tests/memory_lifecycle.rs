@@ -223,12 +223,7 @@ async fn compact_callback_uses_clean_active_history_without_rebuilding_system() 
     let provider = Arc::new(Provider::default());
     let mut config = SessionOptions::new(root.clone(), d.path().into());
     config.memory_manager = Some(provider.clone());
-    config
-        .config
-        .execution()
-        .context_policy()
-        .set_keep_recent_tokens(0)
-        .unwrap();
+    config.config.set_context_keep_recent_tokens(0);
     let model = model_fixture::TestModel::new(
         Arc::new(Model::new(vec![])),
         ModelTokenBudget::resolve(

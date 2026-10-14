@@ -205,20 +205,22 @@ Loop 对这类 Provider 只在外层监听总 deadline、取消和断连；否�
 
 ## 配置读写与持久化契约
 
-所有持久化配置在一个 JSON 中，七组数据由一个 Config 持有；全局共享 Arc<Config>。配置的数据定义集中在 config.rs：ModelSettings、ProviderSettings、ConnectionSettings、RequestPolicy、PromptSettings、HookSettings 和 Hook 处理器字段等。执行参数与模型容量复用 core 的同一类型，通过 config 入口导出，不建立重复定义。
+所有配置保存在一个 JSON，共享 Arc<Config>。配置模块只定义 Config、ProviderConfig、ModelConfig、PromptSettings、HookSettings；执行参数与模型容量复用 core 类型。
 
-Config 与各层配置 struct 字段私有；Config 内部持有一把锁，外部通过 Arc<Config> 共享。每组提供只读 getter、返回封装对象的 *_mut 编辑入口，以及整组 setter：models/set_models、execution/set_execution、security/set_security、ui/set_ui、session/set_session、prompt/set_prompt、hooks/set_hooks。setter 不校验业务、不发请求、不自动保存。
+Config 内部只有一份 JSON 文档和一把锁；初始化验证 JSON 结构与类型，getter/setter 使用有类型的入口。模型选择字段直接属于根配置，providers 和 models 分别是服务商、模型的 ID 表。没有 ConfigData、ConfigSection 或 ModelsConfig。已有条目修改直接调用 setter，不复制条目后写回。
 
 ```rust,ignore
-let mut config = Config::init(path)?;
-let models = config.models().select_model("gateway/model", None, None)?;
-config.set_models(models);
+let config = Config::init(path)?;
 config.set_theme("nord".into());
 config.set_steps(Some(20));
+config.set_provider_base_url("gateway", Some(url))?;
+config.set_model_context("gateway/model", Some(128_000))?;
 config.save()?;
+model::select(&config, "gateway/model", None, None)?;
+let resolved = model::resolve(&config)?;
 ```
 
-Config::init 只检查文件、JSON 结构和字段类型，旧平铺字段在此转换。没有网络客户端构建、Hook 编译或业务参数检查。Config::save() 先序列化全部数据，再通过同目录临时文件原子替换主 JSON；不接收旧配置、不比较字段、不写独立 Prompt/Hook 文件。
+Config::init 只检查文件、JSON 结构和字段类型，旧分组及 provider 内模型、连接 options 在此转换。没有网络客户端构建、Hook 编译或业务参数检查。Config::save() 先序列化完整文档，再通过同目录临时文件原子替换主 JSON；不接收旧配置、不比较字段、不写独立 Prompt/Hook 文件。
 
 ### 迁移
 
@@ -230,7 +232,7 @@ Config::init 只检查文件、JSON 结构和字段类型，旧平铺字段在�
 
 SessionClient::model/change_yolo/change_theme 是应用操作入口。运行资源的 apply_* 方法负责应用效果。普通配置直接调用 setter 后 save；保存失败返回错误，内存保留修改。Config 和 assembly 均无通用更新闭包接口。模型和权限切换在各自操作中保留原分组，保存失败恢复该分组并保持原运行资源；其他分组的并发修改保留。主题在本地生效，保存失败提示错误。
 
-执行参数在每轮开始冻结，已运行轮次不被中途改变。SessionOptions 持有启动参数与冻结配置；ResolvedModel 是实际客户端结果。历史、队列、任务、用量、临时批准和记忆内容是领域状态，仍由各自存储维护。
+执行参数在每轮开始冻结，已运行轮次不被中途改变。SessionOptions 持有启动参数与共享 Config；ResolvedModel 是实际客户端结果。历史、队列、任务、用量、临时批准和记忆内容是领域状态，仍由各自存储维护。
 
 ### 控制状态
 
@@ -240,10 +242,8 @@ SessionController::new 返回运行所有者和初始订阅；命令经 client()
 
 ### 验证
 
-测试覆盖单 JSON 七组 round-trip、旧分拆文件迁移后失效、旧文件保留、没有生成额外 JSON、非法业务值仍能原样 JSON 读写、保存/校验失败不发布、模型失败保持运行绑定、下一轮共享执行参数。全工作区测试、Clippy、格式及 TUI 模型/界面冒烟验证实际行为。
+测试覆盖单 JSON round-trip、旧分拆文件迁移后失效、旧文件保留、没有生成额外 JSON、非法业务值仍能原样 JSON 读写、保存/校验失败不发布、模型失败保持运行绑定、下一轮共享执行参数。全工作区测试、Clippy、格式及 TUI 模型/界面冒烟验证实际行为。
 
 约束见 [配置和控制状态约束](config-control-invariants.md)。
 
-共享 Config 的 getter 返回嵌套访问对象。config.models().provider("gateway")?.options().set_base_url(Some(url))? 直接修改同一个 Config，setter 返回前释放锁。已有配置修改无需复制 provider 或整组写回；set_provider 用于新增或替换完整条目。
-
-共享使用 Arc::new(Config::init(path)?)；SessionOptions 也保存同一个 Arc，复制会话组装参数不会复制配置。Config 没有 snapshot 或 Clone；嵌套访问对象只保存引用和字段位置，每次访问短暂加锁。save 在同一把锁内完整序列化并原子保存。模型构建使用内部临时参数，检查构建依据后才提交模型分组，不创建另一个 Config。
+共享使用 Arc::new(Config::init(path)?)；SessionOptions 保存同一个 Arc，复制会话组装参数不会复制配置。Config 没有 snapshot 或 Clone。getter/setter 在内部短暂加锁，save 在同一把锁内完整序列化并原子保存。模型构建使用内部临时参数，检查构建依据后才提交模型选择字段，不创建另一个 Config。执行参数 getter 仅提供本轮执行输入，修改始终调用 Config 的 setter。

@@ -4,24 +4,23 @@
   "type": "object",
   "properties": {
     "$schema": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-    "models": {"$ref": "#/$defs/models"},
     "execution": {"$ref": "#/$defs/execution"},
-    "security": {
-      "type": "object",
-      "properties": {"trusted_shell": {"type": "boolean"}, "yolo": {"type": "boolean"}},
-      "additionalProperties": false
-    },
-    "ui": {"type": "object", "properties": {"theme": {"type": "string"}}, "additionalProperties": false},
-    "session": {
-      "type": "object",
-      "properties": {"directory": {"type": "string"}, "extensions": {"type": "boolean"}},
-      "additionalProperties": false
-    },
     "prompt": {"$ref": "#/$defs/prompt"},
-    "hooks": {"$ref": "#/$defs/hooks"}
+    "hooks": {"$ref": "#/$defs/hooks"},
+    "theme": {"type": "string"},
+    "trusted_shell": {"type": "boolean"},
+    "yolo": {"type": "boolean"},
+    "directory": {"type": "string"},
+    "extensions": {"type": "boolean"},
+    "model": {"type": "string", "pattern": "^[^/]+/.+$"},
+    "variant": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    "effort_overrides": {"type": "object", "additionalProperties": {"type": "object", "additionalProperties": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]}}},
+    "compaction_model": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    "providers": {"type": "object", "additionalProperties": {"$ref": "#/$defs/provider"}},
+    "models": {"type": "object", "additionalProperties": {"$ref": "#/$defs/model"}}
   },
   "additionalProperties": false,
-  "required": ["models"],
+  "required": ["model", "providers"],
   "$defs": {
     "duration": {
       "type": "object",
@@ -83,41 +82,12 @@
       },
       "additionalProperties": false
     },
-    "requests": {
-      "type": "object",
-      "properties": {
-        "rpm": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 60000}, {"type": "null"}]},
-        "cooldown_seconds": {"type": "integer", "minimum": 0, "maximum": 3600}
-      },
-      "additionalProperties": false
-    },
-    "connection": {
-      "type": "object",
-      "properties": {
-        "baseURL": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "apiKey": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "timeout": {"anyOf": [{"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}, {"const": false}]},
-        "headerTimeout": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
-        "chunkTimeout": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
-        "requests": {"$ref": "#/$defs/requests"},
-        "headers": {"type": "object", "additionalProperties": {"type": "string"}}
-      },
-      "additionalProperties": false
-    },
     "limits": {
       "type": "object",
       "properties": {
         "context": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
         "input": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
         "output": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 4294967295}, {"type": "null"}]}
-      },
-      "additionalProperties": false
-    },
-    "pricing": {
-      "type": "object",
-      "properties": {
-        "input": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-        "output": {"anyOf": [{"type": "number"}, {"type": "null"}]}
       },
       "additionalProperties": false
     },
@@ -131,9 +101,7 @@
       },
       "additionalProperties": true
     },
-    "variant": {
-      "allOf": [{"$ref": "#/$defs/generation"}, {"type": "object", "properties": {"disabled": {"type": "boolean"}}}]
-    },
+    "variant": {"allOf": [{"$ref": "#/$defs/generation"}, {"type": "object", "properties": {"disabled": {"type": "boolean"}}}]},
     "model": {
       "type": "object",
       "properties": {
@@ -143,7 +111,9 @@
         "options": {"$ref": "#/$defs/generation"},
         "headers": {"type": "object", "additionalProperties": {"type": "string"}},
         "variants": {"type": "object", "additionalProperties": {"$ref": "#/$defs/variant"}},
-        "pricing": {"$ref": "#/$defs/pricing"}
+        "provider": {"type": "string"},
+        "input_price": {"type": ["number", "null"]},
+        "output_price": {"type": ["number", "null"]}
       },
       "additionalProperties": false
     },
@@ -153,29 +123,17 @@
         "api": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "npm": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "options": {"$ref": "#/$defs/connection"},
-        "models": {"type": "object", "additionalProperties": {"$ref": "#/$defs/model"}}
+        "baseURL": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "apiKey": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "timeout": {"anyOf": [{"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]}, {"const": false}]},
+        "headerTimeout": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "chunkTimeout": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "rpm": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 60000}, {"type": "null"}]},
+        "cooldownSeconds": {"type": "integer", "minimum": 0, "maximum": 3600}
       },
       "additionalProperties": false,
       "not": {"required": ["api", "npm"]}
-    },
-    "models": {
-      "type": "object",
-      "properties": {
-        "model": {"type": "string", "pattern": "^[^/]+/.+$"},
-        "compaction": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "variant": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "effort_overrides": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "object",
-            "additionalProperties": {"enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]}
-          }
-        },
-        "providers": {"type": "object", "additionalProperties": {"$ref": "#/$defs/provider"}}
-      },
-      "additionalProperties": false,
-      "required": ["model", "providers"]
     },
     "prompt": {
       "type": "object",
@@ -191,91 +149,13 @@
       },
       "additionalProperties": false
     },
-    "handler": {
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "type": {"const": "command"},
-            "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-            "if": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
-            "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]},
-            "command": {"type": "string"},
-            "shell": {"anyOf": [{"enum": ["bash", "powershell"]}, {"type": "null"}]},
-            "async": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
-            "asyncRewake": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}
-          },
-          "additionalProperties": true,
-          "required": ["type", "command"]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "type": {"const": "http"},
-            "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-            "if": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
-            "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]},
-            "url": {"type": "string"},
-            "headers": {"anyOf": [{"type": "object", "additionalProperties": {"type": "string"}}, {"type": "null"}]},
-            "allowedEnvVars": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]}
-          },
-          "additionalProperties": true,
-          "required": ["type", "url"]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "type": {"const": "prompt"},
-            "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-            "if": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
-            "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]},
-            "prompt": {"type": "string"},
-            "model": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-          },
-          "additionalProperties": true,
-          "required": ["type", "prompt"]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "type": {"const": "agent"},
-            "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]},
-            "if": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
-            "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]},
-            "prompt": {"type": "string"},
-            "model": {"anyOf": [{"type": "string"}, {"type": "null"}]}
-          },
-          "additionalProperties": true,
-          "required": ["type", "prompt"]
-        }
-      ]
-    },
-    "hookEvents": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "array",
-        "items": {
-          "type": "object",
-          "properties": {
-            "matcher": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "hooks": {"type": "array", "items": {"$ref": "#/$defs/handler"}}
-          },
-          "additionalProperties": true,
-          "required": ["hooks"]
-        }
-      }
-    },
+    "handler": {"oneOf": [{"type": "object", "properties": {"type": {"const": "command"}, "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]}, "if": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}, "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]}, "command": {"type": "string"}, "shell": {"anyOf": [{"enum": ["bash", "powershell"]}, {"type": "null"}]}, "async": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}, "asyncRewake": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}}, "additionalProperties": true, "required": ["type", "command"]}, {"type": "object", "properties": {"type": {"const": "http"}, "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]}, "if": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}, "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]}, "url": {"type": "string"}, "headers": {"anyOf": [{"type": "object", "additionalProperties": {"type": "string"}}, {"type": "null"}]}, "allowedEnvVars": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]}}, "additionalProperties": true, "required": ["type", "url"]}, {"type": "object", "properties": {"type": {"const": "prompt"}, "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]}, "if": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}, "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]}, "prompt": {"type": "string"}, "model": {"anyOf": [{"type": "string"}, {"type": "null"}]}}, "additionalProperties": true, "required": ["type", "prompt"]}, {"type": "object", "properties": {"type": {"const": "agent"}, "timeout": {"anyOf": [{"type": "number"}, {"type": "null"}]}, "if": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "once": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}, "statusMessage": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "failurePolicy": {"anyOf": [{"enum": ["open", "closed"]}, {"type": "null"}]}, "prompt": {"type": "string"}, "model": {"anyOf": [{"type": "string"}, {"type": "null"}]}}, "additionalProperties": true, "required": ["type", "prompt"]}]},
+    "hookEvents": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "object", "properties": {"matcher": {"anyOf": [{"type": "string"}, {"type": "null"}]}, "hooks": {"type": "array", "items": {"$ref": "#/$defs/handler"}}}, "additionalProperties": true, "required": ["hooks"]}}},
     "hooks": {
       "type": "object",
-      "properties": {"events": {"$ref": "#/$defs/hookEvents"}},
+      "properties": {
+        "events": {"$ref": "#/$defs/hookEvents"}
+      },
       "additionalProperties": false
     }
   }

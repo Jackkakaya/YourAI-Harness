@@ -137,7 +137,7 @@ async fn run() -> Result<(), Error> {
     let config = Arc::new(Config::init(&path)?);
     yourai_harness::assembly::validate_config(&config)?;
     let theme = serde_json::from_value::<crate::ui::theme::Theme>(serde_json::Value::String(
-        config.ui().theme(),
+        config.theme(),
     ))?;
     // Resolve `theme: "system"` once at startup (v1: no runtime watch).
     if theme == crate::ui::theme::Theme::System {
@@ -146,18 +146,18 @@ async fn run() -> Result<(), Error> {
     if selected_model.is_some() || variant.is_some() {
         let id = selected_model
             .as_deref()
-            .unwrap_or(&config.models().model())
+            .unwrap_or(&config.model())
             .to_owned();
         let selected_variant = variant.or_else(|| {
             if selected_model.is_none() {
-                config.models().variant()
+                config.variant()
             } else {
                 None
             }
         });
-        config.set_models(config.models().select_model(&id, selected_variant, None)?);
+        yourai_harness::model::select(&config, &id, selected_variant, None)?;
     }
-    let yolo = yolo || config.security().yolo();
+    let yolo = yolo || config.yolo();
     config.set_yolo(yolo);
     if import_json {
         let count = yourai_harness::storage::sqlite::import_json_sessions(
@@ -171,20 +171,18 @@ async fn run() -> Result<(), Error> {
         return Ok(());
     }
     if check {
-        let selection = config.models().resolve()?;
+        let selection = yourai_harness::model::resolve(&config)?;
         config
-            .execution()
             .context_policy()
             .validate_for(selection.model.token_budget())?;
-        if let Some(summary) = config.models().resolve_compaction()? {
+        if let Some(summary) = yourai_harness::model::resolve_compaction(&config)? {
             config
-                .execution()
                 .context_policy()
                 .validate_for(summary.model.token_budget())?;
         }
         println!(
             "Config OK: {} / {} (no network request)",
-            config.models().model(),
+            config.model(),
             selection.model.model_iden()
         );
         return Ok(());
@@ -201,11 +199,10 @@ async fn run() -> Result<(), Error> {
             launcher::Choice::Quit => return Ok(()),
         }
     }
-    let selection = config.models().resolve()?;
-    let compaction = config.models().resolve_compaction()?;
+    let selection = yourai_harness::model::resolve(&config)?;
+    let compaction = yourai_harness::model::resolve_compaction(&config)?;
     let model = selection.model.clone();
     if config
-        .execution()
         .context_policy()
         .input_budget(model.token_budget())
         .is_none()
@@ -218,7 +215,7 @@ async fn run() -> Result<(), Error> {
         std::env::current_dir()?,
     );
     hc.model_provider = selection.provider.clone();
-    hc.request_policy = selection.requests.clone();
+    hc.request_policy = selection.requests;
     hc.compaction_model = compaction;
     hc.resume = resume.take();
     hc.config = Arc::clone(&config);
@@ -226,11 +223,11 @@ async fn run() -> Result<(), Error> {
     config_template.resume = None;
     let harness = Harness::open(hc, model).await?;
     let limits = TurnLimits::default();
-    let config_clone_model = match &config.models().variant() {
-        Some(variant) => format!("{} · {variant}", config.models().model()),
-        None => config.models().model(),
+    let config_clone_model = match &config.variant() {
+        Some(variant) => format!("{} · {variant}", config.model()),
+        None => config.model(),
     };
-    let config_clone_trusted = config.security().trusted_shell();
+    let config_clone_trusted = config.trusted_shell();
     let config_clone_theme = theme;
     let (session_id, pending) = ui::run(
         harness,

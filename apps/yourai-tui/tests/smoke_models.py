@@ -321,9 +321,9 @@ with tempfile.TemporaryDirectory() as tmp:
         assert child.returncode == 0
         assert termios.tcgetattr(slave) == original, 'terminal mode was not restored'
         saved = json.loads(config.read_text())
-        assert saved['models']['model'] == 'mock/alt', saved['models']['model']
-        assert saved['models'].get('variant') is None
-        assert saved['models']['effort_overrides']['mock/alt'][''] == 'medium'
+        assert saved['model'] == 'mock/alt', saved['model']
+        assert saved.get('variant') is None
+        assert saved['effort_overrides']['mock/alt'][''] == 'medium'
         assert 'prompt' in saved and 'hooks' in saved
         assert not (Path(tmp) / 'prompts.json').exists()
         assert not (Path(tmp) / 'hooks.json').exists()

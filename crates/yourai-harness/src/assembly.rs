@@ -22,7 +22,7 @@ pub struct SessionOptions {
     pub config: Arc<crate::config::Config>,
     pub memory_manager: Option<Arc<dyn MemoryManager>>,
     pub skill_provider: Option<Arc<dyn SkillProvider>>,
-    pub request_policy: crate::model::RequestPolicy,
+    pub request_policy: (Option<u32>, u64),
     /// Stable provider key used to retain admission state across model switches.
     pub model_provider: String,
     /// Optional pinned summary model and its provider admission settings.
@@ -45,10 +45,11 @@ impl SessionOptions {
         }
     }
 }
+type ProviderBudgets = HashMap<(String, (Option<u32>, u64)), Arc<ModelBudget>>;
 pub struct Harness {
     normal_security: Arc<dyn SecurityProvider>,
     yolo_security: Arc<dyn SecurityProvider>,
-    provider_budgets: Mutex<HashMap<(String, crate::model::RequestPolicy), Arc<ModelBudget>>>,
+    provider_budgets: Mutex<ProviderBudgets>,
     current_budget: Mutex<Arc<ModelBudget>>,
     /// Shared persistence interface for frontends reading clean session history.
     pub sessions: Arc<dyn SessionStore>,
@@ -69,16 +70,14 @@ impl Harness {
         model: Arc<dyn ModelProvider>,
     ) -> Result<Self, YourAiError> {
         let values = config.config.values();
-        values
-            .execution()
+        crate::config::read::<ExecutionOptions>(&values, "execution")
             .context_policy()
             .validate_for(model.token_budget())?;
         if let Some(summary) = &config.compaction_model {
-            values
-                .execution()
+            crate::config::read::<ExecutionOptions>(&values, "execution")
                 .context_policy()
                 .validate_for(summary.model.token_budget())?;
-            summary.requests.validate()?;
+            crate::model::validate_requests(summary.requests)?;
         }
         let catalog = Arc::new(SessionCatalog::new(&config.root)?);
         let source = if config.resume.is_some() {
@@ -90,10 +89,9 @@ impl Harness {
             prepare_session(&catalog, &config, model.as_ref(), &values).await?;
         let id = meta.id;
         let session_config = config.clone();
-        let budget =
-            ModelBudget::configured(config.request_policy.clone(), (*catalog.store).clone())?;
+        let budget = ModelBudget::configured(config.request_policy, (*catalog.store).clone())?;
         let mut provider_budgets = HashMap::from([(
-            (config.model_provider.clone(), config.request_policy.clone()),
+            (config.model_provider.clone(), config.request_policy),
             budget.clone(),
         )]);
         let model: Arc<dyn ModelProvider> = Arc::new(MeteredModel {
@@ -103,23 +101,26 @@ impl Harness {
         let usage = Arc::new(LocalUsage((*catalog.store).clone()));
         let hooks = Arc::new(DefaultHookManager::new().with_model(model.clone()));
         hooks
-            .register_config(values.hooks().events(), HookSource::Project)
+            .register_config(
+                crate::config::read::<crate::config::HookSettings>(&values, "hooks").events(),
+                HookSource::Project,
+            )
             .await?;
         let (agent, tools) = assemble(
             &id,
             lease.store(),
             &config.cwd,
-            values.security().trusted_shell(),
+            crate::config::read::<bool>(&values, "trusted_shell"),
             Agent::builder()
                 .model(model.clone())
                 .hooks(hooks.clone())
                 .usage(usage.clone()),
-            values.execution(),
+            &crate::config::read::<ExecutionOptions>(&values, "execution"),
         )
         .await?;
         if let Some(summary) = config.compaction_model {
             let settings = summary;
-            let key = (settings.provider, settings.requests.clone());
+            let key = (settings.provider, settings.requests);
             let summary_budget = match provider_budgets.get(&key) {
                 Some(existing) => existing.clone(),
                 None => budget.for_provider(settings.requests)?,
@@ -132,15 +133,15 @@ impl Harness {
         }
         let normal_security = agent.security()?;
         let yolo_security: Arc<dyn SecurityProvider> = Arc::new(crate::security::YoloSecurity);
-        if values.security().yolo() {
+        if crate::config::read::<bool>(&values, "yolo") {
             agent.set_security(yolo_security.clone());
         }
-        let memory = if values.session().extensions() {
+        let memory = if crate::config::read::<bool>(&values, "extensions") {
             Some(Arc::new(LocalMemory::new(lease.store(), id.clone())))
         } else {
             None
         };
-        let skills = if values.session().extensions() {
+        let skills = if crate::config::read::<bool>(&values, "extensions") {
             Some(Arc::new(LocalSkills::new(lease.store(), id.clone())))
         } else {
             None
@@ -163,14 +164,14 @@ impl Harness {
         let host =
             start_session(&session_config, id, lease, agent, prepared, source, &values).await?;
         let ready = async {
-            let workspace = if values.session().extensions() {
+            let workspace = if crate::config::read::<bool>(&values, "extensions") {
                 Some(host.workspace()?)
             } else {
                 None
             };
             // Task progress is a basic coding capability, independent of workspace/subagents.
             let tasks = Some(host.task_manager("default")?);
-            let subagents = if values.session().extensions() {
+            let subagents = if crate::config::read::<bool>(&values, "extensions") {
                 Some(subagent(&host, None, None))
             } else {
                 None
@@ -256,9 +257,9 @@ impl Harness {
         model: Arc<dyn ModelProvider>,
         policy: ContextPolicy,
         provider: String,
-        requests: crate::model::RequestPolicy,
+        requests: (Option<u32>, u64),
     ) -> Result<(), YourAiError> {
-        requests.validate()?;
+        crate::model::validate_requests(requests)?;
         self.switch_model_inner(model, policy, Some((provider, requests)), None)
             .await
     }
@@ -267,10 +268,10 @@ impl Harness {
         model: Arc<dyn ModelProvider>,
         policy: ContextPolicy,
         provider: String,
-        requests: crate::model::RequestPolicy,
+        requests: (Option<u32>, u64),
         commit: impl FnOnce() -> Result<(), YourAiError> + Send,
     ) -> Result<(), YourAiError> {
-        requests.validate()?;
+        crate::model::validate_requests(requests)?;
         self.switch_model_inner(
             model,
             policy,
@@ -283,7 +284,7 @@ impl Harness {
         &self,
         model: Arc<dyn ModelProvider>,
         policy: ContextPolicy,
-        settings: Option<(String, crate::model::RequestPolicy)>,
+        settings: Option<(String, (Option<u32>, u64))>,
         commit: Option<Box<dyn FnOnce() -> Result<(), YourAiError> + Send + '_>>,
     ) -> Result<(), YourAiError> {
         policy.validate_for(model.token_budget())?;
@@ -293,12 +294,12 @@ impl Harness {
                 .provider_budgets
                 .lock()
                 .unwrap()
-                .get(&(settings.0.clone(), settings.1.clone()))
+                .get(&(settings.0.clone(), settings.1))
                 .cloned()
             {
                 budget
             } else {
-                self.budget.for_provider(settings.1.clone())?
+                self.budget.for_provider(settings.1)?
             }
         } else {
             self.current_budget.lock().unwrap().clone()
@@ -412,16 +413,18 @@ pub(crate) async fn start_session(
     agent: Arc<Agent>,
     prepared: crate::context::prompt::PreparedPrompt,
     source: &str,
-    values: &crate::config::ConfigData,
+    values: &serde_json::Value,
 ) -> Result<Arc<SessionManager>, YourAiError> {
     let mut environment = SessionEnvironment::new(id, config.cwd.clone());
     environment.transcript_path = Some(SqliteStore::path(&config.root));
     environment.instructions = prepared.instructions;
-    let mut settings = values.execution().clone();
+    let mut settings = crate::config::read::<ExecutionOptions>(values, "execution");
     if source != "startup" {
         settings.set_instruction_paths(vec![]);
     }
-    settings.set_workspace_enabled(settings.workspace_enabled() || values.session().extensions());
+    settings.set_workspace_enabled(
+        settings.workspace_enabled() || crate::config::read::<bool>(values, "extensions"),
+    );
     let host = SessionManager::open_owned(lease, environment, agent, settings, source).await?;
     let ready = async {
         for notice in prepared.notices {
@@ -449,7 +452,7 @@ pub(crate) async fn prepare_session(
     catalog: &SessionCatalog,
     config: &SessionOptions,
     model: &dyn ModelProvider,
-    values: &crate::config::ConfigData,
+    values: &serde_json::Value,
 ) -> Result<
     (
         SessionMeta,
@@ -458,7 +461,10 @@ pub(crate) async fn prepare_session(
     ),
     YourAiError,
 > {
-    let prompt = resolved_prompt(&config.config, values.prompt());
+    let prompt = resolved_prompt(
+        &config.config,
+        &crate::config::read::<crate::config::PromptSettings>(values, "prompt"),
+    );
     let existing = match &config.resume {
         Some(id) => Some(catalog.store.load_session(id).await?),
         None => None,
@@ -483,11 +489,10 @@ pub(crate) async fn prepare_session(
             &prompt,
             &config.cwd,
             prompt.system_prompt().as_deref(),
-            values.execution().instruction_paths(),
+            crate::config::read::<ExecutionOptions>(values, "execution").instruction_paths(),
             config.skill_provider.as_deref(),
             config.memory_manager.as_deref(),
-            values
-                .execution()
+            crate::config::read::<ExecutionOptions>(values, "execution")
                 .context_policy()
                 .maintenance_threshold(model.token_budget()),
             &tokio_util::sync::CancellationToken::new(),
@@ -535,14 +540,13 @@ pub fn resolve_session(
     id: Option<SessionId>,
 ) -> Result<(SessionOptions, Arc<dyn ModelProvider>), crate::config::Error> {
     let values = config.values();
-    let models = values.models();
-    let selection = models.resolve()?;
+    let selection = crate::model::configured::resolve_data(&values)?;
     let mut options = template.clone();
     options.resume = id;
     options.config = Arc::clone(config);
-    options.compaction_model = models.resolve_compaction()?;
+    options.compaction_model = crate::model::configured::resolve_compaction_data(&values)?;
     options.model_provider = selection.provider.clone();
-    options.request_policy = selection.requests.clone();
+    options.request_policy = selection.requests;
     Ok((options, selection.model))
 }
 
@@ -567,7 +571,7 @@ pub fn session_dir(config: &crate::config::Config) -> PathBuf {
         .path()
         .and_then(std::path::Path::parent)
         .unwrap_or_else(|| std::path::Path::new("."));
-    let directory = config.session().directory();
+    let directory = config.directory();
     let root = if directory == std::path::Path::new(".yourai/sessions") {
         data_session_dir(base)
     } else {
@@ -605,13 +609,15 @@ fn resolved_prompt(
 
 pub fn validate_config(config: &crate::config::Config) -> Result<(), crate::config::Error> {
     let values = config.values();
-    values.models().validate(config.path().is_some())?;
-    if values.execution().steps() == Some(0) {
+    crate::model::configured::validate_data(&values, config.path().is_some())?;
+    if crate::config::read::<ExecutionOptions>(&values, "execution").steps() == Some(0) {
         return Err("steps must be a positive integer".into());
     }
-    values.execution().context_policy().validate()?;
+    crate::config::read::<ExecutionOptions>(&values, "execution")
+        .context_policy()
+        .validate()?;
     crate::hooks::build_registrations(
-        values.hooks().events(),
+        crate::config::read::<crate::config::HookSettings>(&values, "hooks").events(),
         crate::hooks::registration::HookSource::Project,
     )?;
     Ok(())

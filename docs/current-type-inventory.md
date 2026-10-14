@@ -172,10 +172,6 @@
 | `TaskTool` | struct | `pub` | [crates/yourai-harness/src/collaboration/tools.rs:6](../crates/yourai-harness/src/collaboration/tools.rs#L6) |
 | `SubagentTool` | struct | `pub` | [crates/yourai-harness/src/collaboration/tools.rs:7](../crates/yourai-harness/src/collaboration/tools.rs#L7) |
 | `Config` | struct | `pub` | [crates/yourai-harness/src/config.rs:23](../crates/yourai-harness/src/config.rs#L23) |
-| `ModelSettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:38](../crates/yourai-harness/src/config.rs#L38) |
-| `SecuritySettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:50](../crates/yourai-harness/src/config.rs#L50) |
-| `UiSettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:56](../crates/yourai-harness/src/config.rs#L56) |
-| `SessionSettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:68](../crates/yourai-harness/src/config.rs#L68) |
 | `PromptSettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:82](../crates/yourai-harness/src/config.rs#L82) |
 | `HookSettings` | struct | `pub` | [crates/yourai-harness/src/config.rs:108](../crates/yourai-harness/src/config.rs#L108) |
 | `ResolvedModel` | struct | `pub` | [crates/yourai-harness/src/config.rs:418](../crates/yourai-harness/src/config.rs#L418) |
@@ -228,7 +224,6 @@
 | `PermissionRuleValue` | struct | `pub` | [crates/yourai-harness/src/hooks/wire_output.rs:281](../crates/yourai-harness/src/hooks/wire_output.rs#L281) |
 | `MemoryHookAdapter` | struct | `private` | [crates/yourai-harness/src/memory/hooks.rs:33](../crates/yourai-harness/src/memory/hooks.rs#L33) |
 | `LocalMemory` | struct | `pub` | [crates/yourai-harness/src/memory/mod.rs:9](../crates/yourai-harness/src/memory/mod.rs#L9) |
-| `RequestPolicy` | struct | `pub` | [crates/yourai-harness/src/model/control.rs:13](../crates/yourai-harness/src/model/control.rs#L13) |
 | `RequestControl` | struct | `pub(super)` | [crates/yourai-harness/src/model/control.rs:30](../crates/yourai-harness/src/model/control.rs#L30) |
 | `RequestMetrics` | struct | `pub` | [crates/yourai-harness/src/model/metrics.rs:8](../crates/yourai-harness/src/model/metrics.rs#L8) |
 | `Attempt` | struct | `pub(super)` | [crates/yourai-harness/src/model/metrics.rs:32](../crates/yourai-harness/src/model/metrics.rs#L32) |
@@ -344,4 +339,4 @@
 
 ## 配置接口调整补充（2026-10-13）
 
-按用户最新确定的分类方案，只有一个共享配置入口 Config；内部七类数据分别为 models(ModelSettings)、execution(ExecutionOptions)、security(SecuritySettings)、ui(UiSettings)、session(SessionSettings)、prompt(PromptSettings)、hooks(HookSettings)。新增六个分组 struct，ExecutionOptions 复用 core 执行数据；各分组没有独立加载、保存或全局实例，共享一个 Arc<Config>，嵌套 getter/setter 内部短暂加锁，save 统一写入主 JSON。ContextPolicy/ImagePolicy 是 execution 的嵌套策略，RequestPolicy/ModelLimits 为资源装配数据。旧平铺 JSON 可读，保存时迁移为与 Rust 类别对应的 JSON；Prompt 和 Hook 全部内嵌主 JSON，旧独立文件仅供迁移读取。详见 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13)。
+当前配置已收敛为 Config、ProviderConfig、ModelConfig、PromptSettings、HookSettings 五个 struct。Config 私有持有一份 JSON 文档；主题、安全与会话的少量字段直接归 Config。模型选择直接归根配置，providers/models 为独立 ID 表，连接、请求策略、价格、variant 不再有独立 struct。ExecutionOptions、ContextPolicy、ImagePolicy、ModelLimits、ModelTimeouts 复用 core。共享 Arc<Config>，setter 内部加锁，save 原子保存完整 JSON；旧分组和分拆文件只用于兼容读取。

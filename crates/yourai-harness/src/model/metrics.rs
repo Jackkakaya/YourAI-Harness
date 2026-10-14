@@ -209,16 +209,7 @@ mod tests {
     async fn transient_429_without_retry_after_uses_configured_cooldown() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::SqliteStore::open(&dir.path().join("sessions.sqlite3")).unwrap();
-        let budget = ModelBudget::configured(
-            {
-                let mut settings = super::super::RequestPolicy::default();
-                settings.set_rpm(None);
-                settings.set_cooldown_seconds(7);
-                settings
-            },
-            store,
-        )
-        .unwrap();
+        let budget = ModelBudget::configured((None, 7), store).unwrap();
         budget.reserve();
         let model = super::super::MeteredModel {
             inner: Arc::new(super::super::GenaiModel::new(
@@ -289,12 +280,7 @@ mod tests {
             let error = http_error_with_status(status, body);
             assert_eq!(provider.recovery(&error), recovery, "{status}: {body}");
             let budget = ModelBudget::configured(
-                {
-                    let mut settings = super::super::RequestPolicy::default();
-                    settings.set_rpm(None);
-                    settings.set_cooldown_seconds(7);
-                    settings
-                },
+                (None, 7),
                 crate::SqliteStore::open(std::path::Path::new(":memory:")).unwrap(),
             )
             .unwrap();

@@ -1561,7 +1561,7 @@ mod tests {
         let path = dir.path().join("yourai.json");
         std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
         let cfg = crate::config::Config::init(&path).unwrap();
-        let model = cfg.models().resolve().unwrap().model;
+        let model = yourai_harness::model::resolve(&cfg).unwrap().model;
         let hc =
             yourai_harness::SessionOptions::new(dir.path().join("sessions"), dir.path().into());
         hc.config.set_system_prompt(Some("test".into()));
@@ -1614,14 +1614,7 @@ mod tests {
         app.handle(key(KeyCode::Enter));
         finish(&mut app).await;
         assert!(!cfg
-            .models()
-            .provider("mock")
-            .unwrap()
-            .model("a")
-            .unwrap()
-            .variant("inherit")
-            .unwrap()
-            .options()
+            .variant_options("mock/a", "inherit")
             .unwrap()
             .contains_key("reasoningEffort"));
         // A base change must still reach the variant after that confirmation.
@@ -1638,14 +1631,7 @@ mod tests {
         finish(&mut app).await;
         assert_eq!(app.view.model.effort.as_deref(), Some("high"));
         assert!(!cfg
-            .models()
-            .provider("mock")
-            .unwrap()
-            .model("a")
-            .unwrap()
-            .variant("inherit")
-            .unwrap()
-            .options()
+            .variant_options("mock/a", "inherit")
             .unwrap()
             .contains_key("reasoningEffort"));
         // Intentionally changing high to low pins only the variant.
@@ -1668,9 +1654,7 @@ mod tests {
         finish(&mut app).await;
         assert_eq!(app.view.model.effort.as_deref(), Some("low"));
         assert_eq!(
-            cfg.models()
-                .effective_effort("mock/a", Some("inherit"))
-                .as_deref(),
+            yourai_harness::model::effective_effort(&cfg, "mock/a", Some("inherit")).as_deref(),
             Some("low")
         );
         // Config default removes that override and resumes live inheritance.
@@ -1683,14 +1667,7 @@ mod tests {
         finish(&mut app).await;
         assert_eq!(app.view.model.effort.as_deref(), Some("medium"));
         assert!(!cfg
-            .models()
-            .provider("mock")
-            .unwrap()
-            .model("a")
-            .unwrap()
-            .variant("inherit")
-            .unwrap()
-            .options()
+            .variant_options("mock/a", "inherit")
             .unwrap()
             .contains_key("reasoningEffort"));
         app.close().await.unwrap();
@@ -1703,12 +1680,12 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         app.change_theme(crate::ui::theme::Theme::Nord);
         assert_eq!(app.view.theme, crate::ui::theme::Theme::Nord);
-        assert_eq!(config.ui().theme(), "nord");
+        assert_eq!(config.theme(), "nord");
         let client = app.controller.backend.client();
         assert!(client.change_yolo(true).is_err());
         assert!(!client.yolo());
-        assert!(!config.security().yolo());
-        assert_eq!(config.ui().theme(), "nord");
+        assert!(!config.yolo());
+        assert_eq!(config.theme(), "nord");
         assert!(path.is_dir());
         app.close().await.unwrap();
     }

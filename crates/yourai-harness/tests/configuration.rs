@@ -57,7 +57,7 @@ async fn shared_config_updates_the_next_turn_and_reload_without_session_override
     let source = Arc::clone(&shared);
     h.host
         .bind_config_source(Arc::new(move || {
-            source.execution().resolve(&TurnLimits::default())
+            source.execution_options().resolve(&TurnLimits::default())
         }))
         .unwrap();
     let mut limits = TurnLimits::default();
@@ -294,7 +294,7 @@ fn config_files(directory: &std::path::Path) -> Arc<yourai_harness::config::Conf
 
 #[test]
 fn split_files_migrate_once_and_main_json_becomes_authoritative() {
-    use yourai_harness::config::{Config, UiSettings};
+    use yourai_harness::config::Config;
     let dir = tempfile::tempdir().unwrap();
     let shared = config_files(dir.path());
     let legacy = dir.path().join("prompts.json");
@@ -302,30 +302,26 @@ fn split_files_migrate_once_and_main_json_becomes_authoritative() {
     {
         let config = &shared;
         config.set_yolo(true);
-        config.set_ui({
-            let mut settings = UiSettings::default();
-            settings.set_theme("nord".into());
-            settings
-        });
+        config.set_theme("nord".into());
         config.save()
     }
     .unwrap();
     let main = dir.path().join("yourai.json");
     let mut saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
-    assert_eq!(saved["security"]["yolo"], true);
+    assert_eq!(saved["yolo"], true);
     assert_eq!(saved["prompt"]["system_prompt"], "original prompt");
     assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
-    saved["ui"]["theme"] = "light".into();
+    saved["theme"] = "light".into();
     saved["prompt"]["system_prompt"] = "external main edit".into();
     std::fs::write(&main, serde_json::to_vec(&saved).unwrap()).unwrap();
     // Old split data is no longer read once prompt is in the main JSON.
     std::fs::write(&legacy, "corrupt obsolete file").unwrap();
-    assert_eq!(shared.ui().theme(), "nord");
+    assert_eq!(shared.theme(), "nord");
     let reloaded = Config::init(&main).unwrap();
-    assert_eq!(reloaded.ui().theme(), "light");
+    assert_eq!(reloaded.theme(), "light");
     assert_eq!(
-        reloaded.prompt().system_prompt().as_deref(),
+        reloaded.system_prompt().as_deref(),
         Some("external main edit")
     );
     {
@@ -335,11 +331,7 @@ fn split_files_migrate_once_and_main_json_becomes_authoritative() {
     }
     .unwrap();
     assert_eq!(
-        Config::init(&main)
-            .unwrap()
-            .prompt()
-            .system_prompt()
-            .as_deref(),
+        Config::init(&main).unwrap().system_prompt().as_deref(),
         Some("edited in app")
     );
     assert_eq!(
@@ -350,16 +342,12 @@ fn split_files_migrate_once_and_main_json_becomes_authoritative() {
 
 #[test]
 fn legacy_inline_prompts_save_in_the_same_json_without_split_files() {
-    use yourai_harness::config::{Config, UiSettings};
+    use yourai_harness::config::Config;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("yourai.json");
     std::fs::write(&path, r#"{"model":"mock/a","provider":{},"system_prompt":"legacy prompt","append_system_prompt":"additional","profile_file":"profile.md"}"#).unwrap();
     let config = Config::init(&path).unwrap();
-    config.set_ui({
-        let mut settings = UiSettings::default();
-        settings.set_theme("nord".into());
-        settings
-    });
+    config.set_theme("nord".into());
     config.save().unwrap();
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert!(saved.get("system_prompt").is_none());
@@ -369,11 +357,7 @@ fn legacy_inline_prompts_save_in_the_same_json_without_split_files() {
     assert!(!dir.path().join("prompts.json").exists());
     assert!(!dir.path().join("hooks.json").exists());
     assert_eq!(
-        Config::init(&path)
-            .unwrap()
-            .prompt()
-            .system_prompt()
-            .as_deref(),
+        Config::init(&path).unwrap().system_prompt().as_deref(),
         Some("legacy prompt")
     );
 }
@@ -411,7 +395,7 @@ async fn model_switch_saves_global_choices_and_file_failure_keeps_live_bindings(
     initial.set_soul_file(None);
     let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
     options.config = Arc::clone(&initial);
-    let model = initial.models().resolve().unwrap().model;
+    let model = yourai_harness::model::resolve(&initial).unwrap().model;
     let h = Harness::open(options.clone(), model).await.unwrap();
     let shared = initial;
     let (backend, mut events) = controller::SessionController::new(
@@ -444,7 +428,7 @@ async fn model_switch_saves_global_choices_and_file_failure_keeps_live_bindings(
         .model("mock/b".into(), Some("short".into()), None)
         .unwrap();
     assert!(model_result(&mut events).await.is_err());
-    assert_eq!(shared.models().model(), "mock/a");
+    assert_eq!(shared.model(), "mock/a");
     assert_eq!(h.host.agent().model().unwrap().model_iden(), "a");
     std::fs::remove_dir(&path).unwrap();
     backend
@@ -458,13 +442,10 @@ async fn model_switch_saves_global_choices_and_file_failure_keeps_live_bindings(
     model_result(&mut events).await.unwrap();
     assert_eq!(h.host.agent().model().unwrap().model_iden(), "b");
     let reloaded = Config::init(&path).unwrap();
-    assert_eq!(reloaded.models().model(), "mock/b");
-    assert_eq!(reloaded.models().variant().as_deref(), Some("short"));
+    assert_eq!(reloaded.model(), "mock/b");
+    assert_eq!(reloaded.variant().as_deref(), Some("short"));
     assert_eq!(
-        reloaded
-            .models()
-            .effective_effort("mock/b", Some("short"))
-            .as_deref(),
+        yourai_harness::model::effective_effort(&reloaded, "mock/b", Some("short")).as_deref(),
         Some("high")
     );
     assert!(h
@@ -487,7 +468,7 @@ async fn model_switch_saves_global_choices_and_file_failure_keeps_live_bindings(
 
 #[test]
 fn legacy_external_hooks_migrate_without_modifying_the_backup() {
-    use yourai_harness::config::{Config, HookSettings, UiSettings};
+    use yourai_harness::config::{Config, HookSettings};
     let dir = tempfile::tempdir().unwrap();
     config_files(dir.path());
     let main = dir.path().join("yourai.json");
@@ -504,12 +485,8 @@ fn legacy_external_hooks_migrate_without_modifying_the_backup() {
     std::fs::write(&main, serde_json::to_vec(&document).unwrap()).unwrap();
     let config = Config::init(&main).unwrap();
     let backup = std::fs::read(&external).unwrap();
-    assert_eq!(config.hooks().events(), hooks);
-    config.set_ui({
-        let mut settings = UiSettings::default();
-        settings.set_theme("nord".into());
-        settings
-    });
+    assert_eq!(config.events(), hooks);
+    config.set_theme("nord".into());
     config.save().unwrap();
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
     assert_eq!(saved["hooks"]["events"], hooks);
@@ -517,17 +494,14 @@ fn legacy_external_hooks_migrate_without_modifying_the_backup() {
     assert_eq!(std::fs::read(&external).unwrap(), backup);
     std::fs::remove_file(&external).unwrap();
     std::fs::create_dir(&external).unwrap();
-    assert_eq!(Config::init(&main).unwrap().hooks().events(), hooks);
+    assert_eq!(Config::init(&main).unwrap().events(), hooks);
     config.set_hooks({
         let mut settings = HookSettings::default();
         settings.set_events(serde_json::json!({}));
         settings
     });
     config.save().unwrap();
-    assert_eq!(
-        Config::init(&main).unwrap().hooks().events(),
-        serde_json::json!({})
-    );
+    assert_eq!(Config::init(&main).unwrap().events(), serde_json::json!({}));
 }
 
 #[test]
@@ -558,10 +532,7 @@ fn external_hooks_reject_conflicts_missing_and_malformed_files() {
             .is_err());
     }
     std::fs::write(dir.path().join("hooks.json"), r#"{"hooks":{"events":{}}}"#).unwrap();
-    assert_eq!(
-        Config::init(&main).unwrap().hooks().events(),
-        serde_json::json!({})
-    );
+    assert_eq!(Config::init(&main).unwrap().events(), serde_json::json!({}));
     document["hooks"] = serde_json::json!({"Stop":[]});
     std::fs::write(&main, serde_json::to_vec(&document).unwrap()).unwrap();
     assert!(Config::init(&main).is_err());
@@ -569,9 +540,7 @@ fn external_hooks_reject_conflicts_missing_and_malformed_files() {
 
 #[test]
 fn one_save_writes_every_category_to_one_json_without_reloading() {
-    use yourai_harness::config::{
-        Config, HookSettings, SecuritySettings, SessionSettings, UiSettings,
-    };
+    use yourai_harness::config::{Config, HookSettings};
     let dir = tempfile::tempdir().unwrap();
     let shared = config_files(dir.path());
     let main = dir.path().join("yourai.json");
@@ -583,23 +552,11 @@ fn one_save_writes_every_category_to_one_json_without_reloading() {
         config.set_model("mock/b".into());
         config.set_variant(Some("short".into()));
         config.set_steps(Some(3));
-        config.set_security({
-            let mut settings = SecuritySettings::default();
-            settings.set_yolo(true);
-            settings.set_trusted_shell(true);
-            settings
-        });
-        config.set_ui({
-            let mut settings = UiSettings::default();
-            settings.set_theme("nord".into());
-            settings
-        });
-        config.set_session({
-            let mut settings = SessionSettings::default();
-            settings.set_directory("custom-sessions".into());
-            settings.set_extensions(true);
-            settings
-        });
+        config.set_yolo(true);
+        config.set_trusted_shell(true);
+        config.set_theme("nord".into());
+        config.set_directory("custom-sessions".into());
+        config.set_extensions(true);
         config.set_system_prompt(Some("cached prompt".into()));
         config.set_hooks({
             let mut settings = HookSettings::default();
@@ -610,21 +567,18 @@ fn one_save_writes_every_category_to_one_json_without_reloading() {
     }
     .unwrap();
     let reloaded = Config::init(&main).unwrap();
-    assert_eq!(reloaded.models().model(), "mock/b");
-    assert_eq!(reloaded.models().variant().as_deref(), Some("short"));
-    assert_eq!(reloaded.execution().steps(), Some(3));
-    assert!(reloaded.security().yolo() && reloaded.security().trusted_shell());
-    assert_eq!(reloaded.ui().theme(), "nord");
+    assert_eq!(reloaded.model(), "mock/b");
+    assert_eq!(reloaded.variant().as_deref(), Some("short"));
+    assert_eq!(reloaded.steps(), Some(3));
+    assert!(reloaded.yolo() && reloaded.trusted_shell());
+    assert_eq!(reloaded.theme(), "nord");
     assert_eq!(
-        *reloaded.session().directory(),
+        *reloaded.directory(),
         std::path::PathBuf::from("custom-sessions")
     );
-    assert!(reloaded.session().extensions());
-    assert_eq!(
-        reloaded.prompt().system_prompt().as_deref(),
-        Some("cached prompt")
-    );
-    assert_eq!(reloaded.hooks().events(), serde_json::json!({"Stop":[]}));
+    assert!(reloaded.extensions());
+    assert_eq!(reloaded.system_prompt().as_deref(), Some("cached prompt"));
+    assert_eq!(reloaded.events(), serde_json::json!({"Stop":[]}));
     assert_eq!(
         std::fs::read_to_string(&legacy).unwrap(),
         "obsolete external edit"
@@ -646,8 +600,8 @@ fn grouped_configuration_roundtrips_and_rejects_ambiguous_or_unknown_fields() {
     });
     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
     let shared = Arc::new(Config::init(&path).unwrap());
-    assert_eq!(shared.execution().steps(), Some(4));
-    assert_eq!(shared.execution().attachment_image().max_width(), 1200);
+    assert_eq!(shared.steps(), Some(4));
+    assert_eq!(shared.attachment_image().max_width(), 1200);
     {
         let value = &shared;
         value.set_yolo(true);
@@ -656,16 +610,15 @@ fn grouped_configuration_roundtrips_and_rejects_ambiguous_or_unknown_fields() {
     .unwrap();
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(saved["execution"]["context"]["summary_tokens"], 1234);
-    assert_eq!(saved["models"]["model"], "mock/a");
-    assert!(saved.get("model").is_none());
+    assert_eq!(saved["model"], "mock/a");
+    assert!(saved["models"].get("model").is_none());
+    for wrapper in ["ui", "security", "session"] {
+        assert!(saved.get(wrapper).is_none());
+    }
     assert!(saved.get("steps").is_none());
     assert_eq!(saved["prompt"]["system_prompt"], "inline grouped prompt");
     assert_eq!(
-        Config::init(&path)
-            .unwrap()
-            .prompt()
-            .system_prompt()
-            .as_deref(),
+        Config::init(&path).unwrap().system_prompt().as_deref(),
         Some("inline grouped prompt")
     );
     for (category, key) in [
@@ -728,43 +681,35 @@ fn legacy_hook_references_cannot_recursively_read_the_main_config() {
 }
 
 #[test]
-fn preparing_a_model_selection_does_not_modify_shared_configuration() {
+fn selecting_a_model_updates_memory_without_implicitly_saving() {
     let dir = tempfile::tempdir().unwrap();
     let config = config_files(dir.path());
-    let before = serde_json::to_value(&config).unwrap();
-    let model = config
-        .models()
-        .select_model("mock/b", Some("short".into()), None)
-        .unwrap();
-    assert_eq!(model.model(), "mock/b");
-    assert_eq!(serde_json::to_value(&config).unwrap(), before);
+    let path = dir.path().join("yourai.json");
+    let before = std::fs::read(&path).unwrap();
+    yourai_harness::model::select(&config, "mock/b", Some("short".into()), None).unwrap();
+    assert_eq!(config.model(), "mock/b");
+    assert_eq!(config.variant().as_deref(), Some("short"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
 #[test]
-fn invalid_model_choice_does_not_partially_modify_a_candidate() {
+fn invalid_model_choice_does_not_partially_modify_configuration() {
     use yourai_harness::model::EffortChoice;
     let dir = tempfile::tempdir().unwrap();
-    let candidate = config_files(dir.path());
-    let before = serde_json::to_value(&candidate).unwrap();
-    assert!(candidate
-        .models()
-        .select_model(
+    let config = config_files(dir.path());
+    let before = serde_json::to_value(&config).unwrap();
+    for (id, variant, effort) in [
+        (
             "mock/b",
             Some("short".into()),
-            Some(&EffortChoice::Set("invalid".into()))
-        )
-        .is_err());
-    assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
-    assert!(candidate
-        .models()
-        .select_model("mock/b", Some("missing".into()), None)
-        .is_err());
-    assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
-    assert!(candidate
-        .models()
-        .select_model("mock/", None, None)
-        .is_err());
-    assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
+            Some(EffortChoice::Set("invalid".into())),
+        ),
+        ("mock/b", Some("missing".into()), None),
+        ("mock/", None, None),
+    ] {
+        assert!(yourai_harness::model::select(&config, id, variant, effort.as_ref()).is_err());
+        assert_eq!(serde_json::to_value(&config).unwrap(), before);
+    }
 }
 
 #[test]
@@ -776,8 +721,8 @@ fn explicit_validation_reports_invalid_edits_without_saving() {
     config.set_steps(Some(0));
     config.set_theme("nord".into());
     assert!(yourai_harness::assembly::validate_config(&config).is_err());
-    assert_eq!(config.execution().steps(), Some(0));
-    assert_eq!(config.ui().theme(), "nord");
+    assert_eq!(config.steps(), Some(0));
+    assert_eq!(config.theme(), "nord");
     assert_eq!(std::fs::read(&main).unwrap(), before);
 }
 
@@ -796,27 +741,20 @@ fn json_loading_and_saving_do_not_apply_business_rules() {
     )
     .unwrap();
     let config = Config::init(&path).unwrap();
-    assert_eq!(config.execution().steps(), Some(0));
-    config.set_ui({
-        let mut settings = yourai_harness::config::UiSettings::default();
-        settings.set_theme("nord".into());
-        settings
-    });
+    assert_eq!(config.steps(), Some(0));
+    config.set_theme("nord".into());
     config.save().unwrap();
     let reloaded = Config::init(&path).unwrap();
-    assert_eq!(reloaded.ui().theme(), "nord");
-    assert_eq!(reloaded.models().model(), "not-a-provider-selection");
-    assert_eq!(reloaded.execution().steps(), Some(0));
-    assert_eq!(
-        reloaded.hooks().events(),
-        serde_json::json!({"UnknownEvent":[]})
-    );
+    assert_eq!(reloaded.theme(), "nord");
+    assert_eq!(reloaded.model(), "not-a-provider-selection");
+    assert_eq!(reloaded.steps(), Some(0));
+    assert_eq!(reloaded.events(), serde_json::json!({"UnknownEvent":[]}));
     assert!(yourai_harness::assembly::validate_config(&reloaded).is_err());
 }
 
 #[tokio::test]
 async fn model_switch_preserves_unrelated_edits_and_rejects_stale_resources() {
-    use yourai_harness::{config::UiSettings, controller};
+    use yourai_harness::controller;
     struct Gate {
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
@@ -838,9 +776,12 @@ async fn model_switch_preserves_unrelated_edits_and_rejects_stale_resources() {
     initial.set_soul_file(None);
     let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
     options.config = Arc::clone(&initial);
-    let h = Harness::open(options.clone(), initial.models().resolve().unwrap().model)
-        .await
-        .unwrap();
+    let h = Harness::open(
+        options.clone(),
+        yourai_harness::model::resolve(&initial).unwrap().model,
+    )
+    .await
+    .unwrap();
     let gate = Arc::new(Gate {
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -872,16 +813,9 @@ async fn model_switch_preserves_unrelated_edits_and_rejects_stale_resources() {
         {
             let config = &shared;
             if stale {
-                let context = config.execution().context_policy();
-                context
-                    .set_safety_margin(context.safety_margin() + 1)
-                    .unwrap();
+                config.set_context_safety_margin(config.context_safety_margin() + 1);
             } else {
-                config.set_ui({
-                    let mut settings = UiSettings::default();
-                    settings.set_theme("nord".into());
-                    settings
-                });
+                config.set_theme("nord".into());
             }
             config.save()
         }
@@ -901,14 +835,14 @@ async fn model_switch_preserves_unrelated_edits_and_rejects_stale_resources() {
         } else {
             assert_eq!(result.unwrap().label, "mock/b");
         }
-        assert_eq!(shared.models().model(), "mock/b");
+        assert_eq!(shared.model(), "mock/b");
         assert_eq!(
             backend.harness().host.agent().model().unwrap().model_iden(),
             "b"
         );
         let saved = yourai_harness::config::Config::init(&dir.path().join("yourai.json")).unwrap();
-        assert_eq!(saved.models().model(), "mock/b");
-        assert_eq!(saved.ui().theme(), "nord");
+        assert_eq!(saved.model(), "mock/b");
+        assert_eq!(saved.theme(), "nord");
     }
     backend.close().await.unwrap();
 }
@@ -919,11 +853,11 @@ fn legacy_selected_loads_but_saves_as_model_and_rejects_duplicates() {
     let path = dir.path().join("yourai.json");
     std::fs::write(&path, r#"{"models":{"selected":"mock/a"}}"#).unwrap();
     let config = yourai_harness::config::Config::init(&path).unwrap();
-    assert_eq!(config.models().model(), "mock/a");
+    assert_eq!(config.model(), "mock/a");
     config.save().unwrap();
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(saved["models"]["model"], "mock/a");
-    assert!(saved["models"].get("selected").is_none());
+    assert_eq!(saved["model"], "mock/a");
+    assert!(saved.get("selected").is_none());
     for document in [
         r#"{"models":{"model":"mock/a","selected":"mock/b"}}"#,
         r#"{"model":"mock/a","models":{"selected":"mock/b"}}"#,
@@ -942,26 +876,18 @@ fn direct_setters_update_shared_data_and_only_save_when_requested() {
     let before = std::fs::read(&path).unwrap();
     config.set_model("mock/b".into());
     config
-        .models()
-        .provider("mock")
-        .unwrap()
-        .options()
-        .set_base_url(Some("http://localhost:8081/v1".into()))
+        .set_provider_base_url("mock", Some("http://localhost:8081/v1".into()))
         .unwrap();
     config.set_steps(Some(7));
-    config
-        .execution()
-        .context_policy()
-        .set_summary_tokens(1500)
-        .unwrap();
+    config.set_context_summary_tokens(1500);
     config.set_yolo(true);
     config.set_theme("nord".into());
     config.set_extensions(true);
     config.set_system_prompt(Some("local prompt".into()));
     config.set_events(serde_json::json!({"SessionStart":[]}));
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert_eq!(config.models().model(), "mock/b");
-    assert_eq!(config.execution().steps(), Some(7));
+    assert_eq!(config.model(), "mock/b");
+    assert_eq!(config.steps(), Some(7));
     config.save().unwrap();
     let saved = Config::init(&path).unwrap();
     assert_eq!(
@@ -993,8 +919,8 @@ fn arc_config_serializes_concurrent_setters() {
         worker.join().unwrap();
     }
     assert_eq!(config.theme(), "theme-20");
-    assert_eq!(config.execution().steps(), Some(20));
-    assert_eq!(config.models().model(), "mock/model-20");
+    assert_eq!(config.steps(), Some(20));
+    assert_eq!(config.model(), "mock/model-20");
     let saved = yourai_harness::config::Config::init(&dir.path().join("yourai.json")).unwrap();
     assert_eq!(
         serde_json::to_value(config.as_ref()).unwrap(),
@@ -1003,48 +929,35 @@ fn arc_config_serializes_concurrent_setters() {
 }
 
 #[test]
-fn nested_sections_write_the_same_config_and_report_removed_entries() {
+fn indexed_setters_modify_shared_data_and_reject_missing_entries() {
     let dir = tempfile::tempdir().unwrap();
     let config = config_files(dir.path());
-    let provider = config.models().provider("mock").unwrap();
-    let connection = provider.options();
-    connection
-        .set_base_url(Some("http://localhost:8081/v1".into()))
+    config
+        .set_provider_base_url("mock", Some("http://localhost:8081/v1".into()))
         .unwrap();
-    provider
-        .model("a")
-        .unwrap()
-        .limit()
-        .set_context(Some(12345))
-        .unwrap();
+    config.set_model_context("mock/a", Some(12345)).unwrap();
     assert_eq!(
-        config
-            .models()
-            .provider("mock")
-            .unwrap()
-            .options()
-            .base_url()
-            .unwrap()
-            .as_deref(),
+        config.provider_base_url("mock").unwrap().as_deref(),
         Some("http://localhost:8081/v1")
     );
+    assert_eq!(config.model_context("mock/a").unwrap(), Some(12345));
     config.save().unwrap();
     let json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("yourai.json")).unwrap()).unwrap();
-    assert_eq!(
-        json["models"]["providers"]["mock"]["models"]["a"]["limit"]["context"],
-        12345
-    );
-    config.models().set_providers(Default::default()).unwrap();
-    assert!(connection.set_api_key(Some("removed".into())).is_err());
-    assert!(connection.api_key().is_err());
+    assert_eq!(json["models"]["mock/a"]["limit"]["context"], 12345);
+    config.remove_provider("mock").unwrap();
+    assert!(config
+        .set_provider_api_key("mock", Some("removed".into()))
+        .is_err());
+    assert!(config.provider_api_key("mock").is_err());
+    assert!(config.set_model_context("missing/a", Some(123)).is_err());
 }
 
 #[test]
-fn retained_sections_never_keep_the_global_lock() {
+fn reading_a_field_never_keeps_the_global_lock() {
     let dir = tempfile::tempdir().unwrap();
     let config = config_files(dir.path());
-    let ui = config.ui();
+    let old_theme = config.theme();
     let (tx, rx) = std::sync::mpsc::channel();
     let writer = Arc::clone(&config);
     let task = std::thread::spawn(move || {
@@ -1055,10 +968,9 @@ fn retained_sections_never_keep_the_global_lock() {
     });
     rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     task.join().unwrap();
-    ui.set_theme("through-section".into()).unwrap();
-    assert_eq!(config.theme(), "through-section");
-    assert_eq!(config.execution().steps(), Some(20));
-    assert_eq!(ui.theme(), "through-section");
+    assert_ne!(old_theme, config.theme());
+    assert_eq!(config.theme(), "nord");
+    assert_eq!(config.steps(), Some(20));
 }
 
 #[test]
@@ -1066,8 +978,8 @@ fn session_options_clone_shares_the_same_config() {
     let options = SessionOptions::new("sessions".into(), ".".into());
     let other = options.clone();
     assert!(Arc::ptr_eq(&options.config, &other.config));
-    other.config.ui().set_theme("nord".into()).unwrap();
-    assert_eq!(options.config.ui().theme(), "nord");
+    other.config.set_theme("nord".into());
+    assert_eq!(options.config.theme(), "nord");
 }
 
 #[test]
@@ -1078,10 +990,9 @@ fn concurrent_nested_setters_preserve_other_fields() {
         .map(|worker| {
             let config = Arc::clone(&config);
             std::thread::spawn(move || {
-                let connection = config.models().provider("mock").unwrap().options();
                 for step in 0..20 {
-                    connection
-                        .set_header(format!("worker-{worker}"), step.to_string())
+                    config
+                        .set_provider_header("mock", format!("worker-{worker}"), step.to_string())
                         .unwrap();
                 }
             })
@@ -1091,22 +1002,13 @@ fn concurrent_nested_setters_preserve_other_fields() {
         task.join().unwrap();
     }
     config.save().unwrap();
-    let headers = config
-        .models()
-        .provider("mock")
-        .unwrap()
-        .options()
-        .headers()
-        .unwrap();
+    let headers = config.provider_headers("mock").unwrap();
     for worker in 0..3 {
         assert_eq!(headers[&format!("worker-{worker}")], "19");
     }
     let json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("yourai.json")).unwrap()).unwrap();
-    assert_eq!(
-        json["models"]["providers"]["mock"]["options"]["headers"]["worker-2"],
-        "19"
-    );
+    assert_eq!(json["providers"]["mock"]["headers"]["worker-2"], "19");
 }
 
 #[tokio::test]
@@ -1118,13 +1020,16 @@ async fn opening_a_session_uses_current_defaults_without_overwriting_them() {
     config.set_yolo(true);
     let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
     options.config = Arc::clone(&config);
-    let harness = Harness::open(options.clone(), config.models().resolve().unwrap().model)
-        .await
-        .unwrap();
+    let harness = Harness::open(
+        options.clone(),
+        yourai_harness::model::resolve(&config).unwrap().model,
+    )
+    .await
+    .unwrap();
     assert!(harness.yolo());
     let (backend, mut events) =
         SessionController::new(harness, Arc::clone(&config), options, TurnLimits::default());
-    config.security().set_yolo(false).unwrap();
+    config.set_yolo(false);
     config.save().unwrap();
     backend.client().switch(None).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1137,12 +1042,11 @@ async fn opening_a_session_uses_current_defaults_without_overwriting_them() {
     })
     .await
     .unwrap();
-    assert!(!config.security().yolo());
+    assert!(!config.yolo());
     assert!(!backend.harness().yolo());
     assert!(
         !yourai_harness::config::Config::init(&dir.path().join("yourai.json"))
             .unwrap()
-            .security()
             .yolo()
     );
     backend.close().await.unwrap();
@@ -1150,31 +1054,44 @@ async fn opening_a_session_uses_current_defaults_without_overwriting_them() {
 
 #[test]
 fn model_menu_projects_one_consistent_configuration_version() {
-    let config = Arc::new(yourai_harness::config::Config::default());
-    let variants: Vec<yourai_harness::config::ModelSettings> = ["a", "b"]
+    use yourai_harness::config::{Config, ModelConfig, ProviderConfig};
+    let config = Arc::new(Config::default());
+    config.set_provider("mock".into(), ProviderConfig::default());
+    config.set_model("mock/main".into());
+    let versions: Vec<ModelConfig> = ["a", "b"]
         .into_iter()
         .map(|id| {
             serde_json::from_value(serde_json::json!({
-            "model":format!("{id}/main"),
-            "providers":{id:{"models":{"main":{"variants":{"fast":{"reasoningEffort":"high"}}}}}}
-        })).unwrap()
+                "provider":"mock","variants":{
+                    format!("{id}-fast"):{"reasoningEffort":"high"},
+                    format!("{id}-slow"):{"reasoningEffort":"low"}
+                }
+            }))
+            .unwrap()
         })
         .collect();
-    config.set_models(variants[0].clone());
+    config
+        .set_model_config("mock/main".into(), versions[0].clone())
+        .unwrap();
     let writer = Arc::clone(&config);
     let task = std::thread::spawn(move || {
         for iteration in 0..1000 {
-            writer.set_models(variants[iteration % 2].clone());
+            writer
+                .set_model_config("mock/main".into(), versions[iteration % 2].clone())
+                .unwrap();
         }
     });
     for _ in 0..1000 {
-        let choices = config.models().choices();
-        assert_eq!(choices.len(), 2);
-        let id = &choices[0].id;
-        assert_eq!(choices[1].id, *id);
-        assert_eq!(choices[0].label, *id);
-        assert_eq!(choices[1].label, format!("{id} · fast"));
+        let choices = yourai_harness::model::choices(&config);
+        assert_eq!(choices.len(), 3);
+        assert!(choices.iter().all(|choice| choice.id == "mock/main"));
+        let prefix = choices[1].variant.as_ref().unwrap().chars().next().unwrap();
+        assert_eq!(
+            choices[2].variant.as_ref().unwrap().chars().next().unwrap(),
+            prefix
+        );
         assert_eq!(choices[1].effort.as_deref(), Some("high"));
+        assert_eq!(choices[2].effort.as_deref(), Some("low"));
     }
     task.join().unwrap();
 }
