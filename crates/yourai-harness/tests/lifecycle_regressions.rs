@@ -487,9 +487,10 @@ async fn imported_task_backup_is_retired_even_when_it_changes_or_breaks() {
             id.clone(),
             cwd.path().into(),
             Agent::builder().model(Arc::new(Model::new(vec![]))),
-            ExecutionOptions {
-                context_policy: ContextPolicy::default(),
-                ..Default::default()
+            {
+                let mut settings: yourai_core::execution::ExecutionOptions = Default::default();
+                settings.set_context_policy(ContextPolicy::default());
+                settings
             },
             "resume",
         )

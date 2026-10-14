@@ -37,7 +37,7 @@ async fn run(harness: &Harness, limits: TurnLimits) {
 
 #[tokio::test]
 async fn shared_config_updates_the_next_turn_and_reload_without_session_overrides() {
-    use yourai_harness::config::{self, Config};
+    use yourai_harness::config::Config;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("yourai.json");
     std::fs::write(
@@ -45,34 +45,37 @@ async fn shared_config_updates_the_next_turn_and_reload_without_session_override
         r#"{"model":"mock/a","steps":5,"max_model_retries":2,"provider":{}}"#,
     )
     .unwrap();
-    let shared = Arc::new(Mutex::new(Config::load(&path).unwrap()));
+    let shared = Arc::new(Config::init(&path).unwrap());
     let seen = Arc::new(Mutex::new(vec![]));
     let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    options.config.prompt.system_prompt = Some("test".into());
+    options.config.set_system_prompt(Some("test".into()));
     options.agent_loop = Some(Arc::new(Probe(seen.clone())));
-    options.config = shared.lock().unwrap().clone();
+    options.config = Arc::clone(&shared);
     let h = Harness::open(options.clone(), Arc::new(support::Model::new(vec![])))
         .await
         .unwrap();
-    let source = shared.clone();
+    let source = Arc::clone(&shared);
     h.host
-        .bind_config_source(Arc::new(move || source.lock().unwrap().execution_options()))
+        .bind_config_source(Arc::new(move || {
+            source.execution().resolve(&TurnLimits::default())
+        }))
         .unwrap();
     let mut limits = TurnLimits::default();
     limits.steps = Some(3);
     run(&h, limits).await;
-    config::update(&shared, |config| {
-        config.execution.memory_search_limit = 7;
-        Ok(())
-    })
+    {
+        let config = &shared;
+        config.set_memory_search_limit(7);
+        config.save()
+    }
     .unwrap();
     run(&h, TurnLimits::default()).await;
     let configs = seen.lock().unwrap().clone();
-    assert_eq!(configs[0].steps, Some(3));
-    assert_eq!(configs[0].max_model_retries, 2);
-    assert_eq!(configs[0].memory_search_limit, 0);
-    assert_eq!(configs[1].steps, Some(5));
-    assert_eq!(configs[1].memory_search_limit, 7);
+    assert_eq!(configs[0].steps(), Some(3));
+    assert_eq!(configs[0].max_model_retries(), 2);
+    assert_eq!(configs[0].memory_search_limit(), 0);
+    assert_eq!(configs[1].steps(), Some(5));
+    assert_eq!(configs[1].memory_search_limit(), 7);
     assert!(h
         .host
         .store()
@@ -81,22 +84,22 @@ async fn shared_config_updates_the_next_turn_and_reload_without_session_override
         .is_none());
     options.resume = Some(h.host.environment().id);
     h.close().await.unwrap();
-    options.config = Config::load(&path).unwrap();
+    options.config = Arc::new(Config::init(&path).unwrap());
     let resumed = Harness::open(options, Arc::new(support::Model::new(vec![])))
         .await
         .unwrap();
-    assert_eq!(resumed.host.config().memory_search_limit, 7);
+    assert_eq!(resumed.host.config().memory_search_limit(), 7);
     resumed.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn child_inherits_execution_limits_without_activating_parent_skills() {
     let dir = tempfile::tempdir().unwrap();
-    let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    options.config.prompt.system_prompt = Some("test".into());
-    options.config.session.extensions = true;
-    options.config.execution.steps = Some(1);
-    options.config.execution.skill_ids = vec!["parent-only".into()];
+    let options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    options.config.set_system_prompt(Some("test".into()));
+    options.config.set_extensions(true);
+    options.config.set_steps(Some(1));
+    options.config.set_skill_ids(vec!["parent-only".into()]);
     let h = Harness::open(options, Arc::new(support::Model::new(vec![])))
         .await
         .unwrap();
@@ -136,7 +139,7 @@ async fn child_inherits_execution_limits_without_activating_parent_skills() {
         assert!(requests[0].request.tools.as_ref().is_none_or(Vec::is_empty));
         assert!(!format!("{:?}", requests[0].request).contains("PARENT_ONLY_SKILL"));
     }
-    assert_eq!(h.host.config().skill_ids, vec!["parent-only"]);
+    assert_eq!(*h.host.config().skill_ids(), vec!["parent-only"]);
     h.close().await.unwrap();
 }
 
@@ -144,7 +147,7 @@ async fn child_inherits_execution_limits_without_activating_parent_skills() {
 async fn title_backfill_failure_does_not_prevent_resume() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    options.config.prompt.system_prompt = Some("test".into());
+    options.config.set_system_prompt(Some("test".into()));
     options.agent_loop = Some(Arc::new(Probe(Arc::new(Mutex::new(vec![])))));
     let h = Harness::open(options.clone(), Arc::new(support::Model::new(vec![])))
         .await
@@ -206,9 +209,10 @@ async fn session_factories_preserve_bindings_separately_from_runtime_configurati
         .unwrap();
     first.close(None).await.unwrap();
 
-    let settings = ExecutionOptions {
-        steps: Some(3),
-        ..Default::default()
+    let settings = {
+        let mut settings: ExecutionOptions = Default::default();
+        settings.set_steps(Some(3));
+        settings
     };
     let restored = yourai_harness::runtime::restore(
         &root,
@@ -240,8 +244,8 @@ async fn session_factories_preserve_bindings_separately_from_runtime_configurati
         .unwrap()
         .result
         .unwrap();
-    assert_eq!(seen.lock().unwrap()[0].steps, None);
-    assert_eq!(seen.lock().unwrap()[1].steps, Some(3));
+    assert_eq!(seen.lock().unwrap()[0].steps(), None);
+    assert_eq!(seen.lock().unwrap()[1].steps(), Some(3));
     assert_eq!(
         hooks
             .seen
@@ -267,7 +271,7 @@ async fn session_factory_rejects_missing_model_before_creating_storage() {
     assert!(!root.exists());
 }
 
-fn config_files(directory: &std::path::Path) -> yourai_harness::config::Config {
+fn config_files(directory: &std::path::Path) -> Arc<yourai_harness::config::Config> {
     let path = directory.join("yourai.json");
     std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
         "model":"mock/a", "provider":{"mock":{
@@ -285,170 +289,180 @@ fn config_files(directory: &std::path::Path) -> yourai_harness::config::Config {
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     value["provider"]["mock"]["options"]["apiKey"] = "test-only".into();
     std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-    yourai_harness::config::Config::load(&path).unwrap()
+    Arc::new(yourai_harness::config::Config::init(&path).unwrap())
 }
 
 #[test]
-fn ordinary_and_prompt_files_load_once_and_save_independently() {
-    use yourai_harness::config::{self, Config};
+fn split_files_migrate_once_and_main_json_becomes_authoritative() {
+    use yourai_harness::config::{Config, UiSettings};
     let dir = tempfile::tempdir().unwrap();
-    let shared = Arc::new(Mutex::new(config_files(dir.path())));
-    let prompt_path = dir.path().join("prompts.json");
-    let original_prompt = std::fs::read(&prompt_path).unwrap();
-    config::update(&shared, |config| {
-        config.security.yolo = true;
-        config.ui.theme = "nord".into();
-        Ok(())
-    })
+    let shared = config_files(dir.path());
+    let legacy = dir.path().join("prompts.json");
+    let legacy_before = std::fs::read(&legacy).unwrap();
+    {
+        let config = &shared;
+        config.set_yolo(true);
+        config.set_ui({
+            let mut settings = UiSettings::default();
+            settings.set_theme("nord".into());
+            settings
+        });
+        config.save()
+    }
     .unwrap();
-    assert_eq!(std::fs::read(&prompt_path).unwrap(), original_prompt);
-    let main_path = dir.path().join("yourai.json");
-    let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&main_path).unwrap()).unwrap();
+    let main = dir.path().join("yourai.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
     assert_eq!(saved["security"]["yolo"], true);
-    assert!(saved.get("system_prompt").is_none());
-    assert!(saved.get("soul_file").is_none());
-    assert!(saved.get("prompt").is_none());
-    assert_eq!(shared.lock().unwrap().ui.theme, "nord");
-    // Out-of-process edits do not affect the cached values.
-    let mut edited = saved.clone();
-    edited["ui"]["theme"] = "light".into();
-    std::fs::write(&main_path, serde_json::to_vec(&edited).unwrap()).unwrap();
-    std::fs::write(&prompt_path, r#"{"system_prompt":"externally changed"}"#).unwrap();
-    assert_eq!(shared.lock().unwrap().ui.theme, "nord");
+    assert_eq!(saved["prompt"]["system_prompt"], "original prompt");
+    assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+    saved["ui"]["theme"] = "light".into();
+    saved["prompt"]["system_prompt"] = "external main edit".into();
+    std::fs::write(&main, serde_json::to_vec(&saved).unwrap()).unwrap();
+    // Old split data is no longer read once prompt is in the main JSON.
+    std::fs::write(&legacy, "corrupt obsolete file").unwrap();
+    assert_eq!(shared.ui().theme(), "nord");
+    let reloaded = Config::init(&main).unwrap();
+    assert_eq!(reloaded.ui().theme(), "light");
     assert_eq!(
-        shared.lock().unwrap().prompt.system_prompt.as_deref(),
-        Some("original prompt")
+        reloaded.prompt().system_prompt().as_deref(),
+        Some("external main edit")
     );
-    let reloaded = Config::load(&main_path).unwrap();
-    assert_eq!(reloaded.ui.theme, "light");
-    assert_eq!(
-        reloaded.prompt.system_prompt.as_deref(),
-        Some("externally changed")
-    );
-    // An in-app prompt edit touches its own file, never the ordinary config.
-    let main_before = std::fs::read(&main_path).unwrap();
-    config::update(&shared, |prompt| {
-        prompt.prompt.system_prompt = Some("edited in app".into());
-        Ok(())
-    })
+    {
+        let config = &shared;
+        config.set_system_prompt(Some("edited in app".into()));
+        config.save()
+    }
     .unwrap();
-    assert_eq!(std::fs::read(&main_path).unwrap(), main_before);
     assert_eq!(
-        shared.lock().unwrap().prompt.system_prompt.as_deref(),
-        Some("edited in app")
-    );
-    assert_eq!(
-        Config::load(&main_path)
+        Config::init(&main)
             .unwrap()
-            .prompt
-            .system_prompt
+            .prompt()
+            .system_prompt()
             .as_deref(),
         Some("edited in app")
     );
+    assert_eq!(
+        std::fs::read_to_string(&legacy).unwrap(),
+        "corrupt obsolete file"
+    );
 }
 
 #[test]
-fn legacy_inline_prompts_are_preserved_when_the_main_config_is_saved() {
-    use yourai_harness::config::{self, Config};
+fn legacy_inline_prompts_save_in_the_same_json_without_split_files() {
+    use yourai_harness::config::{Config, UiSettings};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("yourai.json");
     std::fs::write(&path, r#"{"model":"mock/a","provider":{},"system_prompt":"legacy prompt","append_system_prompt":"additional","profile_file":"profile.md"}"#).unwrap();
-    let shared = Arc::new(Mutex::new(Config::load(&path).unwrap()));
-    assert!(
-        !dir.path().join("prompts.json").exists(),
-        "load must not migrate files"
-    );
-    config::update(&shared, |config| {
-        config.security.yolo = true;
-        Ok(())
-    })
-    .unwrap();
-    let main: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert!(main.get("system_prompt").is_none());
-    let prompt: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.path().join("prompts.json")).unwrap()).unwrap();
-    assert_eq!(prompt["system_prompt"], "legacy prompt");
-    assert_eq!(prompt["append_system_prompt"], "additional");
-    assert_eq!(prompt["profile_file"], "profile.md");
+    let config = Config::init(&path).unwrap();
+    config.set_ui({
+        let mut settings = UiSettings::default();
+        settings.set_theme("nord".into());
+        settings
+    });
+    config.save().unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(saved.get("system_prompt").is_none());
+    assert_eq!(saved["prompt"]["system_prompt"], "legacy prompt");
+    assert_eq!(saved["prompt"]["append_system_prompt"], "additional");
+    assert_eq!(saved["prompt"]["profile_file"], "profile.md");
+    assert!(!dir.path().join("prompts.json").exists());
+    assert!(!dir.path().join("hooks.json").exists());
     assert_eq!(
-        Config::load(&path).unwrap().prompt.system_prompt.as_deref(),
+        Config::init(&path)
+            .unwrap()
+            .prompt()
+            .system_prompt()
+            .as_deref(),
         Some("legacy prompt")
     );
 }
 
 #[test]
-fn failed_file_save_does_not_publish_new_values() {
-    use yourai_harness::config;
+fn failed_save_keeps_local_edits_and_leaves_legacy_files_untouched() {
     let dir = tempfile::tempdir().unwrap();
-    let shared = Arc::new(Mutex::new(config_files(dir.path())));
+    let shared = config_files(dir.path());
     let path = dir.path().join("yourai.json");
+    let before = serde_json::to_value(&shared).unwrap();
+    let legacy_before = std::fs::read(dir.path().join("prompts.json")).unwrap();
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
-    let prompt_before = std::fs::read(dir.path().join("prompts.json")).unwrap();
-    assert!(config::update(&shared, |config| {
-        config.security.yolo = true;
-        Ok(())
-    })
+    assert!({
+        let config = &shared;
+        config.set_yolo(true);
+        config.set_theme("nord".into());
+        config.set_system_prompt(Some("local edit".into()));
+        config.save()
+    }
     .is_err());
-    assert!(!shared.lock().unwrap().security.yolo);
+    assert_ne!(serde_json::to_value(&shared).unwrap(), before);
     assert_eq!(
         std::fs::read(dir.path().join("prompts.json")).unwrap(),
-        prompt_before
+        legacy_before
     );
-    std::fs::remove_file(dir.path().join("prompts.json")).unwrap();
-    std::fs::create_dir(dir.path().join("prompts.json")).unwrap();
-    assert!(config::update(&shared, |prompt| {
-        prompt.prompt.system_prompt = Some("must not publish".into());
-        Ok(())
-    })
-    .is_err());
-    assert_eq!(
-        shared.lock().unwrap().prompt.system_prompt.as_deref(),
-        Some("original prompt")
-    );
+    assert!(path.is_dir());
 }
 
 #[tokio::test]
 async fn model_switch_saves_global_choices_and_file_failure_keeps_live_bindings() {
-    use yourai_harness::{
-        config::{Config, EffortChoice},
-        controller,
-    };
+    use yourai_harness::{config::Config, controller, model::EffortChoice};
     let dir = tempfile::tempdir().unwrap();
-    let mut initial = config_files(dir.path());
-    initial.prompt.soul_file = None;
+    let initial = config_files(dir.path());
+    initial.set_soul_file(None);
     let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    initial.apply_to(&mut options);
-    let model = initial.resolve(None).unwrap().model;
+    options.config = Arc::clone(&initial);
+    let model = initial.models().resolve().unwrap().model;
     let h = Harness::open(options.clone(), model).await.unwrap();
-    let shared = Arc::new(Mutex::new(initial));
+    let shared = initial;
+    let (backend, mut events) = controller::SessionController::new(
+        h,
+        Arc::clone(&shared),
+        options.clone(),
+        TurnLimits::default(),
+    );
+    let h = backend.harness();
+    async fn model_result(
+        events: &mut controller::SessionSubscription,
+    ) -> Result<controller::ModelSelection, String> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Some(controller::SessionEvent::Model(result)) => return result,
+                    Some(_) => {}
+                    None => panic!("backend closed before model result"),
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
     let path = dir.path().join("yourai.json");
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
-    assert!(
-        controller::switch_model(&shared, &h, "mock/b", Some("short".into()), None)
-            .await
-            .is_err()
-    );
-    assert_eq!(shared.lock().unwrap().models.selected, "mock/a");
+    backend
+        .client()
+        .model("mock/b".into(), Some("short".into()), None)
+        .unwrap();
+    assert!(model_result(&mut events).await.is_err());
+    assert_eq!(shared.models().model(), "mock/a");
     assert_eq!(h.host.agent().model().unwrap().model_iden(), "a");
     std::fs::remove_dir(&path).unwrap();
-    controller::switch_model(
-        &shared,
-        &h,
-        "mock/b",
-        Some("short".into()),
-        Some(EffortChoice::Set("high".into())),
-    )
-    .await
-    .unwrap();
+    backend
+        .client()
+        .model(
+            "mock/b".into(),
+            Some("short".into()),
+            Some(EffortChoice::Set("high".into())),
+        )
+        .unwrap();
+    model_result(&mut events).await.unwrap();
     assert_eq!(h.host.agent().model().unwrap().model_iden(), "b");
-    let reloaded = Config::load(&path).unwrap();
-    assert_eq!(reloaded.models.selected, "mock/b");
-    assert_eq!(reloaded.models.variant.as_deref(), Some("short"));
+    let reloaded = Config::init(&path).unwrap();
+    assert_eq!(reloaded.models().model(), "mock/b");
+    assert_eq!(reloaded.models().variant().as_deref(), Some("short"));
     assert_eq!(
         reloaded
+            .models()
             .effective_effort("mock/b", Some("short"))
             .as_deref(),
         Some("high")
@@ -460,78 +474,60 @@ async fn model_switch_saves_global_choices_and_file_failure_keeps_live_bindings(
         .unwrap()
         .is_none());
     // Resuming a different session never restores a competing model preference.
-    let loaded = Arc::new(Mutex::new(reloaded));
-    let (_, model) =
-        controller::prepare_session(&loaded, &options, Some(h.host.environment().id)).unwrap();
+    let loaded = Arc::new(reloaded);
+    let (_, model) = yourai_harness::assembly::resolve_session(
+        &loaded.clone(),
+        &options,
+        Some(h.host.environment().id),
+    )
+    .unwrap();
     assert_eq!(model.model_iden(), "b");
-    h.close().await.unwrap();
+    backend.close().await.unwrap();
 }
 
 #[test]
-fn hooks_can_stay_inline_or_use_a_separate_cached_json_source() {
-    use yourai_harness::config::{self, Config};
+fn legacy_external_hooks_migrate_without_modifying_the_backup() {
+    use yourai_harness::config::{Config, HookSettings, UiSettings};
     let dir = tempfile::tempdir().unwrap();
     config_files(dir.path());
     let main = dir.path().join("yourai.json");
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
     let hooks = serde_json::json!({"PreToolUse":[{"hooks":[{"type":"command","command":"echo original"}]}]});
-    document["hooks"] = hooks.clone();
-    std::fs::write(&main, serde_json::to_vec(&document).unwrap()).unwrap();
-    let inline = Arc::new(std::sync::Mutex::new(Config::load(&main).unwrap()));
-    config::update(&inline, |value| {
-        value.hooks.events = serde_json::json!({});
-        Ok(())
-    })
-    .unwrap();
-    assert_eq!(
-        Config::load(&main).unwrap().hooks.events,
-        serde_json::json!({})
-    );
-
-    std::fs::create_dir(dir.path().join("settings")).unwrap();
-    let external = dir.path().join("settings/hooks.json");
+    let external = dir.path().join("hooks.json");
     std::fs::write(
         &external,
         serde_json::to_vec(&serde_json::json!({"hooks":hooks})).unwrap(),
     )
     .unwrap();
-    document.as_object_mut().unwrap().remove("hooks");
-    document["hooks_file"] = "settings/hooks.json".into();
+    document["hooks"] = serde_json::json!({"file":"hooks.json"});
     std::fs::write(&main, serde_json::to_vec(&document).unwrap()).unwrap();
-    let shared = Arc::new(std::sync::Mutex::new(Config::load(&main).unwrap()));
-    let original = std::fs::read(&external).unwrap();
-    config::update(&shared, |value| {
-        value.security.yolo = true;
-        Ok(())
-    })
-    .unwrap();
-    assert_eq!(std::fs::read(&external).unwrap(), original);
+    let config = Config::init(&main).unwrap();
+    let backup = std::fs::read(&external).unwrap();
+    assert_eq!(config.hooks().events(), hooks);
+    config.set_ui({
+        let mut settings = UiSettings::default();
+        settings.set_theme("nord".into());
+        settings
+    });
+    config.save().unwrap();
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
-    assert!(saved["hooks"].get("events").is_none());
-    assert_eq!(saved["hooks"]["file"], "settings/hooks.json");
-    std::fs::write(&external, r#"{"hooks":{}}"#).unwrap();
-    assert_eq!(shared.lock().unwrap().hooks.events, hooks);
-    assert_eq!(
-        Config::load(&main).unwrap().hooks.events,
-        serde_json::json!({})
-    );
-    let main_before = std::fs::read(&main).unwrap();
-    config::update(&shared, |value| {
-        value.hooks.events = serde_json::json!({});
-        Ok(())
-    })
-    .unwrap();
-    assert_eq!(std::fs::read(&main).unwrap(), main_before);
-    assert_eq!(shared.lock().unwrap().hooks.events, serde_json::json!({}));
+    assert_eq!(saved["hooks"]["events"], hooks);
+    assert!(saved["hooks"].get("file").is_none());
+    assert_eq!(std::fs::read(&external).unwrap(), backup);
     std::fs::remove_file(&external).unwrap();
     std::fs::create_dir(&external).unwrap();
-    assert!(config::update(&shared, |value| {
-        value.hooks.events["Stop"] = serde_json::json!([]);
-        Ok(())
-    })
-    .is_err());
-    assert_eq!(shared.lock().unwrap().hooks.events, serde_json::json!({}));
+    assert_eq!(Config::init(&main).unwrap().hooks().events(), hooks);
+    config.set_hooks({
+        let mut settings = HookSettings::default();
+        settings.set_events(serde_json::json!({}));
+        settings
+    });
+    config.save().unwrap();
+    assert_eq!(
+        Config::init(&main).unwrap().hooks().events(),
+        serde_json::json!({})
+    );
 }
 
 #[test]
@@ -544,105 +540,132 @@ fn external_hooks_reject_conflicts_missing_and_malformed_files() {
         serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
     document["hooks_file"] = "hooks.json".into();
     std::fs::write(&main, serde_json::to_vec(&document).unwrap()).unwrap();
-    assert!(Config::load(&main).is_err());
-    for invalid in ["{", "{}", r#"{"hook":{}}"#, r#"{"hooks":[]}"#] {
+    assert!(Config::init(&main).is_err());
+    for invalid in [
+        "{",
+        "{}",
+        r#"{"hook":{}}"#,
+        r#"{"hooks":[]}"#,
+        r#"{"hooks":{},"extra":true}"#,
+        r#"{"hooks":{"events":{},"file":"other.json"}}"#,
+    ] {
         std::fs::write(dir.path().join("hooks.json"), invalid).unwrap();
-        assert!(Config::load(&main).is_err());
+        assert!(Config::init(&main)
+            .and_then(|config| {
+                yourai_harness::assembly::validate_config(&config)?;
+                Ok(config)
+            })
+            .is_err());
     }
     std::fs::write(dir.path().join("hooks.json"), r#"{"hooks":{"events":{}}}"#).unwrap();
     assert_eq!(
-        Config::load(&main).unwrap().hooks.events,
+        Config::init(&main).unwrap().hooks().events(),
         serde_json::json!({})
     );
     document["hooks"] = serde_json::json!({"Stop":[]});
     std::fs::write(&main, serde_json::to_vec(&document).unwrap()).unwrap();
-    assert!(Config::load(&main).is_err());
+    assert!(Config::init(&main).is_err());
 }
 
 #[test]
-fn one_update_edits_cached_fields_and_saves_without_reloading_any_file() {
-    use yourai_harness::config::{self, Config};
+fn one_save_writes_every_category_to_one_json_without_reloading() {
+    use yourai_harness::config::{
+        Config, HookSettings, SecuritySettings, SessionSettings, UiSettings,
+    };
     let dir = tempfile::tempdir().unwrap();
-    let shared = Arc::new(Mutex::new(config_files(dir.path())));
+    let shared = config_files(dir.path());
     let main = dir.path().join("yourai.json");
-    let prompt = dir.path().join("prompts.json");
-    // A corrupt external edit cannot influence in-app edits of the cached Config.
+    let legacy = dir.path().join("prompts.json");
     std::fs::write(&main, "invalid external edit").unwrap();
-    std::fs::write(&prompt, "invalid external edit").unwrap();
-    config::update(&shared, |value| {
-        value.execution.steps = Some(3);
-        value.security.yolo = true;
-        value.ui.theme = "nord".into();
-        value.prompt.system_prompt = Some("live cached prompt".into());
-        value.hooks.file = Some("hooks.json".into());
-        value.hooks.events = serde_json::json!({"PreToolUse":[{"hooks":[{"type":"command","command":"echo cached"}]}]});
-        Ok(())
-    }).unwrap();
+    std::fs::write(&legacy, "obsolete external edit").unwrap();
     {
-        let live = shared.lock().unwrap();
-        assert_eq!(live.execution.steps, Some(3));
-        assert!(live.security.yolo);
-        assert_eq!(live.ui.theme, "nord");
-        assert_eq!(
-            live.prompt.system_prompt.as_deref(),
-            Some("live cached prompt")
-        );
-        assert_eq!(live.execution_options().steps, Some(3));
+        let config = &shared;
+        config.set_model("mock/b".into());
+        config.set_variant(Some("short".into()));
+        config.set_steps(Some(3));
+        config.set_security({
+            let mut settings = SecuritySettings::default();
+            settings.set_yolo(true);
+            settings.set_trusted_shell(true);
+            settings
+        });
+        config.set_ui({
+            let mut settings = UiSettings::default();
+            settings.set_theme("nord".into());
+            settings
+        });
+        config.set_session({
+            let mut settings = SessionSettings::default();
+            settings.set_directory("custom-sessions".into());
+            settings.set_extensions(true);
+            settings
+        });
+        config.set_system_prompt(Some("cached prompt".into()));
+        config.set_hooks({
+            let mut settings = HookSettings::default();
+            settings.set_events(serde_json :: json ! ({ "Stop" : [] }));
+            settings
+        });
+        config.save()
     }
-    let reloaded = Config::load(&main).unwrap();
-    assert_eq!(reloaded.execution.steps, Some(3));
-    assert_eq!(
-        reloaded.prompt.system_prompt.as_deref(),
-        Some("live cached prompt")
-    );
-    assert_eq!(reloaded.hooks.events, shared.lock().unwrap().hooks.events);
-    let separate = std::fs::read(dir.path().join("hooks.json")).unwrap();
-    config::update(&shared, |value| {
-        value.hooks.file = None;
-        Ok(())
-    })
     .unwrap();
+    let reloaded = Config::init(&main).unwrap();
+    assert_eq!(reloaded.models().model(), "mock/b");
+    assert_eq!(reloaded.models().variant().as_deref(), Some("short"));
+    assert_eq!(reloaded.execution().steps(), Some(3));
+    assert!(reloaded.security().yolo() && reloaded.security().trusted_shell());
+    assert_eq!(reloaded.ui().theme(), "nord");
     assert_eq!(
-        std::fs::read(dir.path().join("hooks.json")).unwrap(),
-        separate
+        *reloaded.session().directory(),
+        std::path::PathBuf::from("custom-sessions")
     );
-    let inline = Config::load(&main).unwrap();
-    assert!(inline.hooks.file.is_none());
-    assert_eq!(inline.hooks.events, shared.lock().unwrap().hooks.events);
+    assert!(reloaded.session().extensions());
+    assert_eq!(
+        reloaded.prompt().system_prompt().as_deref(),
+        Some("cached prompt")
+    );
+    assert_eq!(reloaded.hooks().events(), serde_json::json!({"Stop":[]}));
+    assert_eq!(
+        std::fs::read_to_string(&legacy).unwrap(),
+        "obsolete external edit"
+    );
+    assert!(!dir.path().join("hooks.json").exists());
 }
 
 #[test]
 fn grouped_configuration_roundtrips_and_rejects_ambiguous_or_unknown_fields() {
-    use yourai_harness::config::{self, Config};
+    use yourai_harness::config::Config;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("yourai.json");
     let document = serde_json::json!({
-        "models":{"selected":"mock/a", "providers":{}},
+        "models":{"model":"mock/a", "providers":{}},
         "execution":{"steps":4,"context":{"summary_tokens":1234},"attachment_image":{"max_width":1200}},
         "security":{"yolo":false},"ui":{"theme":"nord"},
         "session":{"directory":"sessions","extensions":true},
         "prompt":{"system_prompt":"inline grouped prompt"},"hooks":{"events":{}}
     });
     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-    let shared = Arc::new(Mutex::new(Config::load(&path).unwrap()));
-    assert_eq!(shared.lock().unwrap().execution.steps, Some(4));
-    assert_eq!(
-        shared.lock().unwrap().execution.attachment_image.max_width,
-        1200
-    );
-    config::update(&shared, |value| {
-        value.security.yolo = true;
-        Ok(())
-    })
+    let shared = Arc::new(Config::init(&path).unwrap());
+    assert_eq!(shared.execution().steps(), Some(4));
+    assert_eq!(shared.execution().attachment_image().max_width(), 1200);
+    {
+        let value = &shared;
+        value.set_yolo(true);
+        value.save()
+    }
     .unwrap();
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(saved["execution"]["context"]["summary_tokens"], 1234);
-    assert_eq!(saved["models"]["selected"], "mock/a");
+    assert_eq!(saved["models"]["model"], "mock/a");
     assert!(saved.get("model").is_none());
     assert!(saved.get("steps").is_none());
-    assert!(saved.get("prompt").is_none());
+    assert_eq!(saved["prompt"]["system_prompt"], "inline grouped prompt");
     assert_eq!(
-        Config::load(&path).unwrap().prompt.system_prompt.as_deref(),
+        Config::init(&path)
+            .unwrap()
+            .prompt()
+            .system_prompt()
+            .as_deref(),
         Some("inline grouped prompt")
     );
     for (category, key) in [
@@ -662,7 +685,7 @@ fn grouped_configuration_roundtrips_and_rejects_ambiguous_or_unknown_fields() {
         );
     }
     for (legacy, category, key) in [
-        ("model", "models", "selected"),
+        ("model", "models", "model"),
         ("steps", "execution", "steps"),
         ("theme", "ui", "theme"),
         ("yolo", "security", "yolo"),
@@ -677,44 +700,481 @@ fn grouped_configuration_roundtrips_and_rejects_ambiguous_or_unknown_fields() {
 }
 
 #[test]
-fn hook_source_aliases_are_rejected_before_any_category_is_saved() {
-    use yourai_harness::config;
+fn legacy_hook_references_cannot_recursively_read_the_main_config() {
+    use yourai_harness::config::Config;
     let dir = tempfile::tempdir().unwrap();
-    let shared = Arc::new(Mutex::new(config_files(dir.path())));
+    config_files(dir.path());
     let main = dir.path().join("yourai.json");
-    let prompt = dir.path().join("prompts.json");
-    let main_before = std::fs::read(&main).unwrap();
-    let prompt_before = std::fs::read(&prompt).unwrap();
     std::fs::create_dir(dir.path().join("nested")).unwrap();
-    let aliases = vec![
+    let mut aliases = vec![
         std::path::PathBuf::from("yourai.json"),
         "./yourai.json".into(),
         "nested/../yourai.json".into(),
-        "prompts.json".into(),
         main.clone(),
-        prompt.clone(),
     ];
     #[cfg(unix)]
-    let aliases = {
-        let mut aliases = aliases;
+    {
         std::os::unix::fs::symlink(&main, dir.path().join("main-link.json")).unwrap();
         aliases.push("main-link.json".into());
-        aliases
-    };
-    for alias in aliases {
-        assert!(config::update(&shared, |value| {
-            value.hooks.file = Some(alias);
-            value.ui.theme = "must not publish".into();
-            value.prompt.system_prompt = Some("must not save".into());
-            Ok(())
-        })
-        .is_err());
-        assert_eq!(std::fs::read(&main).unwrap(), main_before);
-        assert_eq!(std::fs::read(&prompt).unwrap(), prompt_before);
-        assert!(shared.lock().unwrap().hooks.file.is_none());
-        assert_eq!(
-            shared.lock().unwrap().prompt.system_prompt.as_deref(),
-            Some("original prompt")
-        );
     }
+    for alias in aliases {
+        let document =
+            serde_json::json!({"models":{"model":"mock/a","providers":{}}, "hooks":{"file":alias}});
+        std::fs::write(&main, serde_json::to_vec(&document).unwrap()).unwrap();
+        let before = std::fs::read(&main).unwrap();
+        assert!(Config::init(&main).is_err());
+        assert_eq!(std::fs::read(&main).unwrap(), before);
+    }
+}
+
+#[test]
+fn preparing_a_model_selection_does_not_modify_shared_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_files(dir.path());
+    let before = serde_json::to_value(&config).unwrap();
+    let model = config
+        .models()
+        .select_model("mock/b", Some("short".into()), None)
+        .unwrap();
+    assert_eq!(model.model(), "mock/b");
+    assert_eq!(serde_json::to_value(&config).unwrap(), before);
+}
+
+#[test]
+fn invalid_model_choice_does_not_partially_modify_a_candidate() {
+    use yourai_harness::model::EffortChoice;
+    let dir = tempfile::tempdir().unwrap();
+    let candidate = config_files(dir.path());
+    let before = serde_json::to_value(&candidate).unwrap();
+    assert!(candidate
+        .models()
+        .select_model(
+            "mock/b",
+            Some("short".into()),
+            Some(&EffortChoice::Set("invalid".into()))
+        )
+        .is_err());
+    assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
+    assert!(candidate
+        .models()
+        .select_model("mock/b", Some("missing".into()), None)
+        .is_err());
+    assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
+    assert!(candidate
+        .models()
+        .select_model("mock/", None, None)
+        .is_err());
+    assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
+}
+
+#[test]
+fn explicit_validation_reports_invalid_edits_without_saving() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_files(dir.path());
+    let main = dir.path().join("yourai.json");
+    let before = std::fs::read(&main).unwrap();
+    config.set_steps(Some(0));
+    config.set_theme("nord".into());
+    assert!(yourai_harness::assembly::validate_config(&config).is_err());
+    assert_eq!(config.execution().steps(), Some(0));
+    assert_eq!(config.ui().theme(), "nord");
+    assert_eq!(std::fs::read(&main).unwrap(), before);
+}
+
+#[test]
+fn json_loading_and_saving_do_not_apply_business_rules() {
+    use yourai_harness::config::Config;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("yourai.json");
+    std::fs::write(
+        &path,
+        r#"{
+        "models":{"model":"not-a-provider-selection","providers":{}},
+        "execution":{"steps":0},
+        "hooks":{"events":{"UnknownEvent":[]}}
+    }"#,
+    )
+    .unwrap();
+    let config = Config::init(&path).unwrap();
+    assert_eq!(config.execution().steps(), Some(0));
+    config.set_ui({
+        let mut settings = yourai_harness::config::UiSettings::default();
+        settings.set_theme("nord".into());
+        settings
+    });
+    config.save().unwrap();
+    let reloaded = Config::init(&path).unwrap();
+    assert_eq!(reloaded.ui().theme(), "nord");
+    assert_eq!(reloaded.models().model(), "not-a-provider-selection");
+    assert_eq!(reloaded.execution().steps(), Some(0));
+    assert_eq!(
+        reloaded.hooks().events(),
+        serde_json::json!({"UnknownEvent":[]})
+    );
+    assert!(yourai_harness::assembly::validate_config(&reloaded).is_err());
+}
+
+#[tokio::test]
+async fn model_switch_preserves_unrelated_edits_and_rejects_stale_resources() {
+    use yourai_harness::{config::UiSettings, controller};
+    struct Gate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    impl HookHandler for Gate {
+        fn execute<'a>(
+            &'a self,
+            _: &'a HookInvocation,
+        ) -> BoxFuture<'a, Result<HookOutput, YourAiError>> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(HookOutput::Parsed(serde_json::json!({})))
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let initial = config_files(dir.path());
+    initial.set_soul_file(None);
+    let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    options.config = Arc::clone(&initial);
+    let h = Harness::open(options.clone(), initial.models().resolve().unwrap().model)
+        .await
+        .unwrap();
+    let gate = Arc::new(Gate {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    h.hooks
+        .register(NativeHookRegistration {
+            id: "config-gate".into(),
+            event: HookEventKind::ConfigChange,
+            matcher: None,
+            handler: gate.clone(),
+            timeout: Some(std::time::Duration::from_secs(10)),
+            source: HookSource::Session,
+            failure_policy: FailurePolicy::Closed,
+            once: false,
+        })
+        .await
+        .unwrap();
+    let shared = initial;
+    let (backend, mut events) =
+        controller::SessionController::new(h, Arc::clone(&shared), options, TurnLimits::default());
+    for stale in [false, true] {
+        backend
+            .client()
+            .model(if stale { "mock/a" } else { "mock/b" }.into(), None, None)
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+            .await
+            .unwrap();
+        {
+            let config = &shared;
+            if stale {
+                let context = config.execution().context_policy();
+                context
+                    .set_safety_margin(context.safety_margin() + 1)
+                    .unwrap();
+            } else {
+                config.set_ui({
+                    let mut settings = UiSettings::default();
+                    settings.set_theme("nord".into());
+                    settings
+                });
+            }
+            config.save()
+        }
+        .unwrap();
+        gate.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(controller::SessionEvent::Model(result)) = events.recv().await {
+                    break result;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if stale {
+            assert!(result.unwrap_err().contains("changed while preparing"));
+        } else {
+            assert_eq!(result.unwrap().label, "mock/b");
+        }
+        assert_eq!(shared.models().model(), "mock/b");
+        assert_eq!(
+            backend.harness().host.agent().model().unwrap().model_iden(),
+            "b"
+        );
+        let saved = yourai_harness::config::Config::init(&dir.path().join("yourai.json")).unwrap();
+        assert_eq!(saved.models().model(), "mock/b");
+        assert_eq!(saved.ui().theme(), "nord");
+    }
+    backend.close().await.unwrap();
+}
+
+#[test]
+fn legacy_selected_loads_but_saves_as_model_and_rejects_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("yourai.json");
+    std::fs::write(&path, r#"{"models":{"selected":"mock/a"}}"#).unwrap();
+    let config = yourai_harness::config::Config::init(&path).unwrap();
+    assert_eq!(config.models().model(), "mock/a");
+    config.save().unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["models"]["model"], "mock/a");
+    assert!(saved["models"].get("selected").is_none());
+    for document in [
+        r#"{"models":{"model":"mock/a","selected":"mock/b"}}"#,
+        r#"{"model":"mock/a","models":{"selected":"mock/b"}}"#,
+    ] {
+        std::fs::write(&path, document).unwrap();
+        assert!(yourai_harness::config::Config::init(&path).is_err());
+    }
+}
+
+#[test]
+fn direct_setters_update_shared_data_and_only_save_when_requested() {
+    use yourai_harness::config::Config;
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_files(dir.path());
+    let path = dir.path().join("yourai.json");
+    let before = std::fs::read(&path).unwrap();
+    config.set_model("mock/b".into());
+    config
+        .models()
+        .provider("mock")
+        .unwrap()
+        .options()
+        .set_base_url(Some("http://localhost:8081/v1".into()))
+        .unwrap();
+    config.set_steps(Some(7));
+    config
+        .execution()
+        .context_policy()
+        .set_summary_tokens(1500)
+        .unwrap();
+    config.set_yolo(true);
+    config.set_theme("nord".into());
+    config.set_extensions(true);
+    config.set_system_prompt(Some("local prompt".into()));
+    config.set_events(serde_json::json!({"SessionStart":[]}));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(config.models().model(), "mock/b");
+    assert_eq!(config.execution().steps(), Some(7));
+    config.save().unwrap();
+    let saved = Config::init(&path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&config).unwrap(),
+        serde_json::to_value(saved).unwrap()
+    );
+}
+
+#[test]
+fn arc_config_serializes_concurrent_setters() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_files(dir.path());
+    let workers: Vec<_> = (0..3)
+        .map(|worker| {
+            let config = Arc::clone(&config);
+            std::thread::spawn(move || {
+                for step in 1..=20 {
+                    match worker {
+                        0 => config.set_theme(format!("theme-{step}")),
+                        1 => config.set_steps(Some(step)),
+                        _ => config.set_model(format!("mock/model-{step}")),
+                    }
+                    config.save().unwrap();
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(config.theme(), "theme-20");
+    assert_eq!(config.execution().steps(), Some(20));
+    assert_eq!(config.models().model(), "mock/model-20");
+    let saved = yourai_harness::config::Config::init(&dir.path().join("yourai.json")).unwrap();
+    assert_eq!(
+        serde_json::to_value(config.as_ref()).unwrap(),
+        serde_json::to_value(saved).unwrap()
+    );
+}
+
+#[test]
+fn nested_sections_write_the_same_config_and_report_removed_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_files(dir.path());
+    let provider = config.models().provider("mock").unwrap();
+    let connection = provider.options();
+    connection
+        .set_base_url(Some("http://localhost:8081/v1".into()))
+        .unwrap();
+    provider
+        .model("a")
+        .unwrap()
+        .limit()
+        .set_context(Some(12345))
+        .unwrap();
+    assert_eq!(
+        config
+            .models()
+            .provider("mock")
+            .unwrap()
+            .options()
+            .base_url()
+            .unwrap()
+            .as_deref(),
+        Some("http://localhost:8081/v1")
+    );
+    config.save().unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("yourai.json")).unwrap()).unwrap();
+    assert_eq!(
+        json["models"]["providers"]["mock"]["models"]["a"]["limit"]["context"],
+        12345
+    );
+    config.models().set_providers(Default::default()).unwrap();
+    assert!(connection.set_api_key(Some("removed".into())).is_err());
+    assert!(connection.api_key().is_err());
+}
+
+#[test]
+fn retained_sections_never_keep_the_global_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_files(dir.path());
+    let ui = config.ui();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer = Arc::clone(&config);
+    let task = std::thread::spawn(move || {
+        writer.set_theme("nord".into());
+        writer.set_steps(Some(20));
+        writer.save().unwrap();
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    task.join().unwrap();
+    ui.set_theme("through-section".into()).unwrap();
+    assert_eq!(config.theme(), "through-section");
+    assert_eq!(config.execution().steps(), Some(20));
+    assert_eq!(ui.theme(), "through-section");
+}
+
+#[test]
+fn session_options_clone_shares_the_same_config() {
+    let options = SessionOptions::new("sessions".into(), ".".into());
+    let other = options.clone();
+    assert!(Arc::ptr_eq(&options.config, &other.config));
+    other.config.ui().set_theme("nord".into()).unwrap();
+    assert_eq!(options.config.ui().theme(), "nord");
+}
+
+#[test]
+fn concurrent_nested_setters_preserve_other_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_files(dir.path());
+    let tasks: Vec<_> = (0..3)
+        .map(|worker| {
+            let config = Arc::clone(&config);
+            std::thread::spawn(move || {
+                let connection = config.models().provider("mock").unwrap().options();
+                for step in 0..20 {
+                    connection
+                        .set_header(format!("worker-{worker}"), step.to_string())
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.join().unwrap();
+    }
+    config.save().unwrap();
+    let headers = config
+        .models()
+        .provider("mock")
+        .unwrap()
+        .options()
+        .headers()
+        .unwrap();
+    for worker in 0..3 {
+        assert_eq!(headers[&format!("worker-{worker}")], "19");
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("yourai.json")).unwrap()).unwrap();
+    assert_eq!(
+        json["models"]["providers"]["mock"]["options"]["headers"]["worker-2"],
+        "19"
+    );
+}
+
+#[tokio::test]
+async fn opening_a_session_uses_current_defaults_without_overwriting_them() {
+    use yourai_harness::controller::{SessionController, SessionEvent};
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_files(dir.path());
+    config.set_soul_file(None);
+    config.set_yolo(true);
+    let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    options.config = Arc::clone(&config);
+    let harness = Harness::open(options.clone(), config.models().resolve().unwrap().model)
+        .await
+        .unwrap();
+    assert!(harness.yolo());
+    let (backend, mut events) =
+        SessionController::new(harness, Arc::clone(&config), options, TurnLimits::default());
+    config.security().set_yolo(false).unwrap();
+    config.save().unwrap();
+    backend.client().switch(None).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(SessionEvent::Opened(result)) = events.recv().await {
+                result.unwrap();
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!config.security().yolo());
+    assert!(!backend.harness().yolo());
+    assert!(
+        !yourai_harness::config::Config::init(&dir.path().join("yourai.json"))
+            .unwrap()
+            .security()
+            .yolo()
+    );
+    backend.close().await.unwrap();
+}
+
+#[test]
+fn model_menu_projects_one_consistent_configuration_version() {
+    let config = Arc::new(yourai_harness::config::Config::default());
+    let variants: Vec<yourai_harness::config::ModelSettings> = ["a", "b"]
+        .into_iter()
+        .map(|id| {
+            serde_json::from_value(serde_json::json!({
+            "model":format!("{id}/main"),
+            "providers":{id:{"models":{"main":{"variants":{"fast":{"reasoningEffort":"high"}}}}}}
+        })).unwrap()
+        })
+        .collect();
+    config.set_models(variants[0].clone());
+    let writer = Arc::clone(&config);
+    let task = std::thread::spawn(move || {
+        for iteration in 0..1000 {
+            writer.set_models(variants[iteration % 2].clone());
+        }
+    });
+    for _ in 0..1000 {
+        let choices = config.models().choices();
+        assert_eq!(choices.len(), 2);
+        let id = &choices[0].id;
+        assert_eq!(choices[1].id, *id);
+        assert_eq!(choices[0].label, *id);
+        assert_eq!(choices[1].label, format!("{id} · fast"));
+        assert_eq!(choices[1].effort.as_deref(), Some("high"));
+    }
+    task.join().unwrap();
 }

@@ -1,6 +1,7 @@
 use crate::{compactor::ContextPolicy, turn::TurnLimits};
 use std::{path::PathBuf, time::Duration};
 
+crate::settings_fields! {
 /// Image attachment policy, mirroring opencode `attachment.image.*`
 /// (`packages/opencode/src/image/image.ts`). Over-sized images are resized
 /// (Lanczos3, PNG then JPEG at descending qualities) instead of rejected;
@@ -8,12 +9,13 @@ use std::{path::PathBuf, time::Duration};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ImagePolicy {
-    pub auto_resize: bool,
-    pub max_width: u32,
-    pub max_height: u32,
+    auto_resize: bool => set_auto_resize [value],
+    max_width: u32 => set_max_width [value],
+    max_height: u32 => set_max_height [value],
     /// Ceiling on the base64 payload length, matching the provider-side
     /// limit the number applies to (opencode: 5 MiB base64).
-    pub max_base64_bytes: usize,
+    max_base64_bytes: usize => set_max_base64_bytes [value],
+}
 }
 impl Default for ImagePolicy {
     fn default() -> Self {
@@ -26,46 +28,48 @@ impl Default for ImagePolicy {
     }
 }
 
+crate::settings_fields! {
 /// Plain execution data copied from the application config for one turn.
 /// Standalone callers may supply these values directly. This type owns no storage.
 /// TurnLimits can impose stricter limits without changing the shared defaults.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExecutionOptions {
-    pub skill_ids: Vec<String>,
-    pub memory_search_limit: usize,
+    skill_ids: Vec<String> => set_skill_ids [ref],
+    memory_search_limit: usize => set_memory_search_limit [value],
     #[serde(rename = "context")]
-    pub context_policy: ContextPolicy,
+    context_policy: ContextPolicy => set_context_policy [mut context_policy_mut],
     #[serde(alias = "max_model_calls")]
-    pub steps: Option<u32>,
-    pub model_timeout: Option<Duration>,
-    pub allow_background_wake: bool,
-    pub max_followups: usize,
-    pub instruction_paths: Vec<PathBuf>,
-    pub workspace_enabled: bool,
-    pub memory_max_chars: usize,
+    steps: Option<u32> => set_steps [value],
+    model_timeout: Option<Duration> => set_model_timeout [value],
+    allow_background_wake: bool => set_allow_background_wake [value],
+    max_followups: usize => set_max_followups [value],
+    instruction_paths: Vec<PathBuf> => set_instruction_paths [ref],
+    workspace_enabled: bool => set_workspace_enabled [value],
+    memory_max_chars: usize => set_memory_max_chars [value],
     /// OpenCode-compatible attachment image normalization policy.
-    pub attachment_image: ImagePolicy,
+    attachment_image: ImagePolicy => set_attachment_image [mut attachment_image_mut],
     /// Char cap for text files attached by reference (before line-window
     /// selection the cap applies to the selected window). Directories and
     /// binary media are unaffected.
-    pub attachment_text_max_chars: usize,
-    pub max_model_retries: u32,
-    pub max_overflow_compactions: u32,
-    pub max_stop_continuations: u32,
-    pub max_permission_rechecks: u32,
-    pub retry_delay: Duration,
-    pub retry_max_delay: Duration,
+    attachment_text_max_chars: usize => set_attachment_text_max_chars [value],
+    max_model_retries: u32 => set_max_model_retries [value],
+    max_overflow_compactions: u32 => set_max_overflow_compactions [value],
+    max_stop_continuations: u32 => set_max_stop_continuations [value],
+    max_permission_rechecks: u32 => set_max_permission_rechecks [value],
+    retry_delay: Duration => set_retry_delay [value],
+    retry_max_delay: Duration => set_retry_max_delay [value],
     /// Optional bound for generic provider operations; no implicit turn deadline.
-    pub operation_timeout: Option<Duration>,
+    operation_timeout: Option<Duration> => set_operation_timeout [value],
     /// Optional host tool bound. Built-in tools own their default timeouts.
-    pub tool_timeout: Option<Duration>,
-    pub approval_timeout: Option<Duration>,
-    pub hook_timeout: Option<Duration>,
+    tool_timeout: Option<Duration> => set_tool_timeout [value],
+    approval_timeout: Option<Duration> => set_approval_timeout [value],
+    hook_timeout: Option<Duration> => set_hook_timeout [value],
     /// Optional bound for durable cleanup, independent of the cancelled turn.
-    pub cleanup_timeout: Option<Duration>,
+    cleanup_timeout: Option<Duration> => set_cleanup_timeout [value],
     /// Grace for tools to settle after cancellation, shared with failure reporting.
-    pub tool_cleanup_timeout: Duration,
+    tool_cleanup_timeout: Duration => set_tool_cleanup_timeout [value],
+}
 }
 impl Default for ExecutionOptions {
     fn default() -> Self {
@@ -122,11 +126,12 @@ mod tests {
     use super::*;
     #[test]
     fn per_turn_limits_can_only_tighten_configured_ceilings() {
-        let config = ExecutionOptions {
-            steps: Some(5),
-            tool_timeout: Some(Duration::from_secs(10)),
-            hook_timeout: None,
-            ..Default::default()
+        let config = {
+            let mut settings: ExecutionOptions = Default::default();
+            settings.set_steps(Some(5));
+            settings.set_tool_timeout(Some(Duration::from_secs(10)));
+            settings.set_hook_timeout(None);
+            settings
         };
         let limits = TurnLimits {
             steps: Some(9),

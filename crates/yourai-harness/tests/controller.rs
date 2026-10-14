@@ -1,8 +1,5 @@
 //! Backend behavior must not require a frontend to poll or consume output.
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use yourai_core::prelude::*;
 use yourai_harness::{
     config::Config,
@@ -19,26 +16,16 @@ impl AgentLoop for Program {
         })
     }
 }
-async fn fixture() -> (
-    tempfile::TempDir,
-    Harness,
-    Arc<Mutex<Config>>,
-    SessionOptions,
-) {
+async fn fixture() -> (tempfile::TempDir, Harness, Arc<Config>, SessionOptions) {
     fixture_with_loop(Arc::new(Program)).await
 }
 async fn fixture_with_loop(
     agent_loop: Arc<dyn AgentLoop>,
-) -> (
-    tempfile::TempDir,
-    Harness,
-    Arc<Mutex<Config>>,
-    SessionOptions,
-) {
+) -> (tempfile::TempDir, Harness, Arc<Config>, SessionOptions) {
     let dir = tempfile::tempdir().unwrap();
     let config: Config = serde_json::from_value(serde_json::json!({
       "models": {
-        "selected": "mock/test",
+        "model": "mock/test",
         "providers": {
           "mock": {
             "options": {
@@ -53,13 +40,13 @@ async fn fixture_with_loop(
     .unwrap();
     let path = dir.path().join("yourai.json");
     std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-    let config = Config::load(&path).unwrap();
-    let model = config.resolve(None).unwrap().model;
+    let config = Config::init(&path).unwrap();
+    let model = config.models().resolve().unwrap().model;
     let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    options.config.prompt.system_prompt = Some("test".into());
+    options.config.set_system_prompt(Some("test".into()));
     options.agent_loop = Some(agent_loop);
     let h = Harness::open(options.clone(), model).await.unwrap();
-    (dir, h, Arc::new(Mutex::new(config)), options)
+    (dir, h, Arc::new(config), options)
 }
 async fn wait_until(mut ready: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -73,8 +60,10 @@ async fn wait_until(mut ready: impl FnMut() -> bool) {
 #[tokio::test]
 async fn execution_and_operation_completion_progress_without_frontend_polling() {
     let (_dir, h, config, options) = fixture().await;
-    let mut backend = SessionController::new(h, config, options, TurnLimits::default());
-    assert!(backend.submit(In::user_text("execute without a UI")));
+    let (backend, mut events) = SessionController::new(h, config, options, TurnLimits::default());
+    assert!(backend
+        .client()
+        .submit(In::user_text("execute without a UI")));
     wait_until(|| {
         backend
             .harness()
@@ -87,17 +76,24 @@ async fn execution_and_operation_completion_progress_without_frontend_polling() 
             .any(|m| m.content.first_text() == Some("backend completed"))
     })
     .await;
-    wait_until(|| backend.idle()).await;
-    backend.list().unwrap();
-    assert!(!backend.submit(In::user_text("defer during operation")));
+    wait_until(|| backend.client().idle()).await;
+    backend.client().list().unwrap();
+    assert!(!backend
+        .client()
+        .submit(In::user_text("defer during operation")));
     assert!(matches!(
-        backend.reply("unknown".into(), serde_json::json!({})),
+        backend
+            .client()
+            .reply("unknown".into(), serde_json::json!({})),
         Reply::Deferred
     ));
-    assert!(backend.model("other/model".into(), None, None).is_err());
-    wait_until(|| !backend.busy()).await;
+    assert!(backend
+        .client()
+        .model("other/model".into(), None, None)
+        .is_err());
+    wait_until(|| !backend.client().busy()).await;
     let mut listed = false;
-    while let Some(event) = backend.try_recv() {
+    while let Some(event) = events.try_recv() {
         if let SessionEvent::Listed(Ok(rows)) = event {
             assert_eq!(rows.len(), 1);
             listed = true;
@@ -105,7 +101,9 @@ async fn execution_and_operation_completion_progress_without_frontend_polling() 
     }
     assert!(listed);
     assert!(matches!(
-        backend.reply("unknown".into(), serde_json::json!({})),
+        backend
+            .client()
+            .reply("unknown".into(), serde_json::json!({})),
         Reply::Rejected(_)
     ));
     backend.close().await.unwrap();
@@ -148,15 +146,15 @@ async fn new_session_accepts_input_while_backend_retires_the_previous_session() 
         })
         .await
         .unwrap();
-    let backend = SessionController::new(h, config, options, TurnLimits::default());
-    backend.switch(None).unwrap();
+    let (backend, _events) = SessionController::new(h, config, options, TurnLimits::default());
+    backend.client().switch(None).unwrap();
     tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
         .await
         .unwrap();
-    assert_ne!(backend.environment().id, id);
-    assert!(backend.busy());
-    assert!(backend.list().is_err());
-    assert!(backend.submit(In::user_text("new session input")));
+    assert_ne!(backend.client().environment().id, id);
+    assert!(backend.client().busy());
+    assert!(backend.client().list().is_err());
+    assert!(backend.client().submit(In::user_text("new session input")));
     wait_until(|| {
         backend
             .harness()
@@ -170,20 +168,20 @@ async fn new_session_accepts_input_while_backend_retires_the_previous_session() 
     })
     .await;
     gate.release.notify_one();
-    wait_until(|| !backend.busy()).await;
+    wait_until(|| !backend.client().busy()).await;
     assert_eq!(old.status(), SessionStatus::Closed);
     backend.close().await.unwrap();
 }
 #[tokio::test]
 async fn failed_switch_keeps_the_current_backend_and_current_session_cannot_be_deleted() {
     let (_dir, h, config, options) = fixture().await;
-    let mut backend = SessionController::new(h, config, options, TurnLimits::default());
-    let id = backend.environment().id;
-    assert!(backend.delete(id.clone()).is_err());
-    backend.switch(Some(SessionId::new())).unwrap();
-    wait_until(|| !backend.busy()).await;
-    assert_eq!(backend.environment().id, id);
-    assert!(std::iter::from_fn(|| backend.try_recv())
+    let (backend, mut events) = SessionController::new(h, config, options, TurnLimits::default());
+    let id = backend.client().environment().id;
+    assert!(backend.client().delete(id.clone()).is_err());
+    backend.client().switch(Some(SessionId::new())).unwrap();
+    wait_until(|| !backend.client().busy()).await;
+    assert_eq!(backend.client().environment().id, id);
+    assert!(std::iter::from_fn(|| events.try_recv())
         .any(|event| matches!(event, SessionEvent::Opened(Err(_)))));
     backend.close().await.unwrap();
 }
@@ -201,15 +199,15 @@ async fn task_queries_expose_one_versioned_snapshot_and_queued_input_blocks_swit
     assert_eq!(snapshot.1[0].id, task.id);
     assert!(h.host.tasks_since(Some(snapshot.0)).is_none());
     h.host.submit(In::follow_up("queued")).unwrap();
-    let backend = SessionController::new(h, config, options, TurnLimits::default());
-    assert!(backend.switch(None).is_err());
+    let (backend, _events) = SessionController::new(h, config, options, TurnLimits::default());
+    assert!(backend.client().switch(None).is_err());
     backend.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn disconnecting_clients_keeps_execution_alive_and_close_rejects_live_clients() {
     let (_dir, h, config, options) = fixture().await;
-    let backend = SessionController::new(h, config, options, TurnLimits::default());
+    let (backend, _events) = SessionController::new(h, config, options, TurnLimits::default());
     let h = backend.harness();
     let client = backend.client();
     assert!(client.submit(In::user_text("finish after disconnect")));
@@ -224,7 +222,7 @@ async fn disconnecting_clients_keeps_execution_alive_and_close_rejects_live_clie
             .any(|m| m.content.first_text() == Some("backend completed"))
     })
     .await;
-    wait_until(|| backend.idle()).await;
+    wait_until(|| backend.client().idle()).await;
     let client = backend.client();
     tokio::time::timeout(Duration::from_secs(10), backend.close())
         .await
@@ -238,13 +236,13 @@ async fn disconnecting_clients_keeps_execution_alive_and_close_rejects_live_clie
     ));
     assert!(client.list().is_err());
     assert!(client.steer_pending("unknown".into()).is_err());
-    assert!(client.set_yolo(true).is_err());
+    assert!(client.change_yolo(true).is_err());
 }
 
 #[tokio::test]
 async fn dropping_backend_owner_closes_session_even_with_connected_clients() {
     let (_dir, h, config, options) = fixture().await;
-    let backend = SessionController::new(h, config, options, TurnLimits::default());
+    let (backend, _events) = SessionController::new(h, config, options, TurnLimits::default());
     let h = backend.harness();
     let client = backend.client();
     drop(backend);
@@ -270,7 +268,7 @@ impl AgentLoop for BurstProgram {
 #[tokio::test]
 async fn independent_subscribers_report_gaps_without_blocking_execution() {
     let (_dir, h, config, options) = fixture_with_loop(Arc::new(BurstProgram)).await;
-    let backend = SessionController::new(h, config, options, TurnLimits::default());
+    let (backend, _events) = SessionController::new(h, config, options, TurnLimits::default());
     let client = backend.client();
     let mut slow = client.subscribe().unwrap();
     let mut fast = client.subscribe().unwrap();
@@ -308,7 +306,7 @@ async fn independent_subscribers_report_gaps_without_blocking_execution() {
             .any(|m| m.content.first_text() == Some("backend completed"))
     })
     .await;
-    wait_until(|| backend.idle()).await;
+    wait_until(|| backend.client().idle()).await;
     // Let the backend publish the final buffered output before stopping it.
     tokio::time::timeout(Duration::from_secs(10), published_rx)
         .await
@@ -332,14 +330,14 @@ async fn independent_subscribers_report_gaps_without_blocking_execution() {
 #[tokio::test]
 async fn subscribing_starts_at_future_events_and_close_ends_existing_subscriptions() {
     let (_dir, h, config, options) = fixture().await;
-    let backend = SessionController::new(h, config, options, TurnLimits::default());
-    backend.list().unwrap();
-    wait_until(|| !backend.busy()).await;
+    let (backend, _events) = SessionController::new(h, config, options, TurnLimits::default());
+    backend.client().list().unwrap();
+    wait_until(|| !backend.client().busy()).await;
     let client = backend.client();
     let mut first = client.subscribe().unwrap();
     let mut second = client.subscribe().unwrap();
     assert!(first.try_recv().is_none()); // No implicit replay of the previous list result.
-    backend.list().unwrap();
+    backend.client().list().unwrap();
     for subscription in [&mut first, &mut second] {
         let event = tokio::time::timeout(Duration::from_secs(10), subscription.recv())
             .await

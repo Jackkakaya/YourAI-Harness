@@ -203,62 +203,47 @@ Loop 对这类 Provider 只在外层监听总 deadline、取消和断连；否�
 宿主状态查询和取消不持有 journal 写事务锁。详细设计见
 [代码质量整改](./architecture-quality-repairs.md)。
 
-## 配置读写与持久化契约（2026-10-13）
+## 配置读写与持久化契约
 
-配置入口统一为一个共享 `Config`。它按类别组织数据；各类别不读写文件、不拥有独立全局实例，全部通过 config::update 修改。没有 ConfigManager、设置服务或额外 Repository。
+所有持久化配置在一个 JSON 中，七组数据由一个 Config 持有；全局共享 Arc<Config>。配置的数据定义集中在 config.rs：ModelSettings、ProviderSettings、ConnectionSettings、RequestPolicy、PromptSettings、HookSettings 和 Hook 处理器字段等。执行参数与模型容量复用 core 的同一类型，通过 config 入口导出，不建立重复定义。
 
-| 类别/字段 | 数据 struct | 用途和来源 |
-|---|---|---|
-| models | ModelSettings | selected、compaction、variant、effort_overrides、providers；主配置 |
-| execution | ExecutionOptions | steps、超时、重试、context、附件、技能/记忆执行数据；主配置 |
-| security | SecuritySettings | yolo、trusted_shell；主配置 |
-| ui | UiSettings | theme；主配置 |
-| session | SessionSettings | directory、extensions；主配置 |
-| prompt | PromptSettings | system_prompt、soul_file、memory_file、profile_file、append_system_prompt、memory_file_max_chars、profile_file_max_chars、provider_max_chars；prompts.json |
-| hooks | HookSettings | events、可选 file；内嵌或独立 Hook 文件 |
-
-JSON 和 Rust 的类别路径一致。execution.context 在 Rust 中为 execution.context_policy；ContextPolicy、ImagePolicy 是执行类别的嵌套策略。RequestPolicy 和 ModelLimits 从 models.providers 的 JSON 数据解析用于资源装配；不各自维护配置源。
-
-### 文件与兼容
-
-主配置 JSON 或 SQLite 保存 models/execution/security/ui/session/hooks。Prompt 单独保存在同目录 prompts.json，文件内容就是 PromptSettings 的字段，不重复包装。Hook 少时使用 hooks.events；多时主配置使用 `{"hooks":{"file":"hooks.json"}}`，独立 JSON 为 `{"hooks":{"events":{...}}}`。路径相对于主配置。非空内嵌事件与外部引用同时存在时报错，避免重复注册。旧独立 Hook 的 `{"hooks":{事件名:[...]}}` 格式仍可读取。
-
-旧平铺主配置由一个 normalize_document 函数转换成分类字段；首次普通保存迁移为分类 JSON。未知字段和同一字段的重复新旧定义都拒绝。旧内嵌 Prompt 保存时先保留到独立文件，不丢失内容。已有独立 Prompt 文件时，普通保存不改写它。
-
-SQLite 的 app_config(id=1,config_json) 保存相同分类文档。空库从邻近 yourai.json 导入一次，随后只写所选源，不双写主 JSON。没有新增存储接口类。
-
-### 读取和修改
+Config 与各层配置 struct 字段私有；Config 内部持有一把锁，外部通过 Arc<Config> 共享。每组提供只读 getter、返回封装对象的 *_mut 编辑入口，以及整组 setter：models/set_models、execution/set_execution、security/set_security、ui/set_ui、session/set_session、prompt/set_prompt、hooks/set_hooks。setter 不校验业务、不发请求、不自动保存。
 
 ```rust,ignore
-let config = Arc::new(Mutex::new(Config::load(path)?));
-let model = config.lock().unwrap().models.selected.clone();
-let steps = config.lock().unwrap().execution.steps;
-config::update(&config, |value| {
-    value.execution.steps = Some(20);
-    value.security.yolo = true;
-    value.ui.theme = "nord".into();
-    Ok(())
-})?;
-config::update(&config, |value| {
-    value.prompt.system_prompt = Some("编程助手".into());
-    Ok(())
-})?;
+let mut config = Config::init(path)?;
+let models = config.models().select_model("gateway/model", None, None)?;
+config.set_models(models);
+config.set_theme("nord".into());
+config.set_steps(Some(20));
+config.save()?;
 ```
 
-Get 只读共享字段；Set 修改候选数据，校验并同步保存变化的来源，然后发布共享内存。保存时不重新加载配置；外部文件编辑只在下次启动读取。修改 hooks.file 可将缓存定义保存到新来源，无须重新读取文件。一次跨文件更新可能涉及多个独立文件提交，并非跨文件数据库事务；失败时共享内存不发布。
+Config::init 只检查文件、JSON 结构和字段类型，旧平铺字段在此转换。没有网络客户端构建、Hook 编译或业务参数检查。Config::save() 先序列化全部数据，再通过同目录临时文件原子替换主 JSON；不接收旧配置、不比较字段、不写独立 Prompt/Hook 文件。
 
-模型、YOLO、主题的应用操作经 SessionClient.model/set_yolo/set_theme，内部调用同一个 config::update；模型与权限还同步更新实际资源。不能只改 models.selected 就声称已切换当前模型客户端。
+### 迁移
 
-ExecutionOptions 同时是 execution 类别数据和 core 的每轮冻结参数。SessionManager 绑定读取共享配置的函数，下一轮取得 execution 的新值，已有轮次不被中途改写。SessionOptions 只持有一份 Config 和启动/依赖参数；ResolvedModel 是创建后的客户端和准入数据。Prompt 与 Hook 的会话资源在新建会话时装配；连接、会话目录与扩展等资源设置需要相应的重新装配操作。
+主 JSON 已有 prompt 时使用它；缺少时可读取相邻旧 prompts.json。旧 hooks.file 引用可读取为 hooks.events，非空内嵌事件与引用同时存在时报错。初始化不写文件；首次保存把全部内容写入主 JSON，旧文件保留作备份。保存后的主 JSON 包含 prompt 与 hooks.events，旧文件即使被损坏或删除也不影响重新初始化。旧 Hook 引用不能递归指向主配置。
 
-历史、队列、任务、用量、权限规则、临时批准与记忆内容是领域状态，不放入应用 Config；旧会话 config/model_preferences 文档不作为全局配置来源。
+### 运行修改
+
+模型模块负责选择、effort、价格、参数校验和客户端构建；hooks/registration.rs 负责 Hook 定义校验与运行注册；assembly 负责路径、会话装配及业务校验。Config 中只有数据和 JSON 读写。
+
+SessionClient::model/change_yolo/change_theme 是应用操作入口。运行资源的 apply_* 方法负责应用效果。普通配置直接调用 setter 后 save；保存失败返回错误，内存保留修改。Config 和 assembly 均无通用更新闭包接口。模型和权限切换在各自操作中保留原分组，保存失败恢复该分组并保持原运行资源；其他分组的并发修改保留。主题在本地生效，保存失败提示错误。
+
+执行参数在每轮开始冻结，已运行轮次不被中途改变。SessionOptions 持有启动参数与冻结配置；ResolvedModel 是实际客户端结果。历史、队列、任务、用量、临时批准和记忆内容是领域状态，仍由各自存储维护。
+
+### 控制状态
+
+controller/state.rs 私有模块拥有当前 Harness、输出通道、生命周期、压缩状态、输入计数和恢复标志。Runner/Client 只能调用状态转换与查询；任务句柄表示任务所有权和完成通知，SessionSnapshot 只用于显示。
+
+SessionController::new 返回运行所有者和初始订阅；命令经 client()，事件经 SessionSubscription。没有 Deref 转发。旧会话退休期间允许新会话接收输入，关闭后不能由完成任务重新恢复可用状态。
 
 ### 验证
 
-配置测试覆盖：两文件独立保存、外部修改只在 reload 生效、旧内嵌 prompt 无损分离、JSON 保存失败不发布、SQLite 同格式与写失败回滚、模型选择全局保存及资源失败保持旧绑定、下一轮读取共享配置、旧会话设置不覆盖全局值。继续运行 workspace、Clippy、fmt/diff 及两组离线 TUI smoke。
+测试覆盖单 JSON 七组 round-trip、旧分拆文件迁移后失效、旧文件保留、没有生成额外 JSON、非法业务值仍能原样 JSON 读写、保存/校验失败不发布、模型失败保持运行绑定、下一轮共享执行参数。全工作区测试、Clippy、格式及 TUI 模型/界面冒烟验证实际行为。
 
-分类改造验证记录见本次工作区测试与配置集成测试；包含旧格式迁移、类别未知字段/重复字段校验、JSON/SQLite 同格式、保存失败保留内存、下一轮共享执行参数与 TUI 配置落盘检查。
+约束见 [配置和控制状态约束](config-control-invariants.md)。
 
-本次分类改造验证：workspace 648 项通过、2 项既有 ignored；配置集成测试 15 项通过；Clippy（全目标，-D warnings）、fmt/diff 检查及两组离线 TUI smoke 均通过。
+共享 Config 的 getter 返回嵌套访问对象。config.models().provider("gateway")?.options().set_base_url(Some(url))? 直接修改同一个 Config，setter 返回前释放锁。已有配置修改无需复制 provider 或整组写回；set_provider 用于新增或替换完整条目。
 
-全局同步检查：中英文 README、架构/设计文档、TUI 启动与模型/会话测试均使用现行分类路径；明确的旧格式兼容用例保留。hooks.file 在读取或保存前拒绝与主配置、prompts.json 的路径别名（含符号链接），避免配置源互相覆盖。额外启动器 smoke 通过，现行配置文档的本仓库链接已核对。
+共享使用 Arc::new(Config::init(path)?)；SessionOptions 也保存同一个 Arc，复制会话组装参数不会复制配置。Config 没有 snapshot 或 Clone；嵌套访问对象只保存引用和字段位置，每次访问短暂加锁。save 在同一把锁内完整序列化并原子保存。模型构建使用内部临时参数，检查构建依据后才提交模型分组，不创建另一个 Config。

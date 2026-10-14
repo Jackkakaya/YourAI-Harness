@@ -285,7 +285,7 @@ impl Tool {
             if let Some(runtime) = &turn.tc.snap.hooks {
                 let invocation = turn.invocation(event);
                 let deadline = cleanup_deadline.unwrap_or_else(|| {
-                    tokio::time::Instant::now() + turn.config.tool_cleanup_timeout
+                    tokio::time::Instant::now() + turn.config.tool_cleanup_timeout()
                 });
                 if deadline <= tokio::time::Instant::now() {
                     None
@@ -380,7 +380,7 @@ impl Tool {
         };
         let future = self.backend.run(tool_context, call.fn_arguments.clone());
         tokio::pin!(future);
-        let deadline = turn.deadline(turn.config.tool_timeout);
+        let deadline = turn.deadline(turn.config.tool_timeout());
         let mut request_ids = HashSet::new();
         loop {
             tokio::select! {
@@ -427,7 +427,7 @@ impl Tool {
         cause: YourAiError,
     ) -> Result<Value, YourAiError> {
         cancel.cancel();
-        let deadline = tokio::time::Instant::now() + turn.config.tool_cleanup_timeout;
+        let deadline = tokio::time::Instant::now() + turn.config.tool_cleanup_timeout();
         *cleanup_deadline = Some(deadline);
         if let Ok(result) = tokio::time::timeout_at(deadline, future).await {
             let (output, is_error) = match result {

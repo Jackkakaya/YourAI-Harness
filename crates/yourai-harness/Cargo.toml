@@ -20,6 +20,7 @@ regex.workspace = true
 tracing.workspace = true
 reqwest = { workspace = true, features = ["gzip", "brotli", "deflate"] }
 tempfile = "3"
+parking_lot = { version = "0.12", features = ["serde"] }
 similar = "2"
 httpdate = "1"
 html2md = "0.2.15"

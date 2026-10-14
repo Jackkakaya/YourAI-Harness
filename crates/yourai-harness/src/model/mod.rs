@@ -8,7 +8,11 @@ pub(crate) mod retry;
 #[cfg(test)]
 #[path = "../../tests/support/model.rs"]
 mod settings_fixture;
-pub use control::RequestPolicy;
+pub use crate::config::{
+    ConnectionSettings, ConnectionTimeout, Error, ModelDefinition, ModelPricing, ModelSettings,
+    ProviderSettings, RequestPolicy, VariantSettings,
+};
+pub use configured::{EffortChoice, ModelChoice, ResolvedModel, EFFORT_CHOICES};
 use futures_util::StreamExt;
 use metrics::Attempt;
 pub use metrics::RequestMetrics;
@@ -50,9 +54,9 @@ impl GenaiModel {
         let old = self.budget.limits();
         let new = budget.limits();
         for (declared, bound) in [
-            (new.context, old.context),
-            (new.input, old.input),
-            (new.output.map(u64::from), old.output.map(u64::from)),
+            (new.context(), old.context()),
+            (new.input(), old.input()),
+            (new.output().map(u64::from), old.output().map(u64::from)),
         ] {
             if bound.is_some_and(|bound| declared.is_none_or(|n| n > bound)) {
                 return Err(ErrorKind::Config(
@@ -61,7 +65,7 @@ impl GenaiModel {
                 .into());
             }
         }
-        if timeouts.headers.is_zero() || timeouts.read.is_zero() {
+        if timeouts.headers().is_zero() || timeouts.read().is_zero() {
             return Err(ErrorKind::Config("model timeouts must be positive".into()).into());
         }
         self.budget = budget;
@@ -437,10 +441,11 @@ mod media_tokens_tests {
     #[tokio::test]
     async fn provider_settings_reject_oversize_output_before_network() {
         let budget = ModelTokenBudget::resolve(
-            ModelLimits {
-                context: Some(8192),
-                output: Some(32),
-                ..Default::default()
+            {
+                let mut settings: ModelLimits = Default::default();
+                settings.set_context(Some(8192));
+                settings.set_output(Some(32));
+                settings
             },
             None,
         )
@@ -461,10 +466,11 @@ mod media_tokens_tests {
             );
         }
         let wider = ModelTokenBudget::resolve(
-            ModelLimits {
-                context: Some(16384),
-                output: Some(32),
-                ..Default::default()
+            {
+                let mut settings: ModelLimits = Default::default();
+                settings.set_context(Some(16384));
+                settings.set_output(Some(32));
+                settings
             },
             None,
         )

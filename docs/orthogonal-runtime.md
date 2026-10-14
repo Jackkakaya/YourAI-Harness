@@ -31,7 +31,7 @@
 - `DefaultLoop` 为无状态调度策略。独立运行通过 `Agent::run_with(input, config, options)` 显式传入配置，不另传循环配置。
 - `ToolOutputStore` 是装配依赖，位于 provider 快照；不放进配置。每轮绑定固定实现，模型与程序调用共享同一工具账本。
 - 应用共享 Config；SessionManager 每轮读取并冻结执行数据。Agent、AgentBuilder 与 ProviderSnapshot 都不保存可编辑配置。模型切换在会话操作锁内更新模型/上下文绑定，不改写启动 context_policy。
-- `Workspace.change_config/notify/config` 移除。配置修改属于共享 Config 和 config::update；SessionManager 只读取每轮执行数据，输入提交通知仍属于宿主。
+- `Workspace.change_config/notify/config` 移除。配置修改属于共享 Config 的 getter/setter 与 save；SessionManager 只读取每轮执行数据，输入提交通知仍属于宿主。
 - 创建、恢复、子会话共享 `prepare_session → assemble → start_session`；适配器差异留在装配阶段，生命周期和初始化失败清理只实现一次。
 - 子会话继承父会话执行设置，不自动激活父会话的技能、记忆或指令路径；ContextPolicy 来自冻结的上下文选择；显式模型、安全和沙箱继承保持原语义。
 - `SessionStore` 的租约、状态、原文操作成为必须实现的方法，不再静默继承 `unsupported` 默认实现。
@@ -51,10 +51,10 @@
 
 用户后续要求采用简单的文件与共享内存方案，替代此前分散的会话设置管理。完整清单见 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13)。
 
-- 一份共享 Config；yourai.json 放常规配置，prompts.json 放 prompt。只在启动 load，不自动监听。
-- config::update 修改同一份 Config，按变化字段保存主配置、Prompt 或独立 Hook 文件后发布内存。运行中不重新加载文件，失败不发布。
+- 一份共享 Config；yourai.json 保存全部七组配置。只在初始化 init 时读取，旧分拆文件仅用于迁移，不自动监听。
+- 嵌套 setter 直接修改同一份 Config 并内部加锁，save 原子写入完整主 JSON；普通保存失败保留内存修改，模型和安全切换失败回滚对应分组。
 - 模型/effort、YOLO、主题都保存主配置；不恢复 SQLite 中独立的会话配置。
-- 可选择 SQLite 主配置源，仍使用同一 JSON 文档；不双写 JSON 与 SQLite。
+- 应用配置只使用主 JSON；SQLite 仅保存会话等领域数据。
 - 每轮从共享配置的 execution 类别复制 core 执行数据；已经运行的轮次冻结。Prompt 用于新会话，已存在的会话保留冻结历史。
 - 旧会话偏好与独立 InputSettings 已删除；当前 ModelSettings 仅为 Config.models 的数据分组。没有新增 ConfigManager 或配置服务。
 
@@ -72,4 +72,4 @@
 
 实施 Server 前不引入抽象 Transport 或多协议支持。需单独验证双客户端唯一执行、审批只生效一次、快照订阅不丢事件、Server 重启恢复、数据库租约 fencing。
 
-配置现按 models/execution/security/ui/session/prompt/hooks 分类，类别只是数据分组，各组都由 Config 和 config::update 统一加载/修改/保存。JSON 与 Rust 路径一致，旧平铺格式可读、保存后迁移。详见 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13)。
+配置现按 models/execution/security/ui/session/prompt/hooks 分类，类别只是数据分组，各组都由 Config::init、嵌套 setter 和 Config::save 统一加载/修改/保存。JSON 与 Rust 路径一致，旧平铺格式可读、保存后迁移。详见 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13)。

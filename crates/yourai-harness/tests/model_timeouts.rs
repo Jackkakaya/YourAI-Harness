@@ -139,13 +139,12 @@ async fn server(mode: &'static str) -> (GenaiModel, tokio::task::JoinHandle<()>)
         .unwrap();
     (
         GenaiModel::new(client, "test")
-            .with_settings(
-                ModelTokenBudget::default(),
-                ModelTimeouts {
-                    headers: Duration::from_millis(200),
-                    read: Duration::from_millis(200),
-                },
-            )
+            .with_settings(ModelTokenBudget::default(), {
+                let mut settings = ModelTimeouts::default();
+                settings.set_headers(Duration::from_millis(200));
+                settings.set_read(Duration::from_millis(200));
+                settings
+            })
             .unwrap(),
         task,
     )
@@ -230,13 +229,12 @@ async fn headers_and_body_have_independent_deadlines() {
             (200, 700)
         };
         let model = model
-            .with_settings(
-                ModelTokenBudget::default(),
-                ModelTimeouts {
-                    headers: Duration::from_millis(header),
-                    read: Duration::from_millis(read),
-                },
-            )
+            .with_settings(ModelTokenBudget::default(), {
+                let mut settings = ModelTimeouts::default();
+                settings.set_headers(Duration::from_millis(header));
+                settings.set_read(Duration::from_millis(read));
+                settings
+            })
             .unwrap();
         let response = tokio::time::timeout(Duration::from_secs(3), model.complete(request()))
             .await
@@ -269,9 +267,11 @@ async fn raw_byte_progress_keeps_compaction_and_metered_main_loop_alive() {
                     Duration::from_secs(3),
                     agent.run_with(
                         In::user_text("hello"),
-                        ExecutionOptions {
-                            max_model_retries: 0,
-                            ..Default::default()
+                        {
+                            let mut settings: yourai_core::execution::ExecutionOptions =
+                                Default::default();
+                            settings.set_max_model_retries(0);
+                            settings
                         },
                         TurnOptions::default(),
                     ),
@@ -312,9 +312,11 @@ async fn explicit_turn_deadline_still_stops_a_healthy_heartbeat_stream() {
             agent
                 .start_with(
                     In::user_text("hello"),
-                    ExecutionOptions {
-                        max_model_retries: 0,
-                        ..Default::default()
+                    {
+                        let mut settings: yourai_core::execution::ExecutionOptions =
+                            Default::default();
+                        settings.set_max_model_retries(0);
+                        settings
                     },
                     options,
                 )
@@ -352,9 +354,11 @@ async fn per_turn_model_limit_is_forwarded_to_transport() {
             agent
                 .start_with(
                     In::user_text("hello"),
-                    ExecutionOptions {
-                        max_model_retries: 0,
-                        ..Default::default()
+                    {
+                        let mut settings: yourai_core::execution::ExecutionOptions =
+                            Default::default();
+                        settings.set_max_model_retries(0);
+                        settings
                     },
                     options,
                 )
@@ -410,20 +414,19 @@ async fn configured_model_defaults_reach_collected_and_default_loop_requests() {
         let (model, task) = server("headers").await;
         let model = Arc::new(
             model
-                .with_settings(
-                    ModelTokenBudget::default(),
-                    ModelTimeouts {
-                        headers: Duration::from_millis(40),
-                        read: Duration::from_millis(70),
-                    },
-                )
+                .with_settings(ModelTokenBudget::default(), {
+                    let mut settings = ModelTimeouts::default();
+                    settings.set_headers(Duration::from_millis(40));
+                    settings.set_read(Duration::from_millis(70));
+                    settings
+                })
                 .unwrap(),
         );
         let model = Arc::new(MeteredModel {
             inner: model,
             budget: ModelBudget::new(),
         });
-        assert_eq!(model.timeouts().headers, Duration::from_millis(40));
+        assert_eq!(model.timeouts().headers(), Duration::from_millis(40));
         let work = async {
             if collected {
                 model

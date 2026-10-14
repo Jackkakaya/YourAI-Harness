@@ -6,12 +6,13 @@ use yourai_core::prelude::*;
 use yourai_harness::{tools::ToolOutputStore, DefaultContext, SqliteStore};
 
 fn policy() -> ContextPolicy {
-    ContextPolicy {
-        safety_margin: 100,
-        advance_tokens: Some(200),
-        keep_recent_tokens: 0,
-        summary_min_savings: 1,
-        ..Default::default()
+    {
+        let mut settings: yourai_core::compactor::ContextPolicy = Default::default();
+        settings.set_safety_margin(100);
+        settings.set_advance_tokens(Some(200));
+        settings.set_keep_recent_tokens(0);
+        settings.set_summary_min_savings(1);
+        settings
     }
 }
 async fn setup(p: ContextPolicy) -> (Arc<SqliteStore>, Arc<DefaultContext>) {

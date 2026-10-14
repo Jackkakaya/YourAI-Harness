@@ -23,7 +23,7 @@ impl Turn<'_> {
             return Ok(HookDispatchResult::empty(kind));
         };
         let invocation = self.invocation(event);
-        let timeout = self.config.hook_timeout;
+        let timeout = self.config.hook_timeout();
         let result = self
             .wait_operation(hooks.dispatch(&invocation), timeout, "hook")
             .await?;

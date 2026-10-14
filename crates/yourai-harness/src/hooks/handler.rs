@@ -54,9 +54,10 @@ impl ModelHookHandler {
             }
             let mut options = TurnOptions::default();
             options.source = Some("hook");
-            let config = yourai_core::execution::ExecutionOptions {
-                steps: Some(8),
-                ..Default::default()
+            let config = {
+                let mut settings: ExecutionOptions = Default::default();
+                settings.set_steps(Some(8));
+                settings
             };
             builder
                 .build()
@@ -162,17 +163,17 @@ where
 
 /// Compile a validated registration once; missing dependencies fail before registration.
 pub(crate) fn handler_from_config(
-    config: &crate::hooks::config::HandlerConfig,
+    config: &crate::config::HandlerConfig,
     http_policy: crate::hooks::http::HttpHookPolicy,
     provider: Option<Arc<dyn yourai_core::model::ModelProvider>>,
     background: crate::hooks::command::BackgroundCommandContext,
 ) -> Result<Arc<dyn HookHandler>, yourai_core::YourAiError> {
     let handler: Arc<dyn HookHandler> = match config {
-        crate::hooks::config::HandlerConfig::Command { command, shell, .. } => Arc::new(
+        crate::config::HandlerConfig::Command { command, shell, .. } => Arc::new(
             crate::hooks::command::CommandHandler::new(command.clone(), *shell)
                 .with_background(background),
         ),
-        crate::hooks::config::HandlerConfig::Http {
+        crate::config::HandlerConfig::Http {
             url,
             headers,
             allowed_env_vars,
@@ -185,15 +186,15 @@ pub(crate) fn handler_from_config(
             )
             .with_policy(http_policy),
         ),
-        crate::hooks::config::HandlerConfig::Prompt { prompt, model, .. }
-        | crate::hooks::config::HandlerConfig::Agent { prompt, model, .. } => {
+        crate::config::HandlerConfig::Prompt { prompt, model, .. }
+        | crate::config::HandlerConfig::Agent { prompt, model, .. } => {
             let fallback = provider.ok_or_else(|| {
                 yourai_core::ErrorKind::Config("prompt/agent hook requires a model".into())
             })?;
             Arc::new(ModelHookHandler {
                 prompt: prompt.clone(),
                 model: model.clone(),
-                agentic: matches!(config, crate::hooks::config::HandlerConfig::Agent { .. }),
+                agentic: matches!(config, crate::config::HandlerConfig::Agent { .. }),
                 fallback,
             })
         }

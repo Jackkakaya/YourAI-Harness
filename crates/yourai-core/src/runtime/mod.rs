@@ -186,7 +186,7 @@ impl SessionManager {
         let budget = model.token_budget();
         Ok(ContextUsage {
             estimated_tokens: request.estimated_tokens,
-            context_window: budget.limits().context,
+            context_window: budget.limits().context(),
             input_budget: request.input_budget,
             output_reserve: u64::from(budget.max_output_tokens()),
         })
@@ -477,7 +477,7 @@ impl SessionManager {
         journal.seen.insert(event.id.clone());
         journal.events.push(event.clone());
         if event.wake
-            && self.config().allow_background_wake
+            && self.config().allow_background_wake()
             && self.status() == SessionStatus::Idle
             && journal.queue.is_empty()
         {
@@ -521,7 +521,7 @@ impl SessionManager {
         cancel: &CancellationToken,
     ) -> Result<Vec<SessionTurn>, YourAiError> {
         let mut reports = vec![];
-        for _ in 0..self.config().max_followups {
+        for _ in 0..self.config().max_followups() {
             match self.run_next(limits.clone(), out, cancel).await? {
                 Some(report) => {
                     let failed = report.result.is_err();
@@ -793,7 +793,7 @@ impl SessionManager {
                 tokio::select! {biased;
                                        _=timeout=>{timed_out=true;break},
                                        _=request_cancel.cancelled(),if !request_cancelled=>{request_cancelled=true;task_cancel.cancel();},
-                                       _=task_cancel.cancelled(),if !cancel_consumed=>{cancel_consumed=true;cancelled_at=host.config().cleanup_timeout.map(|t|tokio::time::Instant::now()+t);},
+                                       _=task_cancel.cancelled(),if !cancel_consumed=>{cancel_consumed=true;cancelled_at=host.config().cleanup_timeout().map(|t|tokio::time::Instant::now()+t);},
                                        event=handle.outbox.recv()=>match event{Some(event)=>{if let Out::Ask{id,..}=&event{host.live.lock().unwrap().asks.insert(id.clone());}
                 if tx.send(event).is_err(){task_cancel.cancel();}},None=>break}
                                    }
@@ -838,7 +838,7 @@ impl SessionManager {
                     }
                     if host.events.pending().iter().any(|e| e.wake)
                         && journal.queue.is_empty()
-                        && host.config().allow_background_wake
+                        && host.config().allow_background_wake()
                     {
                         journal.queue.push_back(In::follow_up(RUNTIME_EVENT_PROMPT));
                     }
@@ -947,7 +947,7 @@ impl SessionManager {
                     })
                     .unwrap_or_default();
                 Compactor::from_snapshot(&snapshot, Some(&environment))?
-                    .exec(request, &token, host.config().hook_timeout)
+                    .exec(request, &token, host.config().hook_timeout())
                     .await
             };
             tokio::pin!(task);
@@ -983,7 +983,7 @@ impl SessionManager {
         for child in children {
             let id = child.environment().id;
             if let Err(cause) =
-                Box::pin(child.close(self.config().cleanup_timeout.or(timeout))).await
+                Box::pin(child.close(self.config().cleanup_timeout().or(timeout))).await
             {
                 failures.push(cause.to_string());
             }

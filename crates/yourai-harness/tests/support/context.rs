@@ -131,10 +131,11 @@ pub fn configured(
     TestModel::new(
         model,
         ModelTokenBudget::resolve(
-            ModelLimits {
-                context,
-                output: Some(output),
-                ..Default::default()
+            {
+                let mut settings: ModelLimits = Default::default();
+                settings.set_context(context);
+                settings.set_output(Some(output));
+                settings
             },
             None,
         )

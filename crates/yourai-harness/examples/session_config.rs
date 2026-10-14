@@ -10,7 +10,7 @@ impl AgentLoop for DemoLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
             let mut turn = Turn::open(tc).await?;
-            println!("Turn uses frozen steps: {:?}", turn.config().steps);
+            println!("Turn uses frozen steps: {:?}", turn.config().steps());
             let result = turn.complete("done").await.map(|_| ());
             turn.finish(result).await
         })
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let mut options =
         SessionOptions::new(directory.path().join("sessions"), directory.path().into());
-    options.config.execution.steps = Some(20);
+    options.config.set_steps(Some(20));
     options.agent_loop = Some(Arc::new(DemoLoop));
     let harness = Harness::open(
         options,
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = &harness.host;
 
     // Startup settings stay immutable. Per-turn overrides can tighten limits.
-    println!("Session startup steps: {:?}", session.config().steps);
+    println!("Session startup steps: {:?}", session.config().steps());
     let mut limits = TurnLimits::default();
     limits.steps = Some(10);
 

@@ -18,9 +18,9 @@ impl TestModel {
         let old = existing.limits();
         let new = budget.limits();
         for (declared, bound) in [
-            (new.context, old.context),
-            (new.input, old.input),
-            (new.output.map(u64::from), old.output.map(u64::from)),
+            (new.context(), old.context()),
+            (new.input(), old.input()),
+            (new.output().map(u64::from), old.output().map(u64::from)),
         ] {
             if bound.is_some_and(|bound| declared.is_none_or(|n| n > bound)) {
                 return Err(ErrorKind::Config(
@@ -29,7 +29,7 @@ impl TestModel {
                 .into());
             }
         }
-        if timeouts.headers.is_zero() || timeouts.read.is_zero() {
+        if timeouts.headers().is_zero() || timeouts.read().is_zero() {
             return Err(ErrorKind::Config("model timeouts must be positive".into()).into());
         }
         Ok(Arc::new(Self {

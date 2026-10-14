@@ -101,7 +101,7 @@ pub async fn run(
     yolo: bool,
     theme: theme::Theme,
     limits: TurnLimits,
-    config: Arc<std::sync::Mutex<Config>>,
+    config: Arc<Config>,
     choices: Vec<crate::models::ModelChoice>,
     config_template: SessionOptions,
 ) -> Result<(String, Vec<In>), Error> {
@@ -110,13 +110,15 @@ pub async fn run(
     view.theme = theme;
     view.model_choices = choices;
     let (pricing, effort) = {
-        let cfg = config.lock().map_err(|e| Error::from(e.to_string()))?;
-        let p = cfg.pricing();
+        let cfg = &config;
+        let p = cfg.models().pricing();
         let pricing = match p {
             (Some(i), Some(o)) => Some((i, o)),
             _ => None,
         };
-        let effort = cfg.effective_effort(&cfg.models.selected, cfg.models.variant.as_deref());
+        let effort = cfg
+            .models()
+            .effective_effort(cfg.models().model(), cfg.models().variant().as_deref());
         (pricing, effort)
     };
     view.model = state::ModelInfo {

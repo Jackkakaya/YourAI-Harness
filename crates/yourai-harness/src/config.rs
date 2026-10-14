@@ -1,105 +1,396 @@
-use crate::model::configured::model_timeouts;
+pub use yourai_core::{
+    compactor::ContextPolicy,
+    execution::{ExecutionOptions, ImagePolicy},
+    model::{ModelLimits, ModelTimeouts},
+};
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
-use yourai_core::prelude::{ModelLimits, ModelProvider};
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
-/// Borrowed option maps for one picker entry.
-type EntryOptions<'a> = (&'a Map<String, Value>, Option<&'a Map<String, Value>>);
 
-/// The sole shared configuration. Categories are data, with no separate storage.
-#[derive(Clone, Default, Serialize)]
-pub struct Config {
-    #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
-    pub schema: Option<String>,
-    pub models: ModelSettings,
-    pub execution: yourai_core::execution::ExecutionOptions,
-    pub security: SecuritySettings,
-    pub ui: UiSettings,
-    pub session: SessionSettings,
-    pub prompt: PromptSettings,
-    pub hooks: HookSettings,
-    #[serde(skip)]
-    path: Option<PathBuf>,
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ModelSettings {
-    pub selected: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compaction: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub variant: Option<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub effort_overrides: BTreeMap<String, BTreeMap<String, String>>,
-    pub providers: BTreeMap<String, ProviderSettings>,
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ProviderSettings {
-    #[serde(alias = "npm")]
-    pub api: Option<String>,
-    pub name: Option<String>,
-    pub options: ConnectionSettings,
-    pub models: BTreeMap<String, ModelDefinition>,
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
-pub struct ConnectionSettings {
-    #[serde(rename = "baseURL")]
-    pub base_url: Option<String>,
-    pub api_key: Option<String>,
-    pub timeout: Option<ConnectionTimeout>,
-    pub header_timeout: Option<u64>,
-    pub chunk_timeout: Option<u64>,
-    pub requests: crate::model::RequestPolicy,
-    pub headers: BTreeMap<String, String>,
-}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ConnectionTimeout {
     Milliseconds(u64),
     Disabled(bool),
 }
+
+/// Handler 配置（discriminated union on `type`）。
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum HandlerConfig {
+    #[serde(rename = "command")]
+    Command {
+        command: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shell: Option<HookShell>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "if")]
+        if_condition: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        once: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "async")]
+        is_async: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "asyncRewake")]
+        async_rewake: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "statusMessage")]
+        status_message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "failurePolicy")]
+        failure_policy: Option<FailurePolicyConfig>,
+    },
+    #[serde(rename = "http")]
+    Http {
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        headers: Option<HashMap<String, String>>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "allowedEnvVars")]
+        allowed_env_vars: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "if")]
+        if_condition: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        once: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "statusMessage")]
+        status_message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "failurePolicy")]
+        failure_policy: Option<FailurePolicyConfig>,
+    },
+    #[serde(rename = "prompt")]
+    Prompt {
+        prompt: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "if")]
+        if_condition: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        once: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "statusMessage")]
+        status_message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "failurePolicy")]
+        failure_policy: Option<FailurePolicyConfig>,
+    },
+    #[serde(rename = "agent")]
+    Agent {
+        prompt: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "if")]
+        if_condition: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        once: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "statusMessage")]
+        status_message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none", rename = "failurePolicy")]
+        failure_policy: Option<FailurePolicyConfig>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailurePolicyConfig {
+    Open,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookShell {
+    Bash,
+    Powershell,
+}
+
+/// Application settings. Share with Arc; setters acquire the internal lock.
+/// ```compile_fail
+/// let config = yourai_harness::config::Config::default();
+/// let duplicate = config.clone();
+/// ```
+/// Setters change configuration data; a running model/security change goes through
+/// the session operation that prepares and applies its resources.
+/// ```compile_fail
+/// let config = yourai_harness::config::Config::default();
+/// config.snapshot();
+/// ```
+#[derive(Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Config {
+    data: parking_lot::Mutex<ConfigData>,
+    #[serde(skip)]
+    path: Option<PathBuf>,
+}
+
+type Selector<'a, T> =
+    std::sync::Arc<dyn for<'b> Fn(&'b mut ConfigData) -> Option<&'b mut T> + Send + Sync + 'a>;
+/// A borrowed path into the one Config. It owns no configuration data or lock.
+/// Each getter/setter locks only for that call. Missing indexed entries return errors.
+pub struct ConfigSection<'a, T: 'static> {
+    config: &'a Config,
+    select: Selector<'a, T>,
+}
+impl<'a, T: 'static> ConfigSection<'a, T> {
+    fn access<R>(&self, action: impl FnOnce(&mut T) -> R) -> Result<R, Error> {
+        let mut data = self.config.data.lock();
+        let value = (self.select)(&mut data).ok_or("configuration entry no longer exists")?;
+        Ok(action(value))
+    }
+    fn root<R>(&self, action: impl FnOnce(&mut T) -> R) -> R {
+        self.access(action)
+            .expect("root configuration group always exists")
+    }
+    fn child<U: 'static>(
+        &self,
+        select: impl for<'b> Fn(&'b mut T) -> Option<&'b mut U> + Send + Sync + 'a,
+    ) -> ConfigSection<'a, U> {
+        let parent = std::sync::Arc::clone(&self.select);
+        ConfigSection {
+            config: self.config,
+            select: std::sync::Arc::new(move |data| select(parent(data)?)),
+        }
+    }
+}
+impl<T: Serialize + 'static> Serialize for ConfigSection<'_, T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.access(|value| value.serialize(serializer))
+            .map_err(serde::ser::Error::custom)?
+    }
+}
+macro_rules! view_fields {
+    ($mode:ident $name:ident { $($field:ident: $ty:ty => $setter:ident [$($kind:tt)*],)* }) => {
+        impl<'a> ConfigSection<'a, $name> { $(
+            view_fields!(@get $mode $field: $ty [$($kind)*]);
+            pub fn $setter(&self, value: $ty) -> Result<(), Error> {
+                self.access(|node| node.$setter(value))
+            }
+        )* }
+    };
+    (@get $mode:ident limit: $ty:ty [value]) => {
+        pub fn limit(&self) -> ConfigSection<'a, ModelLimits> { self.child(|node| Some(node.limit_mut())) }
+    };
+    (@get $mode:ident $field:ident: $ty:ty [mut $edit:ident]) => {
+        pub fn $field(&self) -> ConfigSection<'a, $ty> { self.child(|node| Some(node.$edit())) }
+    };
+    (@get root $field:ident: $ty:ty [map $edit:ident $child:ty]) => {
+        pub fn $field(&self) -> BTreeMap<String, ConfigSection<'a, $child>> {
+            self.root(|node| node.$field().keys().cloned().collect::<Vec<_>>()).into_iter().map(|id| {
+                let key = id.clone(); (id, self.child(move |node| node.$edit(&key)))
+            }).collect()
+        }
+    };
+    (@get nested $field:ident: $ty:ty [map $edit:ident $child:ty]) => {
+        pub fn $field(&self) -> Result<BTreeMap<String, ConfigSection<'a, $child>>, Error> {
+            Ok(self.access(|node| node.$field().keys().cloned().collect::<Vec<_>>())?.into_iter().map(|id| {
+                let key = id.clone(); (id, self.child(move |node| node.$edit(&key)))
+            }).collect())
+        }
+    };
+    (@get root $field:ident: $ty:ty [value]) => {
+        pub fn $field(&self) -> $ty { self.root(|node| node.$field()) }
+    };
+    (@get nested $field:ident: $ty:ty [value]) => {
+        pub fn $field(&self) -> Result<$ty, Error> { self.access(|node| node.$field()) }
+    };
+    (@get root $field:ident: $ty:ty [$kind:ident]) => {
+        pub fn $field(&self) -> $ty { self.root(|node| node.$field().clone()) }
+    };
+    (@get nested $field:ident: $ty:ty [$kind:ident]) => {
+        pub fn $field(&self) -> Result<$ty, Error> { self.access(|node| node.$field().clone()) }
+    };
+}
+// JSON structs describe data; shared access is generated from the same fields.
+macro_rules! config_fields {
+    ($( $(#[$attr:meta])* $vis:vis struct $name:ident
+        $(as $group:ident => $get:ident, $set:ident)? {
+        $( $(#[$field_attr:meta])* $field:ident: $ty:ty => $setter:ident [$($kind:tt)*], )*
+    })+) => {
+        yourai_core::settings_fields! { $( $(#[$attr])* $vis struct $name {
+            $( $(#[$field_attr])* $field: $ty => $setter [$($kind)*], )*
+        })+ }
+        $(config_fields!(@shared $name $(, $group, $get, $set)?; $($field: $ty => $setter [$($kind)*],)*);)+
+    };
+    (@shared $name:ident, $group:ident, $get:ident, $set:ident; $($field:ident: $ty:ty => $setter:ident [$($kind:tt)*],)*) => {
+        view_fields! { root $name { $($field: $ty => $setter [$($kind)*],)* } }
+        impl Config {
+            pub fn $get(&self) -> ConfigSection<'_, $name> {
+                ConfigSection { config: self, select: std::sync::Arc::new(|data| Some(&mut data.$group)) }
+            }
+            pub fn $set(&self, value: $name) { self.data.lock().$set(value); }
+            $(pub fn $setter(&self, value: $ty) {
+                self.$get().$setter(value).expect("root configuration group always exists");
+            })*
+        }
+    };
+    (@shared ConfigData; $($field:ident: $ty:ty => $setter:ident [$($kind:tt)*],)*) => {};
+    (@shared $name:ident; $($field:ident: $ty:ty => $setter:ident [$($kind:tt)*],)*) => {
+        view_fields! { nested $name { $($field: $ty => $setter [$($kind)*],)* } }
+    };
+}
+config_fields! { @shared ExecutionOptions, execution, execution, set_execution;
+    skill_ids: Vec<String> => set_skill_ids [ref],
+    memory_search_limit: usize => set_memory_search_limit [value],
+    context_policy: ContextPolicy => set_context_policy [mut context_policy_mut],
+    steps: Option<u32> => set_steps [value],
+    model_timeout: Option<Duration> => set_model_timeout [value],
+    allow_background_wake: bool => set_allow_background_wake [value],
+    max_followups: usize => set_max_followups [value],
+    instruction_paths: Vec<PathBuf> => set_instruction_paths [ref],
+    workspace_enabled: bool => set_workspace_enabled [value],
+    memory_max_chars: usize => set_memory_max_chars [value],
+    attachment_image: ImagePolicy => set_attachment_image [mut attachment_image_mut],
+    attachment_text_max_chars: usize => set_attachment_text_max_chars [value],
+    max_model_retries: u32 => set_max_model_retries [value],
+    max_overflow_compactions: u32 => set_max_overflow_compactions [value],
+    max_stop_continuations: u32 => set_max_stop_continuations [value],
+    max_permission_rechecks: u32 => set_max_permission_rechecks [value],
+    retry_delay: Duration => set_retry_delay [value],
+    retry_max_delay: Duration => set_retry_max_delay [value],
+    operation_timeout: Option<Duration> => set_operation_timeout [value],
+    tool_timeout: Option<Duration> => set_tool_timeout [value],
+    approval_timeout: Option<Duration> => set_approval_timeout [value],
+    hook_timeout: Option<Duration> => set_hook_timeout [value],
+    cleanup_timeout: Option<Duration> => set_cleanup_timeout [value],
+    tool_cleanup_timeout: Duration => set_tool_cleanup_timeout [value],
+}
+view_fields! { root ContextPolicy {
+    safety_margin: u64 => set_safety_margin [value],
+    advance_tokens: Option<u64> => set_advance_tokens [value],
+    keep_recent_tokens: u64 => set_keep_recent_tokens [value],
+    summary_tokens: u64 => set_summary_tokens [value],
+    summary_min_savings: u64 => set_summary_min_savings [value],
+} }
+view_fields! { root ImagePolicy {
+    auto_resize: bool => set_auto_resize [value],
+    max_width: u32 => set_max_width [value],
+    max_height: u32 => set_max_height [value],
+    max_base64_bytes: usize => set_max_base64_bytes [value],
+} }
+view_fields! { nested ModelLimits {
+    context: Option<u64> => set_context [value],
+    input: Option<u64> => set_input [value],
+    output: Option<u32> => set_output [value],
+} }
+config_fields! {
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelSettings as models => models, set_models {
+    #[serde(alias = "selected")]
+    model: String => set_model [ref],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compaction: Option<String> => set_compaction [ref],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    variant: Option<String> => set_variant [ref],
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    effort_overrides: BTreeMap<String, BTreeMap<String, String>> => set_effort_overrides [ref],
+    providers: BTreeMap<String, ProviderSettings> => set_providers [map provider_mut ProviderSettings],
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderSettings {
+    #[serde(alias = "npm")]
+    api: Option<String> => set_api [ref],
+    name: Option<String> => set_name [ref],
+    options: ConnectionSettings => set_options [mut options_mut],
+    models: BTreeMap<String, ModelDefinition> => set_models [map model_mut ModelDefinition],
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct ConnectionSettings {
+    #[serde(rename = "baseURL")]
+    base_url: Option<String> => set_base_url [ref],
+    api_key: Option<String> => set_api_key [ref],
+    timeout: Option<ConnectionTimeout> => set_timeout [ref],
+    header_timeout: Option<u64> => set_header_timeout [value],
+    chunk_timeout: Option<u64> => set_chunk_timeout [value],
+    requests: RequestPolicy => set_requests [mut requests_mut],
+    headers: BTreeMap<String, String> => set_headers [ref],
+}
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelDefinition {
-    pub id: Option<String>,
-    pub name: Option<String>,
-    pub limit: ModelLimits,
-    pub options: Map<String, Value>,
-    pub headers: BTreeMap<String, String>,
-    pub variants: BTreeMap<String, VariantSettings>,
-    pub pricing: ModelPricing,
+    id: Option<String> => set_id [ref],
+    name: Option<String> => set_name [ref],
+    limit: ModelLimits => set_limit [value],
+    options: Map<String, Value> => set_options [ref],
+    headers: BTreeMap<String, String> => set_headers [ref],
+    variants: BTreeMap<String, VariantSettings> => set_variants [map variant_mut VariantSettings],
+    pricing: ModelPricing => set_pricing [mut pricing_mut],
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct VariantSettings {
     #[serde(default)]
-    pub disabled: bool,
+    disabled: bool => set_disabled [value],
     #[serde(flatten)]
-    pub options: Map<String, Value>,
+    options: Map<String, Value> => set_options [ref],
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelPricing {
-    pub input: Option<f64>,
-    pub output: Option<f64>,
+    input: Option<f64> => set_input [value],
+    output: Option<f64> => set_output [value],
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestPolicy {
+    /// Optional known provider quota. Requests are paced evenly, without a burst allowance.
+    rpm: Option<u32> => set_rpm [value],
+    /// Opt-in shared fallback for HTTP 429 without a server delay; zero disables it.
+    cooldown_seconds: u64 => set_cooldown_seconds [value],
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct SecuritySettings {
-    pub trusted_shell: bool,
-    pub yolo: bool,
+pub(crate) struct ConfigData {
+    #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
+    schema: Option<String> => set_schema [ref],
+    models: ModelSettings => set_models [mut models_mut],
+    execution: ExecutionOptions => set_execution [mut execution_mut],
+    security: SecuritySettings => set_security [mut security_mut],
+    ui: UiSettings => set_ui [mut ui_mut],
+    session: SessionSettings => set_session [mut session_mut],
+    prompt: PromptSettings => set_prompt [mut prompt_mut],
+    hooks: HookSettings => set_hooks [mut hooks_mut],
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecuritySettings as security => security, set_security {
+    trusted_shell: bool => set_trusted_shell [value],
+    yolo: bool => set_yolo [value],
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct UiSettings {
-    pub theme: String,
+pub struct UiSettings as ui => ui, set_ui {
+    theme: String => set_theme [ref],
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionSettings as session => session, set_session {
+    directory: PathBuf => set_directory [ref],
+    extensions: bool => set_extensions [value],
+}
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromptSettings as prompt => prompt, set_prompt {
+    system_prompt: Option<String> => set_system_prompt [ref],
+    soul_file: Option<PathBuf> => set_soul_file [ref],
+    memory_file: Option<PathBuf> => set_memory_file [ref],
+    profile_file: Option<PathBuf> => set_profile_file [ref],
+    append_system_prompt: Option<String> => set_append_system_prompt [ref],
+    memory_file_max_chars: usize => set_memory_file_max_chars [value],
+    profile_file_max_chars: usize => set_profile_file_max_chars [value],
+    provider_max_chars: usize => set_provider_max_chars [value],
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HookSettings as hooks => hooks, set_hooks {
+    events: Value => set_events [ref],
+}
 }
 impl Default for UiSettings {
     fn default() -> Self {
@@ -108,31 +399,13 @@ impl Default for UiSettings {
         }
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SessionSettings {
-    pub directory: PathBuf,
-    pub extensions: bool,
-}
 impl Default for SessionSettings {
     fn default() -> Self {
         Self {
-            directory: sessions(),
+            directory: ".yourai/sessions".into(),
             extensions: false,
         }
     }
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PromptSettings {
-    pub system_prompt: Option<String>,
-    pub soul_file: Option<PathBuf>,
-    pub memory_file: Option<PathBuf>,
-    pub profile_file: Option<PathBuf>,
-    pub append_system_prompt: Option<String>,
-    pub memory_file_max_chars: usize,
-    pub profile_file_max_chars: usize,
-    pub provider_max_chars: usize,
 }
 impl Default for PromptSettings {
     fn default() -> Self {
@@ -148,49 +421,16 @@ impl Default for PromptSettings {
         }
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct HookSettings {
-    pub events: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file: Option<PathBuf>,
-}
 impl Default for HookSettings {
     fn default() -> Self {
         Self {
             events: empty_object(),
-            file: None,
         }
     }
 }
 fn empty_object() -> Value {
     Value::Object(Map::new())
 }
-
-// Derive the grouped JSON format; legacy keys are normalized only at the boundary.
-#[derive(Default, Deserialize)]
-#[serde(remote = "Config", default, deny_unknown_fields)]
-struct ConfigDocument {
-    #[serde(rename = "$schema")]
-    schema: Option<String>,
-    models: ModelSettings,
-    execution: yourai_core::execution::ExecutionOptions,
-    security: SecuritySettings,
-    ui: UiSettings,
-    session: SessionSettings,
-    prompt: PromptSettings,
-    hooks: HookSettings,
-    #[serde(skip)]
-    path: Option<PathBuf>,
-}
-impl<'de> Deserialize<'de> for Config {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = normalize_document(Value::deserialize(deserializer)?)
-            .map_err(serde::de::Error::custom)?;
-        ConfigDocument::deserialize(value).map_err(serde::de::Error::custom)
-    }
-}
-
 /// Convert legacy flat keys once; grouped values cannot be silently overridden.
 fn normalize_document(mut value: Value) -> Result<Value, Error> {
     let object = value.as_object_mut().ok_or("config must be an object")?;
@@ -219,73 +459,23 @@ fn normalize_document(mut value: Value) -> Result<Value, Error> {
     Ok(value)
 }
 const LEGACY_FIELDS: &[(&str, &str)] = &[
-    ("execution", "skill_ids memory_search_limit context steps model_timeout allow_background_wake max_followups instruction_paths workspace_enabled memory_max_chars attachment_image attachment_text_max_chars max_model_retries max_overflow_compactions max_stop_continuations max_permission_rechecks retry_delay retry_max_delay operation_timeout tool_timeout approval_timeout hook_timeout cleanup_timeout tool_cleanup_timeout max_model_calls:steps"),
-    ("prompt", "system_prompt soul_file memory_file profile_file append_system_prompt memory_file_max_chars profile_file_max_chars provider_max_chars"),
-    ("models", "model:selected compaction_model:compaction variant effort_overrides provider:providers"),
+    (
+        "execution",
+        "skill_ids memory_search_limit context steps model_timeout allow_background_wake max_followups instruction_paths workspace_enabled memory_max_chars attachment_image attachment_text_max_chars max_model_retries max_overflow_compactions max_stop_continuations max_permission_rechecks retry_delay retry_max_delay operation_timeout tool_timeout approval_timeout hook_timeout cleanup_timeout tool_cleanup_timeout max_model_calls:steps",
+    ),
+    (
+        "prompt",
+        "system_prompt soul_file memory_file profile_file append_system_prompt memory_file_max_chars profile_file_max_chars provider_max_chars",
+    ),
+    (
+        "models",
+        "model compaction_model:compaction variant effort_overrides provider:providers",
+    ),
     ("ui", "theme"),
     ("security", "trusted_shell yolo"),
     ("session", "session_dir:directory extensions"),
     ("hooks", "hooks_file:file"),
 ];
-
-/// Edit the cached configuration and synchronously save the changed sources.
-/// No file is re-read. Validation or saving failure leaves shared memory unchanged.
-pub fn update(
-    config: &Arc<std::sync::Mutex<Config>>,
-    change: impl FnOnce(&mut Config) -> Result<(), Error>,
-) -> Result<(), Error> {
-    let mut current = config.lock().map_err(|_| "config lock poisoned")?;
-    let mut next = current.clone();
-    change(&mut next)?;
-    next.validate()?;
-    let path = next
-        .path
-        .as_deref()
-        .ok_or("config has no storage path; load it before updating")?;
-    let prompt_changed = next.prompt_document()? != current.prompt_document()?;
-    if prompt_changed {
-        write_document(
-            &path.parent().unwrap().join("prompts.json"),
-            &next.prompt_document()?,
-        )?;
-    }
-    if next.hooks.events != current.hooks.events || next.hooks.file != current.hooks.file {
-        if let Some(path) = next.hooks_path() {
-            write_document(
-                &path,
-                &serde_json::json!({"hooks": {"events": next.hooks.events}}),
-            )?;
-        }
-    }
-    if next.main_document()? != current.main_document()? {
-        next.save()?;
-    }
-    *current = next;
-    Ok(())
-}
-
-fn storage_path(path: &Path) -> PathBuf {
-    if let Ok(path) = path.canonicalize() {
-        return path;
-    }
-    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-        if let Ok(parent) = parent.canonicalize() {
-            return parent.join(name);
-        }
-    }
-    // Missing sources still need lexical alias checks before any write.
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            component => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
-}
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(value: Value, kind: &str) -> Result<T, Error> {
     serde_json::from_value(value).map_err(|e| {
@@ -297,25 +487,26 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(value: Value, kind: &str) -
         }
     })
 }
-fn parse_document(bytes: &[u8]) -> Result<Value, Error> {
-    serde_json::from_slice(bytes)
+
+fn read_document(path: &Path) -> Result<Value, Error> {
+    let bytes =
+        std::fs::read(path).map_err(|_| format!("Cannot read config at {}", path.display()))?;
+    serde_json::from_slice(&bytes)
         .map_err(|e| format!("Invalid JSON at line {}, column {}", e.line(), e.column()).into())
 }
-fn read_document(path: &Path) -> Result<Value, Error> {
-    parse_document(
-        &std::fs::read(path).map_err(|_| format!("Cannot read config at {}", path.display()))?,
-    )
-}
-fn write_document(path: &Path, value: &Value) -> Result<(), Error> {
-    use std::io::Write;
+fn document_bytes(value: &impl Serialize) -> Result<Vec<u8>, Error> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
+    Ok(bytes)
+}
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    use std::io::Write;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    temp.write_all(&bytes)?;
+    temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
     temp.persist(path).map_err(|e| e.error)?;
     if let Err(error) = std::fs::File::open(parent).and_then(|f| f.sync_all()) {
@@ -324,337 +515,89 @@ fn write_document(path: &Path, value: &Value) -> Result<(), Error> {
     Ok(())
 }
 
-fn sessions() -> PathBuf {
-    ".yourai/sessions".into()
-}
-fn data_session_dir(legacy_base: &Path) -> PathBuf {
-    let data = match std::env::var_os("XDG_DATA_HOME") {
-        Some(v) if !v.is_empty() && Path::new(&v).is_absolute() => PathBuf::from(v),
-        _ => match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join(".local/share"),
-            None => return legacy_base.join(".yourai/sessions"),
-        },
-    };
-    let fresh = data.join("yourai/sessions");
-    let legacy = legacy_base.join(".yourai/sessions");
-    if !fresh.exists() && legacy.exists() {
-        return legacy;
-    }
-    fresh
-}
-#[derive(Clone)]
-pub struct ResolvedModel {
-    pub model: Arc<dyn ModelProvider>,
-    pub provider: String,
-    pub requests: crate::model::RequestPolicy,
-}
-impl ResolvedModel {
-    pub fn apply_to(&self, config: &mut crate::SessionOptions) {
-        config.model_provider = self.provider.clone();
-        config.request_policy = self.requests.clone();
-    }
-}
-
 impl Config {
-    /// The one application config maps to startup resources and execution snapshots.
-    pub fn apply_to(&self, options: &mut crate::SessionOptions) {
-        options.config = self.resolved_paths();
-    }
-    /// Load the JSON configuration and adjacent prompts.json once.
-    /// Editing either file outside the process takes effect on the next load.
-    pub fn load(path: &Path) -> Result<Self, Error> {
-        let mut main = normalize_document(read_document(path)?)?;
-        let path = path.canonicalize()?;
-        let prompt_path = path.parent().unwrap().join("prompts.json");
-        if prompt_path.exists() {
-            let prompt: PromptSettings = decode(read_document(&prompt_path)?, "prompt")?;
-            main["prompt"] = serde_json::to_value(prompt)?;
-        }
-        for key in ["selected", "providers"] {
-            if main
-                .get("models")
-                .and_then(|models| models.get(key))
-                .is_none()
-            {
-                return Err(format!("missing field models.{key} in config").into());
-            }
-        }
-        let mut config: Self = decode(main, "config")?;
-        config.path = Some(path.clone());
-        config.validate_storage_paths()?;
-        if let Some(hooks_file) = &config.hooks.file {
-            if !config.hooks.events.as_object().is_some_and(Map::is_empty) {
-                return Err("choose either hooks.events or hooks.file, not both".into());
-            }
-            let hooks_path = path.parent().unwrap().join(hooks_file);
-            let document = parse_document(&std::fs::read(&hooks_path)?)?;
-            if document.as_object().is_none_or(|object| {
-                !object.contains_key("hooks") || object.keys().any(|key| key != "hooks")
-            }) {
-                return Err("hook file must contain a single hooks object".into());
-            }
-            let hooks = &document["hooks"];
-            config.hooks.events = if hooks.get("events").is_some() {
-                check_fields(hooks, &["events"], "hook file")?;
-                hooks["events"].clone()
-            } else {
-                // Existing standalone event maps continue to load.
-                hooks.clone()
-            };
-        }
-        config.validate()?;
-        Ok(config)
-    }
-    fn hooks_path(&self) -> Option<PathBuf> {
-        self.hooks.file.as_ref().map(|file| {
-            self.path
-                .as_deref()
-                .and_then(Path::parent)
-                .unwrap_or_else(|| Path::new("."))
-                .join(file)
-        })
-    }
-    /// Sources must be separate: otherwise saving one category destroys another.
-    fn validate_storage_paths(&self) -> Result<(), Error> {
-        let Some(main) = self.path.as_deref() else {
-            return Ok(());
-        };
-        let prompt = main.parent().unwrap().join("prompts.json");
-        if storage_path(main) == storage_path(&prompt) {
-            return Err("main config and prompts.json must be separate files".into());
-        }
-        if let Some(hooks) = self.hooks_path() {
-            if storage_path(&hooks) == storage_path(main)
-                || storage_path(&hooks) == storage_path(&prompt)
-            {
-                return Err(
-                    "hooks.file must be separate from the main config and prompts.json".into(),
-                );
-            }
-        }
-        Ok(())
-    }
-    pub fn session_dir(&self) -> PathBuf {
-        let base = self
-            .path
-            .as_deref()
-            .and_then(Path::parent)
-            .unwrap_or_else(|| Path::new("."));
-        let root = if self.session.directory == sessions() {
-            data_session_dir(base)
-        } else {
-            self.session.directory.clone()
-        };
-        if root.is_relative() {
-            base.join(root)
-        } else {
-            root
-        }
-    }
-    pub fn resolved_paths(&self) -> Self {
-        let mut prompt = self.clone();
-        let base = self
-            .path
-            .as_deref()
-            .and_then(Path::parent)
-            .unwrap_or_else(|| Path::new("."));
-        for path in [
-            &mut prompt.prompt.soul_file,
-            &mut prompt.prompt.memory_file,
-            &mut prompt.prompt.profile_file,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if path.is_relative() {
-                *path = base.join(&*path);
-            }
-        }
-        prompt
-    }
-    pub fn validate(&self) -> Result<(), Error> {
-        self.validate_storage_paths()?;
-        if self.execution.steps == Some(0) {
-            return Err("steps must be a positive integer".into());
-        }
-        self.execution.context_policy.validate()?;
-        for provider in self.models.providers.values() {
-            provider.options.requests.validate()?;
-        }
-        crate::hooks::build_registrations(
-            &self.hooks.events,
-            crate::hooks::config::HookSource::Project,
-        )?;
-        for (id, variants) in &self.models.effort_overrides {
-            for (variant, effort) in variants {
-                let mut probe = self.clone();
-                probe.set_entry_effort(
-                    id,
-                    (!variant.is_empty()).then_some(variant.as_str()),
-                    &EffortChoice::Set(effort.clone()),
-                )?;
-            }
-        }
-        Ok(())
-    }
-    /// Persist only ordinary config. The caller replaces shared memory after success.
+    /// Write the complete configuration to its one JSON file.
     pub fn save(&self) -> Result<(), Error> {
-        self.validate()?;
+        self.save_data(&self.data.lock())
+    }
+    pub(crate) fn save_data(&self, data: &ConfigData) -> Result<(), Error> {
         let path = self
             .path
             .as_deref()
-            .ok_or("config has no storage path; load it before updating")?;
-        // If this is an old combined file, retain its prompt values until explicitly
-        // saved to prompts.json; ordinary changes must never silently discard them.
-        if !path.parent().unwrap().join("prompts.json").exists() {
-            write_document(
-                &path.parent().unwrap().join("prompts.json"),
-                &self.prompt_document()?,
-            )?;
+            .ok_or("config has no file path; initialize it before saving")?;
+        write_bytes(path, &document_bytes(data)?)
+    }
+    pub(crate) fn write(&self) -> parking_lot::MutexGuard<'_, ConfigData> {
+        self.data.lock()
+    }
+    // Resource preparation takes coherent input data, never another writable Config.
+    pub(crate) fn values(&self) -> ConfigData {
+        self.data.lock().clone()
+    }
+    pub fn set_provider(&self, id: String, provider: ProviderSettings) {
+        self.data.lock().models.providers.insert(id, provider);
+    }
+    pub fn schema(&self) -> Option<String> {
+        self.data.lock().schema().clone()
+    }
+    pub fn set_schema(&self, value: Option<String>) {
+        self.data.lock().set_schema(value);
+    }
+    pub fn theme(&self) -> String {
+        self.ui().theme()
+    }
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Initialize from JSON. Old split files are read only for migration;
+    /// once saved, the main document contains all settings and takes precedence.
+    pub fn init(path: &Path) -> Result<Self, Error> {
+        let mut document = normalize_document(read_document(path)?)?;
+        let path = path.canonicalize()?;
+        let base = path.parent().unwrap();
+        let legacy_prompt = base.join("prompts.json");
+        if document.get("prompt").is_none() && legacy_prompt != path && legacy_prompt.exists() {
+            document["prompt"] = read_document(&legacy_prompt)?;
         }
-        write_document(path, &self.main_document()?)
-    }
-    fn prompt_document(&self) -> Result<Value, Error> {
-        Ok(serde_json::to_value(&self.prompt)?)
-    }
-    fn main_document(&self) -> Result<Value, Error> {
-        let mut document = serde_json::to_value(self)?;
-        document.as_object_mut().unwrap().remove("prompt");
-        if self.hooks.file.is_some() {
-            document["hooks"].as_object_mut().unwrap().remove("events");
-        }
-        Ok(document)
-    }
-    pub fn apply_execution_options(&mut self, execution: yourai_core::execution::ExecutionOptions) {
-        self.execution = execution;
-    }
-    pub fn execution_options(&self) -> yourai_core::execution::ExecutionOptions {
-        self.execution.clone()
-    }
-    pub fn set_entry_effort(
-        &mut self,
-        id: &str,
-        variant: Option<&str>,
-        choice: &EffortChoice,
-    ) -> Result<(), Error> {
-        let (provider, key) = id.split_once('/').ok_or("model must be provider/model")?;
-        let provider = self
-            .models
-            .providers
-            .get(provider)
-            .ok_or("Unknown provider")?;
-        if let Some(variant) = variant {
-            let model = provider.models.get(key).ok_or("Unknown model")?;
-            if !model.variants.contains_key(variant) {
-                return Err("Unknown model variant".into());
-            }
-        }
-        match choice {
-            EffortChoice::Config => {
-                if let Some(entries) = self.models.effort_overrides.get_mut(id) {
-                    entries.remove(variant.unwrap_or(""));
-                }
-                if self
-                    .models
-                    .effort_overrides
-                    .get(id)
-                    .is_some_and(BTreeMap::is_empty)
+        if let Some(hooks) = document.get_mut("hooks").and_then(Value::as_object_mut) {
+            if let Some(file) = hooks.remove("file").filter(|file| !file.is_null()) {
+                if hooks
+                    .get("events")
+                    .is_some_and(|events| !events.as_object().is_some_and(Map::is_empty))
                 {
-                    self.models.effort_overrides.remove(id);
+                    return Err("choose either hooks.events or legacy hooks.file, not both".into());
                 }
-            }
-            EffortChoice::Set(value) => {
-                if !EFFORT_CHOICES
-                    .iter()
-                    .flatten()
-                    .any(|allowed| *allowed == value)
-                {
-                    return Err(format!("Invalid reasoningEffort: {value}").into());
+                let file: PathBuf = decode(file, "legacy hooks.file")?;
+                let source = base.join(file);
+                if source.canonicalize()? == path {
+                    return Err("legacy hooks.file must differ from the main config".into());
                 }
-                self.models
-                    .effort_overrides
-                    .entry(id.into())
-                    .or_default()
-                    .insert(variant.unwrap_or("").into(), value.clone());
+                let mut wrapper: BTreeMap<String, Value> =
+                    decode(read_document(&source)?, "legacy hook file")?;
+                if wrapper.len() != 1 || !wrapper.contains_key("hooks") {
+                    return Err("legacy hook file must contain only hooks".into());
+                }
+                let events = wrapper.remove("hooks").unwrap();
+                hooks.insert(
+                    "events".into(),
+                    match events.get("events") {
+                        Some(value) if events.as_object().is_some_and(|map| map.len() == 1) => {
+                            value.clone()
+                        }
+                        Some(_) => {
+                            return Err("legacy hook wrapper must contain only events".into());
+                        }
+                        None => events,
+                    },
+                );
             }
         }
-        Ok(())
-    }
-    fn selected_provider(&self) -> Result<&ProviderSettings, Error> {
-        let (provider, _) = self
-            .models
-            .selected
-            .split_once('/')
-            .ok_or("model must be provider/model")?;
-        self.models
-            .providers
-            .get(provider)
-            .ok_or("Unknown provider".into())
-    }
-    /// Returns the pricing for the currently selected model, if configured.
-    pub fn pricing(&self) -> (Option<f64>, Option<f64>) {
-        let Some((provider, key)) = self.models.selected.split_once('/') else {
-            return (None, None);
-        };
-        let Some(model) = self
-            .models
-            .providers
-            .get(provider)
-            .and_then(|p| p.models.get(key))
-        else {
-            return (None, None);
-        };
-        (model.pricing.input, model.pricing.output)
-    }
-    fn model_entry(&self, id: &str, variant: Option<&str>) -> Result<EntryOptions<'_>, Error> {
-        let (provider_id, model_key) = id.split_once('/').ok_or("model must be provider/model")?;
-        let provider = self
-            .models
-            .providers
-            .get(provider_id)
-            .ok_or("Unknown provider")?;
-        let model = provider.models.get(model_key).ok_or("Unknown model")?;
-        let variant_options = match variant {
-            Some(name) => Some(
-                &model
-                    .variants
-                    .get(name)
-                    .ok_or("Unknown model variant")?
-                    .options,
-            ),
-            None => None,
-        };
-        Ok((&model.options, variant_options))
-    }
-    /// Variant overrides/defaults precede model overrides/defaults.
-    pub fn effective_effort(&self, id: &str, variant: Option<&str>) -> Option<String> {
-        let overrides = self.models.effort_overrides.get(id);
-        if let Some(variant) = variant {
-            if let Some(value) = overrides.and_then(|v| v.get(variant)) {
-                return Some(value.clone());
-            }
-            if let Ok((_, Some(options))) = self.model_entry(id, Some(variant)) {
-                if let Some(value) = options.get("reasoningEffort").and_then(Value::as_str) {
-                    return Some(value.into());
-                }
-            }
-        }
-        overrides.and_then(|v| v.get("")).cloned().or_else(|| {
-            self.model_entry(id, None)
-                .ok()?
-                .0
-                .get("reasoningEffort")?
-                .as_str()
-                .map(str::to_owned)
+        let data: ConfigData = decode(document, "config")?;
+        Ok(Self {
+            data: parking_lot::Mutex::new(data),
+            path: Some(path),
         })
-    }
-    pub fn request_policy(&self) -> Result<crate::model::RequestPolicy, Error> {
-        let policy = self.selected_provider()?.options.requests.clone();
-        policy.validate()?;
-        Ok(policy)
-    }
-    pub fn model_timeouts(&self) -> Result<(Option<Duration>, Option<Duration>), Error> {
-        model_timeouts(&self.selected_provider()?.options)
     }
 }
 /// Resolve the standard XDG config directory.
@@ -667,7 +610,6 @@ fn config_dir(xdg_config_home: Option<&Path>, home: Option<&Path>) -> Result<Pat
         .ok_or("Cannot locate config directory: set XDG_CONFIG_HOME or HOME")?;
     Ok(home.join(".config"))
 }
-
 /// Default location; --config overrides this path.
 pub fn default_config_path() -> Result<PathBuf, Error> {
     Ok(config_dir(
@@ -676,42 +618,126 @@ pub fn default_config_path() -> Result<PathBuf, Error> {
             .map(Path::new),
         std::env::var_os("HOME").as_deref().map(Path::new),
     )?
-    .join("yourai")
-    .join("yourai.json"))
+    .join("yourai/yourai.json"))
 }
-
-fn check_fields(value: &Value, allowed: &[&str], kind: &str) -> Result<(), Error> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| format!("{kind} must be an object"))?;
-    for key in object.keys() {
-        if !allowed.contains(&key.as_str()) {
-            return Err(format!("unknown field {key} in {kind}").into());
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests;
 
-pub const EFFORT_CHOICES: [Option<&str>; 8] = [
-    None,
-    Some("none"),
-    Some("minimal"),
-    Some("low"),
-    Some("medium"),
-    Some("high"),
-    Some("xhigh"),
-    Some("max"),
-];
+impl ModelDefinition {
+    pub fn limit_mut(&mut self) -> &mut ModelLimits {
+        &mut self.limit
+    }
+}
 
-/// Runtime thinking-effort selection for one `/models` entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EffortChoice {
-    /// Keep what the (merged) config options specify; removes any runtime
-    /// override previously applied through the picker.
-    Config,
-    /// Set the effort keyword for this entry.
-    Set(String),
+impl<'a> ConfigSection<'a, ModelSettings> {
+    pub fn choices(&self) -> Vec<crate::model::ModelChoice> {
+        self.root(|models| models.choices())
+    }
+    pub fn provider(&self, id: &str) -> Result<ConfigSection<'a, ProviderSettings>, Error> {
+        let key = id.to_owned();
+        let node = self.child(move |models| models.provider_mut(&key));
+        node.access(|_| ())?;
+        Ok(node)
+    }
+    pub fn set_provider(&self, id: String, provider: ProviderSettings) -> Result<(), Error> {
+        self.access(|models| {
+            models.providers.insert(id, provider);
+        })
+    }
+    pub fn select_model(
+        &self,
+        id: &str,
+        variant: Option<String>,
+        effort: Option<&crate::model::EffortChoice>,
+    ) -> Result<ModelSettings, Error> {
+        self.root(|models| models.select_model(id, variant, effort))
+    }
+    pub fn with_effort(
+        &self,
+        id: &str,
+        variant: Option<&str>,
+        effort: &crate::model::EffortChoice,
+    ) -> Result<ModelSettings, Error> {
+        self.root(|models| models.with_effort(id, variant, effort))
+    }
+    pub fn resolve(&self) -> Result<crate::model::ResolvedModel, Error> {
+        self.root(|models| models.clone()).resolve()
+    }
+    pub fn resolve_compaction(&self) -> Result<Option<crate::model::ResolvedModel>, Error> {
+        self.root(|models| models.clone()).resolve_compaction()
+    }
+    pub fn effective_effort(&self, id: impl AsRef<str>, variant: Option<&str>) -> Option<String> {
+        self.root(|models| models.effective_effort(id.as_ref(), variant))
+    }
+    pub fn pricing(&self) -> (Option<f64>, Option<f64>) {
+        self.root(|models| models.pricing())
+    }
+}
+impl<'a> ConfigSection<'a, ProviderSettings> {
+    pub fn model(&self, id: &str) -> Result<ConfigSection<'a, ModelDefinition>, Error> {
+        let key = id.to_owned();
+        let node = self.child(move |provider| provider.model_mut(&key));
+        node.access(|_| ())?;
+        Ok(node)
+    }
+    pub fn set_model(&self, id: String, model: ModelDefinition) -> Result<(), Error> {
+        self.access(|provider| {
+            provider.models.insert(id, model);
+        })
+    }
+}
+impl<'a> ConfigSection<'a, ModelDefinition> {
+    pub fn variant(&self, id: &str) -> Result<ConfigSection<'a, VariantSettings>, Error> {
+        let key = id.to_owned();
+        let node = self.child(move |model| model.variant_mut(&key));
+        node.access(|_| ())?;
+        Ok(node)
+    }
+    pub fn set_variant(&self, id: String, variant: VariantSettings) -> Result<(), Error> {
+        self.access(|model| {
+            model.variants.insert(id, variant);
+        })
+    }
+    pub fn set_option(&self, key: String, value: Value) -> Result<(), Error> {
+        self.access(|model| {
+            model.options.insert(key, value);
+        })
+    }
+}
+impl ConfigSection<'_, VariantSettings> {
+    pub fn set_option(&self, key: String, value: Value) -> Result<(), Error> {
+        self.access(|variant| {
+            variant.options.insert(key, value);
+        })
+    }
+}
+impl ConfigSection<'_, ConnectionSettings> {
+    pub fn set_header(&self, key: String, value: String) -> Result<(), Error> {
+        self.access(|connection| {
+            connection.headers.insert(key, value);
+        })
+    }
+}
+impl ConfigSection<'_, ExecutionOptions> {
+    /// Prepare per-turn execution parameters from the current shared settings.
+    pub fn resolve(&self, limits: &yourai_core::turn::TurnLimits) -> ExecutionOptions {
+        self.root(|execution| execution.resolve(limits))
+    }
+}
+impl ConfigSection<'_, ContextPolicy> {
+    pub fn input_budget(&self, budget: yourai_core::model::ModelTokenBudget) -> Option<u64> {
+        self.root(|policy| policy.input_budget(budget))
+    }
+    pub fn validate_for(
+        &self,
+        budget: yourai_core::model::ModelTokenBudget,
+    ) -> Result<(), yourai_core::YourAiError> {
+        self.root(|policy| policy.validate_for(budget))
+    }
+    pub fn maintenance_threshold(
+        &self,
+        budget: yourai_core::model::ModelTokenBudget,
+    ) -> Option<u64> {
+        self.root(|policy| policy.maintenance_threshold(budget))
+    }
 }

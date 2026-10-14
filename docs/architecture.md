@@ -1173,15 +1173,16 @@ async fn wait_reply(tc: &mut TurnContext<'_>, stash: &mut Vec<In>, id: &str) -> 
 DefaultLoop 是无状态调度策略，没有独立 DefaultLoopConfig。应用共享一份 Config，JSON 与 Rust 都按 models/execution/security/ui/session/prompt/hooks 分类；执行前复制 Config.execution，并用 TurnLimits 收紧本轮限制。
 
 ```rust,ignore
-let shared = Arc::new(Mutex::new(Config::load(config_path)?));
-config::update(&shared, |value| {
-    value.execution.steps = Some(32);
-    value.prompt.system_prompt = Some("编程助手".into());
-    Ok(())
-})?;
+let shared = Arc::new(Config::init(config_path)?);
+{
+    let config = &shared;
+    config.set_steps(Some(32));
+    config.set_system_prompt(Some("编程助手".into()));
+    config.save()?;
+}
 ```
 
-config::update 只修改缓存并保存变化来源，不重新读取文件。外部文件修改下次启动加载。Prompt 与可选 Hook 独立文件仍归同一 Config；模型/权限等资源切换通过现有 SessionClient 操作。详见 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13)。
+Config 只负责 JSON 读写和 getter/setter；直接修改后调用 Config::save() 保存完整 JSON，不重新读取文件。保存失败时内存保留修改。模型和安全策略切换各自负责运行资源的失败保护。外部文件修改下次启动加载。所有配置保存在同一个 JSON，旧 Prompt/Hook 文件仅用于迁移；模型/权限等资源切换通过现有 SessionClient 操作。详见 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13)。
 
 ### 7.4 用户自定义 loop 的最小示例
 

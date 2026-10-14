@@ -8,11 +8,11 @@ use std::{
 
 impl Turn<'_> {
     pub(crate) fn op_timeout(&self) -> Option<Duration> {
-        self.config.operation_timeout
+        self.config.operation_timeout()
     }
     pub(crate) fn deadline(&self, timeout: Option<Duration>) -> Option<Instant> {
         let local = timeout
-            .or(self.config.operation_timeout)
+            .or(self.config.operation_timeout())
             .map(|d| Instant::now() + d);
         match (local, self.tc.info.options.limits.deadline) {
             (Some(local), Some(total)) => Some(local.min(total)),
@@ -231,7 +231,7 @@ impl Turn<'_> {
             }
             Ok::<_, YourAiError>(())
         };
-        let failure = match crate::time::timeout(self.config.cleanup_timeout, cleanup).await {
+        let failure = match crate::time::timeout(self.config.cleanup_timeout(), cleanup).await {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(error.to_string()),
             Err(_) => Some("cleanup timed out".into()),

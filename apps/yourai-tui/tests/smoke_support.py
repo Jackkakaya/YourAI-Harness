@@ -141,7 +141,7 @@ def write_yourai_config(tmp, port):
     config = Path(tmp) / 'config.json'
     config.write_text(json.dumps({
         'models': {
-            'selected': 'mock/scroll',
+            'model': 'mock/scroll',
             'providers': {
                 'mock': {
                     'npm': '@ai-sdk/openai-compatible',
@@ -164,7 +164,7 @@ def write_opencode_config(tmp, port):
     cfg = Path(tmp) / 'oc.json'
     cfg.write_text(json.dumps({
         'models': {
-            'selected': 'mock/scroll',
+            'model': 'mock/scroll',
             'providers': {
                 'mock': {
                     'npm': '@ai-sdk/openai-compatible',

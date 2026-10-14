@@ -21,7 +21,7 @@
 //!   ├── NativeHandler        impl HookHandler          (Rust 闭包)
 //!   ├── wire_output          (Claude wire JSON 反序列化)
 //!   ├── matcher              (CompiledMatcher)
-//!   ├── config               (settings.json 解析)
+//!   ├── registration         (定义校验与运行注册)
 //!   └── event                (wire JSON 序列化)
 //! ```
 //!
@@ -71,11 +71,11 @@
 //! ```
 
 pub mod command;
-pub mod config;
 pub mod event;
 pub mod handler;
 pub mod http;
 pub mod matcher;
+pub mod registration;
 pub mod runtime;
 pub mod wire_output;
 
@@ -85,10 +85,10 @@ pub(crate) const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 // ── Re-exports：实现层类型 ──────────────────────────────────────────
 
 pub use command::{BackgroundHookEvent, CommandHandler};
-pub use config::{build_registrations, HandlerConfig, HookRegistration, HookShell};
 pub use handler::NativeHandler;
 pub use http::{HttpHandler, HttpHookPolicy};
 pub use matcher::CompiledMatcher;
+pub use registration::{build_registrations, HandlerConfig, HookRegistration, HookShell};
 pub use runtime::DefaultHookManager;
 
 // ── Re-exports：从 yourai-core 透传协议类型 ─────────────────────────

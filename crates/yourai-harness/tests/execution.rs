@@ -292,8 +292,8 @@ async fn harness_configuration_keeps_the_custom_loop_and_lifecycle_hooks() {
     let program = direct_program();
     let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
     config.agent_loop = Some(program.clone());
-    config.config.security.yolo = true;
-    config.config.prompt.system_prompt = Some("test".into());
+    config.config.set_yolo(true);
+    config.config.set_system_prompt(Some("test".into()));
     let harness = Harness::open(config, Arc::new(Model::new(vec![])))
         .await
         .unwrap();

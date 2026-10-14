@@ -344,4 +344,4 @@
 
 ## 配置接口调整补充（2026-10-13）
 
-按用户最新确定的分类方案，只有一个共享配置入口 Config；内部七类数据分别为 models(ModelSettings)、execution(ExecutionOptions)、security(SecuritySettings)、ui(UiSettings)、session(SessionSettings)、prompt(PromptSettings)、hooks(HookSettings)。新增六个分组 struct，ExecutionOptions 复用 core 执行数据；各分组没有独立加载、保存或全局实例，全部由 config::update 管理。ContextPolicy/ImagePolicy 是 execution 的嵌套策略，RequestPolicy/ModelLimits 为资源装配数据。旧平铺 JSON 可读，保存时迁移为与 Rust 类别对应的 JSON；Prompt 和可选 Hook 独立文件不改变单一共享入口。详见 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13)。
+按用户最新确定的分类方案，只有一个共享配置入口 Config；内部七类数据分别为 models(ModelSettings)、execution(ExecutionOptions)、security(SecuritySettings)、ui(UiSettings)、session(SessionSettings)、prompt(PromptSettings)、hooks(HookSettings)。新增六个分组 struct，ExecutionOptions 复用 core 执行数据；各分组没有独立加载、保存或全局实例，共享一个 Arc<Config>，嵌套 getter/setter 内部短暂加锁，save 统一写入主 JSON。ContextPolicy/ImagePolicy 是 execution 的嵌套策略，RequestPolicy/ModelLimits 为资源装配数据。旧平铺 JSON 可读，保存时迁移为与 Rust 类别对应的 JSON；Prompt 和 Hook 全部内嵌主 JSON，旧独立文件仅供迁移读取。详见 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13)。

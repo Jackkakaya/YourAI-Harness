@@ -4,65 +4,13 @@ use crate::config::Config;
 /// Selectable reasoning-effort levels in the `/models` effort sub-picker.
 /// `None` means "no explicit effort" (remove any runtime override; the
 /// merged config options decide).
-pub use yourai_harness::config::{EffortChoice, EFFORT_CHOICES};
+pub use yourai_harness::model::{EffortChoice, EFFORT_CHOICES};
 
-/// A selectable model entry in the `/models` picker.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModelChoice {
-    /// "provider/model"
-    pub id: String,
-    /// Variant name; None for the default (no-variant) entry.
-    pub variant: Option<String>,
-    /// Display label: "provider/model" or "provider/model · variant".
-    pub label: String,
-    /// Effective reasoning effort for this entry: the variant's
-    /// `reasoningEffort` when set, else the model's. None = no hint.
-    pub effort: Option<String>,
-}
+pub use yourai_harness::model::ModelChoice;
 
-/// Enumerate all selectable model entries from the config.
-/// Each model always gets one default (no-variant) entry plus one per non-disabled variant.
+/// Enumerate the model menu from one coherent configuration read.
 pub fn model_choices(config: &Config) -> Vec<ModelChoice> {
-    let mut choices = Vec::new();
-    for (provider_id, provider) in &config.models.providers {
-        for (model_key, model) in &provider.models {
-            let id = format!("{provider_id}/{model_key}");
-            // Default entry (no variant).
-            choices.push(ModelChoice {
-                id: id.clone(),
-                variant: None,
-                label: id.clone(),
-                effort: config.effective_effort(&id, None),
-            });
-            // Variant entries.
-            for (variant_name, variant_cfg) in &model.variants {
-                if variant_cfg.disabled {
-                    continue;
-                }
-                choices.push(ModelChoice {
-                    id: id.clone(),
-                    variant: Some(variant_name.clone()),
-                    label: format!("{id} · {variant_name}"),
-                    effort: config.effective_effort(&id, Some(variant_name)),
-                });
-            }
-        }
-    }
-    if !choices
-        .iter()
-        .any(|choice| choice.id == config.models.selected && choice.variant.is_none())
-    {
-        choices.insert(
-            0,
-            ModelChoice {
-                id: config.models.selected.clone(),
-                variant: None,
-                label: config.models.selected.clone(),
-                effort: config.effective_effort(&config.models.selected, None),
-            },
-        );
-    }
-    choices
+    config.models().choices()
 }
 
 #[cfg(test)]
@@ -94,7 +42,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, json_str).unwrap();
-        let config = Config::load(&path).unwrap();
+        let config = Config::init(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         config
     }

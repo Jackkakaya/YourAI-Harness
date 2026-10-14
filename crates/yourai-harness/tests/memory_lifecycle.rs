@@ -123,7 +123,7 @@ async fn callbacks_are_auto_registered_scoped_and_sync_once_after_stop_settles()
     let provider = Arc::new(Provider::default());
     let mut config = SessionOptions::new(d.path().join("sessions"), d.path().into());
     config.memory_manager = Some(provider.clone());
-    config.config.execution.memory_search_limit = 2;
+    config.config.set_memory_search_limit(2);
     let h = Harness::open(
         config,
         Arc::new(Model::new(vec![
@@ -223,14 +223,20 @@ async fn compact_callback_uses_clean_active_history_without_rebuilding_system() 
     let provider = Arc::new(Provider::default());
     let mut config = SessionOptions::new(root.clone(), d.path().into());
     config.memory_manager = Some(provider.clone());
-    config.config.execution.context_policy.keep_recent_tokens = 0;
+    config
+        .config
+        .execution()
+        .context_policy()
+        .set_keep_recent_tokens(0)
+        .unwrap();
     let model = model_fixture::TestModel::new(
         Arc::new(Model::new(vec![])),
         ModelTokenBudget::resolve(
-            ModelLimits {
-                context: Some(32000),
-                output: Some(4096),
-                ..Default::default()
+            {
+                let mut settings: ModelLimits = Default::default();
+                settings.set_context(Some(32000));
+                settings.set_output(Some(4096));
+                settings
             },
             None,
         )

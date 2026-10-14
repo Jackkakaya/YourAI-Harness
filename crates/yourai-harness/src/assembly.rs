@@ -19,7 +19,7 @@ pub struct SessionOptions {
     pub resume: Option<SessionId>,
     /// Optional replacement of the original AgentLoop scheduling interface.
     pub agent_loop: Option<Arc<dyn AgentLoop>>,
-    pub config: crate::config::Config,
+    pub config: Arc<crate::config::Config>,
     pub memory_manager: Option<Arc<dyn MemoryManager>>,
     pub skill_provider: Option<Arc<dyn SkillProvider>>,
     pub request_policy: crate::model::RequestPolicy,
@@ -27,7 +27,7 @@ pub struct SessionOptions {
     pub model_provider: String,
     /// Optional pinned summary model and its provider admission settings.
     /// Without this, compaction follows the currently selected main model.
-    pub compaction_model: Option<crate::config::ResolvedModel>,
+    pub compaction_model: Option<crate::model::ResolvedModel>,
 }
 impl SessionOptions {
     pub fn new(root: PathBuf, cwd: PathBuf) -> Self {
@@ -36,7 +36,7 @@ impl SessionOptions {
             cwd,
             resume: None,
             agent_loop: None,
-            config: crate::config::Config::default(),
+            config: Arc::new(crate::config::Config::default()),
             memory_manager: None,
             skill_provider: None,
             request_policy: Default::default(),
@@ -68,16 +68,15 @@ impl Harness {
         config: SessionOptions,
         model: Arc<dyn ModelProvider>,
     ) -> Result<Self, YourAiError> {
-        config
-            .config
-            .execution
-            .context_policy
+        let values = config.config.values();
+        values
+            .execution()
+            .context_policy()
             .validate_for(model.token_budget())?;
         if let Some(summary) = &config.compaction_model {
-            config
-                .config
-                .execution
-                .context_policy
+            values
+                .execution()
+                .context_policy()
                 .validate_for(summary.model.token_budget())?;
             summary.requests.validate()?;
         }
@@ -87,7 +86,8 @@ impl Harness {
         } else {
             "startup"
         };
-        let (meta, lease, prepared) = prepare_session(&catalog, &config, model.as_ref()).await?;
+        let (meta, lease, prepared) =
+            prepare_session(&catalog, &config, model.as_ref(), &values).await?;
         let id = meta.id;
         let session_config = config.clone();
         let budget =
@@ -103,18 +103,18 @@ impl Harness {
         let usage = Arc::new(LocalUsage((*catalog.store).clone()));
         let hooks = Arc::new(DefaultHookManager::new().with_model(model.clone()));
         hooks
-            .register_config(&config.config.hooks.events, HookSource::Project)
+            .register_config(values.hooks().events(), HookSource::Project)
             .await?;
         let (agent, tools) = assemble(
             &id,
             lease.store(),
             &config.cwd,
-            config.config.security.trusted_shell,
+            values.security().trusted_shell(),
             Agent::builder()
                 .model(model.clone())
                 .hooks(hooks.clone())
                 .usage(usage.clone()),
-            &config.config.execution_options(),
+            values.execution(),
         )
         .await?;
         if let Some(summary) = config.compaction_model {
@@ -132,15 +132,15 @@ impl Harness {
         }
         let normal_security = agent.security()?;
         let yolo_security: Arc<dyn SecurityProvider> = Arc::new(crate::security::YoloSecurity);
-        if config.config.security.yolo {
+        if values.security().yolo() {
             agent.set_security(yolo_security.clone());
         }
-        let memory = if config.config.session.extensions {
+        let memory = if values.session().extensions() {
             Some(Arc::new(LocalMemory::new(lease.store(), id.clone())))
         } else {
             None
         };
-        let skills = if config.config.session.extensions {
+        let skills = if values.session().extensions() {
             Some(Arc::new(LocalSkills::new(lease.store(), id.clone())))
         } else {
             None
@@ -160,16 +160,17 @@ impl Harness {
         } else if let Some(skills) = &skills {
             agent.set_skills(skills.clone());
         }
-        let host = start_session(&session_config, id, lease, agent, prepared, source).await?;
+        let host =
+            start_session(&session_config, id, lease, agent, prepared, source, &values).await?;
         let ready = async {
-            let workspace = if config.config.session.extensions {
+            let workspace = if values.session().extensions() {
                 Some(host.workspace()?)
             } else {
                 None
             };
             // Task progress is a basic coding capability, independent of workspace/subagents.
             let tasks = Some(host.task_manager("default")?);
-            let subagents = if config.config.session.extensions {
+            let subagents = if values.session().extensions() {
                 Some(subagent(&host, None, None))
             } else {
                 None
@@ -217,16 +218,10 @@ impl Harness {
     /// Change the approval mode for this run only; never save a bypass as a session default.
     /// Change permissions only between turns, preserving the original policy.
     /// In-flight tool snapshots and approval questions must finish or be cancelled first.
-    pub fn set_yolo(&self, enabled: bool) -> Result<(), YourAiError> {
-        let _gate = self.host.try_operation()?;
-        self.host.agent().set_security(if enabled {
-            self.yolo_security.clone()
-        } else {
-            self.normal_security.clone()
-        });
-        Ok(())
+    pub fn apply_yolo(&self, enabled: bool) -> Result<(), YourAiError> {
+        self.apply_yolo_with_commit(enabled, || Ok(()))
     }
-    pub(crate) fn set_yolo_config(
+    pub(crate) fn apply_yolo_with_commit(
         &self,
         enabled: bool,
         commit: impl FnOnce() -> Result<(), YourAiError>,
@@ -267,7 +262,7 @@ impl Harness {
         self.switch_model_inner(model, policy, Some((provider, requests)), None)
             .await
     }
-    pub(crate) async fn switch_model_config(
+    pub(crate) async fn apply_model_with_commit(
         &self,
         model: Arc<dyn ModelProvider>,
         policy: ContextPolicy,
@@ -392,7 +387,7 @@ pub(crate) async fn assemble(
         id.clone(),
         String::new(),
         Some(store.clone()),
-        config.context_policy.clone(),
+        config.context_policy().clone(),
     ));
     bindings.session = Some(store.clone());
     bindings.tools = Some(registry.clone());
@@ -417,15 +412,16 @@ pub(crate) async fn start_session(
     agent: Arc<Agent>,
     prepared: crate::context::prompt::PreparedPrompt,
     source: &str,
+    values: &crate::config::ConfigData,
 ) -> Result<Arc<SessionManager>, YourAiError> {
     let mut environment = SessionEnvironment::new(id, config.cwd.clone());
     environment.transcript_path = Some(SqliteStore::path(&config.root));
     environment.instructions = prepared.instructions;
-    let mut settings = config.config.execution_options();
+    let mut settings = values.execution().clone();
     if source != "startup" {
-        settings.instruction_paths.clear();
+        settings.set_instruction_paths(vec![]);
     }
-    settings.workspace_enabled |= config.config.session.extensions;
+    settings.set_workspace_enabled(settings.workspace_enabled() || values.session().extensions());
     let host = SessionManager::open_owned(lease, environment, agent, settings, source).await?;
     let ready = async {
         for notice in prepared.notices {
@@ -453,6 +449,7 @@ pub(crate) async fn prepare_session(
     catalog: &SessionCatalog,
     config: &SessionOptions,
     model: &dyn ModelProvider,
+    values: &crate::config::ConfigData,
 ) -> Result<
     (
         SessionMeta,
@@ -461,6 +458,7 @@ pub(crate) async fn prepare_session(
     ),
     YourAiError,
 > {
+    let prompt = resolved_prompt(&config.config, values.prompt());
     let existing = match &config.resume {
         Some(id) => Some(catalog.store.load_session(id).await?),
         None => None,
@@ -482,16 +480,15 @@ pub(crate) async fn prepare_session(
         }
     } else {
         crate::context::prompt::prepare(
-            &config.config,
+            &prompt,
             &config.cwd,
-            config.config.prompt.system_prompt.as_deref(),
-            &config.config.execution.instruction_paths,
+            prompt.system_prompt().as_deref(),
+            values.execution().instruction_paths(),
             config.skill_provider.as_deref(),
             config.memory_manager.as_deref(),
-            config
-                .config
-                .execution
-                .context_policy
+            values
+                .execution()
+                .context_policy()
                 .maintenance_threshold(model.token_budget()),
             &tokio_util::sync::CancellationToken::new(),
         )
@@ -529,4 +526,93 @@ pub(crate) async fn prepare_session(
     meta.model = Some(model.model_iden().into());
     lease.store().save_session(&meta).await?;
     Ok((meta, lease, prepared))
+}
+
+/// Prepare model resources from coherent input data, retaining the same shared Config.
+pub fn resolve_session(
+    config: &Arc<crate::config::Config>,
+    template: &SessionOptions,
+    id: Option<SessionId>,
+) -> Result<(SessionOptions, Arc<dyn ModelProvider>), crate::config::Error> {
+    let values = config.values();
+    let models = values.models();
+    let selection = models.resolve()?;
+    let mut options = template.clone();
+    options.resume = id;
+    options.config = Arc::clone(config);
+    options.compaction_model = models.resolve_compaction()?;
+    options.model_provider = selection.provider.clone();
+    options.request_policy = selection.requests.clone();
+    Ok((options, selection.model))
+}
+
+fn data_session_dir(legacy_base: &std::path::Path) -> PathBuf {
+    let data = match std::env::var_os("XDG_DATA_HOME") {
+        Some(v) if !v.is_empty() && std::path::Path::new(&v).is_absolute() => PathBuf::from(v),
+        _ => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(".local/share"),
+            None => return legacy_base.join(".yourai/sessions"),
+        },
+    };
+    let fresh = data.join("yourai/sessions");
+    let legacy = legacy_base.join(".yourai/sessions");
+    if !fresh.exists() && legacy.exists() {
+        return legacy;
+    }
+    fresh
+}
+
+pub fn session_dir(config: &crate::config::Config) -> PathBuf {
+    let base = config
+        .path()
+        .and_then(std::path::Path::parent)
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let directory = config.session().directory();
+    let root = if directory == std::path::Path::new(".yourai/sessions") {
+        data_session_dir(base)
+    } else {
+        directory
+    };
+    if root.is_relative() {
+        base.join(root)
+    } else {
+        root
+    }
+}
+fn resolved_prompt(
+    config: &crate::config::Config,
+    settings: &crate::config::PromptSettings,
+) -> crate::config::PromptSettings {
+    let base = config
+        .path()
+        .and_then(std::path::Path::parent)
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut settings = settings.clone();
+    let resolve = |path: &Option<PathBuf>| {
+        path.as_ref().map(|path| {
+            if path.is_relative() {
+                base.join(path)
+            } else {
+                path.clone()
+            }
+        })
+    };
+    settings.set_soul_file(resolve(settings.soul_file()));
+    settings.set_memory_file(resolve(settings.memory_file()));
+    settings.set_profile_file(resolve(settings.profile_file()));
+    settings
+}
+
+pub fn validate_config(config: &crate::config::Config) -> Result<(), crate::config::Error> {
+    let values = config.values();
+    values.models().validate(config.path().is_some())?;
+    if values.execution().steps() == Some(0) {
+        return Err("steps must be a positive integer".into());
+    }
+    values.execution().context_policy().validate()?;
+    crate::hooks::build_registrations(
+        values.hooks().events(),
+        crate::hooks::registration::HookSource::Project,
+    )?;
+    Ok(())
 }

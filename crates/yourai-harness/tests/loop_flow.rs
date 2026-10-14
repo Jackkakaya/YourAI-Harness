@@ -456,9 +456,7 @@ async fn compaction_and_retry_are_bounded_and_do_not_repeat_user_history() {
     model.recovery = ModelRecovery::Compact;
     let model = Arc::new(model);
     let hooks = Arc::new(Hooks::new(|_, _| {}));
-    let config = ExecutionOptions {
-        ..Default::default()
-    };
+    let config = ExecutionOptions::default();
     let turn_config = config;
     let agent = builder(model.clone(), history.clone())
         .hooks(hooks.clone())
@@ -503,9 +501,10 @@ async fn stop_can_continue_but_not_forever() {
         }
     }));
     let model = Arc::new(Model::new(vec![answer("first"), answer("second")]));
-    let turn_config = ExecutionOptions {
-        max_stop_continuations: 1,
-        ..Default::default()
+    let turn_config = {
+        let mut settings: yourai_core::execution::ExecutionOptions = Default::default();
+        settings.set_max_stop_continuations(1);
+        settings
     };
     let agent = builder(model.clone(), Arc::new(History::default()))
         .hooks(hooks)
@@ -746,9 +745,10 @@ async fn model_call_limit_never_executes_calls_from_the_final_step() {
 async fn invisible_failure_announces_structured_retry_status() {
     let mut m = Model::new(vec![error_stream(), answer("resumed")]);
     m.recovery = ModelRecovery::Retry;
-    let turn_config = ExecutionOptions {
-        retry_delay: Duration::ZERO,
-        ..Default::default()
+    let turn_config = {
+        let mut settings: yourai_core::execution::ExecutionOptions = Default::default();
+        settings.set_retry_delay(Duration::ZERO);
+        settings
     };
     let agent = builder(Arc::new(m), Arc::new(History::default())).build();
     let mut handle = agent
@@ -889,10 +889,11 @@ async fn invisible_failure_retries_only_up_to_policy_limit() {
     let mut m = Model::new(vec![error_stream(), error_stream(), answer("never")]);
     m.recovery = ModelRecovery::Retry;
     let model = Arc::new(m);
-    let config = ExecutionOptions {
-        max_model_retries: 1,
-        retry_delay: Duration::ZERO,
-        ..Default::default()
+    let config = {
+        let mut settings: yourai_core::execution::ExecutionOptions = Default::default();
+        settings.set_max_model_retries(1);
+        settings.set_retry_delay(Duration::ZERO);
+        settings
     };
     let turn_config = config;
     let agent = builder(model.clone(), Arc::new(History::default())).build();
@@ -1228,10 +1229,11 @@ async fn retry_respects_max_retries_limit() {
     let mut model = Model::new(vec![error_stream(), answer("must not run")]);
     model.recovery = ModelRecovery::Retry;
     let model = Arc::new(model);
-    let turn_config = ExecutionOptions {
-        retry_delay: Duration::ZERO,
-        max_model_retries: 0,
-        ..Default::default()
+    let turn_config = {
+        let mut settings: yourai_core::execution::ExecutionOptions = Default::default();
+        settings.set_retry_delay(Duration::ZERO);
+        settings.set_max_model_retries(0);
+        settings
     };
     let agent = builder(model.clone(), Arc::new(History::default())).build();
     let err = agent

@@ -54,12 +54,12 @@ impl SubagentFactory for ChildFactory {
             catalog.store.save_session(&meta).await?;
 
             let mut settings = parent.config().clone();
-            settings.context_policy = history.policy();
+            settings.set_context_policy(history.policy());
             // Child input activation is independent of the parent's selected skills/memory.
-            settings.skill_ids.clear();
-            settings.memory_search_limit = 0;
-            settings.instruction_paths.clear();
-            settings.workspace_enabled = false;
+            settings.set_skill_ids(vec![]);
+            settings.set_memory_search_limit(0);
+            settings.set_instruction_paths(vec![]);
+            settings.set_workspace_enabled(false);
             let mut bindings = Agent::builder().model(model);
             bindings.hooks = snapshot.hooks;
             bindings.tools = self.tools.clone();

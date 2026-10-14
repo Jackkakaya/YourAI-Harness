@@ -25,17 +25,17 @@ use yourai_harness::{collaboration::*, *};
 #[test]
 fn default_agent_budgets_are_unlimited() {
     let loop_config = yourai_core::execution::ExecutionOptions::default();
-    assert_eq!(loop_config.steps, None);
+    assert_eq!(loop_config.steps(), None);
     // OpenCode attachment.image defaults: 5 MiB base64 / 2000x2000 / resize.
-    assert!(loop_config.attachment_image.auto_resize);
-    assert_eq!(loop_config.attachment_image.max_width, 2000);
-    assert_eq!(loop_config.attachment_image.max_height, 2000);
+    assert!(loop_config.attachment_image().auto_resize());
+    assert_eq!(loop_config.attachment_image().max_width(), 2000);
+    assert_eq!(loop_config.attachment_image().max_height(), 2000);
     assert_eq!(
-        loop_config.attachment_image.max_base64_bytes,
+        loop_config.attachment_image().max_base64_bytes(),
         5 * 1024 * 1024
     );
     // Text files attached by reference are capped at 50k chars.
-    assert_eq!(loop_config.attachment_text_max_chars, 50_000);
+    assert_eq!(loop_config.attachment_text_max_chars(), 50_000);
 }
 
 fn context(
@@ -48,8 +48,8 @@ fn context(
     services.store = Some(store.clone());
     services.hooks = hooks;
     services.usage = Some(Arc::new(storage::LocalUsage((*store).clone())));
-    services.policy.keep_recent_tokens = 0;
-    services.policy.summary_min_savings = 1;
+    services.policy.set_keep_recent_tokens(0);
+    services.policy.set_summary_min_savings(1);
     DefaultContext::new(
         id,
         context_fixture::configured(model, Some(32_000), 4096),
@@ -235,7 +235,7 @@ async fn startup_instructions_configuration_and_notifications_are_real_operation
     h.check_config_change("project", json!({"memory_search_limit":4}))
         .await
         .unwrap();
-    assert_eq!(h.config().memory_search_limit, 0);
+    assert_eq!(h.config().memory_search_limit(), 0);
     assert!(serde_json::from_value::<yourai_harness::config::Config>(
         json!({"unsupported_field":true})
     )
@@ -1170,9 +1170,9 @@ async fn harness_runs_real_task_tool_through_loop_and_restores_session() {
         events(vec![end("", vec![call])]),
         answer("created"),
     ]));
-    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    config.config.session.extensions = true;
-    config.config.hooks.events = serde_json::from_value(json!({"hooks":{"PermissionRequest":[{"hooks":[{"type":"command","command":"echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'"}]}]}})).unwrap();
+    let config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    config.config.set_extensions(true);
+    config.config.set_hooks({ let mut settings = yourai_harness :: config :: HookSettings :: default () ; settings . set_events (serde_json :: from_value (json ! ({ "hooks" : { "PermissionRequest" : [{ "hooks" : [{ "type" : "command" , "command" : "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}'" }] }] } })) . unwrap ()) ; settings });
     let harness = Harness::open(config, model).await.unwrap();
     let frozen = SessionCatalog::new(dir.path().join("sessions"))
         .unwrap()
@@ -1206,7 +1206,7 @@ async fn harness_runs_real_task_tool_through_loop_and_restores_session() {
     harness.close().await.unwrap();
     let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
     config.resume = Some(id);
-    config.config.session.extensions = true;
+    config.config.set_extensions(true);
     let resumed_model = Arc::new(Model::new(vec![answer("resumed")]));
     let resumed = Harness::open(config, resumed_model.clone()).await.unwrap();
     assert_eq!(resumed.tasks.as_ref().unwrap().list().len(), 1);
@@ -1596,9 +1596,11 @@ async fn manual_compact_uses_current_execution_providers_and_frozen_system() {
 async fn context_usage_estimates_active_request_without_calling_model() {
     let dir = TempDir::new().unwrap();
     let model = Arc::new(Model::new(vec![answer("done")]));
-    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    let config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
 
-    config.config.prompt.system_prompt = Some("You are a coding assistant.".into());
+    config
+        .config
+        .set_system_prompt(Some("You are a coding assistant.".into()));
     let h = Harness::open(
         config,
         context_fixture::configured(model.clone(), Some(32_000), 4096),
@@ -1704,8 +1706,8 @@ async fn rate_limit_attempts_stop_at_retry_limit() {
 #[tokio::test]
 async fn harness_model_switch_preserves_budget_history_and_updates_context() {
     let dir = TempDir::new().unwrap();
-    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    config.config.prompt.system_prompt = Some("test".into());
+    let config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    config.config.set_system_prompt(Some("test".into()));
 
     let old = Arc::new(Model::new(vec![answer("first")]));
     let h = Harness::open(
@@ -1729,24 +1731,25 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
     assert_eq!(h.budget.snapshot().calls, 1);
 
     let new = Arc::new(Model::new(vec![answer("second")]));
-    let policy = ContextPolicy {
-        ..ContextPolicy::default()
-    };
+    let policy = ContextPolicy::default();
     h.switch_model_with_settings(
         TestModel::new(
             context_fixture::configured(new.clone(), Some(32_000), 2048),
             ModelTokenBudget::resolve(
-                ModelLimits {
-                    context: Some(32_000),
-                    output: Some(2048),
-                    ..Default::default()
+                {
+                    let mut settings: ModelLimits = Default::default();
+                    settings.set_context(Some(32_000));
+                    settings.set_output(Some(2048));
+                    settings
                 },
                 None,
             )
             .unwrap(),
-            ModelTimeouts {
-                headers: Duration::from_secs(1),
-                read: Duration::from_secs(1),
+            {
+                let mut settings = ModelTimeouts::default();
+                settings.set_headers(Duration::from_secs(1));
+                settings.set_read(Duration::from_secs(1));
+                settings
             },
         )
         .unwrap(),
@@ -1795,10 +1798,15 @@ async fn harness_model_switch_preserves_budget_history_and_updates_context() {
 async fn pinned_summary_model_keeps_its_binding_and_shared_accounting_after_main_switch() {
     let dir = TempDir::new().unwrap();
     let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    config.config.prompt.system_prompt = Some("test".into());
-    config.config.execution.context_policy.keep_recent_tokens = 0;
+    config.config.set_system_prompt(Some("test".into()));
+    config
+        .config
+        .execution()
+        .context_policy()
+        .set_keep_recent_tokens(0)
+        .unwrap();
     let summary = Arc::new(Model::new(vec![]));
-    config.compaction_model = Some(yourai_harness::config::ResolvedModel {
+    config.compaction_model = Some(yourai_harness::model::ResolvedModel {
         model: context_fixture::configured(summary.clone(), Some(100_000), 8000),
         provider: "summary-provider".into(),
         requests: Default::default(),
@@ -1813,9 +1821,10 @@ async fn pinned_summary_model_keeps_its_binding_and_shared_accounting_after_main
     let pinned = h.host.agent().compaction_model().unwrap();
     h.switch_model(
         context_fixture::configured(Arc::new(Model::new(vec![])), Some(32_000), 2048),
-        ContextPolicy {
-            keep_recent_tokens: 0,
-            ..Default::default()
+        {
+            let mut settings: yourai_core::compactor::ContextPolicy = Default::default();
+            settings.set_keep_recent_tokens(0);
+            settings
         },
     )
     .await
@@ -1857,8 +1866,8 @@ async fn pinned_summary_model_keeps_its_binding_and_shared_accounting_after_main
 #[tokio::test]
 async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
     let dir = TempDir::new().unwrap();
-    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    config.config.prompt.system_prompt = Some("test".into());
+    let config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    config.config.set_system_prompt(Some("test".into()));
 
     let old = Arc::new(Model::new(vec![Box::pin(futures_util::stream::pending())]));
     let h = Harness::open(
@@ -1884,9 +1893,7 @@ async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
     })
     .await
     .unwrap();
-    let policy = ContextPolicy {
-        ..ContextPolicy::default()
-    };
+    let policy = ContextPolicy::default();
     let new = Arc::new(Model::new(vec![answer("new")]));
     assert!(h
         .switch_model(
@@ -1913,21 +1920,19 @@ async fn harness_rejects_model_switch_during_a_turn_without_changing_context() {
 #[tokio::test]
 async fn model_switch_publishes_chunk_timeout_with_model() {
     let dir = TempDir::new().unwrap();
-    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    config.config.prompt.system_prompt = Some("test".into());
+    let config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    config.config.set_system_prompt(Some("test".into()));
     let h = Harness::open(config, Arc::new(Model::new(vec![answer("old")])))
         .await
         .unwrap();
     let next = Arc::new(Model::new(vec![hangs_after("partial")]));
     h.switch_model_with_settings(
-        TestModel::new(
-            next,
-            ModelTokenBudget::default(),
-            ModelTimeouts {
-                headers: Duration::from_millis(20),
-                read: Duration::from_millis(20),
-            },
-        )
+        TestModel::new(next, ModelTokenBudget::default(), {
+            let mut settings = ModelTimeouts::default();
+            settings.set_headers(Duration::from_millis(20));
+            settings.set_read(Duration::from_millis(20));
+            settings
+        })
         .unwrap(),
         ContextPolicy::default(),
         "new".into(),
@@ -2002,10 +2007,10 @@ async fn close_can_wait_for_cleanup_without_an_implicit_deadline() {
 #[tokio::test]
 async fn harness_model_settings_are_inherited_by_child_default_loop() {
     let dir = TempDir::new().unwrap();
-    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    config.config.prompt.system_prompt = Some("test".into());
-    config.config.session.extensions = true;
-    config.config.security.yolo = true;
+    let config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    config.config.set_system_prompt(Some("test".into()));
+    config.config.set_extensions(true);
+    config.config.set_yolo(true);
     let mut spawn = call("spawn", "subagent");
     spawn.fn_arguments = json!({"prompt":"child task"});
     let model = Arc::new(Model::new(vec![
@@ -2015,14 +2020,12 @@ async fn harness_model_settings_are_inherited_by_child_default_loop() {
     ]));
     let h = Harness::open(
         config,
-        TestModel::new(
-            model.clone(),
-            ModelTokenBudget::default(),
-            ModelTimeouts {
-                headers: Duration::from_secs(7),
-                read: Duration::from_secs(11),
-            },
-        )
+        TestModel::new(model.clone(), ModelTokenBudget::default(), {
+            let mut settings = ModelTimeouts::default();
+            settings.set_headers(Duration::from_secs(7));
+            settings.set_read(Duration::from_secs(11));
+            settings
+        })
         .unwrap(),
     )
     .await
@@ -2506,7 +2509,7 @@ async fn dropped_config_change_removes_its_candidate() {
     worker.abort();
     assert!(worker.await.unwrap_err().is_cancelled());
     assert!(!candidate.exists());
-    assert_eq!(h.config().memory_search_limit, 0);
+    assert_eq!(h.config().memory_search_limit(), 0);
     h.close(None).await.unwrap();
 }
 fn initialize_repo(path: &std::path::Path) {
@@ -2780,7 +2783,7 @@ async fn legacy_session_config_is_ignored_without_changing_frozen_prompt() {
         .value;
     assert_eq!(config["memory_search_limit"], 7);
     assert_eq!(config["system_prompt"], "ignored legacy value");
-    assert_eq!(h.config().memory_search_limit, 0);
+    assert_eq!(h.config().memory_search_limit(), 0);
     assert_eq!(h.agent().context_manager().unwrap().system_prompt(), "");
     h.close(None).await.unwrap();
 }

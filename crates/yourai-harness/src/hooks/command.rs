@@ -145,12 +145,12 @@ impl Drop for OwnedChild {
 /// Command hook handler。
 pub struct CommandHandler {
     command: String,
-    shell: Option<crate::hooks::config::HookShell>,
+    shell: Option<crate::hooks::registration::HookShell>,
     background: Option<BackgroundCommandContext>,
 }
 
 impl CommandHandler {
-    pub fn new(command: String, shell: Option<crate::hooks::config::HookShell>) -> Self {
+    pub fn new(command: String, shell: Option<crate::hooks::registration::HookShell>) -> Self {
         Self {
             command,
             shell,
@@ -171,7 +171,7 @@ impl CommandHandler {
         let json_input = to_wire_json(invocation);
 
         let mut cmd = match self.shell {
-            Some(crate::hooks::config::HookShell::Powershell) => {
+            Some(crate::hooks::registration::HookShell::Powershell) => {
                 let mut command = Command::new("pwsh");
                 command
                     .arg("-NoProfile")
@@ -180,7 +180,7 @@ impl CommandHandler {
                     .arg(&self.command);
                 command
             }
-            Some(crate::hooks::config::HookShell::Bash) => {
+            Some(crate::hooks::registration::HookShell::Bash) => {
                 let mut command = Command::new("bash");
                 command.arg("-c").arg(&self.command);
                 command
@@ -543,7 +543,7 @@ mod tests {
     async fn early_stdin_close_preserves_hook_exit_status_and_output() {
         let handler = CommandHandler::new(
             "exec 0<&-; echo blocked >&2; exit 2".into(),
-            Some(crate::hooks::config::HookShell::Bash),
+            Some(crate::hooks::registration::HookShell::Bash),
         );
         let inv = HookInvocation::new(
             BaseInput::new("sess", "/tmp"),
@@ -671,7 +671,7 @@ mod tests {
     async fn explicit_bash_shell_does_not_depend_on_shell_environment() {
         let handler = CommandHandler::new(
             "printf %s \"$BASH_VERSION\"".to_string(),
-            Some(crate::hooks::config::HookShell::Bash),
+            Some(crate::hooks::registration::HookShell::Bash),
         );
         let inv = HookInvocation::new(
             BaseInput::new("sess", "/tmp"),

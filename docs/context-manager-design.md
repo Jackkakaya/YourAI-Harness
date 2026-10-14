@@ -72,7 +72,7 @@ exec
 ```json
 {
   "models": {
-    "selected": "gateway/main-model",
+    "model": "gateway/main-model",
     "compaction": "gateway/summary-model"
   }
 }

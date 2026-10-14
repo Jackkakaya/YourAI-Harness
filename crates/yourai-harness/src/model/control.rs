@@ -1,24 +1,16 @@
 //! One admission/cooldown gate for every model sharing this Harness budget.
 use super::ModelBudget;
+use crate::config::RequestPolicy;
 use crate::storage::request_log::RequestLog;
 #[cfg(test)]
 use crate::SqliteStore;
-use serde::{Deserialize, Serialize};
 use std::{sync::Mutex, time::Duration};
 use tokio::time::Instant;
 use yourai_core::prelude::*;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RequestPolicy {
-    /// Optional known provider quota. Requests are paced evenly, without a burst allowance.
-    pub rpm: Option<u32>,
-    /// Opt-in shared fallback for HTTP 429 without a server delay; zero disables it.
-    pub cooldown_seconds: u64,
-}
 impl RequestPolicy {
     pub fn validate(&self) -> Result<(), YourAiError> {
-        if self.rpm.is_some_and(|n| n == 0 || n > 60_000) || self.cooldown_seconds > 3600 {
+        if self.rpm().is_some_and(|n| n == 0 || n > 60_000) || self.cooldown_seconds() > 3600 {
             return Err(ErrorKind::Config(
                 "requests.rpm must be 1..60000; cooldown_seconds must be 0..3600".into(),
             )
@@ -64,7 +56,7 @@ impl RequestControl {
         let mut deadlines = self.deadlines.lock().unwrap();
         let now = Instant::now();
         let delay = delay
-            .unwrap_or(Duration::from_secs(self.policy.cooldown_seconds))
+            .unwrap_or(Duration::from_secs(self.policy.cooldown_seconds()))
             .min(super::retry::MAX_DELAY);
         let until = now + delay;
         deadlines.1 = deadlines.1.max(until);
@@ -127,7 +119,7 @@ impl ModelBudget {
                         + self
                             .control
                             .policy
-                            .rpm
+                            .rpm()
                             .map(|rpm| Duration::from_secs_f64(60.0 / rpm as f64))
                             .unwrap_or_default();
                     return Ok(());
@@ -152,9 +144,10 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn concurrent_callers_get_distinct_paced_slots() {
-        let budget = budget(RequestPolicy {
-            rpm: Some(2),
-            ..Default::default()
+        let budget = budget({
+            let mut settings: RequestPolicy = Default::default();
+            settings.set_rpm(Some(2));
+            settings
         });
         let start = Instant::now();
         let (a, b, c) = tokio::join!(
@@ -178,9 +171,10 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn pace_and_cancel_wait_without_counting_attempts() {
-        let budget = budget(RequestPolicy {
-            rpm: Some(2),
-            ..Default::default()
+        let budget = budget({
+            let mut settings: RequestPolicy = Default::default();
+            settings.set_rpm(Some(2));
+            settings
         });
         budget.admit().await.unwrap();
         assert_eq!(budget.snapshot().calls, 1);
@@ -197,9 +191,10 @@ mod tests {
     }
     #[tokio::test(start_paused = true)]
     async fn cooldown_is_shared_and_can_be_extended_during_wait() {
-        let budget = budget(RequestPolicy {
-            cooldown_seconds: 60,
-            ..Default::default()
+        let budget = budget({
+            let mut settings: RequestPolicy = Default::default();
+            settings.set_cooldown_seconds(60);
+            settings
         });
         budget.control.cool_down(None);
         let other = budget.clone();
@@ -220,9 +215,11 @@ mod provider_tests {
     async fn provider_gates_are_independent_and_accounting_is_shared() {
         let store = SqliteStore::open(std::path::Path::new(":memory:")).unwrap();
         let a = ModelBudget::configured(
-            RequestPolicy {
-                rpm: Some(1),
-                cooldown_seconds: 60,
+            {
+                let mut settings = RequestPolicy::default();
+                settings.set_rpm(Some(1));
+                settings.set_cooldown_seconds(60);
+                settings
             },
             store.clone(),
         )

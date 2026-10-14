@@ -5,12 +5,12 @@ mod tests {
     use std::time::Duration;
     use yourai_core::prelude::*;
     async fn refresh(controller: &mut session::Controller, view: &mut View) {
-        let revision = controller.backend.snapshot().revision;
-        controller.backend.refresh();
+        let revision = controller.backend.client().snapshot().revision;
+        controller.backend.client().refresh();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 controller.poll(view, None).await;
-                if controller.backend.snapshot().revision != revision {
+                if controller.backend.client().snapshot().revision != revision {
                     controller.poll(view, None).await;
                     break;
                 }
@@ -35,7 +35,7 @@ mod tests {
     #[tokio::test]
     async fn title_refresh_reads_service_metadata_without_writing() {
         let (_dir, mut controller, mut view) = session::fixture().await;
-        let h = controller.harness();
+        let h = controller.backend.harness();
         let context = h.host.environment();
         // A UI preview is not an admitted input and must never name a session.
         view.user("uncommitted preview");
@@ -84,7 +84,7 @@ mod tests {
     #[tokio::test]
     async fn closing_before_first_refresh_saves_committed_title() {
         let (_dir, controller, view) = session::fixture().await;
-        let h = controller.harness();
+        let h = controller.backend.harness();
         let id = h.host.environment().id;
         h.sessions
             .append_messages(
@@ -104,7 +104,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_input_does_not_name_session() {
         let (_dir, mut controller, mut view) = session::fixture().await;
-        let h = controller.harness();
+        let h = controller.backend.harness();
         let input = In::user_text_with_attachments(
             "rejected request",
             vec![UserAttachment::file("missing-file.png", None)],
@@ -188,11 +188,13 @@ mod failure_cleanup_tests {
             release: tokio::sync::Notify::new(),
         });
         controller
+            .backend
             .harness()
             .switch_model(model.clone(), ContextPolicy::default())
             .await
             .unwrap();
         controller
+            .backend
             .harness()
             .hooks
             .register(NativeHookRegistration {
@@ -212,30 +214,30 @@ mod failure_cleanup_tests {
             .await
             .unwrap();
         assert!(matches!(
-            controller.harness().host.status(),
+            controller.backend.harness().host.status(),
             SessionStatus::Running { .. }
         ));
-        assert!(controller.harness().host.last_error().is_none());
+        assert!(controller.backend.harness().host.last_error().is_none());
         assert!(controller.submit(
             In::follow_up("new instruction during failure cleanup"),
             &mut view
         ));
         tokio::time::timeout(Duration::from_secs(5), async {
-            while controller.backend.submitting() {
+            while controller.backend.client().submitting() {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
         if cancel {
-            controller.interrupt();
+            controller.backend.client().interrupt();
         }
         gate.release.notify_one();
         tokio::time::timeout(Duration::from_secs(5), async {
             let expected = if cancel { 1 } else { 2 };
             while model.0.load(std::sync::atomic::Ordering::SeqCst) < expected
                 || matches!(
-                    controller.harness().host.status(),
+                    controller.backend.harness().host.status(),
                     SessionStatus::Running { .. }
                 )
             {

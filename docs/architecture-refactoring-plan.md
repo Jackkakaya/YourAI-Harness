@@ -1,5 +1,7 @@
 # 全局职责收敛与重构计划
 
+> 本文保留历史重构计划。配置部分已于 2026-10-15 更新为单 JSON、Arc<Config>、内部加锁的嵌套 getter/setter 与显式 save；旧 update、分拆存储和 SQLite 配置计划已废止。当前实现以 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13) 为准。
+
 更新日期：2026-10-13。对应分支：`codex/orthogonal-runtime`。状态：第一批进程内重构已完成，第二批接口收敛与配置所有权已收敛到共享 Config，SessionManager 读取每轮冻结数据，后端控制迁移已完成，独立网络 Server 仍未实施。
 
 ## 1. 当前有多少类型

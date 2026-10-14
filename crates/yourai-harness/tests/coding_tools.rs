@@ -51,8 +51,8 @@ async fn coding_loop_modifies_tests_and_persists_results() {
         ),
         answer("fixed and tested"),
     ]));
-    let mut cfg = SessionOptions::new(root.clone(), d.path().into());
-    cfg.config.security.trusted_shell = true;
+    let cfg = SessionOptions::new(root.clone(), d.path().into());
+    cfg.config.set_trusted_shell(true);
     let h = Harness::open(cfg, model.clone()).await.unwrap();
     let capture = Capture(Mutex::new(vec![]));
     h.host
@@ -272,9 +272,10 @@ async fn child_restore_rebinds_builtin_working_directory() {
         id,
         child.path().into(),
         Agent::builder().model(model).tools(h.tools.clone()),
-        ExecutionOptions {
-            context_policy: ContextPolicy::default(),
-            ..Default::default()
+        {
+            let mut settings: yourai_core::execution::ExecutionOptions = Default::default();
+            settings.set_context_policy(ContextPolicy::default());
+            settings
         },
         "startup",
     )
@@ -329,9 +330,9 @@ async fn yolo_skips_all_permissions_including_children_but_preserves_questions()
         invoke("question", "ask_user", json!({"value":1})),
         answer("all done"),
     ]));
-    let mut cfg = SessionOptions::new(d.path().join("sessions"), d.path().into());
-    cfg.config.security.yolo = true;
-    cfg.config.session.extensions = true;
+    let cfg = SessionOptions::new(d.path().join("sessions"), d.path().into());
+    cfg.config.set_yolo(true);
+    cfg.config.set_extensions(true);
     let h = Harness::open(cfg, model).await.unwrap();
     h.tools
         .register(Arc::new(Handler::new("ask_user", Mode::Ask)));
@@ -429,12 +430,12 @@ async fn runtime_yolo_can_be_disabled_and_rejects_changes_during_approval() {
         invoke("second", "shell", json!({"command":"printf second"})),
         answer("second done"),
     ]));
-    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    config.config.security.yolo = true;
+    let config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    config.config.set_yolo(true);
     let h = Harness::open(config, model).await.unwrap();
     // Even CLI-selected YOLO can restore the original permission provider.
-    h.set_yolo(false).unwrap();
-    h.set_yolo(true).unwrap();
+    h.apply_yolo(false).unwrap();
+    h.apply_yolo(true).unwrap();
     h.host.submit(In::user_text("first")).unwrap();
     let capture = Capture(Mutex::new(vec![]));
     h.host
@@ -450,7 +451,7 @@ async fn runtime_yolo_can_be_disabled_and_rejects_changes_during_approval() {
         .unwrap()
         .iter()
         .any(|event| matches!(event, Out::Ask { .. })));
-    h.set_yolo(false).unwrap();
+    h.apply_yolo(false).unwrap();
     h.host.submit(In::user_text("second")).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let host = h.host.clone();
@@ -465,7 +466,7 @@ async fn runtime_yolo_can_be_disabled_and_rejects_changes_during_approval() {
                 assert_eq!(payload["kind"], "permission");
                 approvals += 1;
                 assert!(
-                    h.set_yolo(true).is_err(),
+                    h.apply_yolo(true).is_err(),
                     "a live approval cannot change permissions"
                 );
                 h.host
@@ -481,6 +482,6 @@ async fn runtime_yolo_can_be_disabled_and_rejects_changes_during_approval() {
     .unwrap();
     task.await.unwrap().unwrap().unwrap().result.unwrap();
     assert_eq!(approvals, 1);
-    h.set_yolo(true).unwrap();
+    h.apply_yolo(true).unwrap();
     h.close().await.unwrap();
 }

@@ -130,7 +130,7 @@ def main():
             'models': {'code': model}}
         config.write_text(json.dumps({
         'models': {
-            'selected': 'demo/code',
+            'model': 'demo/code',
             'providers': {
                 'demo': provider
             }

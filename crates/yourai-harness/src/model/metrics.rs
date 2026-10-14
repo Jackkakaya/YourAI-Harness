@@ -210,9 +210,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::SqliteStore::open(&dir.path().join("sessions.sqlite3")).unwrap();
         let budget = ModelBudget::configured(
-            super::super::RequestPolicy {
-                rpm: None,
-                cooldown_seconds: 7,
+            {
+                let mut settings = super::super::RequestPolicy::default();
+                settings.set_rpm(None);
+                settings.set_cooldown_seconds(7);
+                settings
             },
             store,
         )
@@ -287,9 +289,11 @@ mod tests {
             let error = http_error_with_status(status, body);
             assert_eq!(provider.recovery(&error), recovery, "{status}: {body}");
             let budget = ModelBudget::configured(
-                super::super::RequestPolicy {
-                    rpm: None,
-                    cooldown_seconds: 7,
+                {
+                    let mut settings = super::super::RequestPolicy::default();
+                    settings.set_rpm(None);
+                    settings.set_cooldown_seconds(7);
+                    settings
                 },
                 crate::SqliteStore::open(std::path::Path::new(":memory:")).unwrap(),
             )

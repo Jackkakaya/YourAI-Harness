@@ -9,14 +9,11 @@ use super::{
 };
 use crate::config::Error;
 pub(super) use setup::restore_history;
-use std::{
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 use yourai_core::prelude::*;
 pub(super) use yourai_harness::controller::Reply;
 use yourai_harness::{
-    controller::{SessionController, SessionEvent, SessionHistory},
+    controller::{SessionController, SessionEvent, SessionHistory, SessionSubscription},
     Harness, SessionOptions,
 };
 pub(super) enum Target {
@@ -24,88 +21,56 @@ pub(super) enum Target {
     Resume(SessionId),
 }
 pub(super) struct Controller {
-    backend: SessionController,
-    config: Arc<Mutex<Config>>,
+    pub(super) backend: SessionController,
+    pub(super) events: SessionSubscription,
+    config: Arc<Config>,
     revision: Option<u64>,
 }
 impl Controller {
     pub fn new(
         h: Harness,
-        config: Arc<Mutex<Config>>,
+        config: Arc<Config>,
         template: SessionOptions,
         limits: TurnLimits,
     ) -> Self {
+        let (backend, events) = SessionController::new(h, config.clone(), template, limits);
         Self {
-            backend: SessionController::new(h, config.clone(), template, limits),
+            backend,
+            events,
             config,
             revision: Some(0),
         }
     }
-    pub fn yolo(&self) -> bool {
-        self.backend.yolo()
-    }
-    #[cfg(test)]
-    pub fn harness(&self) -> Arc<Harness> {
-        self.backend.harness()
-    }
-    pub fn environment(&self) -> SessionEnvironment {
-        self.backend.environment()
-    }
-    pub fn queued(&self) -> usize {
-        self.backend.queued()
-    }
-    pub fn tasks_since(&self, previous: Option<u64>) -> Option<(u64, Vec<Task>)> {
-        self.backend.tasks_since(previous)
-    }
-    pub fn compacting(&self) -> bool {
-        self.backend.compacting()
-    }
-    #[cfg(test)]
-    pub fn busy(&self) -> bool {
-        self.backend.busy()
-    }
-    pub async fn recv(&mut self) -> Option<SessionEvent> {
-        self.backend.recv().await
-    }
+
     pub fn submit(&mut self, input: In, view: &mut View) -> bool {
-        if self.backend.submit(input) {
+        if self.backend.client().submit(input) {
             true
         } else {
             view.notice(Level::Warning, "A session operation is in progress or the input queue is closed; your draft is kept.");
             false
         }
     }
-    pub fn reply(&mut self, id: String, payload: serde_json::Value, _view: &mut View) -> Reply {
-        self.backend.reply(id, payload)
-    }
-    pub fn interrupt(&mut self) {
-        self.backend.interrupt();
-    }
+
     fn show_error(result: Result<(), String>, view: &mut View) {
         if let Err(message) = result {
             view.notice(Level::Warning, message);
         }
     }
     pub fn steer_pending(&mut self, id: String, view: &mut View) {
-        Self::show_error(self.backend.steer_pending(id), view);
+        Self::show_error(self.backend.client().steer_pending(id), view);
     }
     pub fn compact(&mut self, view: &mut View) {
-        Self::show_error(self.backend.compact(), view);
+        Self::show_error(self.backend.client().compact(), view);
     }
-    pub fn set_theme(&mut self, theme: &str) -> Result<(), String> {
-        self.backend.set_theme(theme)
-    }
-    pub fn set_yolo(&mut self, enabled: bool) -> Result<(), YourAiError> {
-        self.backend.set_yolo(enabled)
-    }
+
     pub fn list(&mut self, view: &mut View) {
-        match self.backend.list() {
+        match self.backend.client().list() {
             Ok(()) => view.overlay = Overlay::LoadingSessions,
             Err(message) => view.notice(Level::Warning, message),
         }
     }
     pub fn delete(&mut self, id: SessionId, view: &mut View) {
-        Self::show_error(self.backend.delete(id), view);
+        Self::show_error(self.backend.client().delete(id), view);
     }
     pub fn model(
         &mut self,
@@ -114,14 +79,14 @@ impl Controller {
         effort: Option<crate::models::EffortChoice>,
         view: &mut View,
     ) {
-        Self::show_error(self.backend.model(id, variant, effort), view);
+        Self::show_error(self.backend.client().model(id, variant, effort), view);
     }
     pub fn switch(&mut self, target: Target, view: &mut View) {
         let id = match target {
             Target::New => None,
             Target::Resume(id) => Some(id),
         };
-        Self::show_error(self.backend.switch(id), view);
+        Self::show_error(self.backend.client().switch(id), view);
     }
     fn event(&mut self, event: SessionEvent, view: &mut View) -> bool {
         match event {
@@ -138,7 +103,7 @@ impl Controller {
                     Ok(rows) if show => {
                         view.overlay = Overlay::Sessions(SessionPickerState {
                             pending_delete: None,
-                            rows: crate::sessions::rows_from(rows, Some(&self.environment().id)),
+                            rows: crate::sessions::rows_from(rows, Some(&self.backend.client().environment().id)),
                             query: String::new(),
                             selected: 0,
                         })
@@ -173,8 +138,8 @@ impl Controller {
                         message.push_str(&format!(" · thinking {effort}"));
                     }
                     view.notice(Level::Info, message);
-                    if let Ok(config) = self.config.lock() {
-                        view.replace_model_choices(crate::models::model_choices(&config));
+                    { let config = &self.config;
+                        view.replace_model_choices(crate::models::model_choices(config));
                     }
                     view.model = selected;
                 }
@@ -185,10 +150,10 @@ impl Controller {
                     let mut fresh = View::default();
                     apply_history(history, &mut fresh);
                     view.session = fresh.session;
-                    if let Ok(preferences) = self.config.lock() {
-                        let selected = yourai_harness::controller::ModelSelection::from_config(&preferences);
+                    { let preferences = &self.config;
+                        let selected = yourai_harness::controller::ModelSelection::from_config(preferences);
                         if view.model.label != selected.label || view.model.effort != selected.effort {
-                            view.replace_model_choices(crate::models::model_choices(&preferences));
+                            view.replace_model_choices(crate::models::model_choices(preferences));
                         }
                         view.model = selected;
                     }
@@ -205,12 +170,12 @@ impl Controller {
     pub async fn poll(&mut self, view: &mut View, first: Option<SessionEvent>) -> bool {
         let mut switched = first.is_some_and(|event| self.event(event, view));
         for _ in 0..256 {
-            match self.backend.try_recv() {
+            match self.events.try_recv() {
                 Some(event) => switched |= self.event(event, view),
                 None => break,
             }
         }
-        let snapshot = self.backend.snapshot();
+        let snapshot = self.backend.client().snapshot();
         view.session.pending_inputs = snapshot.pending_inputs;
         view.session.can_steer = snapshot.can_steer;
         if snapshot.active && !view.session.active {
@@ -218,7 +183,7 @@ impl Controller {
             view.session.since = Some(Instant::now());
         }
         if !snapshot.active
-            && !self.backend.has_events()
+            && !self.events.has_events()
             && (view.session.active || !view.asks_empty())
         {
             view.idle();
@@ -256,7 +221,7 @@ pub(super) async fn fixture() -> (tempfile::TempDir, Controller, View) {
     let dir = tempfile::tempdir().unwrap();
     let cfg: Config = serde_json::from_value(serde_json::json!({
       "models": {
-        "selected": "mock/test",
+        "model": "mock/test",
         "providers": {
           "mock": {
             "options": {
@@ -274,21 +239,16 @@ pub(super) async fn fixture() -> (tempfile::TempDir, Controller, View) {
     .unwrap();
     let path = dir.path().join("yourai.json");
     std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
-    let cfg = Config::load(&path).unwrap();
-    let model = cfg.resolve(None).unwrap().model;
-    let mut hc = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    hc.config.prompt.system_prompt = Some("test".into());
+    let cfg = Config::init(&path).unwrap();
+    let model = cfg.models().resolve().unwrap().model;
+    let hc = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    hc.config.set_system_prompt(Some("test".into()));
     let h = Harness::open(hc.clone(), model).await.unwrap();
     let mut view = View::default();
     view.model.label = "mock/test".into();
     (
         dir,
-        Controller::new(
-            h,
-            Arc::new(std::sync::Mutex::new(cfg)),
-            hc,
-            TurnLimits::default(),
-        ),
+        Controller::new(h, Arc::new(cfg), hc, TurnLimits::default()),
         view,
     )
 }
@@ -306,7 +266,7 @@ mod tests {
 
     async fn finish(controller: &mut Controller, view: &mut View) {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while controller.backend.busy() {
+            while controller.backend.client().busy() {
                 controller.poll(view, None).await;
                 tokio::task::yield_now().await;
             }
@@ -319,14 +279,14 @@ mod tests {
     #[tokio::test]
     async fn failed_switch_keeps_current_session_and_success_preserves_inflight_draft() {
         let (_dir, mut controller, mut view) = fixture().await;
-        let old = controller.harness();
+        let old = controller.backend.harness();
         let id = old.host.environment().id;
         controller.switch(Target::Resume(SessionId::new()), &mut view);
         finish(&mut controller, &mut view).await;
-        assert_eq!(controller.harness().host.environment().id, id);
+        assert_eq!(controller.backend.harness().host.environment().id, id);
         assert_eq!(old.host.status(), SessionStatus::Idle);
         controller.switch(Target::New, &mut view);
-        assert!(controller.backend.operating());
+        assert!(controller.backend.client().operating());
         view.draft.insert("draft typed during opening");
         view.theme = Theme::Nord;
         view.model_choices = vec![crate::models::ModelChoice {
@@ -348,7 +308,7 @@ mod tests {
         // A second operation cannot supersede the first or mutate its settings.
         controller.model("missing/model".into(), None, None, &mut view);
         finish(&mut controller, &mut view).await;
-        assert_ne!(controller.harness().host.environment().id, id);
+        assert_ne!(controller.backend.harness().host.environment().id, id);
         assert_eq!(old.host.status(), SessionStatus::Closed);
         assert_eq!(view.draft.text(), "draft typed during opening");
         assert_eq!(view.theme, Theme::Nord);
@@ -366,19 +326,20 @@ mod tests {
     #[tokio::test]
     async fn queued_inputs_guard_both_new_and_resume() {
         let (_dir, mut controller, mut view) = fixture().await;
-        controller.harness().host.interrupt();
+        controller.backend.harness().host.interrupt();
         // The host queues synchronously; do not yield between submit and guards.
         controller
+            .backend
             .harness()
             .host
             .submit(In::follow_up("queued"))
             .unwrap();
-        let id = controller.harness().host.environment().id;
+        let id = controller.backend.harness().host.environment().id;
         controller.switch(Target::New, &mut view);
-        assert!(!controller.backend.operating());
+        assert!(!controller.backend.client().operating());
         controller.switch(Target::Resume(SessionId::new()), &mut view);
-        assert!(!controller.backend.operating());
-        assert_eq!(controller.harness().host.environment().id, id);
+        assert!(!controller.backend.client().operating());
+        assert_eq!(controller.backend.harness().host.environment().id, id);
         controller.close().await.unwrap();
     }
     #[tokio::test]
@@ -392,13 +353,13 @@ mod tests {
         );
         assert!(controller.submit(input, &mut view));
         view.draft.insert("new unsent draft");
-        let id = controller.harness().host.environment().id;
+        let id = controller.backend.harness().host.environment().id;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 controller.poll(&mut view, None).await;
                 // Host completion can race with poll's UI-state snapshot.
                 // Session switching requires both states to have settled.
-                if controller.backend.idle() && !view.session.active && view.items().iter().any(|item| matches!(item, crate::ui::state::Item::Notice { text, .. } if text.starts_with("Input rejected:"))) {
+                if controller.backend.client().idle() && !view.session.active && view.items().iter().any(|item| matches!(item, crate::ui::state::Item::Notice { text, .. } if text.starts_with("Input rejected:"))) {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -406,12 +367,12 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(controller.harness().host.queued(), 0);
+        assert_eq!(controller.backend.harness().host.queued(), 0);
         assert_eq!(view.draft.text(), "new unsent draft");
         assert_eq!(view.draft.attachment_counts(), (0, 0));
         controller.switch(Target::New, &mut view);
         finish(&mut controller, &mut view).await;
-        assert_ne!(controller.harness().host.environment().id, id);
+        assert_ne!(controller.backend.harness().host.environment().id, id);
         assert_eq!(view.draft.attachment_counts(), (0, 0));
         let (_, pending) = controller.close().await.unwrap();
         assert!(pending.is_empty());
@@ -419,9 +380,10 @@ mod tests {
     #[tokio::test]
     async fn failed_async_submission_preserves_new_draft_and_blocks_session_switch_until_settled() {
         let (_dir, mut controller, mut view) = fixture().await;
-        let id = controller.harness().host.environment().id;
+        let id = controller.backend.harness().host.environment().id;
         let db = rusqlite::Connection::open(
             controller
+                .backend
                 .harness()
                 .host
                 .environment()
@@ -431,20 +393,20 @@ mod tests {
         .unwrap();
         db.execute_batch("CREATE TRIGGER fail_input_insert BEFORE INSERT ON session_state WHEN NEW.state_key='runtime' BEGIN SELECT RAISE(ABORT,'injected state failure'); END; CREATE TRIGGER fail_input_update BEFORE UPDATE ON session_state WHEN NEW.state_key='runtime' BEGIN SELECT RAISE(ABORT,'injected state failure'); END;").unwrap();
         assert!(controller.submit(In::user_text("failed input"), &mut view));
-        assert!(!controller.backend.idle());
+        assert!(!controller.backend.client().idle());
         controller.switch(Target::New, &mut view);
-        assert!(!controller.backend.operating());
+        assert!(!controller.backend.client().operating());
         view.draft.insert("new draft while storage is pending");
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 controller.poll(&mut view, None).await;
-                if controller.backend.idle() && view.items().iter().any(|item| matches!(item, Item::Notice { text, .. } if text.starts_with("Input rejected:"))) { break; }
+                if controller.backend.client().idle() && view.items().iter().any(|item| matches!(item, Item::Notice { text, .. } if text.starts_with("Input rejected:"))) { break; }
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
         assert_eq!(view.draft.text(), "new draft while storage is pending");
-        assert_eq!(controller.harness().host.queued(), 0);
-        assert_eq!(controller.harness().host.environment().id, id);
+        assert_eq!(controller.backend.harness().host.queued(), 0);
+        assert_eq!(controller.backend.harness().host.environment().id, id);
         db.execute_batch("DROP TRIGGER fail_input_insert; DROP TRIGGER fail_input_update;")
             .unwrap();
         controller.close().await.unwrap();

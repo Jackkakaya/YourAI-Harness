@@ -63,9 +63,10 @@ fn wrapped(class: ModelErrorClass, mode: Mode) -> (Arc<dyn ModelProvider>, Arc<M
     let inner = settings_fixture::TestModel::new(
         Arc::new(CustomProvider { class, mode }),
         ModelTokenBudget::default(),
-        ModelTimeouts {
-            headers: Duration::from_secs(1),
-            ..Default::default()
+        {
+            let mut settings: ModelTimeouts = Default::default();
+            settings.set_headers(Duration::from_secs(1));
+            settings
         },
     )
     .unwrap();

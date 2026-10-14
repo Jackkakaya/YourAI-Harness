@@ -47,7 +47,7 @@ pub async fn authorize(
     {
         return turn.tc.check_control();
     }
-    for attempt in 0..=turn.config.max_permission_rechecks {
+    for attempt in 0..=turn.config.max_permission_rechecks() {
         let security = check_policy(turn, handler, &call.fn_arguments).await?;
         let deny = match &hook_permission {
             HookPermission::Deny { reason } => Some(reason.clone()),
@@ -96,7 +96,7 @@ pub async fn authorize(
                             "tool_name": call.fn_name,
                             "input": call.fn_arguments,
                         });
-                        let timeout = turn.config.approval_timeout;
+                        let timeout = turn.config.approval_timeout();
                         let reply = turn
                             .ask(uuid::Uuid::new_v4().to_string(), payload, timeout)
                             .await;
@@ -185,7 +185,7 @@ pub async fn authorize(
             .await?;
         turn.apply_common(&result)?;
         let retry = matches!(result.outcome, HookPointOutcome::PermissionDenied(ref o) if o.retry);
-        if retry && attempt < turn.config.max_permission_rechecks {
+        if retry && attempt < turn.config.max_permission_rechecks() {
             continue;
         }
         return Err(ErrorKind::Tool {

@@ -23,16 +23,17 @@ UI 仍有必要的显示控制，例如 Esc 关闭 overlay、保持草稿、忽�
 ## 其他 UI 如何使用
 
 ```rust,ignore
-let mut backend = SessionController::new(harness, config, options, limits);
-backend.submit(In::user_text("任务"));
-backend.interrupt();
-backend.compact()?;
-backend.model(model_id, variant, effort)?;
-backend.switch(Some(session_id))?;
+let (backend, mut events) = SessionController::new(harness, config, options, limits);
+let client = backend.client();
+client.submit(In::user_text("任务"));
+client.interrupt();
+client.compact()?;
+client.model(model_id, variant, effort)?;
+client.switch(Some(session_id))?;
 
-// 不调用这两个读取入口，后端也会继续推进。
-let snapshot = backend.snapshot();
-while let Some(event) = backend.recv().await {
+// 不消费数据，后端也会继续推进。
+let snapshot = client.snapshot();
+while let Some(event) = events.recv().await {
     // Web、桌面或终端 UI 自行展示相同的领域数据。
 }
 backend.close().await?;
@@ -57,10 +58,10 @@ SessionEvent 表达输出、完成、列表、删除、模型选择和打开会�
 
 终端 smoke 发现最初的空快照会覆盖恢复出的标题，已修复：显示层保留恢复数据，直到后端发布第一次有效刷新，并添加对应回归测试。
 
-独立进程、网络连接、事件恢复游标及重连仍未实现。多个独立事件订阅已支持。SessionController 是后端运行所有者，close/Drop 结束执行；SessionClient 是可克隆命令与快照句柄，其 Drop 不影响执行。客户端可通过 subscribe() 创建独立 SessionSubscription；所有者保留自己的订阅用于进程内 TUI。新订阅只接收未来事件，不自动回放历史。
+独立进程、网络连接、事件恢复游标及重连仍未实现。多个独立事件订阅已支持。SessionController 是后端运行所有者，close/Drop 结束执行；SessionClient 是可克隆命令与快照句柄，其 Drop 不影响执行。客户端可通过 subscribe() 创建独立 SessionSubscription；构造函数同时返回独立初始订阅，TUI 持有该订阅；所有者不再提供事件消费方法。新订阅只接收未来事件，不自动回放历史。
 
 ```rust,ignore
-let backend = SessionController::new(harness, config, options, limits);
+let (backend, _events) = SessionController::new(harness, config, options, limits);
 let client = backend.client();
 client.submit(In::user_text("任务"));
 drop(client); // 后端仍执行；Server 将持续持有 backend。

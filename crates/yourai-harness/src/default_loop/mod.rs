@@ -29,7 +29,7 @@ impl AgentLoop for DefaultLoop {
     fn run_turn<'a>(&'a self, tc: TurnContext<'a>) -> BoxFuture<'a, TurnResult> {
         Box::pin(async move {
             let mut execution = Turn::open(tc).await?;
-            let steps = execution.config().steps;
+            let steps = execution.config().steps();
             let result = async {
                 if !execution.input_accepted() {
                     return Ok(());

@@ -57,7 +57,7 @@ with tempfile.TemporaryDirectory() as tmp:
     config = Path(tmp) / 'config.json'
     config.write_text(json.dumps({
         'models': {
-            'selected': 'mock/smoke',
+            'model': 'mock/smoke',
             'providers': {
                 'mock': {
                     'npm': '@ai-sdk/openai-compatible',
@@ -321,10 +321,12 @@ with tempfile.TemporaryDirectory() as tmp:
         assert child.returncode == 0
         assert termios.tcgetattr(slave) == original, 'terminal mode was not restored'
         saved = json.loads(config.read_text())
-        assert saved['models']['selected'] == 'mock/alt', saved['models']['selected']
+        assert saved['models']['model'] == 'mock/alt', saved['models']['model']
         assert saved['models'].get('variant') is None
         assert saved['models']['effort_overrides']['mock/alt'][''] == 'medium'
-        assert (Path(tmp) / 'prompts.json').is_file()
+        assert 'prompt' in saved and 'hooks' in saved
+        assert not (Path(tmp) / 'prompts.json').exists()
+        assert not (Path(tmp) / 'hooks.json').exists()
         print('PASS: /models two-step confirmation -> cancelled selection -> inherited/explicit effort -> configured defaults + complete F2 cycle + persisted config on HTTP requests')
     finally:
         if child.poll() is None:

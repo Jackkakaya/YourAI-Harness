@@ -102,9 +102,10 @@ pub(crate) async fn fixture_with_hooks(
         dir.path().join("session"),
         context,
         agent,
-        ExecutionOptions {
-            workspace_enabled: true,
-            ..Default::default()
+        {
+            let mut settings: ExecutionOptions = Default::default();
+            settings.set_workspace_enabled(true);
+            settings
         },
         "startup",
     )

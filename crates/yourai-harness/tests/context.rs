@@ -64,12 +64,13 @@ impl ModelProvider for Summarizer {
     }
 }
 fn policy() -> ContextPolicy {
-    ContextPolicy {
-        safety_margin: 100,
-        advance_tokens: Some(2000),
-        keep_recent_tokens: 0,
-        summary_min_savings: 10,
-        ..Default::default()
+    {
+        let mut settings: yourai_core::compactor::ContextPolicy = Default::default();
+        settings.set_safety_margin(100);
+        settings.set_advance_tokens(Some(2000));
+        settings.set_keep_recent_tokens(0);
+        settings.set_summary_min_savings(10);
+        settings
     }
 }
 async fn setup(
@@ -226,7 +227,7 @@ async fn request_projection_preserves_output_without_a_second_truncation() {
 #[tokio::test]
 async fn summary_keeps_original_tool_archive_and_survives_restore_and_fork() {
     let mut p = policy();
-    p.advance_tokens = Some(2200);
+    p.set_advance_tokens(Some(2200));
 
     let model = Summarizer::new();
     let hooks = Arc::new(support::Hooks::new(|_, _| {}));
@@ -286,7 +287,7 @@ async fn summary_keeps_original_tool_archive_and_survives_restore_and_fork() {
 #[tokio::test]
 async fn failed_summary_commit_keeps_history_unapplied_but_accounts_usage() {
     let mut p = policy();
-    p.advance_tokens = Some(3300);
+    p.set_advance_tokens(Some(3300));
 
     let model = Summarizer::new();
     let (dir, store, c) = setup(Some(4000), 500, p, model.clone(), None).await;
@@ -382,7 +383,7 @@ async fn long_turn_can_compact_closed_batches_while_retaining_its_user_request()
 #[tokio::test]
 async fn chunking_has_one_final_commit_and_enforces_call_budget() {
     let mut p = policy();
-    p.safety_margin = 100;
+    p.set_safety_margin(100);
     let model = Summarizer::new();
     let (_, store, c) = setup(Some(2200), 200, p, model.clone(), None).await;
     let mut messages: Vec<_> = (0..5)
@@ -672,7 +673,7 @@ async fn automatic_summary_failure_is_not_repeated_during_model_retries() {
         streams: Default::default(),
     });
     let mut p = policy();
-    p.advance_tokens = Some(3000);
+    p.set_advance_tokens(Some(3000));
     let (_, _, c) = setup(Some(4000), 500, p, model.clone(), None).await;
     append(
         &c,
@@ -1739,7 +1740,7 @@ async fn summary_format_retry_keeps_original_history_until_valid_reply() {
 #[tokio::test]
 async fn recent_retention_prefers_a_whole_user_exchange() {
     let mut p = policy();
-    p.keep_recent_tokens = 500;
+    p.set_keep_recent_tokens(500);
     let model = Summarizer::new();
     let (_, _, c) = setup(Some(12_000), 500, p, model.clone(), None).await;
     let recent_user = "recent request ".repeat(150);

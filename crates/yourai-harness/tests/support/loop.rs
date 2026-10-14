@@ -86,11 +86,12 @@ impl ContextManager for History {
         })
     }
     fn policy(&self) -> ContextPolicy {
-        ContextPolicy {
-            keep_recent_tokens: 0,
-            summary_min_savings: 1,
-            safety_margin: 0,
-            ..Default::default()
+        {
+            let mut settings: yourai_core::compactor::ContextPolicy = Default::default();
+            settings.set_keep_recent_tokens(0);
+            settings.set_summary_min_savings(1);
+            settings.set_safety_margin(0);
+            settings
         }
     }
     fn estimate(&self, request: &ChatRequest, _: &dyn ModelProvider) -> Result<u64, YourAiError> {
@@ -150,9 +151,10 @@ impl Model {
     }
     pub fn with_budget(mut self, context: u64, output: u32) -> Self {
         self.budget = ModelTokenBudget::resolve(
-            ModelLimits {
-                context: Some(context),
-                ..Default::default()
+            {
+                let mut settings: ModelLimits = Default::default();
+                settings.set_context(Some(context));
+                settings
             },
             Some(output),
         )

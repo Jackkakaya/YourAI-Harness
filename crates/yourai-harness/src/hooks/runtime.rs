@@ -14,8 +14,8 @@
 mod outcomes;
 use outcomes::*;
 
-use crate::hooks::config::{HookRegistration, HookSource};
 use crate::hooks::handler::{execute_with_timeout, handler_from_config};
+use crate::hooks::registration::{HookRegistration, HookSource};
 use crate::hooks::wire_output::{
     ElicitationAction, HookJsonOutput, HookSpecificOutput, LegacyDecision, PermissionBehavior,
     SyncOutput,
@@ -146,8 +146,8 @@ impl DefaultHookManager {
         config: &serde_json::Value,
         source: HookSource,
     ) -> Result<(), YourAiError> {
-        let regs =
-            crate::hooks::config::build_registrations(config, source).map_err(ErrorKind::Config)?;
+        let regs = crate::hooks::registration::build_registrations(config, source)
+            .map_err(ErrorKind::Config)?;
         let compiled = regs
             .into_iter()
             .map(|reg| self.compile(reg))
@@ -614,7 +614,7 @@ impl Drop for DefaultHookManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::config::HandlerConfig;
+    use crate::hooks::registration::HandlerConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::Notify;
@@ -677,7 +677,7 @@ mod tests {
             id: id.to_string(),
             event: yourai_core::hooks::HookEventKind::from_name(event_name).unwrap(),
             matcher,
-            handler: crate::hooks::config::HandlerConfig::Command {
+            handler: crate::hooks::registration::HandlerConfig::Command {
                 command: command.to_string(),
                 shell: None,
                 timeout: Some(5.0),

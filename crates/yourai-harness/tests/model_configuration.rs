@@ -75,17 +75,20 @@ fn configured(model: Arc<dyn ModelProvider>, output: u32) -> Arc<dyn ModelProvid
     model_fixture::TestModel::new(
         model,
         ModelTokenBudget::resolve(
-            ModelLimits {
-                context: Some(300_000),
-                output: Some(output),
-                ..Default::default()
+            {
+                let mut settings: ModelLimits = Default::default();
+                settings.set_context(Some(300_000));
+                settings.set_output(Some(output));
+                settings
             },
             None,
         )
         .unwrap(),
-        ModelTimeouts {
-            headers: Duration::from_secs(7),
-            read: Duration::from_secs(11),
+        {
+            let mut settings = ModelTimeouts::default();
+            settings.set_headers(Duration::from_secs(7));
+            settings.set_read(Duration::from_secs(11));
+            settings
         },
     )
     .unwrap()
@@ -107,11 +110,11 @@ async fn switching_models_updates_hooks_and_inherited_children_with_one_budget()
             vec![support::end("parent done", vec![])],
         ],
     );
-    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    config.config.prompt.system_prompt = Some("test".into());
-    config.config.session.extensions = true;
-    config.config.security.yolo = true;
-    config.config.hooks.events = serde_json::from_value(serde_json::json!({"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"prompt","prompt":"check"},{"type":"agent","prompt":"check"}]}]}})).unwrap();
+    let config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    config.config.set_system_prompt(Some("test".into()));
+    config.config.set_extensions(true);
+    config.config.set_yolo(true);
+    config.config.set_hooks({ let mut settings = yourai_harness :: config :: HookSettings :: default () ; settings . set_events (serde_json :: from_value (serde_json :: json ! ({ "hooks" : { "UserPromptSubmit" : [{ "hooks" : [{ "type" : "prompt" , "prompt" : "check" } , { "type" : "agent" , "prompt" : "check" }] }] } })) . unwrap ()) ; settings });
     let h = Harness::open(config, configured(old.clone(), 16_384))
         .await
         .unwrap();
@@ -158,10 +161,10 @@ async fn an_explicitly_pinned_child_keeps_its_model_after_parent_switch() {
         "parent",
         vec![vec![spawn()], vec![support::end("done", vec![])]],
     );
-    let mut config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-    config.config.prompt.system_prompt = Some("test".into());
-    config.config.session.extensions = true;
-    config.config.security.yolo = true;
+    let config = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+    config.config.set_system_prompt(Some("test".into()));
+    config.config.set_extensions(true);
+    config.config.set_yolo(true);
     let h = Harness::open(config, configured(old.clone(), 16_384))
         .await
         .unwrap();

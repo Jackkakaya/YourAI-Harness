@@ -47,8 +47,8 @@
 
 ### 模型配置与流转（/models 相关）
 
-- 当前配置已迁入 harness：共享 `Config` 按 models/execution/security/ui/session/prompt/hooks 分类，JSON 使用相同路径；`config.models.providers` 保存 Provider/模型 JSON 数据。
-- `Config.models.selected` 形如 `"provider/model"`。`Config::resolve(&self, variant)` 返回 `ResolvedModel`，不改写模型容量或共享配置。
+- 当前配置已迁入 harness：共享 `Config` 按 models/execution/security/ui/session/prompt/hooks 分类，JSON 使用相同路径；`config.models().providers()` 保存 Provider/模型 JSON 数据。
+- `config.models().model()` 形如 `"provider/model"`。`ModelSettings::resolve(&self)` 返回 `ResolvedModel`，不改写模型容量或共享配置。
 - 模型/effort 切换通过 `SessionClient.model`，后端在操作锁内解析、准备资源并保存配置，随后发布绑定；TUI 显示结果。
 - 每轮读取 Config.execution 的冻结副本；已开始轮次保持原参数。上下文策略位于 `execution.context`，容量来自选定模型的 ModelTokenBudget。
 - 以下界面重设计计划保留原讨论背景；当前实现与配置用法以 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13) 和 [TUI 文档](tui.md) 为准。
@@ -441,7 +441,7 @@ pub fn model_choices(config: &Config) -> Vec<ModelChoice>;
 
 - CLI 解析：`--resume` 后**无值或下一个参数以 `--` 开头** → 进入选择器；`--resume <ID>` 保留现状直接恢复。`--help` 与 usage 文案改为 `[--resume [SESSION_ID]]`。
 - 实现位置：`Harness::open` **之前**的独立轻量 alternate-screen 循环，新文件 `apps/yourai-tui/src/launcher.rs`（约 150-200 行），只需 `SessionCatalog::new(config.session_dir())` + `store.list_sessions()`，不依赖 harness。
-  - 流程：`Config::load`（及 `--check-config` 等早退分支）之后、`Harness::open` 之前：picker 模式 → `launcher::pick(&config) -> Result<Option<SessionId>, Error>`：`Some(id)` → `hc.resume = Some(id)` 正常启动；`None`（Esc）→ 全新会话继续。
+  - 流程：`Config::init`（及 `--check-config` 等早退分支）之后、`Harness::open` 之前：picker 模式 → `launcher::pick(&config) -> Result<Option<SessionId>, Error>`：`Some(id)` → `hc.resume = Some(id)` 正常启动；`None`（Esc）→ 全新会话继续。
   - 键位：字符输入 = 过滤、Backspace 删除、`↑↓`/`Ctrl-P/N` 移动、`Enter` 选择、`Esc` = 新建会话、`Ctrl-Q` = 直接退出进程。
   - 空数据提示：`No sessions yet — Esc to start fresh`。
 - 搜索逻辑抽纯函数 `filter_sessions(items: &[SessionMeta], query: &str) -> Vec<usize>`（大小写不敏感，命中 title/id/model），launcher 与 `/sessions` 共用，便于单测。
@@ -491,7 +491,7 @@ pub fn model_choices(config: &Config) -> Vec<ModelChoice>;
 | `apps/yourai-tui/src/ui/render.rs` | 删 `sidebar()` → 拆成 `todo_panel()` + `stats_overlay()` + `model_picker()` + `sessions_overlay()`；footer 两段式；**工具卡片渲染器**（类型化预览 + diff 行号槽/整行底色 + spinner）；**运行指示条**；圆角化 + Block title 归位；窄屏 TODO dock；输入框动态高度公式；elapsed `Xm Ys`；`ctx_pressure()`；`help()` 文案；（P2）transcript 滚动条 | ~700 行 |
 | `apps/yourai-tui/src/ui/theme.rs` | 语义槽 10→14（FAINT/YELLOW/DIFF_ADD_BG/DIFF_DEL_BG）；**11 套 IDE 调色板**（§4.7 表）；`Palette` struct 重构 + `apply()` 查表换色；`Theme::System` + `detect_system_theme()` | ~200 行 |
 | `apps/yourai-tui/src/ui/state.rs` | 字段重命名（sidebar→stats、todos_expanded→todo_panel）；新增 `model_label`、`model_picker`、`session_picker`；`activity()` 增加限流分支 | ~50 行 |
-| `apps/yourai-tui/src/ui.rs` | `^B/^T` 新语义；picker 键盘路由；**删除 context 刷新的 sidebar 前置条件**；Esc 关 overlay 顺序；`ui::run` 签名增加 `Arc<Mutex<Config>>`（或 switcher）与 `Vec<ModelChoice>`；删 `FooterAction` 分发；会话切换重建流程 | ~120 行 |
+| `apps/yourai-tui/src/ui.rs` | `^B/^T` 新语义；picker 键盘路由；**删除 context 刷新的 sidebar 前置条件**；Esc 关 overlay 顺序；`ui::run` 签名增加 `Arc<Config>`（或 switcher）与 `Vec<ModelChoice>`；删 `FooterAction` 分发；会话切换重建流程 | ~120 行 |
 | `apps/yourai-tui/src/ui/commands.rs` | `/status`、`/models`、`/sessions` 条目 | ~10 行 |
 | `apps/yourai-tui/src/config.rs`（或新 `models.rs`） | `ModelChoice` + `model_choices()`（遍历 provider/models/variants，过滤 disabled） | ~50 行 |
 | `apps/yourai-tui/src/launcher.rs`（新文件） | 启动会话选择器（独立 TUI 循环 + `filter_sessions()` 纯函数） | ~200 行 |

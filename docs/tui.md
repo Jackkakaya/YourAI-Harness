@@ -21,28 +21,26 @@ yourai
 
 | 类别 | 内容 |
 |---|---|
-| models | selected、compaction、variant、effort_overrides、providers |
+| models | model、compaction、variant、effort_overrides、providers |
 | execution | steps、上下文/附件策略、超时、重试、技能/记忆执行参数 |
 | security | yolo、trusted_shell |
 | ui | theme |
 | session | directory、extensions |
 | prompt | system_prompt、提示词文件引用、追加内容及长度上限 |
-| hooks | events、可选 file |
+| hooks | events |
 
-主配置 `yourai.json` 保存 models/execution/security/ui/session/hooks；同目录 `prompts.json` 是 prompt 类别的独立数据文件（示例见 [prompts.example.json](../prompts.example.json)）。Hook 少时写 `hooks.events`，多时使用 `"hooks": {"file":"hooks.json"}`；独立文件内容为 `{ "hooks": { "events": { ... } } }`。引用路径相对于主配置文件，不合并两份 Hook。独立 Hook 文件的旧事件 map 格式也可读。
+一个 `yourai.json` 保存全部七组配置，包括 `prompt` 和 `hooks.events`。完整示例见 [yourai.example.json](../yourai.example.json)。`Config::init` 只读 JSON，分类 getter/setter 只访问数据，`Config::save()` 原子保存整份配置。业务校验与保存后的发布由使用方负责；运行中的模型、权限、主题操作经 controller。
 
-启动只加载一次，所有类别统一通过 `config::update` 修改缓存，并同步保存发生变化的来源；运行中不重新读取配置文件。保存成功后发布共享内存，失败保留旧值。外部编辑文件下次启动加载。已运行的轮次保留冻结参数，下一轮读取新的执行参数；Prompt/Hook 的会话资源仍在新建会话时装配。
+旧平铺字段、相邻 `prompts.json` 和 `hooks.file` 可以迁移读取。主 JSON 的 `prompt` 优先；下一次保存全部内嵌到主 JSON，旧文件保留且不再参与覆盖。保存不重新读取外部文件。已有轮次使用冻结参数，下一轮取得新执行参数；Prompt/Hook 在新会话装配时生效。
 
-旧的平铺配置、内嵌 prompt 均可继续读取，首次普通保存转成分类格式，并先保留 prompt 到独立文件。同一字段同时出现在平铺和分类位置时报错，不静默覆盖。
-
-`--config PATH` 支持 JSON 和 `.db`/`.sqlite`/`.sqlite3`。SQLite 在 app_config 表保存相同的分类 JSON 文档；空库从邻近 yourai.json 导入一次。更新只写所选主配置源，Prompt 和可选 Hook 文件仍独立。
+`--config PATH` 指定一个 JSON 配置文件；会话数据仍使用 SQLite，与配置文件不同。
 
 ## 模型配置
 
 ```json
 {
   "models": {
-    "selected": "gateway/YOUR_MODEL_NAME",
+    "model": "gateway/YOUR_MODEL_NAME",
     "providers": {
       "gateway": {
         "api": "openai-compatible",

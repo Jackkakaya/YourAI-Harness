@@ -53,7 +53,7 @@ fn block(out: &mut Vec<String>, name: &str, text: &str) {
 }
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare(
-    config: &crate::config::Config,
+    config: &crate::config::PromptSettings,
     cwd: &Path,
     base: Option<&str>,
     instructions: &[PathBuf],
@@ -65,23 +65,18 @@ pub async fn prepare(
     if cancel.is_cancelled() {
         return Err(AbortReason::Cancelled.into());
     }
-    let soul = file(
-        cwd,
-        config.prompt.soul_file.as_deref(),
-        "SOUL.md",
-        usize::MAX,
-    )?;
+    let soul = file(cwd, config.soul_file().as_deref(), "SOUL.md", usize::MAX)?;
     let memory_file = file(
         cwd,
-        config.prompt.memory_file.as_deref(),
+        config.memory_file().as_deref(),
         "Memory.md",
-        config.prompt.memory_file_max_chars,
+        config.memory_file_max_chars(),
     )?;
     let profile = file(
         cwd,
-        config.prompt.profile_file.as_deref(),
+        config.profile_file().as_deref(),
         "profile.md",
-        config.prompt.profile_file_max_chars,
+        config.profile_file_max_chars(),
     )?;
     let mut out = vec![];
     block(&mut out, "SOUL.md", soul.as_ref().map(|(_, s)| s.as_str()).unwrap_or("You are YourAI, a thoughtful, direct programming collaborator. Be honest about uncertainty and respect the user's intent."));
@@ -90,7 +85,7 @@ pub async fn prepare(
     block(
         &mut out,
         "Additional instructions",
-        config.prompt.append_system_prompt.as_deref().unwrap_or(""),
+        config.append_system_prompt().as_deref().unwrap_or(""),
     );
     let excluded: BTreeSet<_> = [&soul, &memory_file, &profile]
         .into_iter()
@@ -171,7 +166,7 @@ pub async fn prepare(
             r = tokio::time::timeout(Duration::from_secs(30), memory.system_prompt_block(cancel)) => r.map_err(|_| error("memory", "initial background timed out")).and_then(|r| r),
         };
         match result {
-            Ok(Some(text)) if text.chars().count() <= config.prompt.provider_max_chars => block(
+            Ok(Some(text)) if text.chars().count() <= config.provider_max_chars() => block(
                 &mut out,
                 "External memory background",
                 &format!("Background snapshot; may become outdated.\n{text}"),

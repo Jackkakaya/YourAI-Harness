@@ -209,10 +209,7 @@ async fn rejected_resume_and_restore_do_not_change_active_session_metadata() {
         id.clone(),
         dir.path().into(),
         Agent::builder().model(NamedModel::new("third")),
-        ExecutionOptions {
-            context_policy: ContextPolicy::default(),
-            ..Default::default()
-        },
+        ExecutionOptions::default(),
         "resume",
     )
     .await
@@ -330,10 +327,9 @@ async fn failed_assembly_releases_execution_lease_for_the_next_open() {
     harness.close().await.unwrap();
     let mut config = SessionOptions::new(root.clone(), dir.path().into());
     config.resume = Some(id.clone());
-    config.config.hooks.events = serde_json::from_value(serde_json::json!({
-        "hooks": {"UnknownEvent": [{"hooks": [{"type":"command", "command":"true"}]}]}
-    }))
-    .unwrap();
+    config
+        .config
+        .set_hooks({ let mut settings = yourai_harness :: config :: HookSettings :: default () ; settings . set_events (serde_json :: from_value (serde_json :: json ! ({ "hooks" : { "UnknownEvent" : [{ "hooks" : [{ "type" : "command" , "command" : "true" }] }] } })) . unwrap ()) ; settings });
     assert!(Harness::open(config, NamedModel::new("failed"))
         .await
         .is_err());
@@ -342,9 +338,10 @@ async fn failed_assembly_releases_execution_lease_for_the_next_open() {
         id,
         dir.path().into(),
         Agent::builder().model(NamedModel::new("restored")),
-        ExecutionOptions {
-            context_policy: ContextPolicy::default(),
-            ..Default::default()
+        {
+            let mut settings: yourai_core::execution::ExecutionOptions = Default::default();
+            settings.set_context_policy(ContextPolicy::default());
+            settings
         },
         "resume",
     )

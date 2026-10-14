@@ -27,7 +27,6 @@ Cargo 将 `yourai` 安装到 bin 目录，通常是 `~/.cargo/bin`。也可以�
 ```sh
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/yourai"
 cp yourai.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/yourai/yourai.json"
-cp prompts.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/yourai/prompts.json"
 ```
 
 编辑这个文件，将 **三处** `YOUR_MODEL_NAME` 都替换成服务提供的模型 ID，设置 `baseURL`，并按照模型实际容量填写上下文和输出上限：
@@ -35,7 +34,7 @@ cp prompts.example.json "${XDG_CONFIG_HOME:-$HOME/.config}/yourai/prompts.json"
 ```json
 {
   "models": {
-    "selected": "gateway/YOUR_MODEL_NAME",
+    "model": "gateway/YOUR_MODEL_NAME",
     "providers": {
       "gateway": {
         "api": "openai-compatible",
@@ -67,11 +66,11 @@ yourai --check-config
 
 `--check-config` 只验证配置，不请求模型。默认配置位置是 `$XDG_CONFIG_HOME/yourai/yourai.json`，未设置时使用 `~/.config/yourai/yourai.json`；可通过 `--config PATH` 指定其他文件。
 
-配置按 `models`、`execution`、`security`、`ui`、`session`、`prompt`、`hooks` 分类，Rust 和 JSON 使用相同路径。主配置保存在 `yourai.json`，Prompt 单独保存在同目录 `prompts.json`。Hook 少时放在 `hooks.events`，多时使用 `"hooks": {"file":"hooks.json"}`；独立文件格式为 `{"hooks":{"events":{...}}}`，路径相对于主配置。
+所有配置保存在一个 `yourai.json`，按 `models`、`execution`、`security`、`ui`、`session`、`prompt`、`hooks` 分组。Rust 数据定义集中在 `config.rs`：固定字段使用 struct，供应商扩展参数使用 JSON Map。`Config::init` 读取，成对的分类 getter/setter 访问数据，`Config::save()` 原子替换完整 JSON；字段私有，全局共享一份 `Arc<Config>`。
 
-所有文件只在启动时加载到一份共享 `Config`。应用内修改通过 `config::update` 同步保存并更新内存，不重新加载文件；外部修改下次启动生效。模型、YOLO 和主题通过现有应用操作更新资源，执行参数下一轮使用；Prompt 与 Hook 用于新建会话。
+Prompt 写在 `prompt`，Hook 写在 `hooks.events`。模型选择和客户端构建由模型模块负责；普通 setter 直接更新共享数据，再显式 save；保存失败保留内存修改。模型与安全切换先准备资源，保存失败回滚对应配置组。运行操作经 `SessionClient::model/change_yolo/change_theme`，内部 `apply_*` 只应用运行效果。已有轮次保留冻结参数，Prompt 与 Hook 用于新建会话。
 
-旧平铺配置仍兼容，首次普通保存迁移为分类格式。同一字段同时使用新旧位置会报错。主配置也支持 SQLite：`yourai --config /path/to/yourai.sqlite3`；空库从相邻 `yourai.json` 导入一次，后续只写所选源，Prompt 与可选 Hook 文件仍独立。
+旧平铺字段、相邻旧 `prompts.json` 和旧 `hooks.file` 引用仅用于迁移读取。主 JSON 中显式的 `prompt` 优先；下一次保存将全部配置内嵌到主 JSON，移除 Hook 文件引用，保留旧文件作为备份。迁移后旧文件不再覆盖主配置。未知字段和重复的新旧字段定义报错；外部修改下次初始化生效。
 
 还支持 `openai-responses`、`anthropic`、`gemini` 和 `ollama` API。多模型、思考强度和 variant 的配置见[模型配置说明](./docs/tui.md#模型配置)。
 

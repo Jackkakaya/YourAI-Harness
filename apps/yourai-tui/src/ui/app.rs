@@ -55,7 +55,8 @@ pub(super) struct App {
 
 impl App {
     pub(super) fn new(controller: Controller, mut view: View, meta: Metadata) -> Self {
-        view.draft.set_cwd(&controller.environment().cwd);
+        view.draft
+            .set_cwd(&controller.backend.client().environment().cwd);
         Self {
             renderer: Renderer::default(),
             controller,
@@ -72,7 +73,7 @@ impl App {
 
     /// The session-output channel, lent to the loop's `select!`.
     pub(super) async fn recv(&mut self) -> Option<yourai_harness::controller::SessionEvent> {
-        self.controller.recv().await
+        self.controller.events.recv().await
     }
 
     /// Reconcile one streaming output and any finished session operation.
@@ -86,7 +87,7 @@ impl App {
         let had_ask = !self.view.asks_empty();
         let was_active = self.view.session.active;
         let switched = self.controller.poll(&mut self.view, first).await;
-        let environment = self.controller.environment();
+        let environment = self.controller.backend.client().environment();
         if switched {
             self.meta.session = environment.id.as_str().to_owned();
             self.renderer = Renderer::default();
@@ -153,7 +154,12 @@ impl App {
     /// Refresh the Todo sidebar from the harness task board, only when the
     /// board changed since the last sync.
     pub(super) fn sync_todos(&mut self) {
-        if let Some((version, tasks)) = self.controller.tasks_since(self.synced_todos) {
+        if let Some((version, tasks)) = self
+            .controller
+            .backend
+            .client()
+            .tasks_since(self.synced_todos)
+        {
             self.synced_todos = Some(version);
             let todos = tasks
                 .into_iter()
@@ -198,7 +204,7 @@ impl App {
             .git_refreshed
             .is_none_or(|at| at.elapsed() >= GIT_REFRESH_INTERVAL);
         if self.git_task.is_none() && due {
-            let cwd = self.controller.environment().cwd.clone();
+            let cwd = self.controller.backend.client().environment().cwd.clone();
             self.git_task = Some(tokio::spawn(async move {
                 crate::git::GitContext::detect(&cwd).await
             }));
@@ -214,7 +220,10 @@ impl App {
 
     /// `(queued inputs, compacting)` for the status line.
     pub(super) fn pressure(&self) -> (usize, bool) {
-        (self.controller.queued(), self.controller.compacting())
+        (
+            self.controller.backend.client().queued(),
+            self.controller.backend.client().compacting(),
+        )
     }
 
     /// Build the complete canvas for `area`. Hit regions recorded here are
@@ -227,7 +236,7 @@ impl App {
         compacting: bool,
     ) -> Canvas {
         // The permission mirror is refreshed from its owner every frame.
-        self.meta.yolo = self.controller.yolo();
+        self.meta.yolo = self.controller.backend.client().yolo();
         self.renderer
             .prepare(area, &mut self.view, &self.meta, time, queued, compacting)
     }
@@ -367,7 +376,7 @@ impl App {
                 self.view.session.navigation.reveal(self.view.selected());
             }
             KeyCode::Char('b') if ctrl => self.view.overlay = Overlay::Stats { scroll: 0 },
-            KeyCode::Char('y') if ctrl => self.set_theme(self.view.theme.next()),
+            KeyCode::Char('y') if ctrl => self.change_theme(self.view.theme.next()),
             // Hand the draft to $VISUAL/$EDITOR. Only while no ask is pending:
             // the ask's own reply editor must keep the keyboard then. The
             // readline association (bash's Ctrl-X Ctrl-E) carries the intent.
@@ -380,8 +389,8 @@ impl App {
                 self.renderer.jump_turn(&mut self.view, false);
             }
             KeyCode::Char('g') if ctrl => {
-                let enabled = !self.controller.yolo();
-                self.set_yolo(enabled);
+                let enabled = !self.controller.backend.client().yolo();
+                self.change_yolo(enabled);
             }
             KeyCode::End if ctrl => {
                 self.view.follow();
@@ -401,7 +410,7 @@ impl App {
             KeyCode::PageUp => self.renderer.scroll(&mut self.view, 10, true),
             KeyCode::PageDown => self.renderer.scroll(&mut self.view, 10, false),
             KeyCode::Esc | KeyCode::Char('c') if key.code == KeyCode::Esc || ctrl => {
-                self.controller.interrupt();
+                self.controller.backend.client().interrupt();
                 self.view.dismiss_asks();
                 self.view.notice(Level::Info, "Cancellation requested.");
             }
@@ -481,7 +490,7 @@ impl App {
             match ask.answer() {
                 Ok(payload) => {
                     let id = ask.id.clone();
-                    match self.controller.reply(id, payload, &mut self.view) {
+                    match self.controller.backend.client().reply(id, payload) {
                         Reply::Sent => {
                             self.view.dismiss_ask();
                             self.view.notice(Level::Info, "Reply sent.");
@@ -526,7 +535,7 @@ impl App {
             }
             Some(commands::Parsed::Yolo(arg)) => {
                 let enabled = match arg {
-                    commands::YoloArg::Toggle => !self.controller.yolo(),
+                    commands::YoloArg::Toggle => !self.controller.backend.client().yolo(),
                     commands::YoloArg::On => true,
                     commands::YoloArg::Off => false,
                     // A usage error keeps the draft for editing, like the
@@ -537,7 +546,7 @@ impl App {
                     }
                 };
                 self.view.draft.set_text("");
-                self.set_yolo(enabled);
+                self.change_yolo(enabled);
                 return Flow::Continue;
             }
             Some(commands::Parsed::Theme(name)) => {
@@ -551,7 +560,7 @@ impl App {
                         self.view.overlay = Overlay::Themes(current_idx);
                     }
                     Some(name) => match theme::Theme::parse(&name) {
-                        Some(theme) => self.set_theme(theme),
+                        Some(theme) => self.change_theme(theme),
                         None => self.view.notice(
                             Level::Warning,
                             format!("Themes: {}. /theme NAME", theme_names()),
@@ -671,7 +680,7 @@ impl App {
                     &mut self.view,
                 );
             }
-            OverlayAction::Theme(theme) => self.set_theme(theme),
+            OverlayAction::Theme(theme) => self.change_theme(theme),
             OverlayAction::Session(id) => {
                 self.controller.switch(Target::Resume(id), &mut self.view);
             }
@@ -735,7 +744,7 @@ impl App {
             .as_str()
             .unwrap_or("tool")
             .to_owned();
-        match self.controller.reply(id, choice.reply(), &mut self.view) {
+        match self.controller.backend.client().reply(id, choice.reply()) {
             Reply::Sent => {
                 self.view.dismiss_ask();
                 self.view.notice(
@@ -760,16 +769,15 @@ impl App {
         Flow::Continue
     }
 
-    fn set_theme(&mut self, theme: super::theme::Theme) {
-        match self.controller.set_theme(theme.name()) {
-            Ok(()) => self.view.theme = theme,
-            Err(error) => self
-                .view
-                .notice(Level::Warning, format!("Could not save theme: {error}")),
+    fn change_theme(&mut self, theme: super::theme::Theme) {
+        self.view.theme = theme;
+        if let Err(error) = self.controller.backend.client().change_theme(theme.name()) {
+            self.view
+                .notice(Level::Warning, format!("Could not save theme: {error}"));
         }
     }
-    fn set_yolo(&mut self, enabled: bool) {
-        match self.controller.set_yolo(enabled) {
+    fn change_yolo(&mut self, enabled: bool) {
+        match self.controller.backend.client().change_yolo(enabled) {
             Ok(()) => {
                 self.view.notice(
                     Level::Info,
@@ -907,7 +915,7 @@ mod tests {
     }
     async fn finish(app: &mut App) {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while app.controller.busy() {
+            while app.controller.backend.client().busy() {
                 app.poll(None).await;
                 tokio::task::yield_now().await;
             }
@@ -939,6 +947,7 @@ mod tests {
     async fn ordinary_send_queues_and_click_promotes_that_message() {
         let (_dir, mut app) = fixture().await;
         app.controller
+            .backend
             .harness()
             .switch_model(std::sync::Arc::new(WaitingModel), ContextPolicy::default())
             .await
@@ -947,7 +956,7 @@ mod tests {
         app.handle(key(KeyCode::Enter));
         tokio::time::timeout(Duration::from_secs(5), async {
             while !matches!(
-                app.controller.harness().host.status(),
+                app.controller.backend.harness().host.status(),
                 SessionStatus::Running { .. }
             ) {
                 app.poll(None).await;
@@ -992,7 +1001,7 @@ mod tests {
             }
         }
         tokio::time::timeout(Duration::from_secs(5), async {
-            while app.controller.harness().host.queued() != 0 {
+            while app.controller.backend.harness().host.queued() != 0 {
                 app.poll(None).await;
                 tokio::task::yield_now().await;
             }
@@ -1034,7 +1043,7 @@ mod tests {
             effort: None,
         }];
         app.handle(key(KeyCode::F(2)));
-        assert!(!app.controller.busy());
+        assert!(!app.controller.backend.client().busy());
         // Two choices: F2 starts a switch to the next one in picker order.
         app.view.model_choices.push(crate::models::ModelChoice {
             id: "mock/other".into(),
@@ -1043,7 +1052,7 @@ mod tests {
             effort: None,
         });
         app.handle(key(KeyCode::F(2)));
-        assert!(app.controller.busy());
+        assert!(app.controller.backend.client().busy());
         finish(&mut app).await;
         app.close().await.unwrap();
     }
@@ -1205,7 +1214,7 @@ mod tests {
         app.view.draft.set_text("");
         type_text(&mut app, "/yolo on");
         app.handle(key(KeyCode::Enter));
-        assert!(app.controller.yolo());
+        assert!(app.controller.backend.client().yolo());
         // The Metadata mirror refreshes from its owner at paint time.
         app.paint(
             Rect::new(0, 0, 80, 24),
@@ -1240,13 +1249,13 @@ mod tests {
     #[tokio::test]
     async fn new_session_switches_and_keeps_the_inflight_draft() {
         let (_dir, mut app) = fixture().await;
-        let old = app.controller.harness().host.environment().id;
+        let old = app.controller.backend.harness().host.environment().id;
         type_text(&mut app, "/new");
         app.handle(key(KeyCode::Enter));
-        assert!(app.controller.busy());
+        assert!(app.controller.backend.client().busy());
         type_text(&mut app, "draft typed while opening");
         finish(&mut app).await;
-        assert_ne!(app.controller.harness().host.environment().id, old);
+        assert_ne!(app.controller.backend.harness().host.environment().id, old);
         assert_eq!(app.view.draft.text(), "draft typed while opening");
         assert_ne!(app.meta.session, old.as_str());
         app.close().await.unwrap();
@@ -1255,7 +1264,7 @@ mod tests {
     #[tokio::test]
     async fn todo_sync_runs_only_when_the_board_changes() {
         let (_dir, mut app) = fixture().await;
-        let tasks = app.controller.harness().tasks.clone().unwrap();
+        let tasks = app.controller.backend.harness().tasks.clone().unwrap();
         app.sync_todos();
         let cached = app.synced_todos;
         assert!(app.view.session.todos.is_empty());
@@ -1388,7 +1397,7 @@ mod tests {
     #[tokio::test]
     async fn regression_cwd_change_refreshes_footer_and_file_completion() {
         let (dir, mut app) = fixture().await;
-        let host = app.controller.harness().host.clone();
+        let host = app.controller.backend.harness().host.clone();
         let original = host.environment().cwd;
         app.meta.cwd = original.to_string_lossy().into_owned();
         let next = dir.path().join("next-workspace");
@@ -1439,7 +1448,7 @@ mod tests {
     #[tokio::test]
     async fn regression_new_session_preserves_live_working_directory() {
         let (dir, mut app) = fixture().await;
-        let host = app.controller.harness().host.clone();
+        let host = app.controller.backend.harness().host.clone();
         let next = dir.path().join("next-workspace");
         std::fs::create_dir(&next).unwrap();
         host.workspace().unwrap().change_cwd(&next).await.unwrap();
@@ -1447,7 +1456,7 @@ mod tests {
         app.poll(None).await;
         app.controller.switch(super::Target::New, &mut app.view);
         finish(&mut app).await;
-        let actual = app.controller.harness().host.environment().cwd;
+        let actual = app.controller.backend.harness().host.environment().cwd;
         app.close().await.unwrap();
         assert_eq!(actual, expected);
     }
@@ -1472,13 +1481,16 @@ mod tests {
             }
         ));
         assert!(
-            !app.controller.busy(),
+            !app.controller.backend.client().busy(),
             "the first Enter must not switch models"
         );
         app.handle(key(KeyCode::Down));
         app.handle(key(KeyCode::Esc));
         assert!(matches!(app.view.overlay, Overlay::Models(0)));
-        assert!(!app.controller.busy(), "cancelling must not apply effort");
+        assert!(
+            !app.controller.backend.client().busy(),
+            "cancelling must not apply effort"
+        );
         app.handle(key(KeyCode::Enter));
         app.handle(key(KeyCode::Enter));
         assert!(!app.view.overlay.is_open());
@@ -1513,12 +1525,12 @@ mod tests {
     ) -> (
         tempfile::TempDir,
         App,
-        std::sync::Arc<std::sync::Mutex<crate::config::Config>>,
+        std::sync::Arc<yourai_harness::config::Config>,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let mut value = serde_json::json!({
           "models": {
-            "selected": "mock/a",
+            "model": "mock/a",
             "providers": {
               "mock": {
                 "options": {
@@ -1548,11 +1560,11 @@ mod tests {
         let cfg: crate::config::Config = serde_json::from_value(value).unwrap();
         let path = dir.path().join("yourai.json");
         std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
-        let cfg = crate::config::Config::load(&path).unwrap();
-        let model = cfg.resolve(None).unwrap().model;
-        let mut hc =
+        let cfg = crate::config::Config::init(&path).unwrap();
+        let model = cfg.models().resolve().unwrap().model;
+        let hc =
             yourai_harness::SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-        hc.config.prompt.system_prompt = Some("test".into());
+        hc.config.set_system_prompt(Some("test".into()));
         let h = yourai_harness::Harness::open(hc.clone(), model)
             .await
             .unwrap();
@@ -1560,7 +1572,7 @@ mod tests {
         view.model.label = "mock/a".into();
         view.model.effort = Some("low".into());
         view.model_choices = crate::models::model_choices(&cfg);
-        let cfg = std::sync::Arc::new(std::sync::Mutex::new(cfg));
+        let cfg = std::sync::Arc::new(cfg);
         let controller = session::Controller::new(h, cfg.clone(), hc, TurnLimits::default());
         let app = App::new(
             controller,
@@ -1601,11 +1613,17 @@ mod tests {
         app.handle(key(KeyCode::Enter));
         app.handle(key(KeyCode::Enter));
         finish(&mut app).await;
-        assert!(
-            !cfg.lock().unwrap().models.providers["mock"].models["a"].variants["inherit"]
-                .options
-                .contains_key("reasoningEffort")
-        );
+        assert!(!cfg
+            .models()
+            .provider("mock")
+            .unwrap()
+            .model("a")
+            .unwrap()
+            .variant("inherit")
+            .unwrap()
+            .options()
+            .unwrap()
+            .contains_key("reasoningEffort"));
         // A base change must still reach the variant after that confirmation.
         app.controller.model(
             "mock/a".into(),
@@ -1619,11 +1637,17 @@ mod tests {
         app.handle(key(KeyCode::Enter));
         finish(&mut app).await;
         assert_eq!(app.view.model.effort.as_deref(), Some("high"));
-        assert!(
-            !cfg.lock().unwrap().models.providers["mock"].models["a"].variants["inherit"]
-                .options
-                .contains_key("reasoningEffort")
-        );
+        assert!(!cfg
+            .models()
+            .provider("mock")
+            .unwrap()
+            .model("a")
+            .unwrap()
+            .variant("inherit")
+            .unwrap()
+            .options()
+            .unwrap()
+            .contains_key("reasoningEffort"));
         // Intentionally changing high to low pins only the variant.
         app.view.overlay = Overlay::Models(inherited);
         app.handle(key(KeyCode::Enter));
@@ -1644,8 +1668,7 @@ mod tests {
         finish(&mut app).await;
         assert_eq!(app.view.model.effort.as_deref(), Some("low"));
         assert_eq!(
-            cfg.lock()
-                .unwrap()
+            cfg.models()
                 .effective_effort("mock/a", Some("inherit"))
                 .as_deref(),
             Some("low")
@@ -1659,11 +1682,34 @@ mod tests {
         app.handle(key(KeyCode::Enter));
         finish(&mut app).await;
         assert_eq!(app.view.model.effort.as_deref(), Some("medium"));
-        assert!(
-            !cfg.lock().unwrap().models.providers["mock"].models["a"].variants["inherit"]
-                .options
-                .contains_key("reasoningEffort")
-        );
+        assert!(!cfg
+            .models()
+            .provider("mock")
+            .unwrap()
+            .model("a")
+            .unwrap()
+            .variant("inherit")
+            .unwrap()
+            .options()
+            .unwrap()
+            .contains_key("reasoningEffort"));
+        app.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn failed_save_keeps_local_theme_but_does_not_enable_runtime_yolo() {
+        let (dir, mut app, config) = model_fixture(false).await;
+        let path = dir.path().join("yourai.json");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        app.change_theme(crate::ui::theme::Theme::Nord);
+        assert_eq!(app.view.theme, crate::ui::theme::Theme::Nord);
+        assert_eq!(config.ui().theme(), "nord");
+        let client = app.controller.backend.client();
+        assert!(client.change_yolo(true).is_err());
+        assert!(!client.yolo());
+        assert!(!config.security().yolo());
+        assert_eq!(config.ui().theme(), "nord");
+        assert!(path.is_dir());
         app.close().await.unwrap();
     }
 }

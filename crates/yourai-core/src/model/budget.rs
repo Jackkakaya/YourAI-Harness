@@ -1,12 +1,14 @@
 //! Model capacity and generation settings have one owner: the selected model.
 use crate::{chat::*, model::ModelProvider, ErrorKind, YourAiError};
 
+crate::settings_fields! {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelLimits {
-    pub context: Option<u64>,
-    pub input: Option<u64>,
-    pub output: Option<u32>,
+    context: Option<u64> => set_context [value],
+    input: Option<u64> => set_input [value],
+    output: Option<u32> => set_output [value],
+}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,10 +102,12 @@ mod tests {
     use super::*;
     #[test]
     fn output_precedence_and_independent_input_limits() {
-        let limits = ModelLimits {
-            context: Some(300_000),
-            input: Some(100_000),
-            output: Some(131_072),
+        let limits = {
+            let mut settings = ModelLimits::default();
+            settings.set_context(Some(300_000));
+            settings.set_input(Some(100_000));
+            settings.set_output(Some(131_072));
+            settings
         };
         let budget = ModelTokenBudget::resolve(limits, None).unwrap();
         assert_eq!(budget.max_output_tokens(), 131_072);

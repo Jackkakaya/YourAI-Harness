@@ -18,16 +18,18 @@ pub enum CompactionTrigger {
     Manual,
 }
 
+crate::settings_fields! {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ContextPolicy {
-    pub safety_margin: u64,
+    safety_margin: u64 => set_safety_margin [value],
     /// Explicit early-compaction distance below the hard input budget.
     /// Unset reserves 10% of the window, at least 16k for windows >= 32k.
-    pub advance_tokens: Option<u64>,
-    pub keep_recent_tokens: u64,
-    pub summary_tokens: u64,
-    pub summary_min_savings: u64,
+    advance_tokens: Option<u64> => set_advance_tokens [value],
+    keep_recent_tokens: u64 => set_keep_recent_tokens [value],
+    summary_tokens: u64 => set_summary_tokens [value],
+    summary_min_savings: u64 => set_summary_min_savings [value],
+}
 }
 impl Default for ContextPolicy {
     fn default() -> Self {
@@ -72,7 +74,7 @@ impl ContextPolicy {
             return Some(input.saturating_sub(advance));
         }
         let limits = budget.limits();
-        let window = match (limits.input, limits.context) {
+        let window = match (limits.input(), limits.context()) {
             (Some(a), Some(b)) => a.min(b),
             (a, b) => a.or(b)?,
         };
@@ -798,9 +800,10 @@ mod tests {
         let policy = ContextPolicy::default();
         let budget = |context, output| {
             ModelTokenBudget::resolve(
-                ModelLimits {
-                    context: Some(context),
-                    ..Default::default()
+                {
+                    let mut settings: ModelLimits = Default::default();
+                    settings.set_context(Some(context));
+                    settings
                 },
                 Some(output),
             )
@@ -830,19 +833,21 @@ mod tests {
             policy.maintenance_threshold(ModelTokenBudget::default()),
             None
         );
-        let explicit = ContextPolicy {
-            advance_tokens: Some(4096),
-            ..policy
+        let explicit = {
+            let mut settings = policy;
+            settings.set_advance_tokens(Some(4096));
+            settings
         };
         assert_eq!(
             explicit.maintenance_threshold(budget(128_000, 4000)),
             Some(118_880)
         );
         let input_limited = ModelTokenBudget::resolve(
-            ModelLimits {
-                context: Some(128_000),
-                input: Some(64_000),
-                ..Default::default()
+            {
+                let mut settings: ModelLimits = Default::default();
+                settings.set_context(Some(128_000));
+                settings.set_input(Some(64_000));
+                settings
             },
             Some(4000),
         )

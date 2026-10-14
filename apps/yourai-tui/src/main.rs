@@ -1,5 +1,5 @@
 mod branding;
-mod config;
+use yourai_harness::config;
 mod git;
 mod launcher;
 mod models;
@@ -134,34 +134,57 @@ async fn run() -> Result<(), Error> {
         Some(p) => p,
         None => config::default_config_path()?,
     };
-    let mut config = Config::load(&path)?;
+    let config = Arc::new(Config::init(&path)?);
+    yourai_harness::assembly::validate_config(&config)?;
     let theme = serde_json::from_value::<crate::ui::theme::Theme>(serde_json::Value::String(
-        config.ui.theme.clone(),
+        config.ui().theme(),
     ))?;
     // Resolve `theme: "system"` once at startup (v1: no runtime watch).
     if theme == crate::ui::theme::Theme::System {
         crate::ui::theme::resolve_system_from_os();
     }
-    if let Some(model) = &selected_model {
-        config.models.selected = model.clone();
-        config.models.variant = None;
+    if selected_model.is_some() || variant.is_some() {
+        let id = selected_model
+            .as_deref()
+            .unwrap_or(&config.models().model())
+            .to_owned();
+        let selected_variant = variant.or_else(|| {
+            if selected_model.is_none() {
+                config.models().variant()
+            } else {
+                None
+            }
+        });
+        config.set_models(config.models().select_model(&id, selected_variant, None)?);
     }
-    let yolo = yolo || config.security.yolo;
-    config.security.yolo = yolo;
+    let yolo = yolo || config.security().yolo();
+    config.set_yolo(yolo);
     if import_json {
-        let count = yourai_harness::storage::sqlite::import_json_sessions(&config.session_dir())?;
+        let count = yourai_harness::storage::sqlite::import_json_sessions(
+            &yourai_harness::assembly::session_dir(&config),
+        )?;
         println!(
             "Imported {count} sessions into {}. Original JSON files retained.",
-            yourai_harness::SqliteStore::path(&config.session_dir()).display()
+            yourai_harness::SqliteStore::path(&yourai_harness::assembly::session_dir(&config))
+                .display()
         );
         return Ok(());
     }
     if check {
-        let selection = config.resolve(variant.as_deref().or(config.models.variant.as_deref()))?;
-        config.resolve_compaction()?;
+        let selection = config.models().resolve()?;
+        config
+            .execution()
+            .context_policy()
+            .validate_for(selection.model.token_budget())?;
+        if let Some(summary) = config.models().resolve_compaction()? {
+            config
+                .execution()
+                .context_policy()
+                .validate_for(summary.model.token_budget())?;
+        }
         println!(
             "Config OK: {} / {} (no network request)",
-            config.models.selected,
+            config.models().model(),
             selection.model.model_iden()
         );
         return Ok(());
@@ -171,50 +194,44 @@ async fn run() -> Result<(), Error> {
     }
     // Bare `--resume` opens the launcher; Esc there falls through to a fresh session.
     if resume.as_ref().is_some_and(|id| id.as_str().is_empty()) {
-        let catalog = SessionCatalog::new(config.session_dir())?;
+        let catalog = SessionCatalog::new(yourai_harness::assembly::session_dir(&config))?;
         match launcher::pick(&catalog, theme).await? {
             launcher::Choice::Resume(picked) => resume = Some(picked),
             launcher::Choice::New => resume = None,
             launcher::Choice::Quit => return Ok(()),
         }
     }
-    // CLI choices override the loaded config in memory for this invocation.
-    if let Some(model) = selected_model {
-        config.models.selected = model;
-        config.models.variant = None;
-    }
-    if variant.is_some() {
-        config.models.variant = variant;
-    }
-    let selection = config.resolve(config.models.variant.as_deref())?;
-    let compaction = config.resolve_compaction()?;
+    let selection = config.models().resolve()?;
+    let compaction = config.models().resolve_compaction()?;
     let model = selection.model.clone();
     if config
-        .execution
-        .context_policy
+        .execution()
+        .context_policy()
         .input_budget(model.token_budget())
         .is_none()
     {
         eprintln!("Context window unknown: configure models.providers.<id>.models.<id>.limit.context to enable automatic/manual summarization.");
     }
     let choices = crate::models::model_choices(&config);
-    let mut hc = SessionOptions::new(config.session_dir(), std::env::current_dir()?);
-    selection.apply_to(&mut hc);
+    let mut hc = SessionOptions::new(
+        yourai_harness::assembly::session_dir(&config),
+        std::env::current_dir()?,
+    );
+    hc.model_provider = selection.provider.clone();
+    hc.request_policy = selection.requests.clone();
     hc.compaction_model = compaction;
     hc.resume = resume.take();
-    config.apply_to(&mut hc);
-    hc.config.security.yolo = yolo;
+    hc.config = Arc::clone(&config);
     let mut config_template = hc.clone();
     config_template.resume = None;
     let harness = Harness::open(hc, model).await?;
     let limits = TurnLimits::default();
-    let config_clone_model = match &config.models.variant {
-        Some(variant) => format!("{} · {variant}", config.models.selected),
-        None => config.models.selected.clone(),
+    let config_clone_model = match &config.models().variant() {
+        Some(variant) => format!("{} · {variant}", config.models().model()),
+        None => config.models().model(),
     };
-    let config_clone_trusted = config.security.trusted_shell;
+    let config_clone_trusted = config.security().trusted_shell();
     let config_clone_theme = theme;
-    let config = Arc::new(std::sync::Mutex::new(config));
     let (session_id, pending) = ui::run(
         harness,
         &config_clone_model,

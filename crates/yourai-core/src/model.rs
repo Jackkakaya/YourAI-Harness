@@ -37,11 +37,13 @@ pub enum ModelErrorClass {
     Unclassified,
 }
 
+crate::settings_fields! {
 /// Defaults owned by the selected model, shared by every execution entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelTimeouts {
-    pub headers: std::time::Duration,
-    pub read: std::time::Duration,
+    headers: std::time::Duration => set_headers [value],
+    read: std::time::Duration => set_read [value],
+}
 }
 /// 5 minutes matches long-thinking models' worst case before first byte.
 const DEFAULT_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -225,7 +227,7 @@ impl Model {
                     if !visible {
                         match model.recovery(&error) {
                             ModelRecovery::Compact
-                                if overflow < turn.config.max_overflow_compactions =>
+                                if overflow < turn.config.max_overflow_compactions() =>
                             {
                                 overflow += 1;
                                 force_compact = true;
@@ -235,10 +237,10 @@ impl Model {
                                 )?;
                                 continue;
                             }
-                            ModelRecovery::Retry if retries < turn.config.max_model_retries => {
+                            ModelRecovery::Retry if retries < turn.config.max_model_retries() => {
                                 let delay = crate::model_error::Backoff {
-                                    initial: turn.config.retry_delay,
-                                    max_without_headers: turn.config.retry_max_delay,
+                                    initial: turn.config.retry_delay(),
+                                    max_without_headers: turn.config.retry_max_delay(),
                                 }
                                 .delay(
                                     retries,
@@ -249,7 +251,7 @@ impl Model {
                                 retries += 1;
                                 turn.send(Out::Retry {
                                     attempt: retries,
-                                    max: turn.config.max_model_retries,
+                                    max: turn.config.max_model_retries(),
                                     reason: retry_cause(&error),
                                     wait_ms: delay.as_millis().min(u64::MAX as u128) as u64,
                                 })?;
@@ -260,7 +262,7 @@ impl Model {
                                         Ok(())
                                     },
                                     turn.config
-                                        .operation_timeout
+                                        .operation_timeout()
                                         .and_then(|op| delay.checked_add(op)),
                                     "retry",
                                 )
@@ -365,7 +367,7 @@ impl Model {
                 options = options.with_tool_choice(ToolChoice::None);
             }
             let model = self.backend.clone();
-            let model_timeout = turn.config.model_timeout;
+            let model_timeout = turn.config.model_timeout();
             let header_timeout = model_timeout
                 .or(options.stream_header_timeout)
                 .unwrap_or(model.timeouts().headers);

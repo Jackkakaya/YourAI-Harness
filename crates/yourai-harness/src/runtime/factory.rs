@@ -27,7 +27,7 @@ pub async fn restore(
 ) -> Result<Arc<SessionManager>, YourAiError> {
     let mut config = crate::SessionOptions::new(root.to_owned(), cwd);
     config.resume = Some(id);
-    config.config.apply_execution_options(settings);
+    config.config.set_execution(settings);
     open(config, bindings, source).await
 }
 
@@ -36,18 +36,18 @@ async fn open(
     mut bindings: AgentBuilder,
     source: &str,
 ) -> Result<Arc<SessionManager>, YourAiError> {
+    let values = config.config.values();
     let model = bindings
         .model
         .as_ref()
         .ok_or_else(|| ErrorKind::Config("provider not configured: model".into()))?;
-    config
-        .config
-        .execution
-        .context_policy
+    values
+        .execution()
+        .context_policy()
         .validate_for(model.token_budget())?;
     let catalog = Arc::new(crate::SessionCatalog::new(&config.root)?);
     let (meta, lease, prepared) =
-        crate::assembly::prepare_session(&catalog, &config, model.as_ref()).await?;
+        crate::assembly::prepare_session(&catalog, &config, model.as_ref(), &values).await?;
     let id = meta.id;
     // Explicit usage implementations are dependencies, just like hooks/security.
     bindings
@@ -57,10 +57,10 @@ async fn open(
         &id,
         lease.store(),
         &config.cwd,
-        config.config.security.trusted_shell,
+        values.security().trusted_shell(),
         bindings,
-        &config.config.execution_options(),
+        values.execution(),
     )
     .await?;
-    crate::assembly::start_session(&config, id, lease, agent, prepared, source).await
+    crate::assembly::start_session(&config, id, lease, agent, prepared, source, &values).await
 }

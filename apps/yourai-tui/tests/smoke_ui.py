@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory() as tmp:
     config = Path(tmp) / 'config.json'
     config.write_text(json.dumps({
         'models': {
-            'selected': 'mock/smoke',
+            'model': 'mock/smoke',
             'providers': {
                 'mock': {
                     'npm': '@ai-sdk/openai-compatible',

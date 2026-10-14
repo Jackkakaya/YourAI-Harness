@@ -79,7 +79,7 @@ impl SessionManager {
                 }
             }));
 
-        if self.config().workspace_enabled || !self.config().instruction_paths.is_empty() {
+        if self.config().workspace_enabled() || !self.config().instruction_paths().is_empty() {
             let workspace = self.workspace()?;
             workspace
                 .setup(if source == "startup" {
@@ -88,7 +88,7 @@ impl SessionManager {
                     "maintenance"
                 })
                 .await?;
-            for path in &self.config().instruction_paths {
+            for path in self.config().instruction_paths() {
                 workspace.load_instructions(path, source).await?;
             }
         }
@@ -171,9 +171,10 @@ impl SessionManager {
         invocation.memory = snapshot.memory;
         invocation.sessions = snapshot.session;
         invocation.usage = snapshot.usage;
-        let result = crate::time::timeout(self.config().hook_timeout, hooks.dispatch(&invocation))
-            .await
-            .map_err(|_| error("hook", "host hook timed out"))??;
+        let result =
+            crate::time::timeout(self.config().hook_timeout(), hooks.dispatch(&invocation))
+                .await
+                .map_err(|_| error("hook", "host hook timed out"))??;
         result.validate_for(invocation.event.kind())?;
         Ok(result)
     }

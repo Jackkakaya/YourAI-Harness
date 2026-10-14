@@ -162,7 +162,7 @@
     "models": {
       "type": "object",
       "properties": {
-        "selected": {"type": "string", "pattern": "^[^/]+/.+$"},
+        "model": {"type": "string", "pattern": "^[^/]+/.+$"},
         "compaction": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "variant": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "effort_overrides": {
@@ -175,7 +175,7 @@
         "providers": {"type": "object", "additionalProperties": {"$ref": "#/$defs/provider"}}
       },
       "additionalProperties": false,
-      "required": ["selected", "providers"]
+      "required": ["model", "providers"]
     },
     "prompt": {
       "type": "object",
@@ -275,7 +275,7 @@
     },
     "hooks": {
       "type": "object",
-      "properties": {"events": {"$ref": "#/$defs/hookEvents"}, "file": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+      "properties": {"events": {"$ref": "#/$defs/hookEvents"}},
       "additionalProperties": false
     }
   }

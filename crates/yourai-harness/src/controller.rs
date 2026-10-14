@@ -1,21 +1,21 @@
 //! Reusable backend session commands. Execution and lifecycle advance without UI polling.
 use crate::{
-    config::{Config, EffortChoice, Error},
+    config::{Config, Error},
+    model::EffortChoice,
     Harness, SessionOptions,
 };
 use std::{
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, Weak,
-    },
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{broadcast, mpsc, watch},
+    sync::{broadcast, mpsc, watch, Notify},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 use yourai_core::prelude::*;
+mod state;
+use state::{AdmissionError, Command, InputAction, Shared};
 
 #[derive(Clone, Debug, Default)]
 pub struct ModelSelection {
@@ -25,17 +25,17 @@ pub struct ModelSelection {
 }
 impl ModelSelection {
     pub fn from_config(preferences: &Config) -> Self {
-        let pricing = preferences.pricing();
+        Self::from_models(preferences.values().models())
+    }
+    fn from_models(models: &crate::config::ModelSettings) -> Self {
+        let pricing = models.pricing();
         Self {
-            label: preferences.models.variant.as_ref().map_or_else(
-                || preferences.models.selected.clone(),
-                |v| format!("{} · {v}", preferences.models.selected),
+            label: models.variant().as_ref().map_or_else(
+                || models.model().clone(),
+                |v| format!("{} · {v}", models.model()),
             ),
             pricing: pricing.0.zip(pricing.1),
-            effort: preferences.effective_effort(
-                &preferences.models.selected,
-                preferences.models.variant.as_deref(),
-            ),
+            effort: models.effective_effort(models.model(), models.variant().as_deref()),
         }
     }
 }
@@ -80,31 +80,9 @@ pub enum Reply {
     Rejected(String),
     Deferred,
 }
-enum InputAction {
-    Submit(In),
-    Steer(String),
-}
-enum Command {
-    List,
-    Delete(SessionId),
-    Model(String, Option<String>, Option<EffortChoice>),
-    Switch(Option<SessionId>),
-    Compact,
-    Refresh,
-}
 enum Effect {
-    Listed(Result<Vec<SessionMeta>, YourAiError>),
-    Deleted(SessionId, Result<(), YourAiError>),
-    Model(Result<ModelSelection, String>),
+    Event(SessionEvent),
     Opened(Result<(Harness, SessionHistory), String>),
-}
-struct Shared {
-    harness: Arc<Harness>,
-    output: mpsc::UnboundedSender<Out>,
-    operation: bool,
-    retired: bool,
-    compacting: bool,
-    closing: bool,
 }
 type Stats = (
     Option<yourai_core::runtime::ContextUsage>,
@@ -120,7 +98,6 @@ pub struct SessionController {
     client: SessionClient,
     shutdown: CancellationToken,
     worker: Option<JoinHandle<CloseResult>>,
-    events: SessionSubscription,
 }
 
 /// A cloneable command and snapshot handle. It does not own execution or close the session.
@@ -129,11 +106,9 @@ pub struct SessionClient {
     shared: Arc<Mutex<Shared>>,
     commands: mpsc::UnboundedSender<Command>,
     inputs: mpsc::UnboundedSender<InputAction>,
-    pending: Arc<AtomicUsize>,
-    restart: Arc<AtomicBool>,
     snapshot: watch::Receiver<SessionSnapshot>,
     events: Weak<broadcast::Sender<SessionEvent>>,
-    config: Arc<Mutex<Config>>,
+    config: Arc<Config>,
 }
 
 /// The maximum number of events retained for subscribers; this is not a replay journal.
@@ -169,19 +144,13 @@ impl SessionSubscription {
     }
 }
 
-impl std::ops::Deref for SessionController {
-    type Target = SessionClient;
-    fn deref(&self) -> &Self::Target {
-        &self.client
-    }
-}
 impl SessionController {
     pub fn new(
         h: Harness,
-        config: Arc<Mutex<Config>>,
+        config: Arc<Config>,
         template: SessionOptions,
         limits: TurnLimits,
-    ) -> Self {
+    ) -> (Self, SessionSubscription) {
         bind_config(&h, &config).expect("session config source must be bound once");
         let h = Arc::new(h);
         let (output, rx) = mpsc::unbounded_channel();
@@ -198,19 +167,14 @@ impl SessionController {
             title: None,
             refresh_error: None,
         };
-        let shared = Arc::new(Mutex::new(Shared {
-            harness: h.clone(),
-            output: output.clone(),
-            operation: false,
-            retired: false,
-            compacting: false,
-            closing: false,
-        }));
+        let wake = Arc::new(Notify::new());
+        let shared = Arc::new(Mutex::new(Shared::new(
+            h.clone(),
+            output.clone(),
+            wake.clone(),
+        )));
         let (inputs, mut input_rx) = mpsc::unbounded_channel();
-        let pending = Arc::new(AtomicUsize::new(0));
-        let restart = Arc::new(AtomicBool::new(false));
         let input_shared = shared.clone();
-        let input_pending = pending.clone();
         let shutdown = CancellationToken::new();
         let input_stop = shutdown.clone();
         let submitter = tokio::spawn(async move {
@@ -229,7 +193,7 @@ impl SessionController {
                 };
                 let (h, output) = {
                     let shared = input_shared.lock().unwrap();
-                    (shared.harness.clone(), shared.output.clone())
+                    (shared.harness(), shared.output())
                 };
                 match input {
                     InputAction::Submit(input) => {
@@ -248,7 +212,7 @@ impl SessionController {
                         }
                     },
                 }
-                input_pending.fetch_sub(1, Ordering::SeqCst);
+                input_shared.lock().unwrap().finish_input();
             }
         });
         let (commands, command_rx) = mpsc::unbounded_channel();
@@ -258,9 +222,7 @@ impl SessionController {
         let events = SessionSubscription { receiver };
         let (snapshot_tx, snapshot_rx) = watch::channel(snapshot.clone());
         let mut runner = Runner {
-            h,
             shared: shared.clone(),
-            output,
             rx,
             events: events_tx,
             snapshots: snapshot_tx,
@@ -268,8 +230,7 @@ impl SessionController {
             config: config.clone(),
             template,
             limits,
-            pending: pending.clone(),
-            restart: restart.clone(),
+            wake,
             cancel: CancellationToken::new(),
             driver: None,
             compact: None,
@@ -281,38 +242,28 @@ impl SessionController {
         runner.resume();
         let stop = shutdown.clone();
         let worker = tokio::spawn(async move {
-            let mut commands = command_rx;
-            let mut tick = tokio::time::interval(Duration::from_millis(10));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = stop.cancelled() => break,
-                    command = commands.recv() => match command { Some(command) => runner.command(command), None => break },
-                    _ = tick.tick() => runner.poll().await,
-                }
-            }
+            runner.run(command_rx, &stop).await;
             // Drain accepted submissions before releasing storage ownership.
             runner.cancel.cancel();
-            runner.h.host.interrupt();
+            runner.harness().host.interrupt();
             let _ = submitter.await;
             runner.close().await
         });
-        Self {
-            client: SessionClient {
-                shared,
-                commands,
-                inputs,
-                pending,
-                restart,
-                snapshot: snapshot_rx,
-                events: event_source,
-                config,
+        (
+            Self {
+                client: SessionClient {
+                    shared,
+                    commands,
+                    inputs,
+                    snapshot: snapshot_rx,
+                    events: event_source,
+                    config,
+                },
+                shutdown,
+                worker: Some(worker),
             },
-            shutdown,
-            worker: Some(worker),
             events,
-        }
+        )
     }
     pub fn client(&self) -> SessionClient {
         self.client.clone()
@@ -321,17 +272,8 @@ impl SessionController {
     pub fn harness(&self) -> Arc<Harness> {
         self.client.harness()
     }
-    pub async fn recv(&mut self) -> Option<SessionEvent> {
-        self.events.recv().await
-    }
-    pub fn has_events(&self) -> bool {
-        self.events.has_events()
-    }
-    pub fn try_recv(&mut self) -> Option<SessionEvent> {
-        self.events.try_recv()
-    }
     pub async fn close(mut self) -> Result<(String, Vec<In>), Error> {
-        self.shared.lock().unwrap().closing = true;
+        self.client.shared.lock().unwrap().close();
         self.shutdown.cancel();
         self.worker
             .take()
@@ -342,7 +284,7 @@ impl SessionController {
 }
 impl Drop for SessionController {
     fn drop(&mut self) {
-        self.shared.lock().unwrap().closing = true;
+        self.client.shared.lock().unwrap().close();
         self.shutdown.cancel();
     }
 }
@@ -351,9 +293,7 @@ impl SessionClient {
     /// Subscribe to future events. Earlier events are not replayed; query the latest snapshot.
     pub fn subscribe(&self) -> Result<SessionSubscription, String> {
         let s = self.shared.lock().unwrap();
-        if s.closing {
-            return Err("Session backend stopped".into());
-        }
+        s.check_open().map_err(|e| e.message().to_owned())?;
         self.events
             .upgrade()
             .map(|events| SessionSubscription {
@@ -362,7 +302,7 @@ impl SessionClient {
             .ok_or_else(|| "Session backend stopped".into())
     }
     fn harness(&self) -> Arc<Harness> {
-        self.shared.lock().unwrap().harness.clone()
+        self.shared.lock().unwrap().harness()
     }
     pub fn environment(&self) -> SessionEnvironment {
         self.harness().host.environment()
@@ -378,107 +318,64 @@ impl SessionClient {
     }
     pub fn busy(&self) -> bool {
         let s = self.shared.lock().unwrap();
-        s.operation || s.retired
+        s.busy()
     }
     pub fn operating(&self) -> bool {
-        self.shared.lock().unwrap().operation
+        self.shared.lock().unwrap().operating()
     }
     pub fn compacting(&self) -> bool {
-        self.shared.lock().unwrap().compacting
+        self.shared.lock().unwrap().compacting()
     }
     pub fn submitting(&self) -> bool {
-        self.pending.load(Ordering::SeqCst) != 0
+        self.shared.lock().unwrap().submitting()
     }
     pub fn idle(&self) -> bool {
         let s = self.shared.lock().unwrap();
-        !self.submitting()
-            && !s.compacting
-            && matches!(s.harness.host.status(), SessionStatus::Idle)
-            && s.harness.host.queued() == 0
+        s.idle()
     }
     pub fn tasks_since(&self, previous: Option<u64>) -> Option<(u64, Vec<Task>)> {
         self.harness().host.tasks_since(previous)
     }
     pub fn submit(&self, input: In) -> bool {
-        let s = self.shared.lock().unwrap();
-        if s.operation || s.closing {
-            return false;
-        }
-        self.pending.fetch_add(1, Ordering::SeqCst);
-        if self.inputs.send(InputAction::Submit(input)).is_ok() {
-            self.restart.store(true, Ordering::SeqCst);
-            true
-        } else {
-            self.pending.fetch_sub(1, Ordering::SeqCst);
-            false
-        }
+        self.shared
+            .lock()
+            .unwrap()
+            .enqueue(&self.inputs, InputAction::Submit(input))
+            .is_ok()
     }
     pub fn reply(&self, id: String, payload: serde_json::Value) -> Reply {
-        let s = self.shared.lock().unwrap();
-        if s.closing {
-            return Reply::Rejected("Session backend stopped".into());
+        let mut s = self.shared.lock().unwrap();
+        match s.check_input() {
+            Err(AdmissionError::Closed) => {
+                return Reply::Rejected(AdmissionError::Closed.message().into())
+            }
+            Err(AdmissionError::Busy) => return Reply::Deferred,
+            Ok(()) => {}
         }
-        if s.operation {
-            return Reply::Deferred;
-        }
-        match s.harness.host.submit(In::Reply { id, payload }) {
+        match s.harness().host.submit(In::Reply { id, payload }) {
             Ok(()) => {
-                self.restart.store(true, Ordering::SeqCst);
+                s.request_resume();
                 Reply::Sent
             }
             Err(e) => Reply::Rejected(e.to_string()),
         }
     }
     pub fn interrupt(&self) {
-        self.restart.store(false, Ordering::SeqCst);
-        self.harness().host.interrupt();
+        self.shared.lock().unwrap().interrupt();
     }
     pub fn steer_pending(&self, id: String) -> Result<(), String> {
-        let s = self.shared.lock().unwrap();
-        if s.closing {
-            return Err("Session backend stopped".into());
-        }
-        if s.operation || s.retired {
-            return Err("A session operation is in progress. Please wait.".into());
-        }
-        self.pending.fetch_add(1, Ordering::SeqCst);
-        if self.inputs.send(InputAction::Steer(id)).is_ok() {
-            Ok(())
-        } else {
-            self.pending.fetch_sub(1, Ordering::SeqCst);
-            Err("Input queue closed".into())
-        }
+        self.shared
+            .lock()
+            .unwrap()
+            .enqueue(&self.inputs, InputAction::Steer(id))
     }
     fn operation(&self, command: Command) -> Result<(), String> {
         let mut s = self.shared.lock().unwrap();
-        if s.closing {
-            return Err("Session backend stopped".into());
+        if !s.admit(&command)? {
+            return Ok(());
         }
-        if s.operation || s.retired {
-            return Err("A session operation is in progress. Please wait.".into());
-        }
-        match &command {
-            Command::Delete(id) if *id == s.harness.host.environment().id => {
-                return Err("The current session cannot be deleted.".into());
-            }
-            Command::Switch(Some(id)) if *id == s.harness.host.environment().id => {
-                return Ok(());
-            }
-            _ => {}
-        }
-        if matches!(
-            command,
-            Command::List | Command::Model(..) | Command::Switch(..) | Command::Compact
-        ) && (self.submitting()
-            || s.compacting
-            || !matches!(s.harness.host.status(), SessionStatus::Idle)
-            || s.harness.host.queued() > 0)
-        {
-            return Err("Finish or cancel the current turn, compaction and queued inputs before changing sessions.".into());
-        }
-        s.operation = true;
         if self.commands.send(command).is_err() {
-            s.operation = false;
+            s.finish_operation();
             return Err("Session backend stopped".into());
         }
         Ok(())
@@ -503,28 +400,24 @@ impl SessionClient {
     pub fn compact(&self) -> Result<(), String> {
         self.operation(Command::Compact)
     }
-    pub fn set_yolo(&self, enabled: bool) -> Result<(), YourAiError> {
+    pub fn change_yolo(&self, enabled: bool) -> Result<(), YourAiError> {
         let s = self.shared.lock().unwrap();
-        if s.closing {
-            return Err(ErrorKind::Config("Session backend stopped".into()).into());
-        }
-        if s.operation || s.retired {
-            return Err(ErrorKind::Config("A session operation is in progress".into()).into());
-        }
-        s.harness.set_yolo_config(enabled, || {
-            crate::config::update(&self.config, |config| {
-                config.security.yolo = enabled;
-                Ok(())
-            })
-            .map_err(|e| crate::error("config", e))
-        })
-    }
-    pub fn set_theme(&self, theme: &str) -> Result<(), String> {
-        crate::config::update(&self.config, |config| {
-            config.ui.theme = theme.into();
+        s.check_operation()
+            .map_err(|e| YourAiError::from(ErrorKind::Config(e.message().into())))?;
+        s.harness().apply_yolo_with_commit(enabled, || {
+            let mut data = self.config.write();
+            let previous = data.security().clone();
+            data.security_mut().set_yolo(enabled);
+            if let Err(error) = self.config.save_data(&data) {
+                data.set_security(previous);
+                return Err(crate::error("config", error));
+            }
             Ok(())
         })
-        .map_err(|e| e.to_string())
+    }
+    pub fn change_theme(&self, theme: &str) -> Result<(), String> {
+        self.config.set_theme(theme.into());
+        self.config.save().map_err(|e| e.to_string())
     }
     pub fn refresh(&self) {
         let _ = self.commands.send(Command::Refresh);
@@ -532,18 +425,15 @@ impl SessionClient {
 }
 
 struct Runner {
-    h: Arc<Harness>,
     shared: Arc<Mutex<Shared>>,
-    output: mpsc::UnboundedSender<Out>,
     rx: mpsc::UnboundedReceiver<Out>,
     events: Arc<broadcast::Sender<SessionEvent>>,
     snapshots: watch::Sender<SessionSnapshot>,
     snapshot: SessionSnapshot,
-    config: Arc<Mutex<Config>>,
+    config: Arc<Config>,
     template: SessionOptions,
     limits: TurnLimits,
-    pending: Arc<AtomicUsize>,
-    restart: Arc<AtomicBool>,
+    wake: Arc<Notify>,
     cancel: CancellationToken,
     driver: Option<JoinHandle<Result<(), YourAiError>>>,
     compact: Option<JoinHandle<Option<Usage>>>,
@@ -553,6 +443,12 @@ struct Runner {
     retired: Option<JoinHandle<Result<Vec<In>, YourAiError>>>,
 }
 impl Runner {
+    fn harness(&self) -> Arc<Harness> {
+        self.shared.lock().unwrap().harness()
+    }
+    fn output(&self) -> mpsc::UnboundedSender<Out> {
+        self.shared.lock().unwrap().output()
+    }
     fn notice(&self, level: Level, message: impl Into<String>) {
         let _ = self.events.send(SessionEvent::Output(Out::Notice {
             level,
@@ -561,9 +457,9 @@ impl Runner {
     }
     fn resume(&mut self) {
         if self.driver.is_none() {
-            self.restart.store(false, Ordering::SeqCst);
-            let host = self.h.host.clone();
-            let tx = self.output.clone();
+            self.shared.lock().unwrap().resume_started();
+            let host = self.harness().host.clone();
+            let tx = self.output();
             let cancel = self.cancel.clone();
             let limits = self.limits.clone();
             self.driver = Some(tokio::spawn(async move {
@@ -572,15 +468,14 @@ impl Runner {
         }
     }
     fn command(&mut self, command: Command) {
-        let h = self.h.clone();
+        let h = self.harness();
         match command {
             Command::Refresh => {
                 self.stats_at = Instant::now() - Duration::from_secs(2);
             }
             Command::Compact => {
-                self.shared.lock().unwrap().compacting = true;
-                self.shared.lock().unwrap().operation = false;
-                let tx = self.output.clone();
+                self.shared.lock().unwrap().start_compaction();
+                let tx = self.output();
                 let cancel = self.cancel.clone();
                 self.compact = Some(tokio::spawn(async move {
                     let result = h
@@ -626,229 +521,233 @@ impl Runner {
             }
             Command::List => {
                 self.operation = Some(tokio::spawn(async move {
-                    Effect::Listed(h.sessions.list_sessions().await)
+                    Effect::Event(SessionEvent::Listed(
+                        h.sessions.list_sessions().await.map_err(|e| e.to_string()),
+                    ))
                 }))
             }
             Command::Delete(id) => {
                 self.operation = Some(tokio::spawn(async move {
                     let result = h.sessions.delete_session(&id).await;
-                    Effect::Deleted(id, result)
+                    Effect::Event(SessionEvent::Deleted(id, result.map_err(|e| e.to_string())))
                 }))
             }
             Command::Model(id, variant, effort) => {
                 let config = self.config.clone();
                 self.operation = Some(tokio::spawn(async move {
-                    Effect::Model(switch_model(&config, &h, &id, variant, effort).await)
+                    Effect::Event(SessionEvent::Model(
+                        switch_model(&config, &h, &id, variant, effort).await,
+                    ))
                 }));
             }
             Command::Switch(id) => {
                 let config = self.config.clone();
                 let mut template = self.template.clone();
                 template.cwd = h.host.environment().cwd;
-                let yolo = h.yolo();
                 self.operation = Some(tokio::spawn(async move {
-                    Effect::Opened(open_session(&config, &template, yolo, id).await)
+                    Effect::Opened(open_session(&config, &template, id).await)
                 }));
             }
         }
     }
-    async fn poll(&mut self) {
-        for _ in 0..256 {
-            match self.rx.try_recv() {
-                Ok(event) => {
+    async fn run(
+        &mut self,
+        mut commands: mpsc::UnboundedReceiver<Command>,
+        stop: &CancellationToken,
+    ) {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => break,
+                command = commands.recv() => match command {
+                    Some(command) => self.command(command),
+                    None => break,
+                },
+                Some(event) = self.rx.recv() => {
                     let _ = self.events.send(SessionEvent::Output(event));
-                }
-                Err(_) => break,
+                    for _ in 0..255 {
+                        match self.rx.try_recv() {
+                            Ok(event) => { let _ = self.events.send(SessionEvent::Output(event)); }
+                            Err(_) => break,
+                        }
+                    }
+                },
+                result = completed(&mut self.driver), if self.rx.is_empty() => {
+                    self.driver = None;
+                    match result {
+                        Ok(Err(YourAiError::Aborted(reason))) => self.notice(
+                            Level::Info,
+                            format!("Stopped: {reason}. Queued inputs remain; send a message to resume."),
+                        ),
+                        Ok(Err(e)) => self.notice(
+                            Level::Error,
+                            format!(
+                                "Execution failed: {}. Send a message to resume.",
+                                summarize_error(&e.to_string())
+                            ),
+                        ),
+                        Err(e) => self.notice(Level::Error, format!("Driver failed: {e}")),
+                        _ => {}
+                    }
+                    let _ = self.events.send(SessionEvent::Settled);
+                },
+                result = completed(&mut self.compact) => {
+                    self.compact = None;
+                    match result {
+                        Ok(Some(usage)) => {
+                            let _ = self.events.send(SessionEvent::Usage(usage));
+                        }
+                        Ok(None) => {}
+                        Err(e) => self.notice(Level::Error, format!("Compact failed: {e}")),
+                    }
+                    self.shared.lock().unwrap().finish_compaction();
+                    self.snapshot.revision += 1;
+                },
+                result = completed(&mut self.retired) => {
+                    self.retired = None;
+                    match result {
+                        Ok(Ok(pending)) if !pending.is_empty() => self.notice(
+                            Level::Warning,
+                            format!(
+                                "{} queued inputs saved in the previous session.",
+                                pending.len()
+                            ),
+                        ),
+                        Ok(Err(e)) => self.notice(
+                            Level::Error,
+                            format!("Could not close previous session: {e}"),
+                        ),
+                        Err(e) => self.notice(
+                            Level::Error,
+                            format!("Previous session close task failed: {e}"),
+                        ),
+                        _ => {}
+                    }
+                    self.shared.lock().unwrap().finish_retirement();
+                    self.resume();
+                    self.notice(
+                        Level::Info,
+                        "Session ready. Previous sessions remain in /sessions.",
+                    );
+                },
+                result = completed(&mut self.operation) => {
+                    self.operation = None;
+                    match result {
+                        Ok(Effect::Event(event)) => {
+                            let _ = self.events.send(event);
+                        }
+                        Ok(Effect::Opened(Err(e))) => {
+                            let _ = self.events.send(SessionEvent::Opened(Err(e)));
+                        }
+                        Ok(Effect::Opened(Ok((h, history)))) => {
+                            self.cancel.cancel();
+                            self.harness().host.interrupt();
+                            let old = self.harness();
+                            let driver = self.driver.take();
+                            let stats = self.stats.take();
+                            let compact = self.compact.take();
+                            self.retired = Some(tokio::spawn(async move {
+                                if let Some(t) = driver {
+                                    let _ = t.await;
+                                }
+                                if let Some(t) = stats {
+                                    let _ = t.await;
+                                }
+                                if let Some(t) = compact {
+                                    let _ = t.await;
+                                }
+                                old.close().await
+                            }));
+                            let (output, rx) = mpsc::unbounded_channel();
+                            self.rx = rx;
+                            self.shared.lock().unwrap().retire(Arc::new(h), output);
+                            self.cancel = CancellationToken::new();
+                            self.snapshot = SessionSnapshot {
+                                revision: self.snapshot.revision + 1,
+                                environment: self.harness().host.environment(),
+                                pending_inputs: vec![],
+                                active: false,
+                                compacting: false,
+                                can_steer: false,
+                                model_metrics: self.harness().model_snapshot(),
+                                context_usage: None,
+                                response_count: Some(history.response_count),
+                                title: history.title.clone(),
+                                refresh_error: None,
+                            };
+                            self.stats_at = Instant::now() - Duration::from_secs(2);
+                            let _ = self.events.send(SessionEvent::Opened(Ok(history)));
+                        }
+                        Err(e) => self.notice(Level::Error, format!("Session operation failed: {e}")),
+                    }
+                    self.shared.lock().unwrap().finish_operation();
+                },
+                result = completed(&mut self.stats) => {
+                    self.stats = None;
+                    match result {
+                        Ok((context, count, title)) => {
+                            self.snapshot.context_usage = context;
+                            self.snapshot.response_count = count;
+                            match title {
+                                Ok(title) => {
+                                    self.snapshot.title = title;
+                                    self.snapshot.refresh_error = None;
+                                }
+                                Err(e) => {
+                                    self.snapshot.refresh_error = Some(format!("Session title unavailable: {e}"))
+                                }
+                            }
+                        }
+                        Err(e) => self.snapshot.refresh_error = Some(format!("Session refresh failed: {e}")),
+                    }
+                    self.snapshot.revision += 1;
+                },
+                _ = self.wake.notified() => {},
+                _ = tick.tick() => {},
             }
-        }
-        if self.driver.as_ref().is_some_and(|t| t.is_finished()) && self.rx.is_empty() {
-            match self.driver.take().unwrap().await {
-                Ok(Err(YourAiError::Aborted(reason))) => self.notice(
-                    Level::Info,
-                    format!("Stopped: {reason}. Queued inputs remain; send a message to resume."),
-                ),
-                Ok(Err(e)) => self.notice(
-                    Level::Error,
-                    format!(
-                        "Execution failed: {}. Send a message to resume.",
-                        summarize_error(&e.to_string())
-                    ),
-                ),
-                Err(e) => self.notice(Level::Error, format!("Driver failed: {e}")),
-                _ => {}
-            }
-            let _ = self.events.send(SessionEvent::Settled);
-        }
-        if self.driver.is_none()
-            && self.restart.load(Ordering::SeqCst)
-            && self.pending.load(Ordering::SeqCst) == 0
-            && matches!(self.h.host.status(), SessionStatus::Idle)
-            && self.compact.is_none()
-        {
-            if self.h.host.queued() > 0 {
+            if self.driver.is_none()
+                && self.compact.is_none()
+                && self.shared.lock().unwrap().take_resume()
+            {
                 self.resume();
-            } else {
-                self.restart.store(false, Ordering::SeqCst);
             }
-        }
-        if self.compact.as_ref().is_some_and(|t| t.is_finished()) {
-            match self.compact.take().unwrap().await {
-                Ok(Some(usage)) => {
-                    let _ = self.events.send(SessionEvent::Usage(usage));
-                }
-                Ok(None) => {}
-                Err(e) => self.notice(Level::Error, format!("Compact failed: {e}")),
+            if self.stats.is_none() && self.stats_at.elapsed() >= Duration::from_secs(1) {
+                let h = self.harness();
+                let host = h.host.clone();
+                let usage = h.usage.clone();
+                let id = host.environment().id;
+                self.stats = Some(tokio::spawn(async move {
+                    let context = tokio::task::spawn_blocking(move || host.context_usage().ok())
+                        .await
+                        .ok()
+                        .flatten();
+                    let count = usage.session_usage(&id).await.ok().map(|u| u.request_count);
+                    let title = h.host.title().await;
+                    (context, count, title)
+                }));
+                self.stats_at = Instant::now();
             }
-            self.shared.lock().unwrap().compacting = false;
-            self.snapshot.revision += 1;
+            self.publish_snapshot();
         }
-        if self.retired.as_ref().is_some_and(|t| t.is_finished()) {
-            match self.retired.take().unwrap().await {
-                Ok(Ok(pending)) if !pending.is_empty() => self.notice(
-                    Level::Warning,
-                    format!(
-                        "{} queued inputs saved in the previous session.",
-                        pending.len()
-                    ),
-                ),
-                Ok(Err(e)) => self.notice(
-                    Level::Error,
-                    format!("Could not close previous session: {e}"),
-                ),
-                Err(e) => self.notice(
-                    Level::Error,
-                    format!("Previous session close task failed: {e}"),
-                ),
-                _ => {}
-            }
-            self.shared.lock().unwrap().retired = false;
-            self.resume();
-            self.notice(
-                Level::Info,
-                "Session ready. Previous sessions remain in /sessions.",
-            );
-        }
-        if self.operation.as_ref().is_some_and(|t| t.is_finished()) {
-            let result = self.operation.take().unwrap().await;
-            match result {
-                Ok(Effect::Listed(result)) => {
-                    let _ = self
-                        .events
-                        .send(SessionEvent::Listed(result.map_err(|e| e.to_string())));
-                }
-                Ok(Effect::Deleted(id, result)) => {
-                    let _ = self
-                        .events
-                        .send(SessionEvent::Deleted(id, result.map_err(|e| e.to_string())));
-                }
-                Ok(Effect::Model(result)) => {
-                    let _ = self.events.send(SessionEvent::Model(result));
-                }
-                Ok(Effect::Opened(Err(e))) => {
-                    let _ = self.events.send(SessionEvent::Opened(Err(e)));
-                }
-                Ok(Effect::Opened(Ok((h, history)))) => {
-                    self.cancel.cancel();
-                    self.h.host.interrupt();
-                    let old = self.h.clone();
-                    let driver = self.driver.take();
-                    let stats = self.stats.take();
-                    let compact = self.compact.take();
-                    self.retired = Some(tokio::spawn(async move {
-                        if let Some(t) = driver {
-                            let _ = t.await;
-                        }
-                        if let Some(t) = stats {
-                            let _ = t.await;
-                        }
-                        if let Some(t) = compact {
-                            let _ = t.await;
-                        }
-                        old.close().await
-                    }));
-                    self.h = Arc::new(h);
-                    let (output, rx) = mpsc::unbounded_channel();
-                    self.output = output;
-                    self.rx = rx;
-                    self.cancel = CancellationToken::new();
-                    self.restart.store(false, Ordering::SeqCst);
-                    self.snapshot = SessionSnapshot {
-                        revision: self.snapshot.revision + 1,
-                        environment: self.h.host.environment(),
-                        pending_inputs: vec![],
-                        active: false,
-                        compacting: false,
-                        can_steer: false,
-                        model_metrics: self.h.model_snapshot(),
-                        context_usage: None,
-                        response_count: Some(history.response_count),
-                        title: history.title.clone(),
-                        refresh_error: None,
-                    };
-                    self.stats_at = Instant::now() - Duration::from_secs(2);
-                    {
-                        let mut shared = self.shared.lock().unwrap();
-                        shared.harness = self.h.clone();
-                        shared.output = self.output.clone();
-                        shared.retired = true;
-                    }
-                    let _ = self.events.send(SessionEvent::Opened(Ok(history)));
-                }
-                Err(e) => self.notice(Level::Error, format!("Session operation failed: {e}")),
-            }
-            self.shared.lock().unwrap().operation = false;
-        }
-        if self.stats.is_none() && self.stats_at.elapsed() >= Duration::from_secs(1) {
-            let host = self.h.host.clone();
-            let usage = self.h.usage.clone();
-            let id = host.environment().id;
-            let h = self.h.clone();
-            self.stats = Some(tokio::spawn(async move {
-                let context = tokio::task::spawn_blocking(move || host.context_usage().ok())
-                    .await
-                    .ok()
-                    .flatten();
-                let count = usage.session_usage(&id).await.ok().map(|u| u.request_count);
-                let title = h.host.title().await;
-                (context, count, title)
-            }));
-            self.stats_at = Instant::now();
-        }
-        if self.stats.as_ref().is_some_and(|t| t.is_finished()) {
-            match self.stats.take().unwrap().await {
-                Ok((context, count, title)) => {
-                    self.snapshot.context_usage = context;
-                    self.snapshot.response_count = count;
-                    match title {
-                        Ok(title) => {
-                            self.snapshot.title = title;
-                            self.snapshot.refresh_error = None;
-                        }
-                        Err(e) => {
-                            self.snapshot.refresh_error =
-                                Some(format!("Session title unavailable: {e}"))
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.snapshot.refresh_error = Some(format!("Session refresh failed: {e}"))
-                }
-            }
-            self.snapshot.revision += 1;
-        }
-        let status = self.h.host.status();
-        self.snapshot.environment = self.h.host.environment();
-        self.snapshot.pending_inputs = self.h.host.pending_inputs();
-        self.snapshot.compacting = self.compact.is_some();
-        self.snapshot.active = self.pending.load(Ordering::SeqCst) != 0
-            || !matches!(status, SessionStatus::Idle | SessionStatus::Closed);
+    }
+    fn publish_snapshot(&mut self) {
+        let shared = self.shared.lock().unwrap();
+        let h = shared.harness();
+        let status = h.host.status();
+        self.snapshot.environment = h.host.environment();
+        self.snapshot.pending_inputs = h.host.pending_inputs();
+        self.snapshot.compacting = shared.compacting();
+        self.snapshot.active =
+            shared.submitting() || !matches!(status, SessionStatus::Idle | SessionStatus::Closed);
         self.snapshot.can_steer = matches!(status, SessionStatus::Running { .. });
-        self.snapshot.model_metrics = self.h.model_snapshot();
+        self.snapshot.model_metrics = h.model_snapshot();
         self.snapshots.send_replace(self.snapshot.clone());
     }
     async fn close(mut self) -> Result<(String, Vec<In>), Error> {
         self.cancel.cancel();
-        self.h.host.interrupt();
+        self.harness().host.interrupt();
         if let Some(task) = self.operation.take() {
             if let Ok(Effect::Opened(Ok((h, _)))) = task.await {
                 h.close().await?;
@@ -866,8 +765,15 @@ impl Runner {
         if let Some(task) = self.driver.take() {
             let _ = task.await;
         }
-        let id = self.h.host.environment().id.to_string();
-        Ok((id, self.h.close().await?))
+        let id = self.harness().host.environment().id.to_string();
+        Ok((id, self.harness().close().await?))
+    }
+}
+
+async fn completed<T>(task: &mut Option<JoinHandle<T>>) -> Result<T, tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -905,37 +811,32 @@ pub async fn history(h: &Harness) -> Result<SessionHistory, YourAiError> {
         title: h.host.title().await?,
     })
 }
-fn bind_config(h: &Harness, config: &Arc<Mutex<Config>>) -> Result<(), YourAiError> {
+fn bind_config(h: &Harness, config: &Arc<Config>) -> Result<(), YourAiError> {
     let config = config.clone();
     h.host.bind_config_source(Arc::new(move || {
-        config
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .execution_options()
+        config.execution().resolve(&TurnLimits::default())
     }))
 }
-pub async fn switch_model(
-    config: &Arc<Mutex<Config>>,
+async fn switch_model(
+    config: &Arc<Config>,
     h: &Harness,
     id: &str,
     variant: Option<String>,
     effort: Option<EffortChoice>,
 ) -> Result<ModelSelection, String> {
-    let mut candidate = config.lock().map_err(|e| e.to_string())?.clone();
-    candidate.models.selected = id.into();
-    if let Some(effort) = &effort {
-        candidate
-            .set_entry_effort(id, variant.as_deref(), effort)
-            .map_err(|e| e.to_string())?;
-    }
-    let crate::config::ResolvedModel {
+    let values = config.values();
+    let dependencies = serde_json::to_value((values.models(), values.execution().context_policy()))
+        .map_err(|e| e.to_string())?;
+    let candidate = values
+        .models()
+        .select_model(id, variant.clone(), effort.as_ref())
+        .map_err(|e| e.to_string())?;
+    let crate::model::ResolvedModel {
         model,
         provider,
         requests,
-    } = candidate
-        .resolve(variant.as_deref())
-        .map_err(|e| e.to_string())?;
-    let policy = candidate.execution.context_policy.clone();
+    } = candidate.resolve().map_err(|e| e.to_string())?;
+    let policy = values.execution().context_policy().clone();
     h.host
         .check_config_change(
             "model",
@@ -943,54 +844,37 @@ pub async fn switch_model(
         )
         .await
         .map_err(|e| e.to_string())?;
-    h.switch_model_config(model, policy, provider, requests, || {
-        crate::config::update(config, |next| {
-            next.models.selected = id.into();
-            next.models.variant = variant.clone();
-            if let Some(effort) = &effort {
-                next.set_entry_effort(id, variant.as_deref(), effort)?;
-            }
-            Ok(())
-        })
-        .map_err(|e| crate::error("config", e))
+    let selection = ModelSelection::from_models(&candidate);
+    h.apply_model_with_commit(model, policy, provider, requests, || {
+        let mut data = config.write();
+        if serde_json::to_value((data.models(), data.execution().context_policy()))
+            .map_err(|e| crate::error("config", e))?
+            != dependencies
+        {
+            return Err(crate::error(
+                "config",
+                "Model settings changed while preparing the switch; retry",
+            ));
+        }
+        let previous = data.models().clone();
+        data.set_models(candidate);
+        if let Err(error) = config.save_data(&data) {
+            data.set_models(previous);
+            return Err(crate::error("config", error));
+        }
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?;
-    let candidate = config.lock().map_err(|e| e.to_string())?.clone();
-    let effective_effort = candidate.effective_effort(id, variant.as_deref());
-    let p = candidate.pricing();
-    Ok(ModelSelection {
-        label: variant.map_or_else(|| id.to_owned(), |v| format!("{id} · {v}")),
-        pricing: p.0.zip(p.1),
-        effort: effective_effort,
-    })
-}
-pub fn prepare_session(
-    config: &Arc<Mutex<Config>>,
-    template: &SessionOptions,
-    id: Option<SessionId>,
-) -> Result<(SessionOptions, Arc<dyn ModelProvider>), Error> {
-    let candidate = config
-        .lock()
-        .map_err(|e| Error::from(e.to_string()))?
-        .clone();
-    let selection = candidate.resolve(candidate.models.variant.as_deref())?;
-    let mut options = template.clone();
-    options.resume = id;
-    candidate.apply_to(&mut options);
-    options.compaction_model = candidate.resolve_compaction()?;
-    selection.apply_to(&mut options);
-    Ok((options, selection.model))
+    Ok(selection)
 }
 async fn open_session(
-    config: &Arc<Mutex<Config>>,
+    config: &Arc<Config>,
     template: &SessionOptions,
-    yolo: bool,
     id: Option<SessionId>,
 ) -> Result<(Harness, SessionHistory), String> {
-    let (mut options, model) = prepare_session(config, template, id)
+    let (options, model) = crate::assembly::resolve_session(config, template, id)
         .map_err(|e| format!("Could not open session: {e}"))?;
-    options.config.security.yolo = yolo;
     let h = Harness::open(options, model)
         .await
         .map_err(|e| format!("Could not open session: {e}"))?;
@@ -1074,7 +958,7 @@ mod switch_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg: Config = serde_json::from_value(serde_json::json!({
           "models": {
-            "selected": "mock/large",
+            "model": "mock/large",
             "providers": {
               "mock": {
                 "npm": "@ai-sdk/openai-compatible",
@@ -1111,13 +995,15 @@ mod switch_tests {
         .unwrap();
         let path = dir.path().join("yourai.json");
         std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
-        let cfg = Config::load(&path).unwrap();
-        let crate::config::ResolvedModel { model, .. } = cfg.resolve(None).unwrap();
-        let mut hc = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-        hc.config.prompt.system_prompt = Some("test".into());
-        hc.config.execution.context_policy = cfg.execution.context_policy.clone();
+        let cfg = Config::init(&path).unwrap();
+        let crate::model::ResolvedModel { model, .. } =
+            cfg.values().models().clone().resolve().unwrap();
+        let hc = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+        hc.config.set_system_prompt(Some("test".into()));
+        hc.config
+            .set_context_policy(cfg.values().execution().clone().context_policy().clone());
         let h = Harness::open(hc.clone(), model).await.unwrap();
-        let config = Arc::new(std::sync::Mutex::new(cfg));
+        let config = Arc::new(cfg);
         for (id, variant) in [
             ("missing/model", None),
             ("mock/small", Some("invalid")),
@@ -1132,18 +1018,21 @@ mod switch_tests {
             )
             .await
             .is_err());
-            let cfg = config.lock().unwrap();
-            assert_eq!(cfg.models.selected, "mock/large");
+            let cfg = &config;
+            assert_eq!(cfg.values().models().clone().model(), "mock/large");
             assert_eq!(
-                cfg.resolve(None)
+                cfg.values()
+                    .models()
+                    .clone()
+                    .resolve()
                     .unwrap()
                     .model
                     .token_budget()
                     .limits()
-                    .context,
+                    .context(),
                 Some(64000)
             );
-            assert_eq!(cfg.models.variant, None);
+            assert!(cfg.values().models().clone().variant().is_none());
             assert_eq!(h.host.context_usage().unwrap().context_window, Some(64000));
         }
         let selected =
@@ -1152,13 +1041,12 @@ mod switch_tests {
                 .unwrap();
         assert_eq!(h.host.context_usage().unwrap().output_reserve, 2048);
         let (_resume, resume_model) =
-            crate::controller::prepare_session(&config, &hc, Some(h.host.environment().id))
-                .unwrap();
-        assert_eq!(resume_model.token_budget().limits().context, Some(32000));
+            crate::assembly::resolve_session(&config, &hc, Some(h.host.environment().id)).unwrap();
+        assert_eq!(resume_model.token_budget().limits().context(), Some(32000));
         // This differs from the default model's 4096, proving variant resolution.
         assert_eq!(resume_model.token_budget().max_output_tokens(), 2048);
         assert_eq!(
-            config.lock().unwrap().models.variant.as_deref(),
+            config.values().models().clone().variant().as_deref(),
             Some("short")
         );
         assert_eq!(selected.label, "mock/small · short");
@@ -1170,7 +1058,7 @@ mod switch_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg: Config = serde_json::from_value(serde_json::json!({
           "models": {
-            "selected": "mock/large",
+            "model": "mock/large",
             "providers": {
               "mock": {
                 "npm": "@ai-sdk/openai-compatible",
@@ -1207,13 +1095,15 @@ mod switch_tests {
         .unwrap();
         let path = dir.path().join("yourai.json");
         std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
-        let cfg = Config::load(&path).unwrap();
-        let crate::config::ResolvedModel { model, .. } = cfg.resolve(None).unwrap();
-        let mut hc = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
-        hc.config.prompt.system_prompt = Some("test".into());
-        hc.config.execution.context_policy = cfg.execution.context_policy.clone();
+        let cfg = Config::init(&path).unwrap();
+        let crate::model::ResolvedModel { model, .. } =
+            cfg.values().models().clone().resolve().unwrap();
+        let hc = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
+        hc.config.set_system_prompt(Some("test".into()));
+        hc.config
+            .set_context_policy(cfg.values().execution().clone().context_policy().clone());
         let h = Harness::open(hc, model).await.unwrap();
-        let config = Arc::new(std::sync::Mutex::new(cfg));
+        let config = Arc::new(cfg);
 
         // Set: writes the variant's options and reports the effective effort.
         let selected = crate::controller::switch_model(
@@ -1221,15 +1111,16 @@ mod switch_tests {
             &h,
             "mock/small",
             Some("short".into()),
-            Some(crate::config::EffortChoice::Set("high".into())),
+            Some(crate::model::EffortChoice::Set("high".into())),
         )
         .await
         .unwrap();
         assert_eq!(selected.effort.as_deref(), Some("high"));
         assert_eq!(
             config
-                .lock()
-                .unwrap()
+                .values()
+                .models()
+                .clone()
                 .effective_effort("mock/small", Some("short"))
                 .as_deref(),
             Some("high")
@@ -1237,8 +1128,9 @@ mod switch_tests {
         // The file-configured model-level effort still applies to its entry.
         assert_eq!(
             config
-                .lock()
-                .unwrap()
+                .values()
+                .models()
+                .clone()
                 .effective_effort("mock/large", None)
                 .as_deref(),
             Some("low")
@@ -1250,14 +1142,15 @@ mod switch_tests {
             &h,
             "mock/small",
             Some("short".into()),
-            Some(crate::config::EffortChoice::Config),
+            Some(crate::model::EffortChoice::Config),
         )
         .await
         .unwrap();
         assert_eq!(selected.effort, None);
         assert!(
-            !config.lock().unwrap().models.providers["mock"].models["small"].variants["short"]
-                .options
+            !config.values().models().clone().providers()["mock"].models()["small"].variants()
+                ["short"]
+                .options()
                 .contains_key("reasoningEffort")
         );
 
@@ -1267,13 +1160,13 @@ mod switch_tests {
             &h,
             "mock/small",
             None,
-            Some(crate::config::EffortChoice::Set("nope".into())),
+            Some(crate::model::EffortChoice::Set("nope".into())),
         )
         .await
         .is_err());
         assert!(
-            config.lock().unwrap().models.providers["mock"].models["small"]
-                .options
+            config.values().models().clone().providers()["mock"].models()["small"]
+                .options()
                 .get("reasoningEffort")
                 .is_none()
         );

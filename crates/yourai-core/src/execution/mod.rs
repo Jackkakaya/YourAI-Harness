@@ -386,7 +386,7 @@ impl<'a> Turn<'a> {
         let feedback = result.blocking_messages();
         let extra = result.additional_contexts().to_vec();
         if !result.common.blocking_errors.is_empty() {
-            if self.stop_continuations >= self.config.max_stop_continuations {
+            if self.stop_continuations >= self.config.max_stop_continuations() {
                 return Err(ErrorKind::Loop("Stop continuation limit reached".into()).into());
             }
             self.stop_continuations += 1;
@@ -420,7 +420,7 @@ impl<'a> Turn<'a> {
         let _guard = cancel.clone().drop_guard();
         let execution =
             Compactor::from_snapshot(&self.tc.snap, self.tc.info.options.session.as_deref())?;
-        let hook_timeout = self.config.hook_timeout;
+        let hook_timeout = self.config.hook_timeout();
         self.ensure_active()?;
         let future = execution.exec(request, &cancel, hook_timeout);
         tokio::pin!(future);

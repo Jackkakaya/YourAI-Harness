@@ -50,6 +50,33 @@
 //! }
 //! ```
 
+/// Declare private settings fields with local getters and setters.
+#[macro_export]
+macro_rules! settings_fields {
+    ($($(#[$attr:meta])* $vis:vis struct $name:ident {
+        $($(#[$field_attr:meta])* $field:ident: $ty:ty => $setter:ident [$($kind:tt)*],)*
+    })+) => {
+        $($(#[$attr])* $vis struct $name { $($(#[$field_attr])* $field: $ty,)* }
+        impl $name {
+            $( $crate::settings_fields!(@get $field, $ty, [$($kind)*]);
+            pub fn $setter(&mut self, value: $ty) { self.$field = value; } )*
+        })+
+    };
+    (@get $field:ident, $ty:ty, [map $edit:ident $child:ty]) => {
+        pub fn $field(&self) -> &$ty { &self.$field }
+        pub fn $edit(&mut self, id: &str) -> Option<&mut $child> { self.$field.get_mut(id) }
+    };
+    (@get $field:ident, $ty:ty, [value]) => {
+        pub fn $field(&self) -> $ty { self.$field }
+    };
+    (@get $field:ident, $ty:ty, [ref]) => {
+        pub fn $field(&self) -> &$ty { &self.$field }
+    };
+    (@get $field:ident, $ty:ty, [mut $edit:ident]) => {
+        pub fn $field(&self) -> &$ty { &self.$field }
+        pub fn $edit(&mut self) -> &mut $ty { &mut self.$field }
+    };
+}
 pub mod agent_loop;
 pub mod compactor;
 pub mod completion;

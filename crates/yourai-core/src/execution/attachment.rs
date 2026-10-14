@@ -117,7 +117,7 @@ pub(crate) fn resolve_attachment(
                 )));
             }
             let (mime, payload) = if ct.starts_with("image/") {
-                normalize_image(data, &ct, &config.attachment_image)?
+                normalize_image(data, &ct, config.attachment_image())?
             } else {
                 (ct, data.clone())
             };
@@ -141,7 +141,7 @@ fn size_error(
 ) -> ResolveError {
     ResolveError::Invalid(format!(
         "Image {width}x{height} with base64 size {bytes} exceeds configured limits and could not be resized below {}x{}/{} bytes",
-        cfg.max_width, cfg.max_height, cfg.max_base64_bytes
+        cfg.max_width(), cfg.max_height(), cfg.max_base64_bytes()
     ))
 }
 
@@ -158,17 +158,20 @@ fn normalize_image(
     let image = image::load_from_memory(&bytes)
         .map_err(|_| ResolveError::Invalid("attachment image could not be decoded".into()))?;
     let (width, height) = (image.width(), image.height());
-    if width <= cfg.max_width && height <= cfg.max_height && data.len() <= cfg.max_base64_bytes {
+    if width <= cfg.max_width()
+        && height <= cfg.max_height()
+        && data.len() <= cfg.max_base64_bytes()
+    {
         // Fast path: within limits, pass the original payload through
         // untouched (no re-encode, no quality loss).
         return Ok((ct.to_owned(), data.to_owned()));
     }
-    if !cfg.auto_resize {
+    if !cfg.auto_resize() {
         return Err(size_error(width, height, data.len(), cfg));
     }
     let scale = 1f64
-        .min(cfg.max_width as f64 / width as f64)
-        .min(cfg.max_height as f64 / height as f64);
+        .min(cfg.max_width() as f64 / width as f64)
+        .min(cfg.max_height() as f64 / height as f64);
     let mut size = (
         ((width as f64 * scale).round() as u32).max(1),
         ((height as f64 * scale).round() as u32).max(1),
@@ -186,7 +189,7 @@ fn normalize_image(
             .collect::<Result<Vec<_>, _>>()?;
         if let Some((mime, data)) = encoded
             .into_iter()
-            .find(|(_, data)| data.len() <= cfg.max_base64_bytes)
+            .find(|(_, data)| data.len() <= cfg.max_base64_bytes())
         {
             return Ok((mime.into(), data));
         }
@@ -371,7 +374,7 @@ fn resolve_file(
         FileKind::Image => {
             let data = read_file_base64(&path, display)?;
             let (mime, payload) =
-                normalize_image(&data, "image/png", &config.attachment_image)?;
+                normalize_image(&data, "image/png", config.attachment_image())?;
             Ok(ContentPart::from_binary_base64(mime, payload.as_str(), path.file_name().and_then(|n| n.to_str()).map(String::from)))
         }
         FileKind::Audio => {
@@ -383,7 +386,7 @@ fn resolve_file(
             let data = read_file_base64(&path, display)?;
             Ok(ContentPart::from_binary_base64("application/pdf", data.as_str(), path.file_name().and_then(|n| n.to_str()).map(String::from)))
         }
-        FileKind::Text => text_part(&path, &ext, file.lines, config.attachment_text_max_chars, display),
+        FileKind::Text => text_part(&path, &ext, file.lines, config.attachment_text_max_chars(), display),
         FileKind::Other => Err(ResolveError::Invalid(format!(
             "unsupported attachment file '{display}': unrecognized extension '{ext}' (only text, images, audio, and PDF are supported)"
         ))),
@@ -511,11 +514,14 @@ mod tests {
     }
 
     fn limits() -> crate::execution::ImagePolicy {
-        crate::execution::ImagePolicy {
-            auto_resize: true,
-            max_width: 64,
-            max_height: 64,
-            max_base64_bytes: 5 * 1024 * 1024,
+        {
+            let mut settings: crate::execution::ImagePolicy =
+                crate::execution::ImagePolicy::default();
+            settings.set_auto_resize(true);
+            settings.set_max_width(64);
+            settings.set_max_height(64);
+            settings.set_max_base64_bytes(5 * 1024 * 1024);
+            settings
         }
     }
 
@@ -578,7 +584,7 @@ mod tests {
     #[test]
     fn oversized_image_is_resized_by_default() {
         let mut cfg = config();
-        cfg.attachment_image = limits();
+        cfg.set_attachment_image(limits());
         let part =
             resolve_attachment(&att("image/png", &noisy_png_base64(100, 100)), &cfg).unwrap();
         let (w, h) = part_dims(&part);
@@ -589,12 +595,15 @@ mod tests {
     #[test]
     fn byte_limit_drives_further_shrinking() {
         let mut cfg = config();
-        cfg.attachment_image = crate::execution::ImagePolicy {
-            auto_resize: true,
-            max_width: 64,
-            max_height: 64,
-            max_base64_bytes: 200,
-        };
+        cfg.set_attachment_image({
+            let mut settings: crate::execution::ImagePolicy =
+                crate::execution::ImagePolicy::default();
+            settings.set_auto_resize(true);
+            settings.set_max_width(64);
+            settings.set_max_height(64);
+            settings.set_max_base64_bytes(200);
+            settings
+        });
         let part =
             resolve_attachment(&att("image/png", &noisy_png_base64(200, 200)), &cfg).unwrap();
         let (w, h) = part_dims(&part);
@@ -608,10 +617,11 @@ mod tests {
     #[test]
     fn oversized_image_without_auto_resize_is_rejected() {
         let mut cfg = config();
-        cfg.attachment_image = crate::execution::ImagePolicy {
-            auto_resize: false,
-            ..limits()
-        };
+        cfg.set_attachment_image({
+            let mut settings: crate::execution::ImagePolicy = limits();
+            settings.set_auto_resize(false);
+            settings
+        });
         let err =
             resolve_attachment(&att("image/png", &noisy_png_base64(100, 100)), &cfg).unwrap_err();
         assert!(err.to_string().contains("exceeds configured limits"));
@@ -718,7 +728,7 @@ mod tests {
             .unwrap();
         std::fs::write(dir.join("shot.png"), &png).unwrap();
         let mut cfg = config();
-        cfg.attachment_image = limits();
+        cfg.set_attachment_image(limits());
         let att = UserAttachment::file(dir.join("shot.png").to_string_lossy().into_owned(), None);
         let part = resolve_attachment(&att, &cfg).unwrap();
         let (w, h) = part_dims(&part);

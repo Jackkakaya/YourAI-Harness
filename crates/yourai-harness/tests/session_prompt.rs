@@ -80,9 +80,11 @@ async fn frozen_prompt_and_recall_replay_survive_file_changes_restart_and_fork()
     let memory = Arc::new(Memory::default());
     let model = Arc::new(Model::new(vec![answer("one"), answer("two")]));
     let mut config = SessionOptions::new(root.clone(), d.path().into());
-    config.config.execution.instruction_paths = vec!["AGENTS.md".into(), "Memory.md".into()];
+    config
+        .config
+        .set_instruction_paths(vec!["AGENTS.md".into(), "Memory.md".into()]);
     config.memory_manager = Some(memory.clone());
-    config.config.execution.memory_search_limit = 3;
+    config.config.set_memory_search_limit(3);
     let h = Harness::open(config, model.clone()).await.unwrap();
     turn(&h, "A").await;
     let first = model.requests.lock().unwrap()[0].request.clone();
@@ -173,11 +175,17 @@ async fn frozen_prompt_and_recall_replay_survive_file_changes_restart_and_fork()
     let resumed_model = Arc::new(Model::new(vec![answer("three")]));
     let mut config = SessionOptions::new(root, d.path().into());
     config.resume = Some(id);
-    config.config.prompt.system_prompt = Some("changed configuration".into());
-    config.config.prompt.soul_file = Some(d.path().join("missing.md"));
-    config.config.execution.instruction_paths = vec!["AGENTS.md".into()];
+    config
+        .config
+        .set_system_prompt(Some("changed configuration".into()));
+    config
+        .config
+        .set_soul_file(Some(d.path().join("missing.md")));
+    config
+        .config
+        .set_instruction_paths(vec!["AGENTS.md".into()]);
     config.memory_manager = Some(offline.clone());
-    config.config.execution.memory_search_limit = 3;
+    config.config.set_memory_search_limit(3);
     let h = Harness::open(config, resumed_model.clone()).await.unwrap();
     turn(&h, "C").await;
     assert_eq!(offline.initial.load(Ordering::SeqCst), 0);
@@ -198,8 +206,8 @@ async fn frozen_prompt_and_recall_replay_survive_file_changes_restart_and_fork()
 async fn no_provider_works_and_explicit_missing_or_oversize_files_fail_before_session_creation() {
     let d = TempDir::new().unwrap();
     let root = d.path().join("sessions");
-    let mut bad = SessionOptions::new(root.clone(), d.path().into());
-    bad.config.prompt.profile_file = Some("missing.md".into());
+    let bad = SessionOptions::new(root.clone(), d.path().into());
+    bad.config.set_profile_file(Some("missing.md".into()));
     assert!(Harness::open(bad, Arc::new(Model::new(vec![])))
         .await
         .is_err());
@@ -211,8 +219,8 @@ async fn no_provider_works_and_explicit_missing_or_oversize_files_fail_before_se
         .unwrap()
         .is_empty());
     std::fs::write(d.path().join("Memory.md"), "too long").unwrap();
-    let mut bad = SessionOptions::new(root.clone(), d.path().into());
-    bad.config.prompt.memory_file_max_chars = 1;
+    let bad = SessionOptions::new(root.clone(), d.path().into());
+    bad.config.set_memory_file_max_chars(1);
     assert!(Harness::open(bad, Arc::new(Model::new(vec![])))
         .await
         .is_err());
@@ -262,16 +270,12 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
         .await
         .unwrap()
         .id;
-    let c = DefaultContext::new(
-        id.clone(),
-        String::new(),
-        Some(store.clone()),
-        ContextPolicy {
-            keep_recent_tokens: 0,
-            summary_min_savings: 1,
-            ..Default::default()
-        },
-    );
+    let c = DefaultContext::new(id.clone(), String::new(), Some(store.clone()), {
+        let mut settings: yourai_core::compactor::ContextPolicy = Default::default();
+        settings.set_keep_recent_tokens(0);
+        settings.set_summary_min_savings(1);
+        settings
+    });
     c.restore().await.unwrap();
     let mut old = StoredMessage::new(ChatMessage::user("old question"));
     old.attach_recall(vec![RecalledMemory {
@@ -291,10 +295,11 @@ async fn compaction_summarizes_sent_memory_but_never_session_system() {
     let configured_model = model_fixture::TestModel::new(
         model.clone(),
         ModelTokenBudget::resolve(
-            ModelLimits {
-                context: Some(32000),
-                output: Some(4096),
-                ..Default::default()
+            {
+                let mut settings: ModelLimits = Default::default();
+                settings.set_context(Some(32000));
+                settings.set_output(Some(4096));
+                settings
             },
             None,
         )
@@ -410,7 +415,7 @@ async fn request_retry_reuses_exact_recall_without_querying_again() {
     let memory = Arc::new(Memory::default());
     let mut cfg = SessionOptions::new(d.path().join("sessions"), d.path().into());
     cfg.memory_manager = Some(memory.clone());
-    cfg.config.execution.memory_search_limit = 3;
+    cfg.config.set_memory_search_limit(3);
     let h = Harness::open(cfg, model.clone()).await.unwrap();
     turn(&h, "query").await;
     {

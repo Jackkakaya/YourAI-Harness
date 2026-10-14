@@ -110,13 +110,13 @@ impl Turn<'_> {
         if let In::UserText { id: Some(id), .. } = &self.queued[index] {
             record.id = id.clone();
         }
-        if initial && self.config.memory_search_limit > 0 && !text.trim().is_empty() {
+        if initial && self.config.memory_search_limit() > 0 && !text.trim().is_empty() {
             if let Some(memory) = self.tc.snap.memory.clone() {
                 let cancel = self.tc.cancel.clone();
                 let query = RecallRequest {
                     query: &text,
-                    limit: self.config.memory_search_limit,
-                    max_chars: self.config.memory_max_chars,
+                    limit: self.config.memory_search_limit(),
+                    max_chars: self.config.memory_max_chars(),
                 };
                 match self
                     .wait_operation(memory.recall(query, &cancel), self.op_timeout(), "memory")
@@ -126,7 +126,7 @@ impl Turn<'_> {
                         let mut seen = std::collections::HashSet::new();
                         let mut selected = vec![];
                         for entry in entries {
-                            if selected.len() >= self.config.memory_search_limit {
+                            if selected.len() >= self.config.memory_search_limit() {
                                 break;
                             }
                             if entry.content.trim().is_empty()
@@ -143,7 +143,7 @@ impl Turn<'_> {
                             // Bound the rendered metadata too, not just provider prose.
                             if serde_json::to_string(&candidate)
                                 .map_or(usize::MAX, |s| s.chars().count())
-                                > self.config.memory_max_chars
+                                > self.config.memory_max_chars()
                             {
                                 continue;
                             }
@@ -158,7 +158,7 @@ impl Turn<'_> {
                 }
             }
         }
-        if initial && !self.config.skill_ids.is_empty() {
+        if initial && !self.config.skill_ids().is_empty() {
             let skills =
                 self.tc.snap.skills.clone().ok_or_else(|| {
                     ErrorKind::Config("selected skills require SkillProvider".into())
@@ -168,7 +168,7 @@ impl Turn<'_> {
                 .clone()
                 .unwrap_or_else(|| record.message.content.clone())
                 .into_parts();
-            for id in &self.config.skill_ids.clone() {
+            for id in &self.config.skill_ids().clone() {
                 let skill = self
                     .wait_operation(skills.load(id), self.op_timeout(), "skill")
                     .await?;
