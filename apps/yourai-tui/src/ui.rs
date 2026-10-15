@@ -109,17 +109,15 @@ pub async fn run(
     let mut view = View::default();
     view.theme = theme;
     view.model_choices = choices;
-    let (pricing, effort) = {
-        let cfg = &config;
-        let p = yourai_harness::model::pricing(cfg);
-        let pricing = match p {
-            (Some(i), Some(o)) => Some((i, o)),
-            _ => None,
-        };
-        let effort =
-            yourai_harness::model::effective_effort(cfg, cfg.model(), cfg.variant().as_deref());
-        (pricing, effort)
-    };
+    let id = config.model();
+    let variant = config.variant();
+    let entry = yourai_harness::model::list_models(&config, false)
+        .into_iter()
+        .find(|entry| entry.id == id && entry.variant == variant);
+    let pricing = entry
+        .as_ref()
+        .and_then(|entry| entry.input_price.zip(entry.output_price));
+    let effort = entry.and_then(|entry| entry.effort);
     view.model = state::ModelInfo {
         label: model.into(),
         pricing,

@@ -41,7 +41,10 @@ async fn fixture_with_loop(
     let path = dir.path().join("yourai.json");
     std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
     let config = Config::init(&path).unwrap();
-    let model = yourai_harness::model::resolve(&config).unwrap().model;
+    let model =
+        yourai_harness::model::resolve(&config, &config.model(), config.variant().as_deref())
+            .unwrap()
+            .model;
     let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
     options.config.set_system_prompt(Some("test".into()));
     options.agent_loop = Some(agent_loop);

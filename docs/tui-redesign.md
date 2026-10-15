@@ -48,7 +48,7 @@
 ### 模型配置与流转（/models 相关）
 
 - 当前配置已迁入 harness：共享 `Config` 直接保存选择、主题、安全与会话字段；providers/models 是独立 ID 表，execution/prompt/hooks 保留明确内容。
-- `config.model()` 形如 `"provider/model"`。`model::resolve(&config)` 返回 `ResolvedModel`，不改写模型容量或共享配置。
+- `config.model()` 形如 `"provider/model"`。`model::resolve(&config, &config.model(), config.variant().as_deref())` 返回 `ResolvedModel`，不改写模型容量或共享配置。
 - 模型/effort 切换通过 `SessionClient.model`，后端在操作锁内解析、准备资源并保存配置，随后发布绑定；TUI 显示结果。
 - 每轮读取 Config.execution 的冻结副本；已开始轮次保持原参数。上下文策略位于 `execution.context`，容量来自选定模型的 ModelTokenBudget。
 - 以下界面重设计计划保留原讨论背景；当前实现与配置用法以 [配置契约](core-contracts.md#配置读写与持久化契约2026-10-13) 和 [TUI 文档](tui.md) 为准。

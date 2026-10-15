@@ -59,10 +59,8 @@ yourai
   "models": {
     "gateway/YOUR_MODEL_NAME": {
       "id": "YOUR_MODEL_NAME",
-      "limit": {
-        "context": 128000,
-        "output": 4096
-      },
+      "context": 128000,
+      "output": 4096,
       "options": {
         "maxOutputTokens": 4096
       },
@@ -86,7 +84,8 @@ yourai
 - `baseURL` 填基础地址（例如 `/v1`），不要填 `/chat/completions`；省略时使用 genai 的默认服务地址。
 - `apiKey` 支持 `{env:VAR}`；无需认证的本地服务可填任意非空占位值，或按 provider 默认认证方式省略。
 - `directory` 和提示词文件路径相对配置文件解析；工作目录仍是启动 TUI 时所在目录。
-- 模型窗口与输出上限放在 `models["provider/model"].limit`；输出预算按 `options.maxOutputTokens`、`limit.output`、32000 的顺序取值，不得超过模型输出容量。输入预算取 `limit.input` 与 `limit.context - 输出预算` 中的较小值，再扣安全余量。思考强度独立于输出预算。旧的 `execution.context.context_window/input_limit/output_reserve` 配置会被拒绝。
+- 模型级 `header_timeout/chunk_timeout` 使用毫秒，未设置时继承 provider 的 `headerTimeout/chunkTimeout`；旧 `limit` 对象读取时迁移为直接字段。
+- 模型窗口与输出上限放在 `models["provider/model"]`；输出预算按 `options.maxOutputTokens`、`output`、32000 的顺序取值，不得超过模型输出容量。输入预算取 `input` 与 `context - 输出预算` 中的较小值，再扣安全余量。思考强度独立于输出预算。旧的 `execution.context.context_window/input_limit/output_reserve` 配置会被拒绝。
 - `variants` 会合并到模型 `options`；含 `"disabled": true` 的 variant 不会出现在 `/models` 选择器中。
 - `options.reasoningEffort`（或 variant 内同名键）设置思考强度：`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`。OpenAI 系以 `reasoning_effort` 发送；Anthropic/Gemini/Bedrock 会换算成 thinking budget。variant 内的设置优先于模型级。
 - 可选 `input_price`、`output_price` 使用每百万 token 的美元价格，例如 `5.0`、`15.0`。状态栏和仪表盘会显示估算成本；未配置时不显示。

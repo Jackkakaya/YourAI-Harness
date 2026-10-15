@@ -395,7 +395,10 @@ async fn model_switch_saves_global_choices_and_file_failure_keeps_live_bindings(
     initial.set_soul_file(None);
     let mut options = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
     options.config = Arc::clone(&initial);
-    let model = yourai_harness::model::resolve(&initial).unwrap().model;
+    let model =
+        yourai_harness::model::resolve(&initial, &initial.model(), initial.variant().as_deref())
+            .unwrap()
+            .model;
     let h = Harness::open(options.clone(), model).await.unwrap();
     let shared = initial;
     let (backend, mut events) = controller::SessionController::new(
@@ -445,7 +448,11 @@ async fn model_switch_saves_global_choices_and_file_failure_keeps_live_bindings(
     assert_eq!(reloaded.model(), "mock/b");
     assert_eq!(reloaded.variant().as_deref(), Some("short"));
     assert_eq!(
-        yourai_harness::model::effective_effort(&reloaded, "mock/b", Some("short")).as_deref(),
+        yourai_harness::model::list_models(&reloaded, false)
+            .into_iter()
+            .find(|entry| entry.id == "mock/b" && entry.variant.as_deref() == Some("short"))
+            .and_then(|entry| entry.effort)
+            .as_deref(),
         Some("high")
     );
     assert!(h
@@ -778,7 +785,9 @@ async fn model_switch_preserves_unrelated_edits_and_rejects_stale_resources() {
     options.config = Arc::clone(&initial);
     let h = Harness::open(
         options.clone(),
-        yourai_harness::model::resolve(&initial).unwrap().model,
+        yourai_harness::model::resolve(&initial, &initial.model(), initial.variant().as_deref())
+            .unwrap()
+            .model,
     )
     .await
     .unwrap();
@@ -944,7 +953,7 @@ fn indexed_setters_modify_shared_data_and_reject_missing_entries() {
     config.save().unwrap();
     let json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("yourai.json")).unwrap()).unwrap();
-    assert_eq!(json["models"]["mock/a"]["limit"]["context"], 12345);
+    assert_eq!(json["models"]["mock/a"]["context"], 12345);
     config.remove_provider("mock").unwrap();
     assert!(config
         .set_provider_api_key("mock", Some("removed".into()))
@@ -1022,7 +1031,9 @@ async fn opening_a_session_uses_current_defaults_without_overwriting_them() {
     options.config = Arc::clone(&config);
     let harness = Harness::open(
         options.clone(),
-        yourai_harness::model::resolve(&config).unwrap().model,
+        yourai_harness::model::resolve(&config, &config.model(), config.variant().as_deref())
+            .unwrap()
+            .model,
     )
     .await
     .unwrap();
@@ -1050,48 +1061,4 @@ async fn opening_a_session_uses_current_defaults_without_overwriting_them() {
             .yolo()
     );
     backend.close().await.unwrap();
-}
-
-#[test]
-fn model_menu_projects_one_consistent_configuration_version() {
-    use yourai_harness::config::{Config, ModelConfig, ProviderConfig};
-    let config = Arc::new(Config::default());
-    config.set_provider("mock".into(), ProviderConfig::default());
-    config.set_model("mock/main".into());
-    let versions: Vec<ModelConfig> = ["a", "b"]
-        .into_iter()
-        .map(|id| {
-            serde_json::from_value(serde_json::json!({
-                "provider":"mock","variants":{
-                    format!("{id}-fast"):{"reasoningEffort":"high"},
-                    format!("{id}-slow"):{"reasoningEffort":"low"}
-                }
-            }))
-            .unwrap()
-        })
-        .collect();
-    config
-        .set_model_config("mock/main".into(), versions[0].clone())
-        .unwrap();
-    let writer = Arc::clone(&config);
-    let task = std::thread::spawn(move || {
-        for iteration in 0..1000 {
-            writer
-                .set_model_config("mock/main".into(), versions[iteration % 2].clone())
-                .unwrap();
-        }
-    });
-    for _ in 0..1000 {
-        let choices = yourai_harness::model::choices(&config);
-        assert_eq!(choices.len(), 3);
-        assert!(choices.iter().all(|choice| choice.id == "mock/main"));
-        let prefix = choices[1].variant.as_ref().unwrap().chars().next().unwrap();
-        assert_eq!(
-            choices[2].variant.as_ref().unwrap().chars().next().unwrap(),
-            prefix
-        );
-        assert_eq!(choices[1].effort.as_deref(), Some("high"));
-        assert_eq!(choices[2].effort.as_deref(), Some("low"));
-    }
-    task.join().unwrap();
 }

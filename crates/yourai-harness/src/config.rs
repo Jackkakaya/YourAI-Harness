@@ -1,7 +1,6 @@
 pub use yourai_core::{
     compactor::ContextPolicy,
     execution::{ExecutionOptions, ImagePolicy},
-    model::{ModelLimits, ModelTimeouts},
 };
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 use serde::{Deserialize, Serialize};
@@ -132,7 +131,11 @@ pub struct ModelConfig {
     provider: String => set_provider [ref],
     id: Option<String> => set_id [ref],
     name: Option<String> => set_name [ref],
-    limit: ModelLimits => set_limit [value],
+    context: Option<u64> => set_context [value],
+    input: Option<u64> => set_input [value],
+    output: Option<u32> => set_output [value],
+    header_timeout: Option<u64> => set_header_timeout [value],
+    chunk_timeout: Option<u64> => set_chunk_timeout [value],
     input_price: Option<f64> => set_input_price [value],
     output_price: Option<f64> => set_output_price [value],
     options: Map<String, Value> => set_options [ref],
@@ -463,6 +466,16 @@ fn normalize_document(mut data: Value) -> Result<Value, Error> {
                 model.insert("provider".into(), Value::String(provider.into()));
             }
         }
+        if let Some(limits) = model.remove("limit") {
+            for (key, value) in limits.as_object().ok_or("limit must be an object")? {
+                if !["context", "input", "output"].contains(&key.as_str()) {
+                    return Err(format!("unknown model limit: {key}").into());
+                }
+                if model.insert(key.clone(), value.clone()).is_some() {
+                    return Err(format!("duplicate model limit: {key}").into());
+                }
+            }
+        }
         if let Some(pricing) = model.remove("pricing") {
             for (key, value) in pricing.as_object().ok_or("pricing must be an object")? {
                 let key = match key.as_str() {
@@ -756,9 +769,11 @@ entry_fields! { "models";
     model_provider, set_model_provider: String => ["provider"];
     model_id, set_model_id: Option<String> => ["id"];
     model_name, set_model_name: Option<String> => ["name"];
-    model_context, set_model_context: Option<u64> => ["limit", "context"];
-    model_input, set_model_input: Option<u64> => ["limit", "input"];
-    model_output, set_model_output: Option<u32> => ["limit", "output"];
+    model_context, set_model_context: Option<u64> => ["context"];
+    model_input, set_model_input: Option<u64> => ["input"];
+    model_output, set_model_output: Option<u32> => ["output"];
+    model_header_timeout, set_model_header_timeout: Option<u64> => ["header_timeout"];
+    model_chunk_timeout, set_model_chunk_timeout: Option<u64> => ["chunk_timeout"];
     model_input_price, set_model_input_price: Option<f64> => ["input_price"];
     model_output_price, set_model_output_price: Option<f64> => ["output_price"];
     model_options, set_model_options: Map<String,Value> => ["options"];

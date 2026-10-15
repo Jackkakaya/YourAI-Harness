@@ -30,17 +30,17 @@ impl ModelSelection {
     fn from_data(data: &serde_json::Value) -> Self {
         let model: String = crate::config::read(data, "model");
         let variant: Option<String> = crate::config::read(data, "variant");
-        let pricing = crate::model::configured::pricing_data(data);
+        let entry = crate::model::configured::list_data(data, false)
+            .into_iter()
+            .find(|entry| entry.id == model && entry.variant == variant);
         Self {
             label: variant
                 .as_ref()
                 .map_or_else(|| model.clone(), |v| format!("{model} · {v}")),
-            pricing: pricing.0.zip(pricing.1),
-            effort: crate::model::configured::effective_effort_data(
-                data,
-                &model,
-                variant.as_deref(),
-            ),
+            pricing: entry
+                .as_ref()
+                .and_then(|entry| entry.input_price.zip(entry.output_price)),
+            effort: entry.and_then(|entry| entry.effort),
         }
     }
 }
@@ -838,7 +838,8 @@ async fn switch_model(
         model,
         provider,
         requests,
-    } = crate::model::configured::resolve_data(&candidate).map_err(|e| e.to_string())?;
+    } = crate::model::configured::resolve_data(&candidate, id, variant.as_deref())
+        .map_err(|e| e.to_string())?;
     let policy =
         crate::config::read::<yourai_core::execution::ExecutionOptions>(&values, "execution")
             .context_policy()
@@ -999,7 +1000,8 @@ mod switch_tests {
         let path = dir.path().join("yourai.json");
         std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
         let cfg = Config::init(&path).unwrap();
-        let crate::model::ResolvedModel { model, .. } = crate::model::resolve(&cfg).unwrap();
+        let crate::model::ResolvedModel { model, .. } =
+            crate::model::resolve(&cfg, &cfg.model(), cfg.variant().as_deref()).unwrap();
         let hc = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
         hc.config.set_system_prompt(Some("test".into()));
         hc.config
@@ -1023,7 +1025,7 @@ mod switch_tests {
             let cfg = &config;
             assert_eq!(cfg.model(), "mock/large");
             assert_eq!(
-                crate::model::resolve(cfg)
+                crate::model::resolve(cfg, &cfg.model(), cfg.variant().as_deref())
                     .unwrap()
                     .model
                     .token_budget()
@@ -1092,7 +1094,8 @@ mod switch_tests {
         let path = dir.path().join("yourai.json");
         std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
         let cfg = Config::init(&path).unwrap();
-        let crate::model::ResolvedModel { model, .. } = crate::model::resolve(&cfg).unwrap();
+        let crate::model::ResolvedModel { model, .. } =
+            crate::model::resolve(&cfg, &cfg.model(), cfg.variant().as_deref()).unwrap();
         let hc = SessionOptions::new(dir.path().join("sessions"), dir.path().into());
         hc.config.set_system_prompt(Some("test".into()));
         hc.config
@@ -1112,12 +1115,20 @@ mod switch_tests {
         .unwrap();
         assert_eq!(selected.effort.as_deref(), Some("high"));
         assert_eq!(
-            crate::model::effective_effort(&config, "mock/small", Some("short")).as_deref(),
+            crate::model::list_models(&config, false)
+                .into_iter()
+                .find(|entry| entry.id == "mock/small" && entry.variant.as_deref() == Some("short"))
+                .and_then(|entry| entry.effort)
+                .as_deref(),
             Some("high")
         );
         // The file-configured model-level effort still applies to its entry.
         assert_eq!(
-            crate::model::effective_effort(&config, "mock/large", None).as_deref(),
+            crate::model::list_models(&config, false)
+                .into_iter()
+                .find(|entry| entry.id == "mock/large" && entry.variant.is_none())
+                .and_then(|entry| entry.effort)
+                .as_deref(),
             Some("low")
         );
 

@@ -82,15 +82,6 @@
       },
       "additionalProperties": false
     },
-    "limits": {
-      "type": "object",
-      "properties": {
-        "context": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
-        "input": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
-        "output": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 4294967295}, {"type": "null"}]}
-      },
-      "additionalProperties": false
-    },
     "generation": {
       "type": "object",
       "properties": {
@@ -107,7 +98,11 @@
       "properties": {
         "id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "limit": {"$ref": "#/$defs/limits"},
+        "context": {"type": ["integer", "null"], "minimum": 1},
+        "input": {"type": ["integer", "null"], "minimum": 1},
+        "output": {"type": ["integer", "null"], "minimum": 1, "maximum": 4294967295},
+        "header_timeout": {"type": ["integer", "null"], "minimum": 1},
+        "chunk_timeout": {"type": ["integer", "null"], "minimum": 1},
         "options": {"$ref": "#/$defs/generation"},
         "headers": {"type": "object", "additionalProperties": {"type": "string"}},
         "variants": {"type": "object", "additionalProperties": {"$ref": "#/$defs/variant"}},

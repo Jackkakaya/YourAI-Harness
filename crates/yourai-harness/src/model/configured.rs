@@ -10,39 +10,82 @@ use genai::{
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::{sync::Arc, time::Duration};
-use yourai_core::prelude::{ModelProvider, ModelTimeouts, ModelTokenBudget};
+use yourai_core::prelude::{ModelLimits, ModelProvider, ModelTimeouts, ModelTokenBudget};
 
-pub(crate) fn build_model(
+/// A configured model/variant and its effective settings, independent of UI labels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelEntry {
+    pub id: String,
+    pub variant: Option<String>,
+    pub effort: Option<String>,
+    pub available: bool,
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
+}
+
+/// List configured models and variants. Availability means the provider binding
+/// exists and the variant is enabled; credentials and connectivity are not tested.
+pub fn list_models(config: &crate::config::Config, available_only: bool) -> Vec<ModelEntry> {
+    list_data(&config.write(), available_only)
+}
+
+pub(crate) fn list_data(data: &Value, available_only: bool) -> Vec<ModelEntry> {
+    let mut ids: Vec<_> = data["models"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    let current = data["model"].as_str().unwrap();
+    if !current.is_empty() && !ids.iter().any(|id| id == current) {
+        ids.push(current.to_owned());
+    }
+    let mut entries = Vec::new();
+    for id in ids {
+        let binding = configured_model(data, &id);
+        let bound = binding.is_ok();
+        let settings = match binding {
+            Ok((_, _, _, settings)) => settings,
+            Err(_) => data["models"]
+                .get(&id)
+                .map(|value| crate::config::decode::<ModelConfig>(value.clone(), "model").unwrap())
+                .unwrap_or_default(),
+        };
+        for variant in
+            std::iter::once(None).chain(settings.variants().keys().map(|name| Some(name.as_str())))
+        {
+            let available = bound && options_for(&settings, variant).is_ok();
+            if available_only && !available {
+                continue;
+            }
+            entries.push(ModelEntry {
+                id: id.clone(),
+                variant: variant.map(str::to_owned),
+                effort: effective_effort_data(data, &id, variant),
+                available,
+                input_price: settings.input_price(),
+                output_price: settings.output_price(),
+            });
+        }
+    }
+    entries
+}
+
+pub(crate) fn resolve_data(
     data: &Value,
     id: &str,
     variant: Option<&str>,
-    effort: Option<&str>,
 ) -> Result<ResolvedModel, Error> {
-    let (provider_id, provider, model_key, model) = provider_entry(data, id)?;
+    let effort = effective_effort_data(data, id, variant);
+    let (provider_id, provider, model_key, model) = configured_model(data, id)?;
     let requests = (provider.rpm(), provider.cooldown_seconds());
     super::control::validate(requests)?;
     let name = model.id().as_deref().unwrap_or(&model_key);
     if name.trim().is_empty() {
         return Err("Model id is empty".into());
     }
-    let mut options = Value::Object(model.options().clone());
-    if let Some(variant) = variant {
-        let selected = model
-            .variants()
-            .get(variant)
-            .ok_or("Unknown model variant")?;
-        if selected
-            .get("disabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Err("Model variant is disabled".into());
-        }
-        let mut selected = selected.clone();
-        selected.remove("disabled");
-        merge(&mut options, Value::Object(selected));
-    }
-    if let Some(effort) = effort {
+    let mut options = Value::Object(options_for(&model, variant)?);
+    if let Some(effort) = &effort {
         options["reasoningEffort"] = Value::String(effort.into());
     }
     #[derive(Deserialize)]
@@ -57,7 +100,11 @@ pub(crate) fn build_model(
     }
     let generation: Generation =
         serde_json::from_value(options).map_err(|_| "Invalid model options value type")?;
-    let budget = ModelTokenBudget::resolve(model.limit(), generation.max_output_tokens)?;
+    let mut limits = ModelLimits::default();
+    limits.set_context(model.context());
+    limits.set_input(model.input());
+    limits.set_output(model.output());
+    let budget = ModelTokenBudget::resolve(limits, generation.max_output_tokens)?;
     if generation
         .temperature
         .is_some_and(|v| !v.is_finite() || v < 0.0)
@@ -117,7 +164,10 @@ pub(crate) fn build_model(
         .map(|(k, v)| Ok((k, expand(&v)?)))
         .collect::<Result<_, Error>>()?;
     let client = provider_client(&provider, &provider_id, chat)?;
-    let (header_timeout, chunk_timeout) = model_timeouts(&provider)?;
+    let (header_timeout, chunk_timeout) = model_timeouts(
+        model.header_timeout().or(provider.header_timeout()),
+        model.chunk_timeout().or(provider.chunk_timeout()),
+    )?;
     let defaults = ModelTimeouts::default();
     let model = Arc::new(
         GenaiModel::new(client, name)
@@ -156,8 +206,9 @@ fn expand(value: &str) -> Result<String, Error> {
     }
     Ok(value.into())
 }
-pub(crate) fn model_timeouts(
-    options: &ProviderConfig,
+fn model_timeouts(
+    header_timeout: Option<u64>,
+    chunk_timeout: Option<u64>,
 ) -> Result<(Option<Duration>, Option<Duration>), Error> {
     let timeout = |key: &str, value: Option<u64>| -> Result<Option<Duration>, Error> {
         value
@@ -171,8 +222,8 @@ pub(crate) fn model_timeouts(
             .transpose()
     };
     Ok((
-        timeout("headerTimeout", options.header_timeout())?,
-        timeout("chunkTimeout", options.chunk_timeout())?,
+        timeout("header_timeout", header_timeout)?,
+        timeout("chunk_timeout", chunk_timeout)?,
     ))
 }
 pub(crate) fn provider_client(
@@ -280,7 +331,8 @@ pub(crate) fn model_parts(id: &str) -> Result<(&str, &str), Error> {
     }
     Ok((provider, model))
 }
-fn provider_entry(
+/// Resolve a configured binding (including implicit models), without creating clients.
+fn configured_model(
     data: &Value,
     id: &str,
 ) -> Result<(String, ProviderConfig, String, ModelConfig), Error> {
@@ -304,44 +356,27 @@ fn provider_entry(
         model,
     ))
 }
-pub(crate) fn resolve_data(data: &Value) -> Result<ResolvedModel, Error> {
-    let id: String = crate::config::read(data, "model");
-    let variant: Option<String> = crate::config::read(data, "variant");
-    build_model(
-        data,
-        &id,
-        variant.as_deref(),
-        effective_effort_data(data, &id, variant.as_deref()).as_deref(),
-    )
-}
-pub(crate) fn resolve_compaction_data(data: &Value) -> Result<Option<ResolvedModel>, Error> {
-    let id: Option<String> = crate::config::read(data, "compaction_model");
-    id.map(|id| {
-        build_model(
-            data,
-            &id,
-            None,
-            effective_effort_data(data, &id, None).as_deref(),
-        )
-    })
-    .transpose()
-}
-fn validate_entry(
-    data: &Value,
-    id: &str,
-    variant: Option<&str>,
-    effort: Option<&str>,
-) -> Result<(), Error> {
-    let (_, _, _, model) = provider_entry(data, id)?;
-    if let Some(variant) = variant {
-        if !model.variants().contains_key(variant) {
-            return Err("Unknown model variant".into());
+/// Resolve inherited generation parameters without constructing a client.
+/// A disabled or missing variant cannot be used by any caller.
+fn options_for(model: &ModelConfig, variant: Option<&str>) -> Result<Map<String, Value>, Error> {
+    let mut options = Value::Object(model.options().clone());
+    if let Some(name) = variant {
+        let selected = model.variants().get(name).ok_or("Unknown model variant")?;
+        if selected
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err("Model variant is disabled".into());
         }
+        let mut selected = selected.clone();
+        selected.remove("disabled");
+        merge(&mut options, Value::Object(selected));
     }
-    if effort.is_some_and(|v| !EFFORT_CHOICES.iter().flatten().any(|allowed| *allowed == v)) {
-        return Err("Invalid reasoningEffort".into());
+    match options {
+        Value::Object(options) => Ok(options),
+        _ => unreachable!("object options merge into an object"),
     }
-    Ok(())
 }
 pub(crate) fn select_data(
     data: &Value,
@@ -349,23 +384,8 @@ pub(crate) fn select_data(
     variant: Option<String>,
     effort: Option<&EffortChoice>,
 ) -> Result<Value, Error> {
-    validate_entry(
-        data,
-        id,
-        variant.as_deref(),
-        match effort {
-            Some(EffortChoice::Set(value)) => Some(value),
-            _ => None,
-        },
-    )?;
-    if let Some(variant) = &variant {
-        if data["models"][id]["variants"][variant]["disabled"]
-            .as_bool()
-            .unwrap_or(false)
-        {
-            return Err("Model variant is disabled".into());
-        }
-    }
+    let (_, _, _, model) = configured_model(data, id)?;
+    options_for(&model, variant.as_deref())?;
     let mut next = data.clone();
     if let Some(effort) = effort {
         set_effort(&mut next, id, variant.as_deref(), effort)?;
@@ -380,15 +400,15 @@ fn set_effort(
     variant: Option<&str>,
     effort: &EffortChoice,
 ) -> Result<(), Error> {
-    validate_entry(
-        data,
-        id,
-        variant,
-        match effort {
-            EffortChoice::Set(v) => Some(v),
-            EffortChoice::Config => None,
-        },
-    )?;
+    if let EffortChoice::Set(value) = effort {
+        if !EFFORT_CHOICES
+            .iter()
+            .flatten()
+            .any(|allowed| *allowed == value)
+        {
+            return Err("Invalid reasoningEffort".into());
+        }
+    }
     let overrides = data["effort_overrides"].as_object_mut().unwrap();
     match effort {
         EffortChoice::Set(value) => {
@@ -426,17 +446,7 @@ pub(crate) fn dependencies(data: &Value) -> Value {
         data["execution"]["context"]
     ])
 }
-pub(crate) fn pricing_data(data: &Value) -> (Option<f64>, Option<f64>) {
-    let id: String = crate::config::read(data, "model");
-    provider_entry(data, &id).map_or((None, None), |(_, _, _, model)| {
-        (model.input_price(), model.output_price())
-    })
-}
-pub(crate) fn effective_effort_data(
-    data: &Value,
-    id: &str,
-    variant: Option<&str>,
-) -> Option<String> {
+fn effective_effort_data(data: &Value, id: &str, variant: Option<&str>) -> Option<String> {
     let overrides = &data["effort_overrides"][id];
     variant
         .and_then(|name| overrides[name].as_str())
@@ -460,99 +470,42 @@ pub(crate) fn validate_data(data: &Value, loaded: bool) -> Result<(), Error> {
         model_parts(&id)?;
     }
     if !data["providers"].as_object().unwrap().is_empty() {
-        validate_entry(data, &id, variant.as_deref(), None)?;
-        if variant.as_ref().is_some_and(|v| {
-            data["models"][&id]["variants"][v]["disabled"]
-                .as_bool()
-                .unwrap_or(false)
-        }) {
-            return Err("Model variant is disabled".into());
-        }
+        let (_, _, _, model) = configured_model(data, &id)?;
+        options_for(&model, variant.as_deref())?;
     }
     for provider in data["providers"].as_object().unwrap().values() {
         let provider: ProviderConfig = crate::config::decode(provider.clone(), "provider")?;
         super::control::validate((provider.rpm(), provider.cooldown_seconds()))?;
     }
     for (id, entries) in data["effort_overrides"].as_object().unwrap() {
-        for (variant, effort) in entries.as_object().unwrap() {
-            validate_entry(
-                data,
-                id,
-                (!variant.is_empty()).then_some(variant),
-                effort.as_str(),
-            )?;
+        let entries = entries.as_object().unwrap();
+        if entries.is_empty() {
+            continue;
+        }
+        let (_, _, _, model) = configured_model(data, id)?;
+        for (name, effort) in entries {
+            if !name.is_empty() && !model.variants().contains_key(name) {
+                return Err("Unknown model variant".into());
+            }
+            if !EFFORT_CHOICES
+                .iter()
+                .flatten()
+                .any(|allowed| Some(*allowed) == effort.as_str())
+            {
+                return Err("Invalid reasoningEffort".into());
+            }
         }
     }
     Ok(())
 }
 
-/// A selectable model entry in the `/models` picker.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModelChoice {
-    /// "provider/model"
-    pub id: String,
-    /// Variant name; None for the default (no-variant) entry.
-    pub variant: Option<String>,
-    /// Display label: "provider/model" or "provider/model · variant".
-    pub label: String,
-    /// Effective reasoning effort for this entry: the variant's
-    /// `reasoningEffort` when set, else the model's. None = no hint.
-    pub effort: Option<String>,
-}
-
-fn choices_data(data: &Value) -> Vec<ModelChoice> {
-    let mut choices = Vec::new();
-    for (id, model) in data["models"].as_object().unwrap() {
-        choices.push(ModelChoice {
-            id: id.clone(),
-            variant: None,
-            label: id.clone(),
-            effort: effective_effort_data(data, id, None),
-        });
-        for (name, variant) in model["variants"].as_object().unwrap() {
-            if variant["disabled"].as_bool().unwrap_or(false) {
-                continue;
-            }
-            choices.push(ModelChoice {
-                id: id.clone(),
-                variant: Some(name.clone()),
-                label: format!("{id} · {name}"),
-                effort: effective_effort_data(data, id, Some(name)),
-            });
-        }
-    }
-    let id: String = crate::config::read(data, "model");
-    if !choices.iter().any(|c| c.id == id && c.variant.is_none()) {
-        choices.insert(
-            0,
-            ModelChoice {
-                id: id.clone(),
-                variant: None,
-                label: id.clone(),
-                effort: effective_effort_data(data, &id, None),
-            },
-        );
-    }
-    choices
-}
-pub fn resolve(config: &crate::config::Config) -> Result<ResolvedModel, Error> {
-    resolve_data(&config.values())
-}
-pub fn resolve_compaction(config: &crate::config::Config) -> Result<Option<ResolvedModel>, Error> {
-    resolve_compaction_data(&config.values())
-}
-pub fn choices(config: &crate::config::Config) -> Vec<ModelChoice> {
-    choices_data(&config.write())
-}
-pub fn pricing(config: &crate::config::Config) -> (Option<f64>, Option<f64>) {
-    pricing_data(&config.write())
-}
-pub fn effective_effort(
+/// Construct the specified model without changing the current selection.
+pub fn resolve(
     config: &crate::config::Config,
-    id: impl AsRef<str>,
+    id: &str,
     variant: Option<&str>,
-) -> Option<String> {
-    effective_effort_data(&config.write(), id.as_ref(), variant)
+) -> Result<ResolvedModel, Error> {
+    resolve_data(&config.values(), id, variant)
 }
 pub fn select(
     config: &crate::config::Config,
@@ -564,4 +517,31 @@ pub fn select(
     let next = select_data(&data, id, variant, effort)?;
     apply_selection(&mut data, &next);
     Ok(())
+}
+
+#[cfg(test)]
+mod list_tests {
+    #[test]
+    fn all_includes_disabled_and_missing_provider_but_available_filters_them() {
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "model": "mock/a",
+            "providers": {"mock": {}},
+            "models": {
+                "mock/a": {"variants": {"enabled": {}, "disabled": {"disabled": true}}},
+                "missing/b": {}
+            }
+        }))
+        .unwrap();
+        let all = super::list_models(&config, false);
+        assert_eq!(all.len(), 4);
+        assert_eq!(all.iter().filter(|entry| entry.available).count(), 2);
+        let available = super::list_models(&config, true);
+        assert_eq!(
+            available,
+            all.into_iter()
+                .filter(|entry| entry.available)
+                .collect::<Vec<_>>()
+        );
+        assert!(available.iter().all(|entry| entry.id == "mock/a"));
+    }
 }

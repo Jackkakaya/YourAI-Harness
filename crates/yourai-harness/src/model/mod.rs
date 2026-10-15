@@ -11,8 +11,7 @@ pub(crate) mod retry;
 mod settings_fixture;
 pub use crate::config::{ConnectionTimeout, Error, ModelConfig, ProviderConfig};
 pub use configured::{
-    choices, effective_effort, pricing, resolve, resolve_compaction, select, EffortChoice,
-    ModelChoice, ResolvedModel, EFFORT_CHOICES,
+    list_models, resolve, select, EffortChoice, ModelEntry, ResolvedModel, EFFORT_CHOICES,
 };
 use futures_util::StreamExt;
 use metrics::Attempt;

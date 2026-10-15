@@ -1561,7 +1561,9 @@ mod tests {
         let path = dir.path().join("yourai.json");
         std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
         let cfg = crate::config::Config::init(&path).unwrap();
-        let model = yourai_harness::model::resolve(&cfg).unwrap().model;
+        let model = yourai_harness::model::resolve(&cfg, &cfg.model(), cfg.variant().as_deref())
+            .unwrap()
+            .model;
         let hc =
             yourai_harness::SessionOptions::new(dir.path().join("sessions"), dir.path().into());
         hc.config.set_system_prompt(Some("test".into()));
@@ -1654,7 +1656,11 @@ mod tests {
         finish(&mut app).await;
         assert_eq!(app.view.model.effort.as_deref(), Some("low"));
         assert_eq!(
-            yourai_harness::model::effective_effort(&cfg, "mock/a", Some("inherit")).as_deref(),
+            yourai_harness::model::list_models(&cfg, false)
+                .into_iter()
+                .find(|entry| entry.id == "mock/a" && entry.variant.as_deref() == Some("inherit"))
+                .and_then(|entry| entry.effort)
+                .as_deref(),
             Some("low")
         );
         // Config default removes that override and resumes live inheritance.

@@ -171,11 +171,16 @@ async fn run() -> Result<(), Error> {
         return Ok(());
     }
     if check {
-        let selection = yourai_harness::model::resolve(&config)?;
+        let selection =
+            yourai_harness::model::resolve(&config, &config.model(), config.variant().as_deref())?;
         config
             .context_policy()
             .validate_for(selection.model.token_budget())?;
-        if let Some(summary) = yourai_harness::model::resolve_compaction(&config)? {
+        if let Some(summary) = config
+            .compaction_model()
+            .map(|id| yourai_harness::model::resolve(&config, &id, None))
+            .transpose()?
+        {
             config
                 .context_policy()
                 .validate_for(summary.model.token_budget())?;
@@ -199,15 +204,19 @@ async fn run() -> Result<(), Error> {
             launcher::Choice::Quit => return Ok(()),
         }
     }
-    let selection = yourai_harness::model::resolve(&config)?;
-    let compaction = yourai_harness::model::resolve_compaction(&config)?;
+    let selection =
+        yourai_harness::model::resolve(&config, &config.model(), config.variant().as_deref())?;
+    let compaction = config
+        .compaction_model()
+        .map(|id| yourai_harness::model::resolve(&config, &id, None))
+        .transpose()?;
     let model = selection.model.clone();
     if config
         .context_policy()
         .input_budget(model.token_budget())
         .is_none()
     {
-        eprintln!("Context window unknown: configure models.providers.<id>.models.<id>.limit.context to enable automatic/manual summarization.");
+        eprintln!("Context window unknown: configure models[provider/model].context to enable automatic/manual summarization.");
     }
     let choices = crate::models::model_choices(&config);
     let mut hc = SessionOptions::new(

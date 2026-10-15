@@ -217,7 +217,7 @@ config.set_provider_base_url("gateway", Some(url))?;
 config.set_model_context("gateway/model", Some(128_000))?;
 config.save()?;
 model::select(&config, "gateway/model", None, None)?;
-let resolved = model::resolve(&config)?;
+let resolved = model::resolve(&config, &config.model(), config.variant().as_deref())?;
 ```
 
 Config::init 只检查文件、JSON 结构和字段类型，旧分组及 provider 内模型、连接 options 在此转换。没有网络客户端构建、Hook 编译或业务参数检查。Config::save() 先序列化完整文档，再通过同目录临时文件原子替换主 JSON；不接收旧配置、不比较字段、不写独立 Prompt/Hook 文件。
@@ -247,3 +247,7 @@ SessionController::new 返回运行所有者和初始订阅；命令经 client()
 约束见 [配置和控制状态约束](config-control-invariants.md)。
 
 共享使用 Arc::new(Config::init(path)?)；SessionOptions 保存同一个 Arc，复制会话组装参数不会复制配置。Config 没有 snapshot 或 Clone。getter/setter 在内部短暂加锁，save 在同一把锁内完整序列化并原子保存。模型构建使用内部临时参数，检查构建依据后才提交模型选择字段，不创建另一个 Config。执行参数 getter 仅提供本轮执行输入，修改始终调用 Config 的 setter。
+
+模型列表由 model::list_models(config, available_only) 查询，统一解析 provider 关联、variant 可用性和 effort；内部持锁读取，无配置 JSON 复制或外部数据拼装。全部模式保留不可用条目并标记 available，可用模式过滤它们。TUI 只生成标签与展示顺序；查询不构建客户端、不验证网络或凭据。
+
+模型配置直接包含 context/input/output/header_timeout/chunk_timeout；旧 limit 对象读取时迁移，保存只写直接字段。模型超时优先于 provider 的 headerTimeout/chunkTimeout，未配置时继承 provider 默认值。core 的 ModelLimits/ModelTimeouts 仅作为运行数据在构建时转换。模型配置对外操作仅 list_models、select、resolve；列表返回 effort、input_price、output_price，resolve 显式接收 id 和 variant，主模型与压缩模型共用。

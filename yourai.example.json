@@ -38,10 +38,8 @@
   "models": {
     "gateway/YOUR_MODEL_NAME": {
       "id": "YOUR_MODEL_NAME",
-      "limit": {
-        "context": 128000,
-        "output": 4096
-      },
+      "context": 128000,
+      "output": 4096,
       "provider": "gateway"
     }
   }

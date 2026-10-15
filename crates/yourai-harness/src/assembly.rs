@@ -540,11 +540,18 @@ pub fn resolve_session(
     id: Option<SessionId>,
 ) -> Result<(SessionOptions, Arc<dyn ModelProvider>), crate::config::Error> {
     let values = config.values();
-    let selection = crate::model::configured::resolve_data(&values)?;
+    let selection = crate::model::configured::resolve_data(
+        &values,
+        values["model"].as_str().unwrap(),
+        values["variant"].as_str(),
+    )?;
     let mut options = template.clone();
     options.resume = id;
     options.config = Arc::clone(config);
-    options.compaction_model = crate::model::configured::resolve_compaction_data(&values)?;
+    options.compaction_model = values["compaction_model"]
+        .as_str()
+        .map(|id| crate::model::configured::resolve_data(&values, id, None))
+        .transpose()?;
     options.model_provider = selection.provider.clone();
     options.request_policy = selection.requests;
     Ok((options, selection.model))
